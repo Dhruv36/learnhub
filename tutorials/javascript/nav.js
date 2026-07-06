@@ -21,6 +21,6 @@ renderSidebar([
     ["Security", "security.html"],
     ["Performance Patterns at Scale", "performance.html"]] },
   { title: "Practice", items: [
-    ["📝 JavaScript Quiz", "quiz.html"],
+    ["📝 Quizzes (10 sets × 20 Qs)", "quiz.html"],
     ["💻 Try It Yourself", "../../playground/index.html"]] }
 ]);
