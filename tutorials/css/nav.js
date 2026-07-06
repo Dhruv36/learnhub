@@ -19,6 +19,6 @@ renderSidebar([
     ["Performance", "performance.html"],
     ["Cross-browser & Accessibility", "cross-browser-a11y.html"]] },
   { title: "Practice", items: [
-    ["📝 CSS Quiz", "quiz.html"],
+    ["📝 Quizzes (10 sets × 20 Qs)", "quiz.html"],
     ["💻 Try It Yourself", "../../playground/index.html"]] }
 ]);
