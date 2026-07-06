@@ -19,6 +19,6 @@ renderSidebar([
     ["Security (XSS, CSP, sanitization)", "security.html"],
     ["Production Patterns (SSR, hydration)", "production-patterns.html"]] },
   { title: "Practice", items: [
-    ["📝 HTML Quiz", "quiz.html"],
+    ["📝 Quizzes (10 sets × 20 Qs)", "quiz.html"],
     ["💻 Try It Yourself", "../../playground/index.html"]] }
 ]);
