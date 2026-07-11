@@ -22,7 +22,7 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 10 | Redis | 11 | 200 | ✅ DONE |
 | 11 | Docker | 12 | 200 | ✅ DONE |
 | 12 | Kubernetes | 12 | 200 | ✅ DONE |
-| 13 | AWS | — | — | ⬜ landing page only |
+| 13 | AWS | 12 | 200 | ✅ DONE |
 | 14 | CI/CD | — | — | ⬜ landing page only |
 | 15 | Angular | — | — | ⬜ landing page only |
 | 16 | .NET (C#) | — | — | ⬜ landing page only |
@@ -30,7 +30,7 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 18 | LeetCode Patterns | 4 patterns + 1 quiz set | | 🟡 partial (batch 2 pending) |
 | 19 | System Design | 5 fundamentals + 1 quiz set | | 🟡 partial (deep dives + case studies pending) |
 
-**Done: 12 full tracks (2,400 quiz questions).** Remaining build order: AWS → CI/CD → Angular → .NET → ASP.NET, then LeetCode batch 2 + System Design case studies (source PDFs at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`).
+**Done: 13 full tracks (2,600 quiz questions).** Remaining build order: CI/CD → Angular → .NET → ASP.NET, then LeetCode batch 2 + System Design case studies (source PDFs at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`).
 
 ---
 
