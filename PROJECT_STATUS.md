@@ -2,7 +2,7 @@
 
 **Live:** https://dhruv36.github.io/learnhub/ · **Repo:** github.com/Dhruv36/learnhub (GitHub Pages, main branch → auto-deploy on push)
 
-A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step. Goal: deep, curated, mid/senior-interview-ready content the engineering community can use as a single reference. Every track = ~12 lessons (Basics → Ultra-Advanced) + **10 quizzes × 20 questions = 200 Qs** with per-answer explanations.
+A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step. Goal: deep, curated, mid/senior-interview-ready content the engineering community can use as a single reference. Every track = ~20 lessons (Basics → Ultra-Advanced) + **10 quizzes × 20 questions = 200 Qs** with per-answer explanations.
 
 ---
 
@@ -21,7 +21,7 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 9 | MongoDB | 12 | 200 | ✅ DONE |
 | 10 | Redis | 11 | 200 | ✅ DONE |
 | 11 | Docker | 12 | 200 | ✅ DONE |
-| 12 | Kubernetes | — | — | ⬜ landing page only |
+| 12 | Kubernetes | 12 | 200 | ✅ DONE |
 | 13 | AWS | — | — | ⬜ landing page only |
 | 14 | CI/CD | — | — | ⬜ landing page only |
 | 15 | Angular | — | — | ⬜ landing page only |
@@ -30,7 +30,7 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 18 | LeetCode Patterns | 4 patterns + 1 quiz set | | 🟡 partial (batch 2 pending) |
 | 19 | System Design | 5 fundamentals + 1 quiz set | | 🟡 partial (deep dives + case studies pending) |
 
-**Done: 11 full tracks (2,200 quiz questions).** Remaining build order: Kubernetes → AWS → CI/CD → Angular → .NET → ASP.NET, then LeetCode batch 2 + System Design case studies (source PDFs at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`).
+**Done: 12 full tracks (2,400 quiz questions).** Remaining build order: AWS → CI/CD → Angular → .NET → ASP.NET, then LeetCode batch 2 + System Design case studies (source PDFs at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`).
 
 ---
 
