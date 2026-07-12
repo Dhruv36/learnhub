@@ -24,13 +24,13 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 12 | Kubernetes | 12 | 200 | ✅ DONE |
 | 13 | AWS | 12 | 200 | ✅ DONE |
 | 14 | CI/CD | 12 | 200 | ✅ DONE |
-| 15 | Angular | 1 | — | 🟡 in progress (lesson 1 of 12 done) |
+| 15 | Angular | 12 | 200 | ✅ DONE |
 | 16 | .NET (C#) | — | — | ⬜ landing page only |
 | 17 | ASP.NET Core | — | — | ⬜ landing page only |
 | 18 | LeetCode Patterns | 4 patterns + 1 quiz set | | 🟡 partial (batch 2 pending) |
 | 19 | System Design | 5 fundamentals + 1 quiz set | | 🟡 partial (deep dives + case studies pending) |
 
-**Done: 14 full tracks (2,800 quiz questions).** Angular in progress (nav.js curriculum locked: index=Components&Templates done; next files in order: data-binding.html, signals.html, pipes.html, services-di.html, routing.html, forms.html, http.html, rxjs.html, ngrx.html, testing.html, enterprise.html, then quiz-bank-1.js/2.js/quiz.html). Remaining build order after Angular: .NET → ASP.NET, then LeetCode batch 2 + System Design case studies (source PDFs at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`).
+**Done: 15 full tracks (3,000 quiz questions).** Remaining build order: .NET (C#) → ASP.NET Core, then LeetCode batch 2 + System Design case studies (source PDFs at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`).
 
 ---
 
