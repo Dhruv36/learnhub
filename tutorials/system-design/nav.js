@@ -13,12 +13,12 @@ renderSidebar([
     ["Microservices Architecture", "microservices.html"],
     ["Heartbeat, Gossip, Retry with Back-off", "heartbeat-gossip.html"]] },
   { title: "2. Deep Dives", items: [
-    ["Concurrency Control (ACID, Isolation)", "#"],
-    ["Authentication (JWT, OAuth2, OIDC)", "#"],
-    ["Security (TLS, Encryption-at-Rest)", "#"],
-    ["Realtime Apps (WebSockets, Push)", "#"],
-    ["Concurrent Programming & Deadlocks", "#"],
-    ["Observability Engineering", "#"]] },
+    ["Concurrency Control (ACID, Isolation)", "concurrency-control.html"],
+    ["Authentication (JWT, OAuth2, OIDC)", "auth-deep-dive.html"],
+    ["Security (TLS, Encryption-at-Rest)", "security-deep-dive.html"],
+    ["Realtime Apps (WebSockets, Push)", "realtime-apps.html"],
+    ["Concurrent Programming & Deadlocks", "concurrent-programming.html"],
+    ["Observability Engineering", "observability.html"]] },
   { title: "3. Case Studies", items: [
     ["Design TinyURL", "#"],
     ["Design API Rate Limiter", "#"],
