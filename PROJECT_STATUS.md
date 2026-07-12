@@ -27,10 +27,10 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 15 | Angular | 12 | 200 | ✅ DONE |
 | 16 | .NET (C#) | 12 | 200 | ✅ DONE |
 | 17 | ASP.NET Core | 12 | 200 | ✅ DONE |
-| 18 | LeetCode Patterns | 4 patterns + 1 quiz set | | 🟡 partial (batch 2 pending) |
-| 19 | System Design | 5 fundamentals + 1 quiz set | | 🟡 partial (deep dives + case studies pending) |
+| 18 | LeetCode Patterns | 11 lessons (Foundations ×3 + all 8 Core Patterns) + 1 quiz set | | 🟡 Core Patterns DONE; Trees & Graphs (4) + Advanced Patterns (6) still ⬜ per nav.js |
+| 19 | System Design | 5 fundamentals + 1 quiz set | | 🟡 partial (Deep Dives ×6, Case Studies ×12, Senior/Staff ×7 still ⬜ per nav.js) |
 
-**Done: 17 full tracks (3,400 quiz questions) — ALL scheduled language/framework/infra tracks complete!** Remaining: LeetCode batch 2 + System Design case studies (source PDFs at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`).
+**Done: 17 full tracks (3,400 quiz questions) — ALL scheduled language/framework/infra tracks complete!** LeetCode Foundations+Core Patterns batch 2 done (see `tutorials/leetcode/nav.js` for the full remaining curriculum: BFS/DFS, Binary Tree Patterns, Topological Sort, Union-Find, Heaps/Top-K, Backtracking, DP, Greedy, Trie, Bit Manipulation — each needs a lesson matching the two-pointers.html format: Concept/Recognition Cues/Template/3 Practice Problems (Easy/Med/Hard w/ solutions)/3 Interview Q&A/Takeaways). System Design remaining topics are in `tutorials/system-design/nav.js` (Deep Dives + 12 Case Studies + Senior/Staff section) — source material at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`. Both remaining tracks are large open scopes (10-30+ topics each) — no quiz-bank files exist yet for either track (old quiz.html files are single small inline quizzes, not the 10×20 quiz-bank pattern used elsewhere).
 
 ---
 
