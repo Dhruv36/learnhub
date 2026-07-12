@@ -20,11 +20,11 @@ renderSidebar([
     ["Topological Sort", "topological-sort.html"],
     ["Union-Find", "union-find.html"]] },
   { title: "Advanced Patterns", items: [
-    ["Heaps / Top-K", "#"],
-    ["Backtracking", "#"],
-    ["Dynamic Programming", "#"],
-    ["Greedy", "#"],
-    ["Trie", "#"],
-    ["Bit Manipulation", "#"]] },
+    ["Heaps / Top-K", "heaps-top-k.html"],
+    ["Backtracking", "backtracking.html"],
+    ["Dynamic Programming", "dynamic-programming.html"],
+    ["Greedy", "greedy.html"],
+    ["Trie", "trie.html"],
+    ["Bit Manipulation", "bit-manipulation.html"]] },
   { title: "Practice", items: [["📝 Pattern Recognition Quiz", "quiz.html"]] }
 ]);
