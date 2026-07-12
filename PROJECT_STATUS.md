@@ -30,7 +30,36 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | ✅ DONE |
 | 19 | System Design | 44 lessons (Fundamentals ×11 + Deep Dives ×6 + Case Studies ×12 + Senior/Staff ×7) | 200 | ✅ DONE |
 
-**Done: 19 full tracks (3,800 quiz questions) — EVERY planned track complete, including LeetCode Patterns and System Design in full!** System Design used a distinct compact per-lesson format (see `tutorials/system-design/caching.html` as the template — denser than the v3 skeleton, no massive Q&A detail blocks, an "Interview Follow-ups" section instead). Its quiz-bank-1.js/2.js were just written (10×20=200 Qs) — **still needs the standard validation run** (`node -e "..."` one-liner from the recipe section, check for `10 200 0`) and a final git commit/push once the shell classifier is available (it was intermittently down this session). If resuming: check `git status` first — recent System Design work may be uncommitted locally. **This is now the FULL platform build-out — nothing else was in the original scope.** Any further work is net-new scope the user would need to request explicitly.
+**v3 build-out done: 19 full tracks (3,800 quiz questions), all committed & pushed.**
+
+---
+
+## 🚧 CURRENT PHASE: Mastery v4 rebuild (started 2026-07-12)
+
+**User feedback:** v3 lessons (~9–13KB each) are too shallow — "can't even master a single topic" at beginner, mid, OR senior level. Directive: make learners masters of each topic.
+
+**Decisions (user-confirmed via AskUserQuestion):**
+1. **Expand curriculum** — split combined topics into focused lessons at 3–5× depth (not deepen-in-place). E.g., JS "Closures & this" → 4 separate lessons. Tracks grow from ~12–16 to ~30+ lessons.
+2. **Work in site order, tracks 1→19**: HTML → CSS → JavaScript → React → Node.js → Python → Java → SQL → MongoDB → Redis → Docker → Kubernetes → AWS → CI/CD → Angular → .NET → ASP.NET Core → LeetCode → System Design. Complete each track fully before moving on.
+
+### v4 mastery lesson format (supersedes v3 skeleton for lesson depth; same HTML shell/header/sidebar/pager)
+Target **~500–700 lines (~35–50KB)** per lesson. Structure:
+1. `<h1>` + level badge + intro: what you'll master + prerequisites line (link previous lessons)
+2. **Gradual concept build**: plain-language explanation → mental model → syntax → several worked, commented examples (never one example where three teach more)
+3. **Step-by-step build section**: construct something real, incrementally, showing output at each step
+4. **Deep-dive sections**: edge cases, browser/runtime behavior, spec gotchas, internals (the senior layer)
+5. **Common Mistakes** table (grown, 6+ rows)
+6. **Interview Questions**: 6+ `<details class="solution">`, explicitly graded — 2 beginner, 2 mid, 2 senior
+7. **🏋️ Graded exercises WITH solutions**: 6–10, easy→hard, each with a `<details class="solution">` solution + explanation (this is new vs v3 — v3 had unsolved practice prompts)
+8. Key Takeaways + pager
+
+### v4 progress
+| # | Track | v4 status |
+|---|-------|-----------|
+| 1 | HTML | 🚧 IN PROGRESS — curriculum expanded 14→~31 lessons (new nav.js); writing lessons in batches, commit every ~4 |
+| 2–19 | all others | ⏳ pending (still at v3 depth) |
+
+Quizzes: existing 200-Q banks stay; extend/retune only after a track's lessons are done, if question topics drifted.
 
 ---
 
