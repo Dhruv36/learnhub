@@ -15,10 +15,10 @@ renderSidebar([
     ["Stack / Monotonic Stack", "monotonic-stack.html"],
     ["Linked List In-place Reversal", "linked-list-reversal.html"]] },
   { title: "Trees & Graphs", items: [
-    ["BFS / DFS", "#"],
-    ["Binary Tree Patterns", "#"],
-    ["Topological Sort", "#"],
-    ["Union-Find", "#"]] },
+    ["BFS / DFS", "bfs-dfs.html"],
+    ["Binary Tree Patterns", "binary-tree-patterns.html"],
+    ["Topological Sort", "topological-sort.html"],
+    ["Union-Find", "union-find.html"]] },
   { title: "Advanced Patterns", items: [
     ["Heaps / Top-K", "#"],
     ["Backtracking", "#"],
