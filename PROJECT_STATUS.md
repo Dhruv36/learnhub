@@ -25,12 +25,12 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 13 | AWS | 12 | 200 | ✅ DONE |
 | 14 | CI/CD | 12 | 200 | ✅ DONE |
 | 15 | Angular | 12 | 200 | ✅ DONE |
-| 16 | .NET (C#) | — | — | ⬜ landing page only |
+| 16 | .NET (C#) | 12 | 200 | ✅ DONE |
 | 17 | ASP.NET Core | — | — | ⬜ landing page only |
 | 18 | LeetCode Patterns | 4 patterns + 1 quiz set | | 🟡 partial (batch 2 pending) |
 | 19 | System Design | 5 fundamentals + 1 quiz set | | 🟡 partial (deep dives + case studies pending) |
 
-**Done: 15 full tracks (3,000 quiz questions).** Remaining build order: .NET (C#) → ASP.NET Core, then LeetCode batch 2 + System Design case studies (source PDFs at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`).
+**Done: 16 full tracks (3,200 quiz questions).** Remaining build order: ASP.NET Core, then LeetCode batch 2 + System Design case studies (source PDFs at `C:\Users\397dh\OneDrive\Desktop\learn\System Design`).
 
 ---
 
