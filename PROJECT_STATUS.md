@@ -57,14 +57,16 @@ Target **~500–700 lines (~35–50KB)** per lesson. Structure:
 | # | Track | v4 status |
 |---|-------|-----------|
 | 1 | HTML | ✅ **DONE** — all 32 mastery-depth lessons shipped (Foundations ×8, Forms Mastery ×6, Semantics & Structure ×3, Media & Embedding ×4, Accessibility ×3, SEO ×2, Performance ×2, Production ×4). Old combined pages (links-images.html, lists-tables.html) kept as redirect stubs to their split successors. Quiz bank NOT yet re-tuned to v4's expanded topic list — old 200 Qs still valid but could use a refresh pass later. |
-| 2–19 | all others | ⏳ pending (still at v3 depth) — CSS is next |
+| 2 | CSS | ✅ **DONE** — all 28 mastery-depth lessons shipped (Foundations ×7, Layout ×6, Motion & Interaction ×3, Modern CSS ×5, Architecture ×3, Production ×4). Old combined pages (colors-units-typography.html, transitions-animations.html, cross-browser-a11y.html) kept as redirect stubs. Link-audited clean (0 broken internal hrefs). Quiz bank not yet re-tuned. |
+| 3–19 | all others | ⏳ pending (still at v3 depth) — JavaScript is next |
 
 Quizzes: existing 200-Q banks stay; extend/retune only after a track's lessons are done, if question topics drifted.
 
-**HTML track v4 build notes (for resuming/replicating on other tracks):**
-- Curriculum was expanded from 14 v3 lessons to 32 v4 lessons by splitting combined topics (e.g. "Forms & Validation" → 6 lessons: Fundamentals, Input Types, Built-in Validation, Constraint Validation API, Selects/Datalist/Files, Form UX & Accessibility).
-- Later lessons deliberately cross-reference earlier ones by name (e.g. Security lesson collects XSS warnings scattered across 9 earlier lessons into one table; Production Patterns closes the loop back to Document Structure's streaming parser and SEO's render stage) — this "assemble the mechanisms" pattern is a deliberate pedagogical device worth replicating in other tracks' closing lessons.
-- Committed in ~10 checkpoints of 2-4 lessons each through the section, pushing after every checkpoint.
+**Build notes for resuming/replicating on remaining tracks:**
+- Curriculum expansion pattern: split each v3 combined-topic lesson into 2-4 focused lessons at 3-5x depth (HTML: 14→32; CSS: 14→28). Group into thematic sections (e.g. CSS: Foundations/Layout/Motion/Modern/Architecture/Production) reflected in nav.js.
+- Later lessons in a track deliberately cross-reference earlier ones by name — a capstone/consolidation lesson near the end of each major section that assembles several prior lessons' techniques into one real component (HTML's Production Patterns, CSS's Component Patterns) is a deliberate, recurring pedagogical device worth replicating.
+- Old superseded combined-topic HTML files become tiny redirect stubs (meta http-equiv=refresh + links to the split successors) rather than being deleted, in case anything external links to the old URL.
+- Commit in checkpoints of 1-4 lessons each, pushing after every checkpoint. Run a link-audit one-liner (grep every internal href, confirm the target file exists) before declaring a track done.
 
 ---
 
