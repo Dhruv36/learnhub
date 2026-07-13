@@ -56,10 +56,15 @@ Target **~500–700 lines (~35–50KB)** per lesson. Structure:
 ### v4 progress
 | # | Track | v4 status |
 |---|-------|-----------|
-| 1 | HTML | 🚧 IN PROGRESS — curriculum expanded 14→~31 lessons (new nav.js); writing lessons in batches, commit every ~4 |
-| 2–19 | all others | ⏳ pending (still at v3 depth) |
+| 1 | HTML | ✅ **DONE** — all 32 mastery-depth lessons shipped (Foundations ×8, Forms Mastery ×6, Semantics & Structure ×3, Media & Embedding ×4, Accessibility ×3, SEO ×2, Performance ×2, Production ×4). Old combined pages (links-images.html, lists-tables.html) kept as redirect stubs to their split successors. Quiz bank NOT yet re-tuned to v4's expanded topic list — old 200 Qs still valid but could use a refresh pass later. |
+| 2–19 | all others | ⏳ pending (still at v3 depth) — CSS is next |
 
 Quizzes: existing 200-Q banks stay; extend/retune only after a track's lessons are done, if question topics drifted.
+
+**HTML track v4 build notes (for resuming/replicating on other tracks):**
+- Curriculum was expanded from 14 v3 lessons to 32 v4 lessons by splitting combined topics (e.g. "Forms & Validation" → 6 lessons: Fundamentals, Input Types, Built-in Validation, Constraint Validation API, Selects/Datalist/Files, Form UX & Accessibility).
+- Later lessons deliberately cross-reference earlier ones by name (e.g. Security lesson collects XSS warnings scattered across 9 earlier lessons into one table; Production Patterns closes the loop back to Document Structure's streaming parser and SEO's render stage) — this "assemble the mechanisms" pattern is a deliberate pedagogical device worth replicating in other tracks' closing lessons.
+- Committed in ~10 checkpoints of 2-4 lessons each through the section, pushing after every checkpoint.
 
 ---
 
