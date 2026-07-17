@@ -14,8 +14,6 @@ renderSidebar([
     ["Concurrency", "concurrency.html"],
     ["JVM Internals & GC", "jvm.html"],
     ["Testing with JUnit", "testing.html"]] },
-  { title: "4. Ultra-Advanced (Production)", items: [
-    ["Spring Boot", "spring-boot.html"]] },
   { title: "Practice", items: [
     ["📝 Quizzes (10 sets × 20 Qs)", "quiz.html"]] }
 ]);
