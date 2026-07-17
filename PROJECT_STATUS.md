@@ -58,7 +58,8 @@ Target **~500–700 lines (~35–50KB)** per lesson. Structure:
 |---|-------|-----------|
 | 1 | HTML | ✅ **DONE** — all 32 mastery-depth lessons shipped (Foundations ×8, Forms Mastery ×6, Semantics & Structure ×3, Media & Embedding ×4, Accessibility ×3, SEO ×2, Performance ×2, Production ×4). Old combined pages (links-images.html, lists-tables.html) kept as redirect stubs to their split successors. Quiz bank NOT yet re-tuned to v4's expanded topic list — old 200 Qs still valid but could use a refresh pass later. |
 | 2 | CSS | ✅ **DONE** — all 28 mastery-depth lessons shipped (Foundations ×7, Layout ×6, Motion & Interaction ×3, Modern CSS ×5, Architecture ×3, Production ×4). Old combined pages (colors-units-typography.html, transitions-animations.html, cross-browser-a11y.html) kept as redirect stubs. Link-audited clean (0 broken internal hrefs). Quiz bank not yet re-tuned. |
-| 3–19 | all others | ⏳ pending (still at v3 depth) — JavaScript is next |
+| 3 | JavaScript | ✅ **DONE** — all 33 mastery-depth lessons shipped (Language Core ×8, Objects & Data ×6, Async ×5, Browser & Web Platform ×4, Modules & Tooling ×2, Production ×8 incl. TypeScript, Memory, Workers, Security, Performance, Metaprogramming). Old combined pages kept as redirect stubs. Link-audited clean; quiz banks validate 10/200/0 (not yet re-tuned to v4 topics). |
+| 4–19 | all others | ⏳ pending (still at v3 depth) — React is next |
 
 Quizzes: existing 200-Q banks stay; extend/retune only after a track's lessons are done, if question topics drifted.
 
