@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Async Patterns — Node.js — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../../playground/index.html">Playground</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Async Patterns <span class="level-badge level-adv">Async Node</span></h1>
+    <p><strong>What you'll master:</strong> Node's async idioms in practice — promisifying legacy callbacks,
+       concurrency control (limits, batching), timeouts and cancellation with AbortSignal, retries with
+       backoff and jitter, and the error-handling discipline that keeps async servers debuggable.
+       Prerequisites: the JS track's <a href="../javascript/promises.html">Promises</a> and
+       <a href="../javascript/promise-patterns.html">Combinators</a> — this lesson is those tools under
+       server load, plus Node-specific machinery.</p>
+
+    <h2>Part 1 — From Callbacks to Promises: the Bridge</h2>
+    <pre>// Node's legacy convention — error-first callbacks:
+someApi.getUser(id, (err, user) =&gt; {
+  if (err) return handle(err);          // ALWAYS first-position error check
+  // …
+});
+// You'll read this forever (old libs, some AWS SDKs, event APIs). Write promises.
+
+// The bridge — util.promisify converts the convention mechanically:
+import { promisify } from "node:util";
+const getUser = promisify(someApi.getUser.bind(someApi));   // note the bind —
+const user = await getUser(id);                              // `this` is lost otherwise
+
+// Hand-promisify when the callback isn't error-first (events, multi-arg):
+function onceListening(server) {
+  return new Promise((resolve, reject) =&gt; {
+    server.once("listening", resolve);
+    server.once("error", reject);       // ALWAYS wire the failure path too —
+  });                                    // or errors hang the await forever
+}
+// (events.once(emitter, "listening") does exactly this — EventEmitter lesson.)
+// And the reverse trap — don't wrap what's already promised:
+// new Promise(res =&gt; fetch(url).then(res))   ❌ the explicit-constructor antipattern</pre>
+
+    <h2>Part 2 — Concurrency Control: the Server-Side Difference</h2>
+    <pre>// The JS track taught the combinators; servers add a constraint the browser
+// rarely hits: UNBOUNDED CONCURRENCY IS AN OUTAGE.
+await Promise.all(userIds.map(id =&gt; enrich(id)));   // 50,000 ids →
+// 50k simultaneous DB queries: pool exhausted, DB pushed over, memory spiked.
+// The browser caps you at ~6 connections; Node happily fires everything.
+
+// The tool: a concurrency limiter. Build the canonical one:
+export function pLimit(max) {
+  let active = 0;
+  const queue = [];
+  const next = () =&gt; {
+    if (active &gt;= max || queue.length === 0) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    fn().then(resolve, reject).finally(() =&gt; { active--; next(); });
+  };
+  return fn =&gt; new Promise((resolve, reject) =&gt; {
+    queue.push({ fn, resolve, reject });
+    next();
+  });
+}
+
+const limit = pLimit(10);                            // 10 in flight, ever
+const results = await Promise.all(
+  userIds.map(id =&gt; limit(() =&gt; enrich(id))));       // same shape, bounded reality
+// (npm: p-limit — same API. Build it once to trust it.)
+//
+// Choosing the number: pool size / downstream rate limits / memory per task —
+// the limit encodes RESPECT for the weakest dependency. And remember
+// allSettled vs all: partial-failure tolerance is a per-callsite decision.</pre>
+
+    <h2>Part 3 — Timeouts &amp; Cancellation: AbortSignal Everywhere</h2>
+    <pre>// Rule: EVERY await on the outside world gets a deadline. A hung dependency
+// without timeouts = your requests hang = your callers hang = cascade.
+
+// AbortSignal is the standard plumbing, and Node core accepts it broadly:
+const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+await fs.readFile(p, { signal });
+const child = spawn(cmd, args, { signal });
+setTimeout(cb, ms, { signal });                       // even timers
+
+// Compose deadlines with user-driven cancellation:
+const signal = AbortSignal.any([
+  AbortSignal.timeout(5000),                          // deadline
+  req.signal,                                          // client disconnected (http)
+]);
+
+// Make YOUR async functions cancelable — accept a signal, forward it, check it:
+async function processOrder(order, { signal } = {}) {
+  const items = await db.getItems(order.id, { signal });   // forward to I/O
+  for (const item of items) {
+    signal?.throwIfAborted();                              // check between steps
+    await reserve(item, { signal });
+  }
+}
+// On abort you get an AbortError — distinguish it (cleanup, not alarm):
+try { await processOrder(o, { signal }); }
+catch (err) {
+  if (err.name === "AbortError") return metrics.count("order.canceled");
+  throw err;
+}
+// Why cancellation matters at load: a canceled request that KEEPS doing DB
+// work is capacity theft — under stress, exactly when clients time out and
+// retry, you do double work unless aborts propagate.</pre>
+
+    <h2>Part 4 — Retries: Backoff, Jitter, and Knowing When Not To</h2>
+    <pre>export async function retry(fn, {
+  attempts = 3, baseMs = 200, maxMs = 5000,
+  retryOn = isTransient, signal,
+} = {}) {
+  let lastErr;
+  for (let i = 0; i &lt; attempts; i++) {
+    signal?.throwIfAborted();
+    try { return await fn({ signal }); }
+    catch (err) {
+      lastErr = err;
+      if (!retryOn(err) || i === attempts - 1) throw err;
+      const backoff = Math.min(baseMs * 2 ** i, maxMs);   // exponential: 200, 400, 800…
+      const jitter = backoff * (0.5 + Math.random() * 0.5); // ⭐ jitter: without it,
+      await setTimeout(jitter, { signal });                 // every client retries in
+    }                                                       // sync waves — thundering herd
+  }
+  throw lastErr;
+}
+
+function isTransient(err) {
+  return err.code === "ECONNRESET" || err.code === "ETIMEDOUT" ||
+         err.status === 429 || err.status &gt;= 500;
+  // NEVER retry: 400/401/403/404/422 — the request is WRONG; repeating it is
+  // log spam at best, duplicate side effects at worst.
+}
+// The prerequisite nobody skips twice: only retry IDEMPOTENT operations.
+// A timed-out POST /charge may have SUCCEEDED — retrying double-charges.
+// Fix at the API level: idempotency keys (REST lesson) make retries safe.
+// (import { setTimeout } from "node:timers/promises" — the awaitable timer.)</pre>
+
+    <h2>Part 5 — Async Error Discipline</h2>
+    <pre>// 1. The unhandled rejection: every promise chain needs an owner.
+doBackgroundSync();                       // ❌ fire-and-forget: a rejection here
+                                           //    hits unhandledRejection → crash (L5)
+doBackgroundSync().catch(err =&gt; log.error({ err }, "bg sync failed"));  // ✅ owned
+
+// 2. Fail fast vs fail soft — a deliberate choice per await:
+const user = await getUser(id);           // fail fast: can't proceed without it
+const recs = await getRecs(id).catch(() =&gt; []);   // fail soft: degraded is fine
+// Mark the soft ones LOUDLY (log the swallow) — silent .catch(() => {}) is how
+// outages hide for weeks.
+
+// 3. Preserve the chain — wrap with `cause`, never rethrow bare strings:
+try { await chargeCard(order); }
+catch (err) {
+  throw new Error(`charge failed for order ${order.id}`, { cause: err });
+}   // logs show YOUR context AND the root ECONNRESET — both matter.
+
+// 4. await in loops — sequential when order matters, and say so:
+for (const migration of migrations) await run(migration);   // ✅ deliberately serial
+// vs the accidental serial map (JS track's classic) — reviewed with "is this
+// order-dependent?" as the question.
+
+// 5. Top-level orchestration (entry files):
+main().catch(err =&gt; { console.error(err); process.exitCode = 1; });
+// — the one place a broad catch is correct: translate failure to exit code.</pre>
+
+    <h2>Part 6 — Composed Patterns (Senior Layer)</h2>
+    <pre>// These three compose into the standard "resilient call" wrapper:
+const result = await retry(
+  ({ signal }) =&gt; limit(() =&gt; fetchJson(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]) })),
+  { attempts: 3, signal: req.signal }
+);
+// deadline per attempt + bounded concurrency + jittered retries + caller abort.
+// This shape (plus circuit breaking + metrics) is what resilience libraries
+// package; each layer's WHY now lives in your head, not the README.
+//
+// Deduplication — many callers, one in-flight operation (cache stampede guard):
+const inflight = new Map();
+export function dedupe(key, fn) {
+  if (inflight.has(key)) return inflight.get(key);        // join the existing call
+  const p = fn().finally(() =&gt; inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+// 200 requests hit an expired cache entry → ONE upstream call, 200 awaiters.
+// (The Caching lesson pairs this with TTLs; React Query does this client-side.)
+//
+// Queues over concurrency for SUSTAINED work: pLimit bounds a burst; a job
+// queue (persistent, retryable, observable) is the tool once work outlives
+// the request or must survive restarts — the Scaling lesson's territory.</pre>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Unbounded <code>Promise.all</code> over large inputs</td><td>Pool/downstream/memory exhaustion — self-inflicted DDoS</td><td>pLimit with a reasoned bound</td></tr>
+      <tr><td>Awaiting external calls without timeouts</td><td>One hung dependency hangs your whole request tree</td><td>AbortSignal.timeout on every outward await</td></tr>
+      <tr><td>Retrying non-idempotent or 4xx operations</td><td>Duplicate charges; guaranteed-failure spam</td><td>retryOn predicate + idempotency keys</td></tr>
+      <tr><td>Retries without jitter</td><td>Synchronized retry waves finish off the recovering service</td><td>Randomize every backoff</td></tr>
+      <tr><td>Fire-and-forget promises</td><td>unhandledRejection crashes; silent lost work</td><td>Every chain owned: await it or .catch-log it</td></tr>
+      <tr><td><code>.catch(() =&gt; {})</code> blanket swallows</td><td>Failures invisible until the business notices</td><td>Fail-soft only with logging + a default that's safe</td></tr>
+      <tr><td>promisify without bind / on non-error-first APIs</td><td>"this" bugs; resolved-with-error weirdness</td><td>bind methods; hand-wrap nonstandard signatures</td></tr>
+      <tr><td>Ignoring AbortError vs real errors</td><td>Cancellations page the on-call; real failures counted as noise</td><td>Branch on <code>err.name === "AbortError"</code></td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What is the error-first callback convention and how do you modernize it?</summary>
+      <p>Legacy Node async APIs take a final callback invoked as <code>cb(err, result)</code> — error in the
+      first position, checked before touching the result. Modernize with <code>util.promisify</code> (binding
+      methods to preserve <code>this</code>), or use the <code>node:fs/promises</code>-style promise APIs where
+      provided; hand-wrap only nonstandard signatures, always wiring both resolve and reject paths.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> Why is <code>Promise.all(items.map(fetchThing))</code> dangerous on a server when it's fine in a browser?</summary>
+      <p>Browsers cap concurrent connections (~6 per host), implicitly throttling you. Node has no such cap:
+      mapping 10,000 items fires 10,000 simultaneous operations — exhausting DB pools, tripping rate limits,
+      and spiking memory (every in-flight result buffered). Server code bounds concurrency explicitly
+      (p-limit) at a number derived from the weakest downstream resource.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Design the timeout/cancellation story for a request handler that calls three services.</summary>
+      <p>One request-scoped signal: <code>AbortSignal.any([req.signal, AbortSignal.timeout(overallBudget)])</code> —
+      client disconnects and the total deadline both cancel everything. Each service call gets its own
+      per-attempt timeout composed with the request signal, and forwards the signal into fetch/DB calls so
+      work actually stops. Handlers distinguish AbortError (cleanup, count a cancellation metric) from real
+      failures. Budgeting: per-call timeouts sum (or nest, for sequential calls) under the overall budget
+      minus response-writing headroom — a 5s budget doesn't grant three 5s calls.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why exponential backoff AND jitter — what does each solve?</summary>
+      <p>Exponential backoff solves persistence: retrying every 100ms hammers a struggling service; doubling
+      delays gives it recovery room while still eventually succeeding. Jitter solves synchronization: if 1,000
+      clients fail together (a blip), fixed backoff schedules 1,000 retries at the same instants — recurring
+      thundering herds that re-kill the recovering service. Randomizing each delay spreads the wave into a
+      trickle. Backoff is per-client politeness; jitter is fleet-level decorrelation — production retry logic
+      needs both, plus a retry budget/cap.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A checkout intermittently double-charges customers. The client has retry logic. Walk the failure and the layered fix.</summary>
+      <p>The retry fires on timeout — but a timeout means "no response," not "no effect": the original
+      POST /charge may have completed after the client gave up, so the retry charges again. Layered fix:
+      (1) idempotency keys — client generates a unique key per checkout intent; the server stores
+      key→result and replays the stored response for duplicates, making retries safe by contract;
+      (2) retry policy — only on transport-level failures and 5xx/429, never on ambiguity without the key,
+      with capped jittered backoff; (3) reconciliation — a sweeper matching provider charges to orders
+      catches anything that slips; (4) the provider's own idempotency support (Stripe et al.) used end-to-end.
+      The principle: retries are only as safe as the API's idempotency design — fix the contract, not the
+      client loop.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Explain request coalescing (dedupe) and where it sits versus caching and rate limiting.</summary>
+      <p>Coalescing collapses concurrent identical operations into one in-flight promise all callers share —
+      keyed by operation identity, cleared on settle. It solves the stampede window that caching alone leaves:
+      when a hot cache entry expires, N requests miss simultaneously and all hit the origin; with coalescing,
+      one refreshes while N−1 wait for it. Distinctions: caching stores <em>results</em> across time;
+      coalescing shares <em>work</em> within a moment; rate limiting bounds <em>throughput</em> regardless of
+      identity. Production caches (and React Query client-side) compose all three: serve-stale-while-
+      revalidate + single-flight refresh + limits. Caveat: coalescing shares failures too — one bad upstream
+      response rejects every waiter, so pair it with retry policy deliberately.</p></details>
+
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (easy):</strong> Promisify this legacy API and use it: <code>legacyDb.find(query, cb)</code> where cb is error-first, and <code>find</code> uses <code>this</code> internally.
+      <details class="solution"><summary>Solution</summary>
+      <pre>import { promisify } from "node:util";
+const find = promisify(legacyDb.find).bind(legacyDb);
+// or: promisify(legacyDb.find.bind(legacyDb)) — either way, bind or bust.
+const rows = await find({ status: "active" });</pre></details></div>
+    <div class="exercise"><strong>2 (easy):</strong> This crashes the process occasionally with an unhandled rejection — find it: <code>app.post("/signup", async (req, res) =&gt; { const user = await createUser(req.body); sendWelcomeEmail(user); res.json(user); });</code>
+      <details class="solution"><summary>Solution</summary>
+      <pre>// sendWelcomeEmail is async and un-awaited, un-caught: fire-and-forget.
+// When SMTP hiccups, its rejection has no owner → unhandledRejection → crash.
+// Fix (fail-soft is right for a welcome email — but OWNED):
+sendWelcomeEmail(user).catch(err =&gt;
+  log.error({ err, userId: user.id }, "welcome email failed"));
+// (Better still: enqueue it — email belongs in a job queue, not the request.)</pre></details></div>
+    <div class="exercise"><strong>3 (medium):</strong> Import 20,000 records via an API allowing 5 concurrent requests and 100 req/s. Write the import loop respecting both limits.
+      <details class="solution"><summary>Solution</summary>
+      <pre>import { setTimeout as sleep } from "node:timers/promises";
+
+const limit = pLimit(5);                          // concurrency bound
+let windowStart = Date.now(), windowCount = 0;
+
+async function rateGate() {                       // 100/s token-ish gate
+  if (Date.now() - windowStart &gt;= 1000) { windowStart = Date.now(); windowCount = 0; }
+  if (++windowCount &gt; 100) {
+    await sleep(1000 - (Date.now() - windowStart));
+    return rateGate();
+  }
+}
+
+const results = await Promise.allSettled(
+  records.map(rec =&gt; limit(async () =&gt; {
+    await rateGate();
+    return retry(({ signal }) =&gt; api.upsert(rec, { signal }), { attempts: 3 });
+  })));
+
+const failed = results.filter(r =&gt; r.status === "rejected");
+console.log(`imported ${results.length - failed.length}, failed ${failed.length}`);
+// allSettled: one bad record shouldn't abort 19,999 good ones — collect and
+// report. ponytail: window-reset rate gate is approximate; a token bucket
+// (Caching/Redis lesson) is the precise version.</pre></details></div>
+    <div class="exercise"><strong>4 (medium):</strong> Add a proper timeout story to <code>getDashboard()</code> which currently awaits <code>getUser</code>, <code>getOrders</code>, <code>getRecs</code> sequentially with no deadlines: total budget 2s, recs are optional, orders depend on user.
+      <details class="solution"><summary>Solution</summary>
+      <pre>async function getDashboard(userId, { signal } = {}) {
+  const budget = AbortSignal.any(
+    [AbortSignal.timeout(2000), ...(signal ? [signal] : [])]);
+
+  const user = await getUser(userId, { signal: budget });        // required, serial
+  const [orders, recs] = await Promise.all([
+    getOrders(user.id, { signal: budget }),                      // required
+    getRecs(user.id, { signal: AbortSignal.any([budget, AbortSignal.timeout(500)]) })
+      .catch(() =&gt; []),                                          // optional: tight
+  ]);                                                            // deadline + fail-soft
+  return { user, orders, recs };
+}
+// Orders and recs parallelize (only user was a real dependency); recs get a
+// 500ms sub-deadline so a slow recommender can't eat the budget; one shared
+// signal means a client disconnect stops ALL downstream work.</pre></details></div>
+    <div class="exercise"><strong>5 (medium):</strong> Your retry wrapper logs show the same 404 retried three times, and separately a burst of retries every ~200ms exactly. Diagnose both from the Part 4 checklist.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// 404 retried: the retryOn predicate is missing or too broad — 4xx means the
+// REQUEST is wrong; repeating it can't succeed. Fix: retry only transient codes
+// (network errors, 429, 5xx). The 404 should surface immediately to the caller.
+// 200ms bursts: no jitter — every failed caller retries at exactly base×2^i,
+// producing synchronized waves (visible as evenly-spaced spikes in logs/graphs).
+// Fix: multiply each backoff by a random factor; the spikes flatten into noise.</pre></details></div>
+    <div class="exercise"><strong>6 (hard):</strong> Implement <code>dedupe</code> with a twist: coalesced callers each get their own AbortSignal respected — if SOME callers abort, they reject with AbortError, but the underlying operation continues for the rest; it aborts only when ALL callers have aborted.
+      <details class="solution"><summary>Solution</summary>
+      <pre>const inflight = new Map();   // key → { promise, controller, waiters }
+
+export function dedupe(key, fn, { signal } = {}) {
+  let entry = inflight.get(key);
+  if (!entry) {
+    const controller = new AbortController();
+    entry = { controller, waiters: 0,
+      promise: fn({ signal: controller.signal })
+        .finally(() =&gt; inflight.delete(key)) };
+    inflight.set(key, entry);
+  }
+  entry.waiters++;
+
+  return new Promise((resolve, reject) =&gt; {
+    const onAbort = () =&gt; {
+      entry.waiters--;
+      if (entry.waiters === 0) entry.controller.abort();   // last one out: cancel
+      reject(new DOMException("Aborted", "AbortError"));    // MY caller sees abort
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    entry.promise.then(
+      v =&gt; { signal?.removeEventListener("abort", onAbort); resolve(v); },
+      e =&gt; { signal?.removeEventListener("abort", onAbort); reject(e); });
+  });
+}
+// Reference counting on waiters: individual cancellations detach cheaply;
+// the expensive upstream call is aborted only when nobody wants it anymore.
+// This is exactly how production request-coalescing layers behave.</pre></details></div>
+    <div class="exercise"><strong>7 (hard):</strong> A nightly sync job (fetch 500 pages from a partner API, upsert each to the DB) currently: Promise.all over all pages, no timeouts, retries everything 5× on any error, and crashed last night taking the partner's API with it. Rewrite the design, not just the code — name each pattern you apply and why.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Postmortem of the original: unbounded fan-out (500 concurrent fetches) hit
+// the partner like a DDoS; their 429s/timeouts triggered 5× blanket retries
+// WITHOUT jitter (retry waves), including retrying 401s from an expired token
+// (guaranteed-failure spam); one rejection nuked the whole Promise.all so
+// partial progress was lost; no timeouts meant hung sockets held the job open.
+// Redesign:
+async function nightlySync({ signal } = {}) {
+  const limit = pLimit(5);                       // ① bounded: respects partner capacity
+  const results = await Promise.allSettled(      // ② partial-failure tolerant
+    pages.map(page =&gt; limit(() =&gt;
+      retry(                                     // ③ retries: transient-only,
+        ({ signal: s }) =&gt; syncPage(page, {      //    exponential + JITTER, max 3
+          signal: AbortSignal.any([s, AbortSignal.timeout(10_000)]),  // ④ deadline
+        }),
+        { attempts: 3, retryOn: isTransient, signal }
+      ))));
+
+  const failed = results
+    .map((r, i) =&gt; ({ r, page: pages[i] }))
+    .filter(x =&gt; x.r.status === "rejected");
+  await recordSyncReport({ total: pages.length, failed });   // ⑤ observable outcome
+  if (failed.length &gt; pages.length * 0.1) process.exitCode = 1;  // ⑥ honest exit:
+}                                                 //    scheduler alerts past threshold
+// ⑦ syncPage's upsert is idempotent (keyed on partner ids) so retries and
+//    re-runs are safe — the job can simply run again for the failed subset.
+// ⑧ And the meta-fix: respect their rate-limit headers (429 + Retry-After)
+//    inside isTransient/backoff — being a good client is an uptime feature.</pre></details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
+      <li>Bridge legacy with <code>promisify</code> (+bind) and hand-wrapped promises that always wire the failure path; never wrap what's already a promise.</li>
+      <li>Server rule #1: bound your concurrency — pLimit at a number derived from the weakest downstream; allSettled when partial failure is tolerable.</li>
+      <li>Every outward await gets a deadline; AbortSignal composes deadlines with caller cancellation and must be forwarded so aborted work actually stops.</li>
+      <li>Retries: transient errors only, exponential backoff with jitter, capped attempts — and only on idempotent operations (idempotency keys make them so).</li>
+      <li>Every promise chain has an owner; fail-fast vs fail-soft is chosen per await, with soft paths logged; wrap errors with <code>cause</code> to keep the chain.</li>
+      <li>Compose: limit + timeout + retry + dedupe is the standard resilient call; sustained work graduates from patterns to queues.</li>
+    </ul></div>
+
+    <div class="pager">
+      <a class="btn btn-outline" href="event-loop.html">← The Event Loop &amp; libuv</a>
+      <a class="btn" href="events.html">Next: EventEmitter →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Event Loop &amp; libuv — Node.js — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../../playground/index.html">Playground</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>The Event Loop &amp; libuv <span class="level-badge level-adv">Async Node</span></h1>
+    <p><strong>What you'll master:</strong> the precise machinery behind "non-blocking" — libuv's loop phases,
+       microtasks vs macrotasks in Node, <code>process.nextTick</code> vs <code>setImmediate</code>, the
+       thread pool (what actually runs on it, and sizing it), and diagnosing loop starvation. Prerequisites:
+       the browser-side <a href="../javascript/event-loop.html">JS Event Loop lesson</a> — the model
+       transfers; this is Node's implementation, with server stakes.</p>
+
+    <h2>Part 1 — The Loop's Phases (What libuv Actually Runs)</h2>
+    <pre>// Each loop ITERATION walks fixed phases, draining a queue per phase:
+//
+//  ┌─&gt; TIMERS      — expired setTimeout/setInterval callbacks
+//  │   PENDING     — deferred system-level callbacks (rare TCP errors etc.)
+//  │   POLL        — ⭐ the heart: wait for I/O completions, run their callbacks
+//  │                  (this is where your server "sleeps" when idle)
+//  │   CHECK       — setImmediate callbacks
+//  └── CLOSE       — close-event callbacks (socket.on("close"))
+//
+// BETWEEN every callback, two MICROTASK queues drain COMPLETELY, in order:
+//   1. process.nextTick queue      (Node-specific, highest priority)
+//   2. Promise microtask queue     (.then / await continuations)
+//
+// So the real granularity is: run ONE macrotask callback → drain nextTicks →
+// drain promise microtasks → next callback. Same contract as the browser
+// (JS track), plus the nextTick queue ahead of promises.</pre>
+    <pre>// The ordering quiz that interviews adore — predict, then verify:
+setTimeout(() =&gt; console.log("timeout"), 0);
+setImmediate(() =&gt; console.log("immediate"));
+process.nextTick(() =&gt; console.log("nextTick"));
+Promise.resolve().then(() =&gt; console.log("promise"));
+console.log("sync");
+// → sync, nextTick, promise, timeout|immediate (those two can swap at top level!)
+// sync code first; nextTick beats promise; timeout-vs-immediate at top level
+// is a RACE (does the loop enter TIMERS before the 1ms floor elapses?).
+// BUT inside an I/O callback, setImmediate ALWAYS wins: you're past TIMERS,
+// and CHECK comes before the next iteration's TIMERS:
+fs.readFile(f, () =&gt; {
+  setTimeout(() =&gt; console.log("t"), 0);
+  setImmediate(() =&gt; console.log("i"));   // deterministically first here
+});</pre>
+
+    <h2>Part 2 — nextTick and the Starvation Hazard</h2>
+    <pre>// process.nextTick runs BEFORE anything else can proceed — including I/O.
+// Its legitimate job: making APIs consistently async:
+function readConfig(cb) {
+  if (cache) return process.nextTick(() =&gt; cb(null, cache));  // async even on hit —
+  fs.readFile(path, cb);                                       // callers can rely on
+}                                                              // ordering (no zalgo)
+// (Promise APIs get this free — resolved promises still defer to microtasks.)
+
+// The hazard — nextTick recursion STARVES the loop:
+function drain() { process.nextTick(drain); }   // ❌ I/O never runs again, ever
+// The queue must empty before the loop advances; refilling it = infinite
+// pre-I/O work. Same trap with promise chains that re-queue themselves.
+// Batch/recursive scheduling that must SHARE the process → setImmediate:
+function processChunk() {
+  doSomeWork();
+  if (more) setImmediate(processChunk);   // ✅ yields: I/O runs between chunks
+}
+// This chunking pattern is THE way to do long CPU-ish work on the loop —
+// each iteration is short; the phases turn between them.</pre>
+
+    <h2>Part 3 — The Thread Pool: Async's Secret Workers</h2>
+    <pre>// Two kinds of "async" under the hood:
+// OS-ASYNC (no threads needed): sockets, DNS via c-ares (lookups by IP),
+//   timers — the OS notifies readiness (epoll/kqueue/IOCP); scales to
+//   thousands of concurrent operations for free.
+// THREAD-POOL (libuv's workers, DEFAULT 4): operations with no async OS API —
+//   ALL filesystem calls · dns.lookup (getaddrinfo!) · zlib compression ·
+//   crypto.pbkdf2/scrypt/randomBytes(cb).
+//
+// Why 4 matters — the hidden concurrency ceiling:
+crypto.pbkdf2(pw, salt, 600_000, 64, "sha512", cb);  // ~80ms of pure CPU, pooled
+// 8 concurrent logins: 4 start, 4 WAIT for a free thread. Password hashing at
+// p99 doubles under mild load and nobody knows why. Same effect: fs-heavy
+// servers, per-request gzip.
+//
+// Levers:
+// UV_THREADPOOL_SIZE=16 node server.js     // env var, max 1024, set BEFORE start
+// — sized to workload (fs/crypto heavy → more), but pool threads are real
+// threads: CPU-bound pool work still competes for cores. True CPU parallelism
+// belongs to worker_threads (Scaling lesson); the pool is for the blocking-API
+// gap, not as a compute engine.
+// Also: dns.lookup vs dns.resolve — lookup blocks a pool thread (libc), resolve
+// does network DNS asynchronously. High-QPS services notice this one.</pre>
+
+    <h2>Part 4 — Blocking: What It Looks Like and How to See It</h2>
+    <pre>// "Don't block the loop" — now with instruments. The loop is blocked whenever
+// a callback runs long; EVERYTHING queues behind it (L1's /block demo).
+//
+// MEASURE IT — event-loop delay, the one server metric to watch:
+import { monitorEventLoopDelay } from "node:perf_hooks";
+const h = monitorEventLoopDelay({ resolution: 20 });
+h.enable();
+setInterval(() =&gt; {
+  console.log(`loop delay p99: ${(h.percentile(99) / 1e6).toFixed(1)}ms`);
+  h.reset();
+}, 10_000);
+// Healthy: p99 &lt; 20ms. A p99 of 300ms means callbacks routinely wait 300ms —
+// YOUR LATENCY FLOOR regardless of how fast handlers are. Export this to
+// metrics (Observability lesson); alert on it.
+//
+// The usual suspects when it spikes:
+// JSON.parse/stringify of megabyte payloads · sync fs/crypto/zlib calls ·
+// catastrophic regex (ReDoS — Security lesson) · huge array sorts/loops ·
+// GC pauses from heap churn.
+// FIND the culprit: node --cpu-prof / clinic flame (Performance lesson) —
+// the flame graph shows exactly which function owned the loop.</pre>
+
+    <h2>Part 5 — The Loop and Process Lifecycle</h2>
+    <pre>// L1 said "the process lives while work is pending" — precisely: the loop
+// exits when no HANDLES (servers, sockets, timers, watchers) remain active.
+//
+// ref/unref — opting a handle out of keeping the process alive:
+const t = setInterval(pollMetrics, 30_000);
+t.unref();                        // metrics polling shouldn't PREVENT exit
+// (You used this in the shutdown exercise — the 10s deadline timer that
+// mustn't hold a drained process open.)
+//
+// Diagnosing "my process won't exit" (the CI-hang classic):
+// something holds a ref — an open DB pool, a forgotten interval, a listening
+// server. Inspect: process.getActiveResourcesInfo() lists live handle types.
+// Fix at the source (close/unref), not with process.exit() (which papers over
+// the leak and skips pending work — L5).</pre>
+
+    <h2>Part 6 — Async Context: Who Does This Callback Belong To? (Senior Layer)</h2>
+    <pre>// One thread, interleaved requests → "which request is this log line from?"
+// AsyncLocalStorage: context that FOLLOWS the async chain, like thread-locals:
+import { AsyncLocalStorage } from "node:async_hooks";
+const als = new AsyncLocalStorage();
+
+// middleware (Building APIs section):
+app.use((req, res, next) =&gt; {
+  als.run({ requestId: crypto.randomUUID() }, next);   // everything next() awaits
+});                                                     // inherits this store
+// ANY depth later — no parameter threading:
+function logInfo(msg) {
+  const ctx = als.getStore();
+  console.log(JSON.stringify({ reqId: ctx?.requestId, msg }));
+}
+// This is how request-scoped logging, tracing (OpenTelemetry), and per-request
+// metrics work in every serious Node service. The machinery beneath —
+// async_hooks tracking each async resource's parent — is also what debuggers
+// and APMs use to stitch async stack traces. Cost is nonzero; use one ALS
+// store per concern-bundle, not dozens.</pre>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Long synchronous work in a callback</td><td>Every concurrent request inherits that latency</td><td>Chunk with setImmediate, or move to workers</td></tr>
+      <tr><td>Recursive <code>process.nextTick</code></td><td>Total I/O starvation — the process is alive but deaf</td><td>setImmediate for yield-between-iterations scheduling</td></tr>
+      <tr><td>Heavy crypto/zlib/fs concurrency on the default pool</td><td>Invisible 4-wide bottleneck; p99 cliffs under load</td><td>Size UV_THREADPOOL_SIZE; move sustained CPU to worker_threads</td></tr>
+      <tr><td>Assuming <code>setTimeout(fn, 0)</code> beats setImmediate</td><td>Nondeterministic top-level ordering; flaky tests</td><td>Know the phases; within I/O callbacks immediate wins</td></tr>
+      <tr><td><code>dns.lookup</code> (default for http clients) at high QPS</td><td>Pool threads consumed by name resolution</td><td>Cached resolvers / dns.resolve / keep-alive agents</td></tr>
+      <tr><td>Diagnosing latency only in handlers</td><td>Loop delay invisible: handlers "fast", users slow</td><td>monitorEventLoopDelay exported as a first-class metric</td></tr>
+      <tr><td>process.exit to "fix" a process that won't quit</td><td>Leaked handle remains unfound; pending work truncated</td><td>getActiveResourcesInfo → close/unref the real holder</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Walk through the event loop's phases and where microtasks fit.</summary>
+      <p>Each iteration: timers (expired setTimeout/Interval) → pending system callbacks → poll (wait for and
+      run I/O completions — where an idle server parks) → check (setImmediate) → close callbacks. Between
+      <em>every individual callback</em>, Node fully drains process.nextTick's queue, then the promise
+      microtask queue. So microtasks aren't a phase — they're the gap between all callbacks, which is why a
+      promise chain can starve I/O just like a sync loop.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> setImmediate vs setTimeout(fn, 0) vs process.nextTick?</summary>
+      <p><code>nextTick</code>: before anything else proceeds — this tick, ahead of promises; for making APIs
+      uniformly async; starves I/O if recursive. <code>setImmediate</code>: the check phase of the current
+      iteration — "after I/O, before next timers"; the correct yield point for chunked work.
+      <code>setTimeout(0)</code>: next timers phase, ≥1ms floor; races setImmediate at top level, loses to it
+      inside I/O callbacks. Priority: nextTick → promises → (phase order decides the rest).</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Which operations use libuv's thread pool, and how does its size become a production incident?</summary>
+      <p>Pool users: all fs operations, <code>dns.lookup</code>, zlib, and CPU-priced crypto
+      (pbkdf2/scrypt/randomBytes). Sockets and timers don't — the OS handles them asynchronously. With the
+      default of 4 threads, the fifth concurrent pooled operation waits — so a login endpoint doing 80ms
+      pbkdf2 serves 4 hashes at a time: at 100 concurrent logins, p99 explodes while CPU looks idle. Diagnose
+      by correlating latency with pooled-op concurrency; fix by sizing UV_THREADPOOL_SIZE to the workload,
+      reducing pooled work (caching DNS, streaming instead of re-compressing), or moving sustained CPU to
+      worker_threads.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What is event-loop delay and why is it the metric for Node services?</summary>
+      <p>The gap between when a callback <em>could</em> run and when it does — measured by
+      <code>monitorEventLoopDelay</code> (a timer that notices its own lateness). It's the shared queue's
+      health: every request on the process pays at least the current loop delay, regardless of handler speed.
+      CPU per-handler metrics miss it entirely (each handler "is fast"); loop delay p99 exposes the
+      aggregate blocking — JSON monsters, sync calls, GC — as one number you can alert on.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A service's p99 doubles at traffic peaks; CPU is 40%, handlers profile fast, DB is fine. Diagnose with this lesson's tools.</summary>
+      <p>Fast handlers + spare CPU + slow p99 = queueing somewhere invisible. Check event-loop delay first: if
+      p99 delay is high, something periodically owns the loop — capture a CPU profile at peak (a fat
+      JSON.stringify, a regex, GC from allocation churn will show as flame towers). If loop delay is clean,
+      check the thread pool: fs/crypto/zlib/dns.lookup concurrency versus pool size — pool queueing doesn't
+      show in loop delay (the loop is free; the <em>completion</em> is late). Also check the HTTP agent's
+      socket limits and DNS (lookup storms at peak). Each hypothesis has a distinct signature: loop delay
+      (loop blocked), pooled-op latency spread (pool starved), socket wait (agent limits) — instrument, don't
+      guess.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> How does AsyncLocalStorage propagate context, and what are its operational caveats?</summary>
+      <p><code>als.run(store, fn)</code> associates the store with the current async execution; the async-hooks
+      machinery tags every async resource created within (promises, timers, I/O callbacks) with that context,
+      so any continuation — however deep — retrieves the same store via <code>getStore()</code>. It's the
+      backbone of request-scoped logging and distributed tracing without parameter-threading. Caveats:
+      measurable overhead (keep store count low, payloads small); context loss across non-instrumented
+      boundaries (some connection-pool callbacks, EventEmitter listeners registered outside the run — re-bind
+      deliberately); and it's per-process — cluster workers each have their own. Test the propagation path in
+      CI; a silent context drop turns "which request logged this" back into archaeology.</p></details>
+
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (easy):</strong> Predict the full output, then verify: <code>console.log(1); setTimeout(() =&gt; console.log(2)); Promise.resolve().then(() =&gt; { console.log(3); process.nextTick(() =&gt; console.log(4)); }); process.nextTick(() =&gt; console.log(5)); console.log(6);</code>
+      <details class="solution"><summary>Solution</summary>
+      <pre>// 1, 6, 5, 3, 4, 2
+// sync (1, 6) → nextTick queue (5) → promise queue (3, which ENQUEUES a new
+// nextTick — drained before moving on: 4) → timers phase (2).
+// The subtlety: microtask processing alternates nextTick/promise queues until
+// BOTH are empty — new nextTicks from promises still run before any macrotask.</pre></details></div>
+    <div class="exercise"><strong>2 (easy):</strong> A readiness probe hits <code>/health</code> every 5s, but during report generation (a 3s synchronous aggregation) probes time out and the orchestrator restarts the pod. Explain the mechanism and the two-word diagnosis.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Loop blocked. The 3s aggregation runs as ONE callback; the health request's
+// handler sits in the poll queue behind it — it cannot run until the loop is
+// free, so the probe times out and the orchestrator (correctly!) restarts a
+// process that couldn't respond. Fix: chunk the aggregation (setImmediate
+// between slices) or move it to a worker — health checks are only meaningful
+// if the loop stays responsive.</pre></details></div>
+    <div class="exercise"><strong>3 (medium):</strong> Write <code>yieldingMap(items, fn, {sliceMs})</code>: maps a huge array on the main thread but yields to the loop every ~sliceMs of work, returning a promise of the results.
+      <details class="solution"><summary>Solution</summary>
+      <pre>export function yieldingMap(items, fn, { sliceMs = 8 } = {}) {
+  return new Promise((resolve, reject) =&gt; {
+    const out = new Array(items.length);
+    let i = 0;
+    function slice() {
+      const deadline = performance.now() + sliceMs;
+      try {
+        while (i &lt; items.length &amp;&amp; performance.now() &lt; deadline) {
+          out[i] = fn(items[i], i); i++;
+        }
+      } catch (err) { return reject(err); }
+      if (i &lt; items.length) setImmediate(slice);   // yield: I/O runs between slices
+      else resolve(out);
+    }
+    slice();
+  });
+}
+// await yieldingMap(millionRows, transform);
+// Loop delay stays ~sliceMs instead of one giant block. For SUSTAINED heavy
+// compute, a worker thread still wins — this pattern is for occasional bursts.</pre></details></div>
+    <div class="exercise"><strong>4 (medium):</strong> Demonstrate the thread-pool ceiling: time 4 concurrent <code>pbkdf2</code> calls vs 8, with the default pool, and explain the numbers. Then show the one-line change that fixes the 8-case.
+      <details class="solution"><summary>Solution</summary>
+      <pre>import { pbkdf2 } from "node:crypto";
+import { promisify } from "node:util";
+const kdf = promisify(pbkdf2);
+
+async function timeN(n) {
+  const t0 = performance.now();
+  await Promise.all(Array.from({ length: n }, () =&gt;
+    kdf("pw", "salt", 300_000, 64, "sha512")));
+  console.log(`${n} concurrent: ${(performance.now() - t0).toFixed(0)}ms`);
+}
+await timeN(4);   // ≈ T (one batch: all 4 pool threads busy in parallel)
+await timeN(8);   // ≈ 2T — NOT 8/4 of CPU limits: calls 5-8 WAITED for threads
+// Fix: UV_THREADPOOL_SIZE=8 node bench.js  → 8 concurrent ≈ T (given ≥8 cores).
+// The lesson: "async" crypto is parallel only up to the pool size — an
+// invisible semaphore around every pooled API.</pre></details></div>
+    <div class="exercise"><strong>5 (medium):</strong> A worker script finishes its queue but the process never exits in CI. Reproduce the bug with a metrics interval + a DB-ish keep-alive, then fix it two ways.
+      <details class="solution"><summary>Solution</summary>
+      <pre>const metrics = setInterval(() =&gt; collect(), 30_000);   // holds a ref
+const keepAlive = net.createConnection(6379);            // fake "pool" socket
+
+await processQueue();
+console.log("done");            // prints… and the process hangs: two live handles
+
+// Fix A — close what you own (the correct default):
+clearInterval(metrics);
+keepAlive.end();                // loop drains → clean natural exit
+
+// Fix B — unref auxiliaries that should never block exit:
+const metrics2 = setInterval(collect, 30_000).unref();   // at creation time
+// (Sockets support .unref() too — right for OPTIONAL keep-alives only.)
+// Diagnosis tool when it's not obvious: console.log(process.getActiveResourcesInfo())
+// after "done" — lists the handle types still holding the loop open.</pre></details></div>
+    <div class="exercise"><strong>6 (hard):</strong> Build request-scoped logging with AsyncLocalStorage on the raw http server: every log line anywhere in the handler chain carries the request id and elapsed ms — without passing any context parameter.
+      <details class="solution"><summary>Solution</summary>
+      <pre>import { AsyncLocalStorage } from "node:async_hooks";
+import http from "node:http";
+import crypto from "node:crypto";
+
+const als = new AsyncLocalStorage();
+
+export function log(msg, extra = {}) {
+  const ctx = als.getStore();
+  console.log(JSON.stringify({
+    ...(ctx &amp;&amp; { reqId: ctx.reqId, ms: Date.now() - ctx.start }),
+    msg, ...extra,
+  }));
+}
+
+http.createServer((req, res) =&gt; {
+  als.run({ reqId: crypto.randomUUID(), start: Date.now() }, async () =&gt; {
+    log("request", { method: req.method, url: req.url });
+    const data = await loadData();          // ← any depth of awaits/callbacks…
+    log("loaded", { rows: data.length });   // …still sees THIS request's store
+    res.end(JSON.stringify(data));
+    log("responded", { status: 200 });
+  });
+}).listen(3000);
+
+async function loadData() {
+  await new Promise(r =&gt; setTimeout(r, 50));
+  log("db query done");                     // deep call, no ctx param — correct reqId
+  return [1, 2, 3];
+}
+// Two interleaved requests produce correctly-attributed lines: the context
+// follows each async chain, not wall-clock order. This exact shape becomes
+// middleware in the Express lessons and feeds tracing in Observability.</pre></details></div>
+    <div class="exercise"><strong>7 (hard):</strong> An image API gzips every response in-handler with <code>zlib.gzipSync</code>, and under load both latency AND health checks degrade; switching to async <code>zlib.gzip</code> helped latency only somewhat. Explain both stages and design the real fix.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Stage 1 — gzipSync: pure CPU ON the loop per response → loop delay grows
+// with concurrency; health checks queue behind compressions (ex. 2's disease).
+// Stage 2 — async gzip: moved the CPU to the THREAD POOL. Loop is free (health
+// checks fine now) but the pool's 4 threads became the throughput ceiling —
+// compressions queue behind each other, so p99 latency still climbs with load,
+// and pooled fs calls now contend too.
+// Real fix, layered:
+// 1. DON'T COMPRESS PER REQUEST: images (JPEG/PNG/WebP) are already
+//    compressed — gzip buys ~0% there. Skip by content type. (Biggest win:
+//    deleting the work.)
+// 2. For compressible responses (JSON/SVG): pre-compress static assets at
+//    build; cache compressed bodies for hot dynamic responses keyed by ETag.
+// 3. Offload the remainder: reverse proxy/CDN does compression (nginx/CF) —
+//    it's their specialty, on their CPUs.
+// 4. If it MUST stay in Node: stream with zlib.createGzip (constant memory,
+//    Streams lesson), size UV_THREADPOOL_SIZE consciously, and cap concurrent
+//    compressions with a semaphore so the pool serves fs too.
+// The meta-lesson: async ≠ free — it names WHERE the work happens (loop vs
+// pool vs elsewhere); the senior fix chose "elsewhere" and "nowhere".</pre></details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
+      <li>Phases per iteration — timers → pending → poll (the I/O heart) → check → close — with nextTick then promise microtasks drained between every callback.</li>
+      <li>nextTick makes APIs uniformly async and starves the loop if recursive; setImmediate is the yield point for chunked work; timeout-vs-immediate is a race only at top level.</li>
+      <li>Two asyncs: OS-async sockets scale freely; fs/dns.lookup/zlib/heavy-crypto ride a 4-thread pool — an invisible semaphore you must size or avoid.</li>
+      <li>Event-loop delay is the metric: every request pays it; monitor it, alert on it, and CPU-profile when it spikes.</li>
+      <li>The process exits when no referenced handles remain — unref auxiliaries, close what you own, and read getActiveResourcesInfo instead of calling process.exit.</li>
+      <li>AsyncLocalStorage carries request context down async chains — the foundation of per-request logging and tracing on a shared thread.</li>
+    </ul></div>
+
+    <div class="pager">
+      <a class="btn btn-outline" href="process-cli.html">← Process, Environment &amp; CLI</a>
+      <a class="btn" href="async-patterns.html">Next: Async Patterns →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
