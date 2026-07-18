@@ -38,7 +38,8 @@ renderSidebar([
     ["The Java Memory Model", "memory-model.html"],
     ["Executors & Futures", "executors.html"],
     ["Concurrent Collections & Atomics", "concurrent-collections.html"],
-    ["Virtual Threads (Project Loom)", "virtual-threads.html"]] },
+    ["Virtual Threads (Project Loom)", "virtual-threads.html"],
+    ["Concurrency Patterns & Pitfalls", "concurrency-patterns.html"]] },
   { title: "6. The JVM & Performance", items: [
     ["JVM Architecture & Class Loading", "jvm.html"],
     ["Memory: Stack, Heap & References", "memory.html"],
