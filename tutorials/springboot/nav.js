@@ -26,6 +26,10 @@ renderSidebar([
     ["Actuator & Observability", "actuator.html"],
     ["Resilience & Microservices", "microservices.html"],
     ["Production & Deployment", "production.html"]] },
+  { title: "6. Event-Driven & Reactive", items: [
+    ["REST API Design & Versioning", "api-design.html"],
+    ["Messaging & Kafka", "messaging.html"],
+    ["Reactive Spring & WebFlux", "reactive.html"]] },
   { title: "Practice", items: [
     ["📝 Quizzes (10 sets × 20 Qs)", "quiz.html"]] }
 ]);
