@@ -81,14 +81,14 @@ window.QUIZ_SETS.push(
     explain: "Then atomics → concurrent collections → locks." },
   { q: "A virtual thread is scheduled by…", options: ["The OS", "The JVM (cheap, millions possible)", "You"], answer: 1,
     explain: "A platform thread is a 1:1 OS thread." },
-  { q: "A blocking virtual thread…", options: ["Wastes an OS thread", "Unmounts from its carrier (OS thread runs others)", "Deadlocks"], answer: 1,
-    explain: "Simple blocking code scales." },
-  { q: "Virtual threads help for… but not…", options: ["CPU-bound / I/O", "I/O-bound / CPU-bound", "neither / both"], answer: 1,
-    explain: "CPU work is still core-limited." },
   { q: "Pinning happens when a virtual thread blocks in…", options: ["a ReentrantLock", "a synchronized block (or native call)", "a loop"], answer: 1,
     explain: "Prefer ReentrantLock around blocking I/O." },
-  { q: "You should NOT… virtual threads", options: ["create", "pool them (create one per task)", "block on them"], answer: 1,
-    explain: "Pooling reintroduces the limits you're escaping." }
+  { q: "The standard fix for deadlock from two threads locking A,B in opposite orders is…", options: ["More threads", "A consistent global lock order (e.g. by id)", "Bigger locks"], answer: 1,
+    explain: "It breaks the circular-wait condition. tryLock-with-timeout is an alternative." },
+  { q: "The classic 'check-then-act' race (if absent, put) is fixed by…", options: ["A comment", "An atomic op like computeIfAbsent / CAS / one lock across both steps", "volatile"], answer: 1,
+    explain: "The check-and-act must be a single atomic operation." },
+  { q: "Deadlock/livelock/starvation are ___ failures; a race is a ___ failure.", options: ["safety / liveness", "liveness / safety", "both the same"], answer: 1,
+    explain: "Liveness = no progress; safety = no wrong result. Design for both." }
 ]},
 
 { title: "Quiz 8 · JVM, Memory & Performance",
