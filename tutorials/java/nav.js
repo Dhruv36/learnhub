@@ -31,7 +31,8 @@ renderSidebar([
   { title: "4. Modern Java", items: [
     ["Records & Sealed Types", "records-sealed.html"],
     ["Pattern Matching & Switch", "pattern-matching.html"],
-    ["var, Text Blocks & Newer APIs", "modern-java.html"]] },
+    ["var, Text Blocks & Newer APIs", "modern-java.html"],
+    ["The Module System (JPMS)", "modules.html"]] },
   { title: "5. Concurrency", items: [
     ["Threads & the Runnable Model", "threads.html"],
     ["Synchronization & Locks", "synchronization.html"],
