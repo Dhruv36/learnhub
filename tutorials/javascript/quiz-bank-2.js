@@ -98,8 +98,8 @@ window.QUIZ_SETS.push(
     explain: "A stack trace is the difference between a 5-minute fix and an afternoon." },
   { q: "new Error('Order 42 failed', { cause: err }) provides…", options: ["Retry logic", "An error CHAIN — business context on top, root cause preserved underneath", "Deduplication"], answer: 1,
     explain: "Log the top error, see the whole story. Re-throwing without cause destroys the trail." },
-  { q: "try { … } catch(e) {} (empty catch) is…", options: ["Defensive programming", "The cardinal sin — bugs vanish silently; at minimum log and rethrow unknowns", "Required for async"], answer: 1,
-    explain: "Silent catches turn crashes into 'weird behavior nobody can reproduce' — strictly worse." },
+  { q: "In tests, mocking belongs at…", options: ["Every import — isolate everything", "PROCESS BOUNDARIES (network, db, clock, random) — mocking your own modules freezes the call graph", "Nowhere, mocks are bad"], answer: 1,
+    explain: "Over-mocked suites break on every refactor while real bugs in the mocked-out code sail through. Dependency injection beats module-mock machinery." },
   { q: "The right place to catch is…", options: ["Every function", "Where you can DO something (retry, fallback, UI) — else let it bubble to a logging boundary", "main() only"], answer: 1,
     explain: "Catch-log-rethrow at every layer = 5 duplicate logs per incident. Handle or pass, never both-everywhere." },
   { q: "Custom error taxonomy (ValidationError, NotFoundError extends AppError) enables…", options: ["Shorter messages", "instanceof-based handling at boundaries: 400 vs 404 vs 500, field UI vs toast vs page", "Faster throws"], answer: 1,
@@ -130,10 +130,10 @@ window.QUIZ_SETS.push(
     explain: "The subtle production gotcha behind 'instanceof stopped working after the bundler change'." },
   { q: "satisfies (config satisfies Config) gives you…", options: ["Runtime checks", "Shape validation WITHOUT widening — literal types preserved for downstream inference", "A cast"], answer: 1,
     explain: "The modern alternative to 'as Config', which silences instead of checks." },
-  { q: "ts-ignore vs proper typing:", options: ["Equivalent", "Each @ts-ignore is a suppressed alarm — allowed only with a comment explaining why, ideally @ts-expect-error", "ignore is best practice"], answer: 1,
-    explain: "@ts-expect-error at least breaks when the underlying issue is fixed — self-cleaning suppression." },
-  { q: "The organizational ROI of TypeScript is…", options: ["Personal typing speed", "Enforced documentation surviving refactors — strangers change code confidently; regressions surface pre-commit", "Smaller bundles"], answer: 1,
-    explain: "Why big companies mandate it: it lowers the cost of every future engineer touching the file." }
+  { q: "expect({a:1}).toBe({a:1}) fails but toEqual passes because…", options: ["toBe is deprecated", "toBe checks IDENTITY (same reference); toEqual checks deep STRUCTURE — two fresh objects are equal, never identical", "toEqual ignores keys"], answer: 1,
+    explain: "toBe for primitives/same-object checks, toEqual for data, toBeCloseTo for floats (0.1+0.2 !== 0.3)." },
+  { q: "it('rejects', () => { expect(load(-1)).rejects.toThrow(); }) passes even when load() is broken because…", options: ["rejects is unreliable", "The rejects matcher returns a PROMISE that's never awaited — the test ends before the assertion runs", "toThrow needs a string"], answer: 1,
+    explain: "The classic async false positive. Fix: async test + await expect(...).rejects.toThrow(); expect.assertions(n) guards try/catch styles." }
 ]},
 
 { title: "Quiz 9 · Memory, Workers & Security",
@@ -222,7 +222,7 @@ window.QUIZ_SETS.push(
     explain: "Index-stable results (results[i] = value), count settlements, one reject short-circuits. 10 lines, much signal." },
   { q: "React's useEffect cleanup returning () => controller.abort() maps to which vanilla concepts?", options: ["Hydration", "Listener/request lifecycle cleanup — the leak-prevention discipline, framework-flavored", "Virtual DOM"], answer: 1,
     explain: "Frameworks rename the fundamentals; the fundamentals grade the interview." },
-  { q: "The single most award-worthy JS habit this track taught:", options: ["Memorizing APIs", "Reason from the MODEL: one thread, reference semantics, closures capture scope, microtasks before macrotasks — everything else derives", "Using newest syntax"], answer: 1,
-    explain: "Four mental models explain 95% of JS behavior questions — that's the foundation seniors stand on. 🏆" }
+  { q: "Three functions repeat if (type==='csv')…else if (type==='json')…else if (type==='xml')…. The refactor:", options: ["A switch statement", "Strategy pattern — a lookup object { csv: toCsv, json: toJson, xml: toXml }; adding a format = adding one entry", "An abstract class hierarchy"], answer: 1,
+    explain: "JS idiom: first-class functions make strategy a lookup object, no interfaces needed. Each strategy is independently testable; the tested dispatcher never changes. 🏆" }
 ]}
 );
