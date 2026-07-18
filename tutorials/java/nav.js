@@ -25,7 +25,9 @@ renderSidebar([
     ["Exceptions & Error Handling", "exceptions.html"],
     ["Optional & Null Safety", "optional.html"],
     ["Dates, Times & BigDecimal", "dates-money.html"],
-    ["I/O, Files & NIO", "io.html"]] },
+    ["I/O, Files & NIO", "io.html"],
+    ["Annotations & Reflection", "annotations-reflection.html"],
+    ["Regular Expressions", "regex.html"]] },
   { title: "4. Modern Java", items: [
     ["Records & Sealed Types", "records-sealed.html"],
     ["Pattern Matching & Switch", "pattern-matching.html"],
