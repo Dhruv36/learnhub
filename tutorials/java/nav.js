@@ -44,7 +44,8 @@ renderSidebar([
     ["JVM Architecture & Class Loading", "jvm.html"],
     ["Memory: Stack, Heap & References", "memory.html"],
     ["Garbage Collection", "gc.html"],
-    ["Performance & Profiling", "performance.html"]] },
+    ["Performance & Profiling", "performance.html"],
+    ["Benchmarking & JMH", "benchmarking.html"]] },
   { title: "7. Professional Java", items: [
     ["Design Patterns in Java", "design-patterns.html"],
     ["SOLID & Clean Code", "solid.html"],
