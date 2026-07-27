@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Async Patterns &amp; Pitfalls — .NET — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="index.html">← .NET Track</a><a href="quiz.html">Quizzes</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Async Patterns &amp; Pitfalls <span class="level-badge level-adv">Async &amp; Concurrency</span></h1>
+    <p><strong>What you'll master:</strong> the production patterns that turn "I know await" into "I can
+       ship async systems": bounded concurrency (<code>SemaphoreSlim</code>,
+       <code>Parallel.ForEachAsync</code>); async streams (<code>IAsyncEnumerable</code>);
+       producer/consumer pipelines with <code>Channel&lt;T&gt;</code>; <code>TaskCompletionSource</code>
+       for bridging callback APIs; async-safe lazy initialization; retry with backoff; and the pitfalls
+       that fill incident reports — sync-over-async under load, <code>lock</code> + <code>await</code>,
+       async in constructors. Prerequisite: <a href="async-await.html">async/await &amp; Tasks</a> —
+       this lesson assumes the state-machine mental model and builds the patterns layer on it.</p>
+
+    <h2>Part 1 — Bounded Concurrency: The Throttle Every Fan-Out Needs</h2>
+    <pre>// Unbounded fan-out is a self-inflicted DoS:
+await Task.WhenAll(urls.Select(FetchAsync));       // 10,000 urls = 10,000 concurrent
+// requests → socket exhaustion, rate-limit bans, downstream timeouts. ALWAYS bound it.
+
+// TOOL 1 — Parallel.ForEachAsync (.NET 6+): the go-to for "do this async thing N-wide":
+await Parallel.ForEachAsync(urls,
+    new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct },
+    async (url, token) =&gt;
+    {
+        var data = await FetchAsync(url, token);
+        await SaveAsync(data, token);
+    });
+// 8 in flight at any moment; new items start as slots free; cancellation flows in.
+
+// TOOL 2 — SemaphoreSlim: the manual throttle, when you need results back or the
+// work isn't a clean foreach. A semaphore = a counter of "permits":
+using var gate = new SemaphoreSlim(8);             // 8 concurrent permits
+var tasks = urls.Select(async url =&gt;
+{
+    await gate.WaitAsync(ct);                      // take a permit (async — no thread blocked)
+    try     { return await FetchAsync(url, ct); }
+    finally { gate.Release(); }                    // ALWAYS release — finally, not after
+});
+var results = await Task.WhenAll(tasks);           // results in input order
+
+// How to pick the limit: it protects the DOWNSTREAM, so match its capacity —
+// DB pool size, API rate limit, disk throughput. Make it config, load-test it.
+// ponytail: fixed limit; adaptive throttling (react to 429/latency) if the target varies.</pre>
+    <div class="note"><strong><code>SemaphoreSlim</code> is also the async lock.</strong> C#'s
+      <code>lock</code> statement cannot contain <code>await</code> (the compiler refuses — the resuming
+      thread may differ from the one that took the monitor). The idiom for "one at a time, but the work
+      is async" is a semaphore of 1: <code>await _gate.WaitAsync(); try { await ... } finally
+      { _gate.Release(); }</code>. .NET 9 added <code>System.Threading.Lock</code>, but for
+      <em>awaitable</em> critical sections, SemaphoreSlim(1,1) remains the standard answer — and a
+      favorite interview question.</div>
+
+    <h2>Part 2 — Async Streams: IAsyncEnumerable&lt;T&gt;</h2>
+    <pre>// IEnumerable pulls values synchronously; Task&lt;List&lt;T&gt;&gt; waits for ALL before yielding ANY.
+// IAsyncEnumerable&lt;T&gt; streams items AS THEY ARRIVE, each awaited:
+public async IAsyncEnumerable&lt;Order&gt; ReadOrdersAsync(
+    [EnumeratorCancellation] CancellationToken ct = default)   // token wires into await foreach
+{
+    string? line;
+    using var reader = File.OpenText("orders.jsonl");
+    while ((line = await reader.ReadLineAsync(ct)) is not null)   // await INSIDE the iterator
+        yield return JsonSerializer.Deserialize&lt;Order&gt;(line)!;    // yield per item
+}
+
+// Consuming — await foreach:
+await foreach (var order in ReadOrdersAsync(ct))
+    await ProcessAsync(order);
+// Memory: ONE order at a time — a 10GB file streams in constant memory, vs
+// Task&lt;List&lt;Order&gt;&gt; materializing everything. First result arrives immediately, not
+// after the whole read. EF Core (AsAsyncEnumerable), gRPC streaming, and
+// System.Text.Json (DeserializeAsyncEnumerable) all speak this shape.
+
+// WithCancellation attaches a token at the consumption site:
+await foreach (var o in source.WithCancellation(ct)) { ... }</pre>
+
+    <h2>Part 3 — Channel&lt;T&gt;: Producer/Consumer Done Right</h2>
+    <pre>// A Channel is an async-native queue: producers write, consumers read, backpressure
+// built in. It replaces hand-rolled Queue+lock+event contraptions.
+var channel = Channel.CreateBounded&lt;Job&gt;(new BoundedChannelOptions(100)
+{
+    FullMode = BoundedChannelFullMode.Wait      // producer AWAITS when full = BACKPRESSURE
+});                                             // (DropOldest/DropWrite for lossy telemetry)
+
+// PRODUCER(S) — e.g. a web endpoint enqueueing work:
+public async Task EnqueueAsync(Job job, CancellationToken ct)
+    =&gt; await channel.Writer.WriteAsync(job, ct);   // waits if the queue is full
+
+// CONSUMER(S) — N background workers (see di-hosting.html for BackgroundService):
+async Task ConsumeAsync(CancellationToken ct)
+{
+    await foreach (var job in channel.Reader.ReadAllAsync(ct))   // IAsyncEnumerable!
+        await HandleAsync(job, ct);
+}
+var workers = Enumerable.Range(0, 4).Select(_ =&gt; ConsumeAsync(ct)).ToArray();
+
+// SHUTDOWN protocol:
+channel.Writer.Complete();          // no more writes
+await Task.WhenAll(workers);        // ReadAllAsync ends when channel drains → workers exit
+
+// Why BOUNDED matters: an unbounded channel with a slow consumer grows until OOM —
+// the queue hides the overload instead of surfacing it. Bounded + Wait pushes the
+// slowdown back to producers (backpressure), which is what you want: fail/slow at the
+// edge, not explode in the middle. Same principle as message-broker queue limits.</pre>
+
+    <h2>Part 4 — TaskCompletionSource: Bridging Callbacks Into Tasks</h2>
+    <pre>// Old APIs signal completion via callbacks/events. TaskCompletionSource&lt;T&gt; (TCS)
+// manufactures a Task YOU complete manually — the adapter between worlds:
+public Task&lt;string&gt; ScanAsync(Scanner scanner, CancellationToken ct = default)
+{
+    var tcs = new TaskCompletionSource&lt;string&gt;(
+        TaskCreationOptions.RunContinuationsAsynchronously);   // ALWAYS pass this (below)
+
+    scanner.ScanCompleted += (s, e) =&gt; tcs.TrySetResult(e.Barcode);   // callback → result
+    scanner.ScanFailed    += (s, e) =&gt; tcs.TrySetException(e.Error);  // callback → exception
+    ct.Register(() =&gt; tcs.TrySetCanceled(ct));                        // cancellation → canceled
+
+    scanner.StartScan();
+    return tcs.Task;                       // awaitable handle over the event-based API
+}
+var barcode = await ScanAsync(scanner, ct);   // caller lives in clean async land
+
+// Notes that separate senior answers:
+// - TrySet* (not Set*): events may fire twice/race — Set* throws on second call.
+// - RunContinuationsAsynchronously: without it, awaiting continuations run INLINE on
+//   the thread calling TrySetResult — a library thread suddenly executes your app's
+//   continuation chain → surprise deadlocks/stalls. This flag is essentially mandatory.
+// - This is exactly how the runtime builds Task.Delay, WhenAll, and every I/O task.</pre>
+
+    <h2>Part 5 — Initialization, Caching &amp; Retry Patterns</h2>
+    <pre>// ASYNC LAZY INIT — "load once, everyone awaits the same load":
+// Lazy&lt;Task&lt;T&gt;&gt; = thread-safe once-only START of the task; all callers share it.
+private readonly Lazy&lt;Task&lt;Settings&gt;&gt; _settings =
+    new(() =&gt; LoadSettingsAsync(), LazyThreadSafetyMode.ExecutionAndPublication);
+public Task&lt;Settings&gt; GetSettingsAsync() =&gt; _settings.Value;
+// First caller triggers LoadSettingsAsync; concurrent callers await the SAME task;
+// later callers get the completed task (zero cost). Caveat: a FAULTED task is cached
+// too — wrap with retry-on-fault if the load can transiently fail.
+
+// This also fixes "async constructor" (constructors can't await):
+// ❌ public Service() { _data = LoadAsync().Result; }        // sync-over-async in ctor!
+// ✅ ctor stores the Lazy; first use awaits. Or a static factory:
+public static async Task&lt;Service&gt; CreateAsync(CancellationToken ct)
+{
+    var data = await LoadAsync(ct);
+    return new Service(data);              // private ctor takes the loaded data
+}
+
+// RETRY WITH EXPONENTIAL BACKOFF + JITTER (transient faults only — see
+// exceptions-nullability.html for the filter discipline):
+public static async Task&lt;T&gt; RetryAsync&lt;T&gt;(Func&lt;CancellationToken, Task&lt;T&gt;&gt; op,
+    int attempts = 4, CancellationToken ct = default)
+{
+    for (int i = 1; ; i++)
+    {
+        try { return await op(ct); }
+        catch (Exception ex) when (IsTransient(ex) &amp;&amp; i &lt; attempts)
+        {
+            var delay = TimeSpan.FromMilliseconds(
+                100 * Math.Pow(2, i)                       // 200, 400, 800ms...
+                + Random.Shared.Next(0, 100));             // JITTER: desynchronize retriers
+            await Task.Delay(delay, ct);
+        }
+    }
+}
+// Backoff gives the dependency room to recover; jitter prevents every client
+// retrying in lockstep (thundering herd). In real services use Polly (retry +
+// circuit breaker + timeout policies, composable) — but know what it does inside.
+// ponytail: no circuit breaker here; add one (Polly) when a dependency can brown-out.</pre>
+
+    <h2>Part 6 — The Pitfalls That Cause Incidents</h2>
+    <pre>// PITFALL 1 — sync-over-async UNDER LOAD (thread-pool starvation):
+// .Result in a request path doesn't just risk deadlock — each call PARKS a pool thread.
+// Under burst traffic: all threads blocked → continuations can't run → the tasks being
+// waited on can't complete → timeouts cascade while CPU sits at 5%. The signature
+// symptom: low CPU, high latency, ThreadPool queue length climbing. Fix: async end-to-end.
+
+// PITFALL 2 — lock + await:
+lock (_sync) { await SaveAsync(); }        // ❌ compile error — and for good reason:
+// the continuation may resume on a DIFFERENT thread, which can't release a Monitor
+// owned by the original. Use SemaphoreSlim(1,1) (Part 1) for async critical sections.
+// Never "work around" with Monitor.Enter/Exit split across an await.
+
+// PITFALL 3 — async work in a request outliving the request:
+_ = Task.Run(() =&gt; SendEmailAsync(user));  // ❌ in ASP.NET: the DI scope (and its
+// DbContext etc.) is disposed when the response returns → ObjectDisposedException at
+// random. Real fix: enqueue to a Channel consumed by a BackgroundService with its own
+// scope (Part 3 + di-hosting.html) — that's the minimal correct "fire and forget".
+
+// PITFALL 4 — Task.Delay for periodic work drifts and overlaps:
+while (true) { await DoWorkAsync(); await Task.Delay(60_000); }   // period = 60s + work time
+// ✅ PeriodicTimer (.NET 6+): fixed cadence, no overlap, clean cancellation:
+using var timer = new PeriodicTimer(TimeSpan.FromMinutes(1));
+while (await timer.WaitForNextTickAsync(ct))
+    await DoWorkAsync(ct);
+
+// PITFALL 5 — awaiting inside foreach when order doesn't matter (revisited):
+// sequential-await loops are the #1 latency bug; WhenAll/ForEachAsync (Part 1) —
+// but remember the opposite trap: DbContext is NOT thread-safe; EF work must stay
+// sequential per context (efcore.html).</pre>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Unbounded <code>WhenAll</code> over a big collection</td><td>Socket exhaustion, 429s, downstream meltdown</td><td><code>Parallel.ForEachAsync</code> with <code>MaxDegreeOfParallelism</code> or a <code>SemaphoreSlim</code> gate</td></tr>
+      <tr><td><code>Release()</code> outside <code>finally</code></td><td>One exception leaks a permit → throughput quietly halves, then deadlocks</td><td><code>try { ... } finally { gate.Release(); }</code> always</td></tr>
+      <tr><td>Unbounded channel with a slow consumer</td><td>Queue grows until OutOfMemory — overload hidden until the crash</td><td><code>CreateBounded</code> + <code>Wait</code> full-mode = backpressure to producers</td></tr>
+      <tr><td>TCS without <code>RunContinuationsAsynchronously</code></td><td>Continuations run inline on the completer's thread → stalls/deadlocks</td><td>Always pass the flag; use <code>TrySet*</code> not <code>Set*</code></td></tr>
+      <tr><td><code>.Result</code> in request paths "because it works in dev"</td><td>Thread-pool starvation under load: low CPU, soaring latency</td><td>Async end-to-end; starvation shows in ThreadPool queue-length counters</td></tr>
+      <tr><td>Fire-and-forget using request-scoped services</td><td><code>ObjectDisposedException</code> after response; lost work on shutdown</td><td>Channel + BackgroundService with its own DI scope</td></tr>
+      <tr><td>Caching a faulted <code>Lazy&lt;Task&gt;</code> forever</td><td>One transient failure at startup bricks the feature until restart</td><td>Retry-wrapped factory, or reset-on-fault lazy variant</td></tr>
+      <tr><td>Retry without jitter or transient-filter</td><td>Thundering-herd retries; pointless retries of permanent failures</td><td>Exponential backoff + jitter; retry only transient exception types</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Q1 (Beginner):</strong> Why is firing 5,000 HTTP requests with one <code>Task.WhenAll</code> a bad idea, and what do you do instead?</summary>
+      <p>All 5,000 start immediately and run concurrently: you exhaust outbound sockets/ports, trip the
+      target's rate limits, saturate your bandwidth, and induce timeouts that look like downstream
+      failures. Instead, bound the concurrency: <code>Parallel.ForEachAsync</code> with
+      <code>MaxDegreeOfParallelism</code> set to what the downstream can handle, or gate each task with a
+      <code>SemaphoreSlim</code> when you need per-item results. The limit protects the dependency, so
+      size it from the dependency's capacity (connection pool, documented rate limit) and make it
+      configurable.</p></details>
+    <details class="solution"><summary><strong>Q2 (Beginner):</strong> What is <code>IAsyncEnumerable&lt;T&gt;</code> and when is it better than <code>Task&lt;List&lt;T&gt;&gt;</code>?</summary>
+      <p>It's the async version of a sequence: items are produced one at a time, each potentially
+      awaited, consumed with <code>await foreach</code>. Prefer it when results arrive incrementally and
+      you don't need them all at once — reading large files/DB result sets, paging an API, gRPC
+      streams. Benefits: constant memory (one item in flight instead of the whole list) and immediate
+      first results (processing starts before the source finishes). <code>Task&lt;List&lt;T&gt;&gt;</code>
+      buffers everything, so memory scales with result size and nothing is available until the end.</p></details>
+    <details class="solution"><summary><strong>Q3 (Mid):</strong> How do you protect a critical section that contains an <code>await</code>? Why won't <code>lock</code> work?</summary>
+      <p><code>lock</code> compiles to <code>Monitor.Enter/Exit</code>, which is thread-affine — the
+      thread that acquires must release. An <code>await</code> may resume on a different thread, which
+      couldn't release the monitor, so C# makes <code>await</code> inside <code>lock</code> a compile
+      error. The idiom is <code>SemaphoreSlim(1,1)</code>: <code>await _gate.WaitAsync(); try { /* async
+      work */ } finally { _gate.Release(); }</code>. <code>WaitAsync</code> queues waiters without
+      blocking threads, and a semaphore has no thread affinity — any thread may release. The
+      <code>finally</code> is essential: a leaked permit permanently shrinks the gate.</p></details>
+    <details class="solution"><summary><strong>Q4 (Mid):</strong> What is <code>TaskCompletionSource</code> for? Name two details that make a TCS-based adapter production-grade.</summary>
+      <p>It creates a <code>Task</code> whose completion <em>you</em> control via
+      <code>SetResult/SetException/SetCanceled</code> — the bridge that wraps callback- or event-based
+      APIs (device SDKs, message replies, old Begin/End patterns) into awaitable methods; it's also how
+      the runtime itself constructs I/O tasks. Production details: (1) construct with
+      <code>TaskCreationOptions.RunContinuationsAsynchronously</code>, otherwise awaiters' continuations
+      execute synchronously on whatever thread calls <code>SetResult</code> — hijacking a library/timer
+      thread and inviting deadlocks; (2) use <code>TrySet*</code> variants since callbacks can race or
+      fire twice; (3) register cancellation (<code>ct.Register(() =&gt; tcs.TrySetCanceled(ct))</code>)
+      and unhook event handlers to avoid leaks.</p></details>
+    <details class="solution"><summary><strong>Q5 (Senior):</strong> Design a background work queue inside a web app: requests enqueue jobs, workers process them, the app must not lose jobs on overload or use disposed services. What do you build?</summary>
+      <p>A bounded <code>Channel&lt;Job&gt;</code> registered as a singleton: endpoints
+      <code>WriteAsync</code> (which awaits when full — backpressure instead of unbounded memory growth;
+      or return 429/503 if waiting is unacceptable). Consumers are a <code>BackgroundService</code>
+      (hosted service) running N workers over <code>Reader.ReadAllAsync</code>; each job execution
+      creates its <em>own DI scope</em> (<code>IServiceScopeFactory.CreateScope</code>) so it never
+      touches request-scoped services that die with the response. Shutdown:
+      <code>StopAsync</code> completes the writer and awaits drain within the host's shutdown timeout.
+      Failures: per-job try/catch, retry transient errors with backoff, dead-letter poison jobs. Honest
+      caveat: an in-process queue loses jobs if the process dies — if durability matters, the same
+      design moves to a broker (Redis/RabbitMQ/Azure Queue) with the BackgroundService as consumer.</p></details>
+    <details class="solution"><summary><strong>Q6 (Senior):</strong> Production symptom: latency spikes to seconds, CPU is at 10%, thread count climbing. Diagnose the likely async pathology and the fix.</summary>
+      <p>Classic thread-pool starvation from sync-over-async. Blocking calls (<code>.Result</code>,
+      <code>.Wait()</code>, <code>GetAwaiter().GetResult()</code>, or sync DB/HTTP calls) in request
+      paths park pool threads; under load all threads end up blocked, so queued continuations —
+      including the completions of the very tasks being waited on — can't run. The pool injects new
+      threads only gradually (hence climbing thread count), latency soars while CPU idles. Confirm via
+      EventCounters (<code>ThreadPool Queue Length</code> growing, thread count rising) or a dump showing
+      pool threads in <code>Monitor.Wait</code>/<code>Task.Wait</code>. Fix: remove the blocking —
+      async end-to-end on hot paths (controllers, middleware, repositories); interim mitigation is
+      <code>ThreadPool.SetMinThreads</code>, but that's a bandage, not the cure.</p></details>
+
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (Easy):</strong> Download 50 URLs, at most 5 concurrently, with results collected — using <code>SemaphoreSlim</code>.
+      <details class="solution"><summary>Solution</summary><pre>using var gate = new SemaphoreSlim(5);
+var tasks = urls.Select(async url =&gt;
+{
+    await gate.WaitAsync();
+    try     { return await http.GetStringAsync(url); }
+    finally { gate.Release(); }                    // finally — permits never leak
+});
+string[] pages = await Task.WhenAll(tasks);        // input order preserved
+// All 50 tasks exist immediately, but only 5 hold permits at once — the other
+// 45 are queued INSIDE WaitAsync without blocking any thread.</pre></details></div>
+    <div class="exercise"><strong>2 (Easy):</strong> Write an async stream <code>CountdownAsync(int from)</code> yielding one number per second, and consume it with <code>await foreach</code>, stopping cleanly on a token.
+      <details class="solution"><summary>Solution</summary><pre>async IAsyncEnumerable&lt;int&gt; CountdownAsync(int from,
+    [EnumeratorCancellation] CancellationToken ct = default)
+{
+    for (int i = from; i &gt;= 0; i--)
+    {
+        await Task.Delay(1000, ct);     // token flows into the delay
+        yield return i;
+    }
+}
+
+using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+try
+{
+    await foreach (var n in CountdownAsync(10).WithCancellation(cts.Token))
+        Console.Write($"{n} ");         // 9 8 7 6 5 — then cancelled
+}
+catch (OperationCanceledException) { Console.Write("stopped"); }
+// [EnumeratorCancellation] is what connects WithCancellation's token to the
+// iterator's ct parameter — without it the token silently doesn't flow.</pre></details></div>
+    <div class="exercise"><strong>3 (Medium):</strong> Build a log pipeline: many producers call <code>Log(string)</code>; one consumer writes batches of up to 100 lines to disk every flush. Bursts must not allocate unboundedly — drop oldest entries under extreme pressure (it's telemetry).
+      <details class="solution"><summary>Solution</summary><pre>var channel = Channel.CreateBounded&lt;string&gt;(new BoundedChannelOptions(10_000)
+{
+    FullMode = BoundedChannelFullMode.DropOldest,   // lossy is CORRECT for telemetry —
+    SingleReader = true                             // losing a log line beats OOM/blocking
+});
+
+public void Log(string line) =&gt; channel.Writer.TryWrite(line);   // never blocks producers
+
+async Task ConsumeAsync(CancellationToken ct)
+{
+    var batch = new List&lt;string&gt;(100);
+    await foreach (var line in channel.Reader.ReadAllAsync(ct))
+    {
+        batch.Add(line);
+        // drain whatever else is immediately available, up to batch size:
+        while (batch.Count &lt; 100 &amp;&amp; channel.Reader.TryRead(out var more))
+            batch.Add(more);
+        await File.AppendAllLinesAsync("app.log", batch, ct);   // ONE write per batch
+        batch.Clear();
+    }
+}
+// Design notes: TryWrite keeps the hot path synchronous and allocation-free for
+// producers; batching amortizes disk I/O; DropOldest chooses WHICH failure mode
+// you get under pressure — an explicit decision, not an accident.</pre></details></div>
+    <div class="exercise"><strong>4 (Medium):</strong> Wrap this callback API into a task, production-grade: <code>geo.LocationFound += handler; geo.LocationError += handler; geo.Start();</code> — with a 10-second timeout and no handler leaks.
+      <details class="solution"><summary>Solution</summary><pre>public async Task&lt;Location&gt; GetLocationAsync(Geolocator geo, CancellationToken ct = default)
+{
+    var tcs = new TaskCompletionSource&lt;Location&gt;(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+
+    void OnFound(object? s, LocationEventArgs e) =&gt; tcs.TrySetResult(e.Location);
+    void OnError(object? s, ErrorEventArgs e)    =&gt; tcs.TrySetException(e.Error);
+
+    geo.LocationFound += OnFound;                  // named handlers → removable
+    geo.LocationError += OnError;
+    using var reg = ct.Register(() =&gt; tcs.TrySetCanceled(ct));
+    try
+    {
+        geo.Start();
+        return await tcs.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);  // timeout
+    }
+    finally
+    {
+        geo.LocationFound -= OnFound;              // ALWAYS unhook — success, timeout,
+        geo.LocationError -= OnError;              // or cancel — no leaked subscriptions
+        geo.Stop();                                // (delegates-events.html Part 5)
+    }
+}
+// TrySet* everywhere (events can race the timeout), RunContinuationsAsynchronously
+// so geo's callback thread never runs our caller's continuations inline.</pre></details></div>
+    <div class="exercise"><strong>5 (Hard):</strong> Spot the two production bugs and fix them:
+<pre>public class RatesService {
+    private Task&lt;Rates&gt;? _rates;
+    public Task&lt;Rates&gt; GetRatesAsync() {
+        if (_rates == null) _rates = FetchRatesAsync();   // fetch takes ~2s, can fail
+        return _rates;
+    }
+}</pre>
+      <details class="solution"><summary>Solution</summary><pre>// BUG 1 — RACE: two concurrent first callers both see null and BOTH fetch
+//         (check-then-act isn't atomic). Mostly wasteful; can double-hit a rate-limited API.
+// BUG 2 — FAULT CACHING: if the first fetch throws, the FAULTED task is stored forever;
+//         every future call re-throws the old error until process restart.
+public class RatesService
+{
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private Task&lt;Rates&gt;? _rates;
+
+    public async Task&lt;Rates&gt; GetRatesAsync(CancellationToken ct = default)
+    {
+        var t = _rates;
+        if (t is { IsFaulted: false, IsCanceled: false }) return await t;  // fast path
+
+        await _gate.WaitAsync(ct);                    // async lock (Part 1 note)
+        try
+        {
+            if (_rates is null or { IsFaulted: true } or { IsCanceled: true })
+                _rates = FetchRatesAsync(ct);         // (re)start ONCE under the gate
+            return await _rates;
+        }
+        finally { _gate.Release(); }
+    }
+}
+// Single-flight: concurrent callers share one fetch; a failed fetch is retried on
+// the next call instead of being cached forever. (Lazy&lt;Task&lt;T&gt;&gt; fixes bug 1
+// alone — the reset-on-fault requirement is what forces the explicit gate.)</pre></details></div>
+    <div class="exercise"><strong>6 (Hard):</strong> Implement <code>HedgedGetAsync</code>: send a request; if no response within 300ms, send a second (hedge) request to a mirror; return whichever answers first; cancel the loser; propagate failure only if both fail.
+      <details class="solution"><summary>Solution</summary><pre>public async Task&lt;Response&gt; HedgedGetAsync(string url, string mirrorUrl,
+    CancellationToken ct = default)
+{
+    using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    var primary = GetAsync(url, linked.Token);
+
+    var first = await Task.WhenAny(primary, Task.Delay(300, linked.Token));
+    if (first == primary &amp;&amp; primary.IsCompletedSuccessfully)
+    {
+        linked.Cancel();                             // nothing else to cancel yet, tidy
+        return primary.Result;                       // fast path: answered under 300ms
+    }
+
+    // Slow (or already failed) → launch the hedge; race both:
+    var hedge = GetAsync(mirrorUrl, linked.Token);
+    var tasks = new List&lt;Task&lt;Response&gt;&gt; { primary, hedge };
+    while (tasks.Count &gt; 0)
+    {
+        var winner = await Task.WhenAny(tasks);
+        if (winner.IsCompletedSuccessfully)
+        {
+            linked.Cancel();                         // cancel the loser — free its resources
+            return winner.Result;
+        }
+        tasks.Remove(winner);                        // that one failed; wait for the other
+    }
+    linked.Cancel();
+    throw new HttpRequestException($"Both {url} and {mirrorUrl} failed");
+}
+// Hedging trades a little extra load for tail-latency cuts (the P99 saver used by
+// Google/BigTable et al.). Key details: linked CTS so the caller's cancel reaches
+// both; cancel the loser (don't leak in-flight requests); only fail when BOTH fail.</pre></details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
+      <li>Bound every fan-out: <code>Parallel.ForEachAsync</code> or a <code>SemaphoreSlim</code> gate sized to the downstream's capacity; <code>Release()</code> lives in <code>finally</code>.</li>
+      <li><code>SemaphoreSlim(1,1)</code> is the async lock — <code>lock</code> can't contain <code>await</code> because monitors are thread-affine.</li>
+      <li><code>IAsyncEnumerable</code> + <code>await foreach</code> streams items as they arrive in constant memory; <code>[EnumeratorCancellation]</code> wires tokens through.</li>
+      <li>Bounded <code>Channel&lt;T&gt;</code> is the producer/consumer backbone: backpressure by design, <code>Complete()</code> + drain for shutdown, DI-scoped consumers for background work.</li>
+      <li><code>TaskCompletionSource</code> bridges callbacks to tasks — always <code>RunContinuationsAsynchronously</code>, <code>TrySet*</code>, and unhook handlers.</li>
+      <li>Know the incident patterns: sync-over-async starves the pool (low CPU + high latency), fire-and-forget outlives its DI scope, unbounded queues hide overload until OOM, retries need backoff + jitter + transient filters.</li>
+    </ul></div>
+
+    <div class="pager">
+      <a class="btn btn-outline" href="async-await.html">← async/await &amp; Tasks</a>
+      <a class="btn" href="threading.html">Next: Threads, Parallelism &amp; Synchronization →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script><script src="nav.js"></script>
+</body>
+</html>
