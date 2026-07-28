@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Memory: Span&lt;T&gt;, GC, IDisposable — LearnHub</title>
+<title>Memory &amp; GC: Span, IDisposable — .NET — LearnHub</title>
 <link rel="stylesheet" href="../../css/style.css">
 </head>
 <body>
@@ -17,162 +17,411 @@
   <aside class="sidebar" id="sidebar"></aside>
 
   <main class="content">
-    <h1>Memory: Span&lt;T&gt;, GC, IDisposable <span class="level-badge level-ultra">Advanced</span></h1>
-    <p>.NET's garbage collector handles most memory management automatically, but understanding it — plus
-       unmanaged resource cleanup via IDisposable, and allocation-free slicing via Span&lt;T&gt; — is what
-       separates developers who can diagnose production memory/performance issues from those who can't.</p>
+    <h1>Memory &amp; GC: Span, IDisposable <span class="level-badge level-ultra">Runtime &amp; Performance</span></h1>
+    <p><strong>What you'll master:</strong> how the .NET garbage collector actually works — generations,
+       the Large Object Heap, GC modes; what makes memory <em>leak</em> in a garbage-collected runtime;
+       deterministic cleanup with <code>IDisposable</code>/<code>using</code> (and when finalizers
+       matter); and the modern allocation-avoidance toolkit — <code>Span&lt;T&gt;</code>,
+       <code>Memory&lt;T&gt;</code>, <code>ArrayPool</code>, <code>stackalloc</code>. Prerequisites:
+       <a href="types.html">Types &amp; Variables</a> (stack vs heap, value vs reference) and
+       <a href="delegates-events.html">Delegates &amp; Events</a> (the classic leak). This is the lesson
+       that turns "the GC handles it" into an actual model you can debug against.</p>
 
-    <h2>Stack vs Heap, GC Generations</h2>
-    <pre>// Value types (structs, locals) generally live on the STACK — fast, automatically reclaimed when the
-// method returns, no GC involvement. Reference types (class instances) live on the managed HEAP,
-// tracked and eventually reclaimed by the Garbage Collector.
+    <h2>Part 1 — The Generational GC: Why Most Allocations Are Nearly Free</h2>
+    <pre>// Allocation in .NET = bump a pointer. ~10ns. The COST is collection, and the GC
+// is built around one empirical fact: MOST OBJECTS DIE YOUNG.
 //
-// The GC uses GENERATIONS based on the observation that most objects die young:
-//   Gen 0 — short-lived objects (most allocations); collected frequently and CHEAPLY
-//   Gen 1 — a buffer between short and long-lived
-//   Gen 2 — long-lived objects (caches, static data); collected rarely but EXPENSIVELY
-// An object surviving a Gen 0 collection gets PROMOTED to Gen 1, then eventually Gen 2 if it keeps
-// surviving. Minimizing Gen 2 collections (by not needlessly promoting short-lived objects) is a
-// core performance lever in high-throughput services.</pre>
-    <div class="note">🗑️ <strong>"The GC handles memory" doesn't mean allocations are free.</strong> Every
-      allocation is still CPU work, and excessive allocation (especially of objects that get promoted to Gen
-      2) causes GC pauses that hurt latency-sensitive applications. High-performance .NET code minimizes
-      unnecessary allocations — this is exactly the problem Span&lt;T&gt; and object pooling solve.</p></div>
+//  Gen 0  — the nursery. New small objects land here. Collected OFTEN, very fast
+//           (only survivors are touched — a mostly-dead gen0 costs almost nothing).
+//  Gen 1  — survivors of gen0. A buffer between "died young" and "long-lived".
+//  Gen 2  — survivors again: caches, singletons, static data. Collected RARELY —
+//           a gen2 ("full") collection walks the whole heap. This is the expensive one.
+//  LOH    — Large Object Heap: objects ≥ 85,000 bytes (big arrays, huge strings).
+//           Collected only with gen2, NOT compacted by default → fragmentation risk.
+//
+// Collection: pause → MARK everything reachable from ROOTS (thread stacks, static
+// fields, GC handles) → SWEEP/COMPACT the dead → resume. "Reachable" is the whole
+// definition of alive. Unreachable ≠ collected immediately — collected WHEN the GC
+// next runs that generation.
 
-    <h2>IDisposable — Deterministic Cleanup for Unmanaged Resources</h2>
-    <pre>// The GC only knows about MANAGED memory. File handles, DB connections, network sockets are
-// UNMANAGED resources the GC doesn't understand — IDisposable is how you clean those up deterministically:
-public class ReportGenerator : IDisposable {
-    private readonly FileStream _file = new("report.txt", FileMode.Create);
-    public void Dispose() => _file.Dispose();     // releases the OS file handle immediately
-}
+// Promotion is the enemy: an object that survives gen0 gets copied to gen1, then gen2.
+// MID-LIFED objects (live a few seconds — e.g. per-request caches under load) are the
+// GC's worst case: too old to die in gen0, too young to sit quietly in gen2 —
+// they inflate gen2 collections. Design for "die immediately" or "live forever".
 
-using var report = new ReportGenerator();    // `using` guarantees Dispose() runs, even if an exception occurs
-// (older syntax: using (var report = new ReportGenerator()) { ... } — same guarantee, block-scoped)
-// Without `using`, the file handle stays open until the GC eventually finalizes the object — which
-// could be seconds, minutes, or never under memory pressure that never triggers a Gen 2 collection.</pre>
+// GC modes (server apps should know their own):
+// Workstation — small heaps, minimal pauses, client apps.
+// Server GC   — per-core heaps + parallel collection: higher throughput, bigger heap.
+//               ASP.NET Core defaults to Server GC.
+// Background GC does gen2 concurrently with your code (short pauses, not none).</pre>
+    <div class="note"><strong>What the GC does NOT manage:</strong> file handles, sockets, DB
+      connections, OS handles, GPU/native memory. The GC sees only managed heap bytes; a
+      <code>FileStream</code> is 100 managed bytes wrapping an OS handle the GC can't see or count.
+      That's why <em>disposal</em> (Part 3) exists — and why "the GC will get to it" is exactly wrong
+      for resources: it might get to it in minutes, and the OS ran out of handles in seconds.</div>
 
-    <h2>Span&lt;T&gt; — Slicing Without Allocating</h2>
-    <pre>// ❌ Substring ALLOCATES a brand-new string on the heap every single call:
-string full = "Hello, World!";
-string slice = full.Substring(7, 5);     // allocates "World" as a NEW string object
+    <h2>Part 2 — Memory Leaks in a GC'd Runtime: Reachability Is the Leak</h2>
+    <pre>// A .NET "leak" = objects that are REACHABLE but USELESS. The GC is doing its job;
+// your object graph lies about what you still need. The usual suspects:
 
-// ✅ Span<char> gives a VIEW into the existing memory — zero allocation:
-ReadOnlySpan<char> span = full.AsSpan(7, 5);   // "World" — just a pointer + length, no new heap object
-// Span<T> works over arrays, strings, and stack-allocated memory uniformly. In a hot loop parsing
-// large amounts of text (e.g., a CSV parser or a web server's request parsing), replacing Substring
-// calls with Span<T> slicing can eliminate MILLIONS of allocations and dramatically cut GC pressure.</pre>
-    <div class="note">⚡ <strong>Span&lt;T&gt; is a stack-only ref struct — it CANNOT be stored on the heap.</strong>
-      This restriction (no Span&lt;T&gt; fields in a class, no Span&lt;T&gt; in async methods across an await) is
-      what lets the runtime guarantee memory safety without GC tracking — the compiler enforces that a Span
-      never outlives the memory it points into. It's a niche but high-leverage tool specifically for
-      allocation-sensitive hot paths (parsers, serializers, high-throughput servers).</p></div>
+// 1. EVENTS (the #1 — full mechanics in delegates-events.html Part 5):
+//    static/long-lived publisher → delegate → Target keeps every subscriber alive.
 
-    <h2>The Dispose Pattern for Classes Holding Unmanaged Resources</h2>
-    <pre>public class ResourceHolder : IDisposable {
+// 2. STATIC COLLECTIONS that only grow:
+static readonly Dictionary&lt;string, Session&gt; _sessions = new();   // who ever removes?
+//    Every static root is a lifetime promise: "until process exit". Cache without
+//    eviction = leak with a nicer name. Use MemoryCache with size/expiry, or evict.
+
+// 3. CLOSURES captured by long-lived things (timers, callbacks, cached delegates):
+_timer = new Timer(_ =&gt; Report(this.Stats), ...);   // 'this' lives as long as the timer
+
+// 4. IDisposable NOT disposed — not a managed leak but a RESOURCE leak (handles,
+//    connections). Symptoms arrive as "too many open files"/pool exhaustion, not RAM.
+
+// DIAGNOSIS WORKFLOW (works with dotnet-counters + dotnet-gcdump / VS profiler):
+// 1. dotnet-counters: is gen2 size climbing across collections? (If gen0/1 churn but
+//    gen2 is flat → not a leak, just allocation pressure.)
+// 2. Take TWO heap snapshots minutes apart → diff → which TYPE is accumulating?
+// 3. Pick an instance → RETENTION PATH to root → the path names the culprit:
+//    "static _sessions → Dictionary → Session" or "EventHandler → Target → View".
+// The retention path IS the answer; everything before it is guessing.</pre>
+
+    <h2>Part 3 — IDisposable &amp; using: Deterministic Cleanup</h2>
+    <pre>// The contract: "I hold a resource; call Dispose() the moment you're done with me."
+// using guarantees it (compiles to try/finally — exceptions included):
+using (var stream = File.OpenRead("data.bin"))
+{
+    Process(stream);
+}                                   // stream.Dispose() here, even if Process threw
+
+// using DECLARATION (C# 8) — disposes at end of enclosing scope; less nesting:
+using var conn = new SqlConnection(cs);
+using var reader = ExecuteReader(conn);
+// both disposed (reverse order) when the method exits
+
+// await using for IAsyncDisposable (flush needs I/O — e.g. streams, EF contexts):
+await using var db = new AppDbContext(options);
+
+// IMPLEMENTING it — modern guidance, three tiers:
+// TIER 1 (95% of your classes): you hold MANAGED disposables → simple Dispose, NO finalizer:
+public sealed class ReportWriter : IDisposable
+{
+    private readonly StreamWriter _writer;      // the resource we own
     private bool _disposed;
-    private IntPtr _unmanagedHandle;    // e.g., a raw OS handle
+    public ReportWriter(string path) =&gt; _writer = new StreamWriter(path);
 
-    protected virtual void Dispose(bool disposing) {
-        if (_disposed) return;
-        if (disposing) { /* dispose MANAGED resources (other IDisposables) here */ }
-        ReleaseUnmanagedHandle(_unmanagedHandle);   // always release unmanaged resources
+    public void Dispose()
+    {
+        if (_disposed) return;                  // idempotent — double-dispose is legal
+        _writer.Dispose();                      // cascade to owned disposables
         _disposed = true;
     }
-    public void Dispose() {
-        Dispose(true);
-        GC.SuppressFinalize(this);      // tells the GC "no need to run my finalizer, I already cleaned up"
-    }
-    ~ResourceHolder() => Dispose(false);   // finalizer — a SAFETY NET if Dispose() was never called
 }
-// This is the "full" IDisposable pattern for classes wrapping truly unmanaged resources directly.
-// Most application code just implements the simple Dispose() and doesn't need a finalizer at all.</pre>
+// Ownership rule: WHOEVER CREATES IT DISPOSES IT (or explicitly hands ownership off).
+// If a class stores an injected disposable it does NOT own, it does NOT dispose it —
+// the DI container does (di-hosting.html).
+
+// TIER 2: you hold RAW native handles → derive from SafeHandle (the BCL's wrapper
+// with a hardened finalizer) rather than writing your own finalizer.
+// TIER 3 (rare, library-authors): the classic Dispose(bool) pattern + finalizer —
+// only when you directly own an unmanaged pointer/handle no SafeHandle covers.
+// Finalizers are a SAFETY NET, not cleanup: they run late, on a dedicated thread,
+// maybe never (process kill), and keep the object alive an extra GC cycle.</pre>
+
+    <h2>Part 4 — Span&lt;T&gt;: Slicing Without Allocating</h2>
+    <pre>// Span&lt;T&gt; = a (pointer, length) view over EXISTING memory — array, string, stack,
+// native. Reading/slicing through a Span allocates NOTHING.
+string csv = "2026-07-27,ORDER-9931,499.99";
+
+// OLD WAY — Substring/Split allocate a new string per piece:
+var parts = csv.Split(',');                    // 1 array + 3 strings on the heap
+
+// SPAN WAY — zero allocations, same logic:
+ReadOnlySpan&lt;char&gt; s = csv;                    // a VIEW, not a copy
+int c1 = s.IndexOf(',');
+ReadOnlySpan&lt;char&gt; date   = s[..c1];           // slices are just (offset, length) —
+ReadOnlySpan&lt;char&gt; rest   = s[(c1 + 1)..];     // no new strings anywhere
+int c2 = rest.IndexOf(',');
+ReadOnlySpan&lt;char&gt; id     = rest[..c2];
+decimal amount = decimal.Parse(rest[(c2 + 1)..]);   // BCL parses spans directly
+
+// stackalloc — a scratch buffer ON THE STACK (freed by returning, GC never involved):
+Span&lt;byte&gt; buffer = stackalloc byte[256];      // small (&lt; ~1KB), method-lifetime only
+Random.Shared.NextBytes(buffer);
+
+// THE RESTRICTION that makes it safe: Span is a ref struct — it may live ONLY on the
+// stack. The compiler REJECTS: Span fields in classes, Span locals crossing await/yield,
+// Span in async signatures. Why: a Span could point at stack memory; letting it
+// escape to the heap could outlive that stack frame → dangling pointer. The compiler
+// makes the dangerous case unrepresentable.
+
+// Memory&lt;T&gt; is the heap-safe sibling: storable in fields, usable across await
+// (Stream.ReadAsync takes Memory&lt;byte&gt;); call .Span inside sync code to work on it.
+
+// ArrayPool&lt;T&gt; — rent/return big temporary buffers instead of allocating (LOH-saver):
+byte[] rented = ArrayPool&lt;byte&gt;.Shared.Rent(1024 * 1024);
+try     { await stream.ReadAsync(rented.AsMemory(0, len), ct); Use(rented); }
+finally { ArrayPool&lt;byte&gt;.Shared.Return(rented); }   // ALWAYS return; may be dirty
+// Repeated 1MB allocations = LOH churn = gen2 pressure; a pool reuses the same buffers.</pre>
+    <div class="note"><strong>Where Span actually pays:</strong> parsing hot paths (the BCL's own
+      parsers, formatters, and <code>System.Text.Json</code> are built on it), serialization, string
+      processing in request pipelines, and buffer management. Where it doesn't: cold paths, code that
+      was already allocation-light, anything crossing awaits (use <code>Memory&lt;T&gt;</code>). Adopt it
+      where the profiler shows allocation pressure — <code>Substring</code>/<code>Split</code> in a loop
+      lighting up gen0 — not by reflex. Readability still wins by default
+      (<a href="performance-aot.html">measure first</a>).</div>
+
+    <h2>Part 5 — Deep Dive: Reading GC Behavior in Production</h2>
+    <pre>// The numbers that matter (dotnet-counters monitor --process-id N):
+//   GC Heap Size / Gen 2 Size   — trending up forever? → leak workflow (Part 2).
+//   Gen 0/1/2 collection counts — healthy apps: MANY gen0, few gen2.
+//   % Time in GC                — &gt;10–15% sustained = allocation pressure is taxing you.
+//   LOH Size                    — sawtooth is fine; monotonic growth = large-object leak
+//                                 or fragmentation (pin-heavy code, no compaction).
+//   Allocation Rate             — MB/s; correlate spikes with endpoints/jobs.
+
+// PATTERNS AND THEIR MEANINGS:
+// "Memory climbs, GC runs, memory doesn't drop" → reachable objects: LEAK (Part 2).
+// "Memory sawtooths aggressively, CPU high in GC" → allocation PRESSURE, not a leak:
+//     hunt per-request allocations (closures, LINQ in hot loops, Substring storms,
+//     large temp arrays) → static lambdas, Span, ArrayPool, pooling.
+// "P99 latency spikes every N minutes, heap large" → gen2/LOH pauses: reduce mid-lifed
+//     objects and LOH churn; consider GC settings LAST, allocations FIRST.
+// "Works for days, then OutOfMemoryException on a 64-bit box" → check LOH fragmentation
+//     and pinned buffers (sockets!) — address-space isn't the limit, contiguity is.
+
+// GC.Collect() in production code: virtually always wrong — it forces the expensive
+// full collection the GC was avoiding, promotes half-dead objects, and hides the real
+// issue. Acceptable: test harnesses, and rare "just unloaded a huge one-off dataset"
+// moments — with a comment justifying it.</pre>
 
     <h2>Common Mistakes</h2>
     <table class="tbl">
-      <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
-      <tr><td>Forgetting `using`/Dispose() on IDisposable resources</td><td>File handles/connections leak, exhausting OS resources</td><td>Always `using` (or try/finally with Dispose())</td></tr>
-      <tr><td>Excessive small allocations in hot loops (e.g., Substring)</td><td>GC pressure, latency spikes/pauses</td><td>Span&lt;T&gt;/ReadOnlySpan&lt;T&gt; for allocation-free slicing</td></tr>
-      <tr><td>Storing a Span&lt;T&gt; as a class field</td><td>Compile error — ref structs can't be heap-stored</td><td>Use Span&lt;T&gt; only for local, stack-scoped operations</td></tr>
-      <tr><td>Relying on finalizers instead of explicit Dispose</td><td>Unmanaged resources held far longer than necessary</td><td>Always call Dispose deterministically; finalizers are a safety net only</td></tr>
-      <tr><td>Assuming GC.Collect() should be called manually</td><td>Usually makes performance WORSE, not better</td><td>Let the GC manage itself; only intervene with real profiling data</td></tr>
-      <tr><td>Large object allocations churning through Gen 2</td><td>Expensive, disruptive full collections</td><td>Object pooling / reduce allocation rate for long-lived-looking objects</td></tr>
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Not disposing <code>IDisposable</code>s (streams, connections, responses)</td><td>Handle/connection-pool exhaustion long before RAM issues</td><td><code>using</code>/<code>await using</code> at every creation site you own</td></tr>
+      <tr><td>Disposing something you don't own (injected service)</td><td>Other consumers get an <code>ObjectDisposedException</code></td><td>Creator disposes; DI container owns what it created</td></tr>
+      <tr><td>Static caches without eviction</td><td>Slow, unbounded "leak" that profilers trace to your dictionary</td><td><code>MemoryCache</code> with size limits/expiration; explicit eviction policy</td></tr>
+      <tr><td>Writing finalizers for managed cleanup</td><td>Objects survive an extra GC cycle; cleanup runs late or never</td><td>Finalizers only via <code>SafeHandle</code>/Tier 3; managed cleanup = <code>Dispose</code></td></tr>
+      <tr><td>Repeated large temp arrays (≥85KB)</td><td>LOH churn → frequent expensive gen2 collections</td><td><code>ArrayPool.Rent/Return</code>; stream instead of buffering whole payloads</td></tr>
+      <tr><td>Trying to store a <code>Span</code> in a field / across <code>await</code></td><td>Compile error (by design)</td><td><code>Memory&lt;T&gt;</code> for storage/async; Span only inside sync scopes</td></tr>
+      <tr><td><code>GC.Collect()</code> to "fix" memory</td><td>Worse pauses, promoted garbage, masked root cause</td><td>Diagnose with counters + snapshot diff; fix reachability or allocations</td></tr>
+      <tr><td>Optimizing allocations without measuring</td><td>Complexity with zero user-visible win</td><td>Profile first; Span/pooling only where pressure is proven</td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1: How does .NET's generational garbage collector work, and why does it matter for performance?</summary>
-      <p>The GC is built around the empirical observation that most objects are short-lived — a huge fraction
-         of allocations die almost immediately (a temporary object created and discarded within a single
-         method call), while a smaller fraction live for the whole application's lifetime (caches, singleton
-         services, static data). To exploit this, the managed heap is divided into generations. Gen 0 holds
-         newly allocated objects and is collected very frequently but very CHEAPLY, since it only has to scan
-         a small region of recently-allocated memory; most objects die in Gen 0 and are reclaimed almost for
-         free. Any object that survives a Gen 0 collection (because something still references it) is promoted
-         to Gen 1, a buffer generation; objects surviving further get promoted to Gen 2, which holds long-lived
-         objects and is collected far less often but much more EXPENSIVELY, since a Gen 2 (full) collection has
-         to examine a much larger portion of the heap and can pause the application noticeably. This matters
-         for performance because the generational hypothesis only pays off if your allocation patterns match
-         it: code that needlessly keeps short-lived-looking objects alive long enough to get promoted into Gen
-         1/Gen 2 forces more expensive collections, and code with a very high allocation RATE (even of
-         short-lived objects) still spends real CPU time doing those Gen 0 collections repeatedly. High
-         throughput, latency-sensitive services specifically minimize allocation rate and avoid unnecessarily
-         retaining references to reduce both collection frequency and the cost of the collections that do
-         happen.</p></details>
-    <details class="solution"><summary>Q2: Why does .NET need both the garbage collector and IDisposable — doesn't the GC handle cleanup?</summary>
-      <p>The garbage collector only manages MANAGED memory — objects allocated on the .NET heap that the
-         runtime fully understands and can track references to. Many resources a program uses are UNMANAGED
-         from the runtime's perspective: open file handles, network sockets, database connections, GDI/OS
-         handles — the GC has no visibility into these and doesn't know when a program is "really done" with
-         them in the way it does for a plain managed object. If cleanup of such resources were left entirely
-         to the GC via finalizers, it would happen NONDETERMINISTICALLY — potentially not until the next Gen 2
-         collection runs, which could be seconds, minutes, or effectively never under low memory pressure —
-         meanwhile the underlying OS resource (a file handle, a database connection from a limited connection
-         pool) stays held, which can exhaust a limited resource pool well before the GC gets around to
-         reclaiming the wrapping .NET object. IDisposable solves this by giving classes an explicit,
-         DETERMINISTIC cleanup method (Dispose()) that application code calls as soon as it's actually done
-         with the resource — most idiomatically via a `using` statement/declaration, which guarantees Dispose()
-         runs as soon as the scope ends, even if an exception is thrown partway through. The GC and
-         IDisposable thus solve complementary problems: the GC reclaims managed memory automatically and
-         eventually; IDisposable releases scarce unmanaged resources promptly and predictably, on the
-         application's own schedule rather than the GC's.</p></details>
-    <details class="solution"><summary>Q3: What problem does Span&lt;T&gt; solve, and why is it restricted to the stack?</summary>
-      <p>Span&lt;T&gt; solves the problem of unnecessary allocation when working with a CONTIGUOUS SLICE of
-         existing memory — an array, a string, or stack-allocated memory. The traditional approach, like
-         string.Substring(start, length), always allocates a brand-new object on the heap containing a copy of
-         that slice's data, even if you only need to read it briefly; in code that does this repeatedly in a
-         hot path (parsing large text, processing incoming network buffers, high-throughput serialization),
-         these allocations add up to significant garbage-collector pressure and measurable overhead. Span&lt;T&gt;
-         (and ReadOnlySpan&lt;T&gt;) instead represents a VIEW into existing memory — essentially a pointer plus a
-         length — letting you slice, read, and pass around a subsection of an array or string without copying
-         or allocating anything at all, uniformly whether the underlying memory is a heap array, a string, or
-         genuinely stack-allocated memory. The critical design constraint is that Span&lt;T&gt; is a `ref struct`,
-         which the compiler enforces cannot be stored as a field in a regular (heap-allocated) class, cannot be
-         boxed, and cannot be used across an `await` in an async method — because doing any of those things
-         could let a Span outlive the actual memory it points into (for example, if that memory was
-         stack-allocated and the stack frame has since been popped), which would be a serious memory-safety
-         violation. By restricting Span&lt;T&gt; to stack-only, purely local usage, the compiler can statically
-         guarantee it never dangles, giving you the performance of raw pointer-like slicing with full memory
-         safety — at the cost of it being usable only in narrower, more local scenarios than a regular
-         object.</p></details>
+    <details class="solution"><summary><strong>Q1 (Beginner):</strong> What does the garbage collector do, and what does "reachable" mean?</summary>
+      <p>The GC automatically reclaims heap memory: it pauses the application, marks every object
+      reachable by following references from roots — thread stacks (local variables), static fields, and
+      GC handles — then reclaims everything unmarked, typically compacting survivors. "Reachable" means
+      there's a reference chain from a root to the object; reachability is the GC's <em>entire</em>
+      definition of alive. Two corollaries: unreferenced objects aren't freed instantly (only when a
+      collection runs), and anything referenced from a static field or live event lives forever no
+      matter how "done" you are with it.</p></details>
+    <details class="solution"><summary><strong>Q2 (Beginner):</strong> What is <code>IDisposable</code>, and what does a <code>using</code> statement guarantee?</summary>
+      <p><code>IDisposable</code> is the contract for deterministic cleanup: the object holds a
+      resource the GC can't manage (file handle, socket, DB connection) and <code>Dispose()</code>
+      releases it immediately. <code>using</code> compiles to try/finally, so <code>Dispose()</code>
+      is called when the block/scope exits — even via exception or early return. This matters because
+      GC timing is unpredictable: a server can exhaust its OS handles or connection pool in seconds
+      while the unhelpfully-still-reachable wrappers wait for a collection that hasn't happened.</p></details>
+    <details class="solution"><summary><strong>Q3 (Mid):</strong> Explain the generational hypothesis and why gen2 collections are the ones you tune against.</summary>
+      <p>The generational hypothesis: most objects die young (temporaries, per-request data), and
+      objects that survive a while tend to live long (caches, singletons). The GC exploits this by
+      collecting gen0 (new objects) frequently and cheaply — cost scales with <em>survivors</em>, and a
+      mostly-dead nursery has few — while gen2 is collected rarely because it requires walking the
+      entire heap (plus the LOH), making it orders of magnitude more expensive and the source of
+      noticeable pauses. Tuning therefore focuses on: minimizing objects that get <em>promoted</em>
+      (mid-lifed objects are the worst case — too old for gen0, too transient for gen2), and avoiding
+      LOH churn, since large objects go straight to the heap that only full collections touch.</p></details>
+    <details class="solution"><summary><strong>Q4 (Mid):</strong> What is <code>Span&lt;T&gt;</code>, why is it a <code>ref struct</code>, and when do you need <code>Memory&lt;T&gt;</code> instead?</summary>
+      <p><code>Span&lt;T&gt;</code> is a stack-only view (pointer + length) over existing memory — array
+      segments, strings, <code>stackalloc</code> buffers, native memory — enabling slicing and parsing
+      with zero allocations (<code>s[..10]</code> creates no new string). It's a <code>ref struct</code>
+      so the compiler can guarantee it never escapes to the heap: a Span might reference stack memory,
+      and if it could be stored in a class field or captured across an <code>await</code>, it could
+      outlive the stack frame it points into. Hence the rules: no class fields, no boxing, no use across
+      await/yield. <code>Memory&lt;T&gt;</code> is the heap-storable equivalent for those cases — keep it
+      in fields, pass it through async methods (<code>Stream.ReadAsync(Memory&lt;byte&gt;)</code>), and
+      call <code>.Span</code> when synchronous work begins.</p></details>
+    <details class="solution"><summary><strong>Q5 (Senior):</strong> A service's memory grows from 300MB to 6GB over two days, then OOMs. Walk through your diagnosis end to end.</summary>
+      <p>First confirm it's managed and reachable: <code>dotnet-counters</code> — if Gen 2 + LOH size
+      climbs monotonically across collections, it's a leak (reachable objects); if heap sawtooths but
+      working set grows, suspect native/pinned memory instead. For a managed leak: capture two
+      <code>dotnet-gcdump</code> snapshots an hour apart, diff by type to find what's accumulating
+      (say, 4M <code>OrderContext</code> instances), then inspect retention paths on samples — the path
+      to root names the mechanism: a static event's invocation list (<code>EventHandler.Target</code>),
+      a static dictionary/cache with no eviction, an <code>IServiceScope</code> never disposed, timers
+      holding closures. Fix the reachability (unsubscribe in Dispose, bounded cache with expiry,
+      dispose scopes), redeploy, and verify the gen2 trend is flat under load. If instead the diff shows
+      churn (high allocation rate, %GC time) rather than growth, the problem is pressure, not leak —
+      different fix (reduce per-request allocations). The discipline: never guess from code review
+      alone; the retention path is evidence.</p></details>
+    <details class="solution"><summary><strong>Q6 (Senior):</strong> When do you implement a finalizer? Describe the modern guidance and what finalizers cost.</summary>
+      <p>Almost never. Finalizers exist as a last-resort safety net for <em>unmanaged</em> resources
+      when Dispose was forgotten — but they're expensive and unreliable: finalizable objects survive at
+      least one extra collection (they're promoted while queued), finalization runs on a single
+      dedicated thread at an unpredictable time (a slow finalizer stalls all others), order is
+      unspecified, and on process termination they may never run. Modern guidance: wrap raw OS handles
+      in a <code>SafeHandle</code> subclass — it provides a hardened, critical finalizer written by the
+      BCL team — and your class then just implements plain <code>IDisposable</code> that disposes the
+      SafeHandle; no finalizer of your own. Hand-written finalizers (with the full
+      <code>Dispose(bool)</code> + <code>GC.SuppressFinalize</code> pattern) are justified only when
+      you directly own unmanaged memory/handles that no SafeHandle can represent — rare outside interop
+      libraries.</p></details>
 
-    <div class="exercise"><strong>🏋️ Practice:</strong> allocate objects in a loop and observe Gen 0/1/2 collection counts with a profiler or GC.CollectionCount(); implement IDisposable on a class wrapping a FileStream and use `using` to guarantee cleanup; deliberately omit `using` and observe a file handle staying open; replace repeated Substring calls in a parsing loop with Span&lt;T&gt; slicing and compare allocations; try (and observe the compile error from) storing a Span&lt;T&gt; as a class field; implement the full Dispose pattern with a finalizer as a safety net.</div>
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (Easy):</strong> This method leaks a resource on exceptions. Fix it two ways (statement and declaration form).
+<pre>public string ReadConfig() {
+    var reader = new StreamReader("app.config");
+    var text = reader.ReadToEnd();      // may throw
+    reader.Dispose();
+    return text;
+}</pre>
+      <details class="solution"><summary>Solution</summary><pre>// If ReadToEnd throws, Dispose is skipped — the file handle leaks until a GC
+// eventually finalizes the underlying stream (maybe minutes later, maybe never).
+
+// Form 1 — using statement:
+public string ReadConfig()
+{
+    using (var reader = new StreamReader("app.config"))
+    {
+        return reader.ReadToEnd();      // Dispose runs on return AND on throw
+    }
+}
+// Form 2 — using declaration (C# 8+, less nesting):
+public string ReadConfig()
+{
+    using var reader = new StreamReader("app.config");
+    return reader.ReadToEnd();          // disposed when the method scope exits
+}
+// (For this exact task, File.ReadAllText("app.config") is the real answer —
+// the BCL manages the handle for you.)</pre></details></div>
+    <div class="exercise"><strong>2 (Easy):</strong> For each, say which generation/heap it likely ends its life in and why: (a) a string built inside a request handler and returned as the response; (b) a singleton configuration object; (c) a 2MB report buffer allocated per report; (d) a per-request DTO held in a static "recent requests" list.
+      <details class="solution"><summary>Solution</summary><pre>// (a) Gen 0 — allocated, serialized into the response, unreachable within the
+//     request: dies young in the nursery. The ideal case.
+// (b) Gen 2 — allocated once at startup, survives collections, promoted to gen2,
+//     lives until process exit. Also fine: stable long-lived data.
+// (c) LOH — ≥85,000 bytes goes straight to the Large Object Heap; collected only
+//     with gen2 and not compacted by default. Per-report 2MB allocations = LOH churn
+//     → rent from ArrayPool instead.
+// (d) THE PROBLEM CHILD: it would die in gen0, but the static list ROOTS it —
+//     promoted to gen2 and retained forever. This is how "leaks" look: reachable
+//     but useless. Bound the list or use an evicting cache.</pre></details></div>
+    <div class="exercise"><strong>3 (Medium):</strong> Implement <code>TempDirectory : IDisposable</code> — creates a unique temp folder on construction, deletes it on dispose, idempotent, usable with <code>using</code>.
+      <details class="solution"><summary>Solution</summary><pre>public sealed class TempDirectory : IDisposable
+{
+    public string Path { get; }
+    private bool _disposed;
+
+    public TempDirectory()
+    {
+        Path = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;                       // idempotent contract
+        try { Directory.Delete(Path, recursive: true); }
+        catch (DirectoryNotFoundException) { }       // already gone = fine
+        _disposed = true;
+    }
+}
+
+// Usage — cleanup guaranteed even when the test/work throws:
+using var tmp = new TempDirectory();
+File.WriteAllText(System.IO.Path.Combine(tmp.Path, "work.txt"), "data");
+// sealed + no finalizer: Tier 1 — we hold no raw OS handles, only behavior.
+// (A finalizer here would be wrong: Directory.Delete on the finalizer thread at
+//  an arbitrary time is exactly the nondeterminism Dispose exists to avoid.)</pre></details></div>
+    <div class="exercise"><strong>4 (Medium):</strong> Rewrite this hot-path parser to zero allocations with <code>ReadOnlySpan&lt;char&gt;</code>: it extracts the status code (chars 9–11) and reason from lines like <code>"HTTP/1.1 404 Not Found"</code>.
+<pre>public (int code, string reason) Parse(string line) {
+    var parts = line.Split(' ', 3);
+    return (int.Parse(parts[1]), parts[2]);
+}</pre>
+      <details class="solution"><summary>Solution</summary><pre>public (int code, string reason) Parse(ReadOnlySpan&lt;char&gt; line)
+{
+    // "HTTP/1.1 404 Not Found"
+    int firstSpace  = line.IndexOf(' ');                       // after version
+    var afterVer    = line[(firstSpace + 1)..];
+    int secondSpace = afterVer.IndexOf(' ');
+    int code   = int.Parse(afterVer[..secondSpace]);           // parses the SLICE — no string
+    var reason = afterVer[(secondSpace + 1)..];
+    return (code, reason.ToString());   // ONE allocation: the reason we must return
+}
+// Split allocated: 1 string[] + 3 strings per line. The span version allocates only
+// the returned reason string (a returned value can't stay a stack-only span).
+// If callers only COMPARE the reason, return the span-friendly shape instead:
+public int ParseCode(ReadOnlySpan&lt;char&gt; line) { ... }          // zero allocations
+// — pushing the "when do we materialize a string" decision to the caller is the
+// standard span-API design move (it's how the BCL's own parsers are shaped).</pre></details></div>
+    <div class="exercise"><strong>5 (Hard):</strong> A file-processing service allocates a <code>new byte[5 * 1024 * 1024]</code> per uploaded file, 50 uploads/min. Ops reports periodic multi-hundred-ms latency spikes and high %GC time. Explain the mechanism and fix it with <code>ArrayPool</code>.
+      <details class="solution"><summary>Solution</summary><pre>// MECHANISM: 5MB ≥ the 85KB threshold → every buffer lands on the LOH. The LOH is
+// collected only during gen2 (full) collections and isn't compacted by default.
+// 50/min × 5MB = 250MB/min of LOH garbage → the GC must run frequent full
+// collections to keep up — each walks the ENTIRE heap → the periodic latency spikes.
+
+public async Task ProcessUploadAsync(Stream upload, long length, CancellationToken ct)
+{
+    byte[] buffer = ArrayPool&lt;byte&gt;.Shared.Rent((int)length);   // reused, not allocated
+    try
+    {
+        int read = 0;
+        while (read &lt; length)
+            read += await upload.ReadAsync(
+                buffer.AsMemory(read, (int)length - read), ct);
+        Process(buffer.AsSpan(0, read));       // NOTE: Rent may return a BIGGER array —
+    }                                          // always slice to the length you filled
+    finally
+    {
+        ArrayPool&lt;byte&gt;.Shared.Return(buffer); // ALWAYS return (finally). Buffer may
+    }                                          // contain old data — clear if sensitive:
+}                                              // Return(buffer, clearArray: true)
+// Steady state: a handful of pooled 5MB buffers cycle forever — LOH allocation rate
+// ~0, full collections become rare, spikes disappear.
+// Even better when possible: STREAM the upload (process in 64KB chunks) and never
+// hold whole files in memory at all.</pre></details></div>
+    <div class="exercise"><strong>6 (Hard):</strong> Diagnose from evidence: heap snapshots show 800,000 <code>HttpClient</code> instances… wait — actually 800,000 <code>SocketsHttpHandler</code> objects and the OS reports ~64k TIME_WAIT sockets. The code does <code>using var client = new HttpClient(); await client.GetAsync(url);</code> per request. Explain why "correct disposal" is the bug here, and fix it.
+      <details class="solution"><summary>Solution</summary><pre>// The developer followed "dispose your IDisposables" — but HttpClient is the
+// documented EXCEPTION: it's designed to be long-lived and shared. Creating one
+// per request means a new connection pool per request; disposing it closes the
+// pooled connections, and closed TCP sockets linger in TIME_WAIT (~2 min by OS
+// design) → socket/port exhaustion under load. The heap shows the handler churn;
+// the OS shows the real damage. Disposal was "correct" per the interface and wrong
+// per the resource's semantics: the expensive thing is the POOL, not the object.
+
+// FIX — one shared client (or IHttpClientFactory in DI apps — di-hosting.html):
+public static class Http
+{
+    public static readonly HttpClient Client = new(new SocketsHttpHandler
+    {
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5)   // rotate connections so
+    });                                                       // DNS changes are honored
+}
+// services.AddHttpClient&lt;CatalogClient&gt;() does the same management for you, plus
+// named/typed clients and Polly integration. PooledConnectionLifetime matters:
+// an immortal client without it never re-resolves DNS (stale endpoints after failover).
+// LESSON: ownership rules are per-resource-semantics, not just per-interface —
+// connection-pooling types (HttpClient, DbContext pools, connection pools) are
+// managed by lifetime, not by using-blocks.</pre></details></div>
 
     <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li>Value types generally live on the stack (fast, no GC); reference types live on the GC-tracked heap, organized into generations (Gen 0 cheap/frequent, Gen 2 expensive/rare) based on "most objects die young."</li>
-      <li>The GC only manages memory — unmanaged resources (files, sockets, connections) need IDisposable + `using` for deterministic, prompt cleanup.</li>
-      <li>Span&lt;T&gt;/ReadOnlySpan&lt;T&gt; slice existing memory with zero allocation, replacing costly operations like Substring in hot paths.</li>
-      <li>Span&lt;T&gt; is a stack-only ref struct — can't be a class field, boxed, or held across an await — the compiler enforces it never outlives its memory.</li>
-      <li>Excessive/unnecessary allocation (not "the GC will handle it") is the real performance concern in high-throughput .NET services — minimize allocation rate and avoid needless promotion to Gen 2.</li>
+      <li>Allocation is a pointer bump; collection is the cost. Generations exploit "most objects die young" — many cheap gen0 collections, rare expensive gen2 ones; mid-lifed and large (LOH ≥85KB) objects are the GC's worst cases.</li>
+      <li>A managed "leak" is reachable-but-useless memory: static collections, event subscriptions, timer closures. Diagnose with snapshot diffs and the retention path — never by guessing.</li>
+      <li>The GC doesn't manage handles/sockets/connections: <code>IDisposable</code> + <code>using</code> gives deterministic cleanup; creator disposes; finalizers only via <code>SafeHandle</code>.</li>
+      <li><code>Span&lt;T&gt;</code> slices existing memory with zero allocations and is compiler-confined to the stack; <code>Memory&lt;T&gt;</code> crosses awaits and fields; <code>ArrayPool</code> recycles big buffers away from the LOH.</li>
+      <li>Read production memory via counters: gen2/LOH trending up = leak; sawtooth + %GC high = allocation pressure — two different problems, two different fixes.</li>
+      <li>Semantics beat rules: pooled resources like <code>HttpClient</code> are shared by design; <code>GC.Collect()</code> is almost never the answer; optimize allocations only where measured.</li>
     </ul></div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="testing.html">← Testing (xUnit)</a>
-      <a class="btn" href="di-hosting.html">Next: Dependency Injection & Hosting →</a>
+      <a class="btn btn-outline" href="threading.html">← Threads, Parallelism &amp; Synchronization</a>
+      <a class="btn" href="performance-aot.html">Next: Performance, Benchmarking &amp; NativeAOT →</a>
     </div>
   </main>
 </div>
 
-<script src="../../js/sidebar.js"></script>
-<script src="nav.js"></script>
+<script src="../../js/sidebar.js"></script><script src="nav.js"></script>
 </body>
 </html>
