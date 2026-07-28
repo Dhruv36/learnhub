@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EF Core in Production — LearnHub</title>
+<title>EF Core in Production — .NET — LearnHub</title>
 <link rel="stylesheet" href="../../css/style.css">
 </head>
 <body>
@@ -17,137 +17,441 @@
   <aside class="sidebar" id="sidebar"></aside>
 
   <main class="content">
-    <h1>EF Core in Production <span class="level-badge level-ultra">Ultra-Advanced</span></h1>
-    <p>Entity Framework Core is the standard .NET ORM — and it's easy to write code that WORKS in dev with a
-       tiny dataset but falls over in production. This lesson focuses on the specific EF Core performance
-       traps that show up under real load: the N+1 problem, tracking overhead, and migration safety.</p>
+    <h1>EF Core in Production <span class="level-badge level-ultra">Professional .NET</span></h1>
+    <p><strong>What you'll master:</strong> Entity Framework Core as professionals run it — the
+       DbContext mental model (change tracker + unit of work); querying that stays on the server
+       (<code>IQueryable</code>, projections, split queries); the N+1 problem and every loading
+       strategy; writing data correctly (SaveChanges, transactions, concurrency tokens,
+       <code>ExecuteUpdate</code>); migrations as a deployment discipline; and the performance toolkit
+       (<code>AsNoTracking</code>, compiled queries, pooling). Prerequisites:
+       <a href="linq.html">LINQ</a> (especially IQueryable vs IEnumerable — EF is that lesson's payoff),
+       <a href="di-hosting.html">DI &amp; Hosting</a> (DbContext lifetime), and SQL basics
+       (<a href="../sql/index.html">SQL track</a>). EF questions in interviews are really "do you know
+       what SQL your C# generates" questions — that's the skill this lesson builds.</p>
 
-    <h2>The N+1 Query Problem — the #1 EF Core Performance Bug</h2>
-    <pre>// ❌ N+1: one query for orders, then ONE MORE QUERY PER ORDER to get its customer:
-var orders = dbContext.Orders.ToList();               // 1 query
-foreach (var order in orders) {
-    Console.WriteLine(order.Customer.Name);             // triggers a SEPARATE query PER ORDER (lazy loading)
+    <h2>Part 1 — The DbContext Mental Model</h2>
+    <pre>// A DbContext is TWO machines in one object:
+// 1. A QUERY TRANSLATOR: LINQ over DbSet&lt;T&gt; → SQL (via the provider).
+// 2. A UNIT OF WORK: every entity it loads is TRACKED — a snapshot is kept;
+//    SaveChanges() diffs current values against snapshots and emits exactly the
+//    INSERT/UPDATE/DELETE statements needed, in one transaction.
+
+public class ShopContext : DbContext
+{
+    public DbSet&lt;Order&gt; Orders =&gt; Set&lt;Order&gt;();
+    public DbSet&lt;Customer&gt; Customers =&gt; Set&lt;Customer&gt;();
+    protected override void OnModelCreating(ModelBuilder b)
+    {
+        b.Entity&lt;Order&gt;(e =&gt;
+        {
+            e.Property(o =&gt; o.Total).HasPrecision(18, 2);
+            e.HasIndex(o =&gt; o.CustomerId);                  // indexes live in the model
+            e.HasOne(o =&gt; o.Customer).WithMany(c =&gt; c.Orders)
+             .HasForeignKey(o =&gt; o.CustomerId);
+            e.Property(o =&gt; o.Status).HasConversion&lt;string&gt;();   // enum → readable column
+        });
+    }
 }
-// 100 orders = 101 total database round-trips. This is the single most common EF Core production
-// incident — works fine with 10 test rows, brings down the database at 10,000 orders.
 
-// ✅ Eager-load related data in ONE query with a JOIN:
-var orders2 = dbContext.Orders.Include(o => o.Customer).ToList();   // 1 query total, with a SQL JOIN</pre>
-    <div class="note">🔍 <strong>Always ask "how many queries does this ACTUALLY run?"</strong> Lazy loading
-      (accessing a navigation property triggers an automatic query) is convenient in a 3-line demo and
-      dangerous in a loop. Use .Include() for eager loading, and enable EF Core's logging in development to
-      SEE the actual SQL/query count your code generates — never assume, always verify.</p></div>
+// The unit-of-work flow:
+var order = await db.Orders.FirstAsync(o =&gt; o.Id == id);   // loaded → TRACKED
+order.Status = OrderStatus.Shipped;                        // just mutate the object
+await db.SaveChangesAsync();                               // diff → UPDATE Orders SET
+                                                           // Status=@p WHERE Id=@id
+// No "Update" call needed for tracked entities — the tracker saw the change.
 
-    <h2>Tracking vs No-Tracking Queries</h2>
-    <pre>// By DEFAULT, EF Core TRACKS every entity it returns — it keeps a snapshot to detect changes for
-// SaveChanges(). This has real overhead (memory + change-detection CPU cost) for READ-ONLY queries:
-var orders = dbContext.Orders.ToList();                 // tracked — overhead you don't need if read-only
+// LIFETIME (di-hosting.html): one context per request/unit of work — short-lived.
+builder.Services.AddDbContext&lt;ShopContext&gt;(o =&gt; o.UseNpgsql(conn));   // scoped
+// DbContext is NOT thread-safe: never share one across parallel tasks
+// (threading.html) — parallel queries need separate contexts (or sequential awaits).</pre>
 
-var orders2 = dbContext.Orders.AsNoTracking().ToList();  // no tracking — faster, less memory, for READS
-// Use AsNoTracking() for any query whose results you're NOT going to modify and SaveChanges() —
-// display/reporting queries, API GET endpoints returning data, anything read-only. Many teams
-// configure AsNoTracking() as the DbContext-wide DEFAULT and opt IN to tracking only when updating.</pre>
+    <h2>Part 2 — Querying: Keep It on the Server</h2>
+    <pre>// DbSet&lt;T&gt; is IQueryable — LINQ builds an EXPRESSION TREE that becomes SQL
+// (linq.html Part 4). The whole game: let the DATABASE do the filtering/paging.
 
-    <h2>Migrations — Schema Changes as Version-Controlled Code</h2>
-    <pre>dotnet ef migrations add AddCustomerEmailIndex     // generates a migration file from model changes
-dotnet ef database update                          // applies pending migrations to the database
+var page = await db.Orders
+    .Where(o =&gt; o.Status == OrderStatus.Paid &amp;&amp; o.Total &gt; 100)   // → WHERE
+    .OrderByDescending(o =&gt; o.CreatedAt)                          // → ORDER BY
+    .Skip(40).Take(20)                                            // → OFFSET/FETCH
+    .Select(o =&gt; new OrderSummaryDto(o.Id, o.Total, o.Customer.Name))  // → JOIN + 3 cols
+    .AsNoTracking()                       // read-only: skip snapshot bookkeeping
+    .ToListAsync(ct);                     // ← SQL executes HERE, once
+// The projection (Select to DTO) is the biggest everyday win: SELECT 3 columns,
+// not SELECT * of two tables, and no tracking overhead — DTOs aren't entities.
 
-// A migration has an Up() (apply) and Down() (revert) method — reviewable, version-controlled schema
-// changes, analogous to the expand/contract pattern from the CI/CD deployment-strategies lesson: a
-// column RENAME should be done as add-new + backfill + remove-old across separate deploys, not a
-// single destructive migration that breaks the currently-running old app version mid-deploy.</pre>
+// THE CLIENT-EVALUATION CLIFF (linq.html Part 6 exercise): anything EF can't
+// translate THROWS. The subtle version is the premature materializer:
+var expensive = (await db.Orders.ToListAsync())      // ❌ ENTIRE TABLE into memory...
+    .Where(o =&gt; ComplexRule(o));                      // ...then filter in C#
+var right = await db.Orders
+    .Where(o =&gt; o.Total &gt; 500)                        // SQL-translatable pre-filter
+    .ToListAsync(ct);
+var final = right.Where(o =&gt; ComplexRule(o)).ToList(); // C# rule on a SMALL set — deliberate
 
-    <h2>Common Query Pitfalls</h2>
+// Streaming big result sets without materializing (constant memory):
+await foreach (var o in db.Orders.AsNoTracking().AsAsyncEnumerable().WithCancellation(ct))
+    Export(o);                                        // async-patterns.html Part 2</pre>
+
+    <h2>Part 3 — Relationships &amp; the N+1 Problem</h2>
+    <pre>// THE N+1 — the most common ORM performance bug in existence:
+var customers = await db.Customers.ToListAsync();          // 1 query
+foreach (var c in customers)
+    Console.Write(c.Orders.Count);                         // lazy-load: +1 query EACH
+// 1000 customers = 1001 round-trips. Dashboards that "got slow with growth" = this.
+
+// STRATEGY 1 — EAGER load what you'll traverse (JOIN / batched):
+var customers = await db.Customers
+    .Include(c =&gt; c.Orders)                                // 1 query (or 2 split — below)
+        .ThenInclude(o =&gt; o.Items)
+    .ToListAsync(ct);
+
+// STRATEGY 2 — PROJECT instead (usually better — you rarely need whole entities):
+var stats = await db.Customers
+    .Select(c =&gt; new { c.Name, OrderCount = c.Orders.Count,
+                       Total = c.Orders.Sum(o =&gt; (decimal?)o.Total) ?? 0 })
+    .ToListAsync(ct);          // ONE query with GROUP-BY-ish aggregation, 3 columns.
+// EF translates navigations INSIDE Select — no Include needed for projections.
+
+// CARTESIAN EXPLOSION: Include of MULTIPLE collections multiplies rows
+// (customer × orders × addresses). Fix: split queries —
+var data = await db.Customers
+    .Include(c =&gt; c.Orders).Include(c =&gt; c.Addresses)
+    .AsSplitQuery()            // → one query per collection, joined by EF in memory
+    .ToListAsync(ct);          // trade: 3 round-trips for no row multiplication
+
+// Lazy loading (virtual navs + proxies): OFF by default in EF Core — leave it off.
+// It's the N+1 generator. Explicit is better: Include, Select, or db.Entry(c)
+// .Collection(x =&gt; x.Orders).LoadAsync() for the rare on-demand case.</pre>
+    <div class="note"><strong>The habit that prevents all of this:</strong> log the SQL in development
+      and <em>read it</em>. <code>optionsBuilder.LogTo(Console.WriteLine, LogLevel.Information)</code>
+      (or the standard logging pipeline) shows every query EF emits. A PR that changes EF queries
+      should quote the generated SQL when the shape isn't obvious — "1 query, indexed WHERE, 4 columns"
+      is reviewable; "the LINQ looks fine" is not. Pair with <code>EnableSensitiveDataLogging()</code>
+      locally (parameter values) and never in prod.</div>
+
+    <h2>Part 4 — Writing Data: Transactions, Concurrency, Bulk Ops</h2>
+    <pre>// SaveChanges IS a transaction: all queued changes commit or roll back together.
+db.Orders.Add(order);                       // Added
+db.Remove(oldDraft);                        // Deleted
+existing.Status = OrderStatus.Paid;         // Modified (tracked)
+await db.SaveChangesAsync(ct);              // ONE transaction, correct order, FK-aware
+
+// EXPLICIT transaction — when logic must see intermediate state or span operations:
+await using var tx = await db.Database.BeginTransactionAsync(ct);
+var stock = await db.Stock.FirstAsync(s =&gt; s.Sku == sku, ct);
+if (stock.Quantity &lt; qty) throw new OutOfStockException(sku);
+stock.Quantity -= qty;
+db.Orders.Add(order);
+await db.SaveChangesAsync(ct);
+await tx.CommitAsync(ct);
+
+// OPTIMISTIC CONCURRENCY — two users edit the same row; last-write-wins silently
+// loses data. A concurrency token detects the conflict:
+public class Product
+{
+    [Timestamp] public byte[] RowVersion { get; set; } = default!;   // SQL Server rowversion
+}   // (Postgres: b.Entity&lt;Product&gt;().Property(p =&gt; p.Version).IsRowVersion() via xmin)
+// UPDATE ... WHERE Id=@id AND RowVersion=@original → 0 rows affected = someone else won:
+try { await db.SaveChangesAsync(ct); }
+catch (DbUpdateConcurrencyException ex)
+{
+    // choose: reload-and-retry, merge fields, or surface 409 Conflict to the user
+    var entry = ex.Entries.Single();
+    await entry.ReloadAsync(ct);            // e.g. retry policy re-applies the change
+}
+
+// BULK operations (EF 7+) — set-based, NO loading, NO change tracker:
+await db.Sessions.Where(s =&gt; s.ExpiresAt &lt; DateTime.UtcNow)
+    .ExecuteDeleteAsync(ct);                            // one DELETE ... WHERE
+await db.Orders.Where(o =&gt; o.Status == Status.Stale)
+    .ExecuteUpdateAsync(s =&gt; s.SetProperty(o =&gt; o.Status, Status.Archived), ct);
+// The old way (load 100k entities, mutate, SaveChanges) is 100k tracked snapshots
+// and 100k UPDATEs. ⚠ Execute* bypasses the tracker: already-loaded entities in
+// this context won't reflect the change — use in maintenance paths, not mid-workflow.</pre>
+
+    <h2>Part 5 — Migrations: Schema Change as Code</h2>
+    <pre>dotnet ef migrations add AddOrderStatusIndex     # scaffold Up()/Down() from model diff
+dotnet ef migrations script --idempotent -o deploy.sql   # SQL script for deployment
+
+// THE DISCIPLINE:
+// 1. REVIEW the generated migration — EF diffs the model, but only YOU know that
+//    "rename" (it may scaffold as DROP + ADD = data loss!) or that the new NOT NULL
+//    column needs a backfill. Edit migrations; they're code.
+// 2. Apply via SQL SCRIPT or a migration bundle in the DEPLOY pipeline — not
+//    db.Database.Migrate() at app startup in multi-instance deployments (two
+//    instances racing the same DDL = lovely outage).
+// 3. EXPAND/CONTRACT for zero-downtime: additive migration first (new nullable
+//    column) → deploy code writing both → backfill → contract migration
+//    (drop old column) LAST, once no code reads it. Never break the schema the
+//    currently-running version depends on.
+// 4. Down() is a courtesy for dev; production rollback = a new forward migration.
+
+// TESTING with a real database — the modern default is Testcontainers:
+// spin up throwaway Postgres/SQL Server in Docker per test run; run migrations;
+// test against REAL SQL semantics. The InMemory provider is NOT a database:
+// no transactions, no constraints, different LINQ translation — it passes tests
+// your production DB fails. SQLite in-memory is the lightweight middle ground
+// when its SQL dialect covers your usage. (More in testing.html.)</pre>
+
+    <h2>Part 6 — Performance Toolkit</h2>
     <table class="tbl">
-      <tr><th>Pitfall</th><th>Why it hurts</th><th>Fix</th></tr>
-      <tr><td>SELECT * via ToList() then filtering in C#</td><td>Pulls the WHOLE table into memory, filters client-side</td><td>Filter with .Where() BEFORE materializing — it translates to SQL WHERE</td></tr>
-      <tr><td>Calling .ToList() then .Count()</td><td>Materializes everything just to count it</td><td>.CountAsync() directly on the IQueryable — translates to SQL COUNT</td></tr>
-      <tr><td>Loading full entities when you only need 2 fields</td><td>Wastes bandwidth/memory on unused columns</td><td>.Select() to project only the needed fields</td></tr>
-      <tr><td>Synchronous EF Core calls in async web code</td><td>Blocks a thread pool thread during I/O</td><td>Always use the async methods (ToListAsync, etc. — async-await lesson)</td></tr>
+      <tr><th>Tool</th><th>What it does</th><th>Use when</th></tr>
+      <tr><td><code>AsNoTracking()</code></td><td>Skips snapshot/change tracking</td><td>Every read-only query (default posture for GET endpoints; projections to DTOs are inherently untracked)</td></tr>
+      <tr><td>Projections (<code>Select</code> → DTO)</td><td>Fetches only needed columns, no entities</td><td>Read models, lists, APIs — the default for queries whose results you won't mutate-and-save</td></tr>
+      <tr><td><code>AsSplitQuery()</code></td><td>One query per included collection</td><td>Multiple collection Includes (cartesian explosion)</td></tr>
+      <tr><td><code>ExecuteUpdate/Delete</code></td><td>Set-based DML, no tracking</td><td>Bulk maintenance touching many rows</td></tr>
+      <tr><td><code>AddDbContextPool</code></td><td>Reuses context instances (resets state between uses)</td><td>High-RPS services where context construction shows up in profiles</td></tr>
+      <tr><td>Compiled queries (<code>EF.CompileAsyncQuery</code>)</td><td>Caches the LINQ→SQL translation delegate</td><td>The same hot query shape run thousands of times/sec (profiler-proven)</td></tr>
+      <tr><td>Raw SQL (<code>FromSql</code>, <code>SqlQuery</code>)</td><td>Hand-written SQL, still parameterized &amp; composable</td><td>Queries LINQ can't express well (CTEs, window functions, hints)</td></tr>
+      <tr><td>Indexes in the model (<code>HasIndex</code>)</td><td>Migrations create real DB indexes</td><td>Every column your WHERE/ORDER BY/FK actually uses — the #1 "EF is slow" fix is a missing index</td></tr>
     </table>
-    <pre>// Projecting only what you need also AVOIDS the N+1 problem in a different way:
-var summaries = dbContext.Orders
-    .Select(o => new { o.Id, CustomerName = o.Customer.Name })   // ONE query with a JOIN, minimal columns
-    .ToListAsync();</pre>
+    <pre>// Raw SQL stays SAFE (parameterized) with interpolation-aware APIs:
+var risky = "'; DROP TABLE Orders; --";
+var rows = await db.Orders
+    .FromSql($"SELECT * FROM Orders WHERE CustomerId = {customerId}")  // FromSql =
+    .Where(o =&gt; o.Total &gt; 100)                    // interpolation → @p0 PARAMETER,
+    .ToListAsync(ct);                             // NOT string concat. Composable too.
+// FromSqlRaw + string.Concat/Format is where injection lives — don't.</pre>
 
     <h2>Common Mistakes</h2>
     <table class="tbl">
-      <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
-      <tr><td>Accessing navigation properties in a loop without Include</td><td>N+1 queries — devastating at scale</td><td>.Include() to eager-load, or .Select() to project</td></tr>
-      <tr><td>Tracking read-only queries by default</td><td>Unnecessary memory/CPU overhead</td><td>.AsNoTracking() for anything you won't SaveChanges()</td></tr>
-      <tr><td>Filtering/sorting in C# after ToList()</td><td>Entire table pulled into memory unnecessarily</td><td>Apply Where/OrderBy BEFORE materializing so it becomes SQL</td></tr>
-      <tr><td>Destructive migrations (drop/rename) deployed atomically</td><td>Breaks the still-running old app version mid-rollout</td><td>Expand/contract migrations across separate deploys</td></tr>
-      <tr><td>Not reviewing generated SQL/query counts</td><td>Performance bugs invisible until production load</td><td>Enable EF Core logging in dev; profile query counts</td></tr>
-      <tr><td>Using synchronous EF Core calls in a web app</td><td>Blocks threads, hurts scalability under load</td><td>Await the async EF Core methods everywhere</td></tr>
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Iterating navigations without Include/projection</td><td>N+1: one query per row — the classic ORM meltdown</td><td><code>Include</code> what you traverse, or project with <code>Select</code>; watch the SQL log</td></tr>
+      <tr><td><code>ToList()</code> early, then filtering</td><td>Whole table into memory; filters run in C#</td><td>Keep composing on <code>IQueryable</code>; materialize last (linq.html)</td></tr>
+      <tr><td>Tracked queries for read-only endpoints</td><td>Snapshot overhead per entity, wasted memory</td><td><code>AsNoTracking()</code> or DTO projections by default on reads</td></tr>
+      <tr><td>Multiple collection Includes, no split</td><td>Cartesian row explosion — megabytes of duplicated data</td><td><code>AsSplitQuery()</code>, or restructure as projections</td></tr>
+      <tr><td>Sharing a DbContext across parallel tasks</td><td>"A second operation was started on this context" / corruption</td><td>One context per unit of work; parallel work = separate scopes (di-hosting.html)</td></tr>
+      <tr><td>No concurrency token on user-editable rows</td><td>Silent last-write-wins data loss</td><td>RowVersion token + handle <code>DbUpdateConcurrencyException</code></td></tr>
+      <tr><td><code>Database.Migrate()</code> at startup of N instances</td><td>Racing DDL, partial migrations, blocked deploys</td><td>Migrations run once in the pipeline (script/bundle), before rollout</td></tr>
+      <tr><td>Testing against the InMemory provider only</td><td>Green tests, prod-only failures (constraints, transactions, translation)</td><td>Testcontainers with the real engine; SQLite where dialect suffices</td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1: What is the N+1 query problem in EF Core, and how do you fix it?</summary>
-      <p>The N+1 problem occurs when code executes ONE query to fetch a list of N entities, and then, because
-         it accesses a related/navigation property on each of those entities (like order.Customer.Name inside
-         a foreach loop), EF Core's lazy loading triggers a SEPARATE database query for EACH of the N entities
-         to fetch that related data — resulting in 1 + N total round-trips to the database instead of the one
-         or two that would actually be necessary. This is dangerous specifically because it's invisible at
-         small scale: a test with 10 orders generates 11 queries, which is fast enough that nobody notices, but
-         the same code with 100,000 orders in production generates 100,001 queries, which can bring the
-         database and the application to a crawl or outright fail under load — making it one of the most
-         common and costly EF Core production incidents. The fix is to EAGER LOAD the related data in the
-         SAME query using .Include(o => o.Customer), which EF Core translates into a single SQL query with a
-         JOIN, fetching all the orders and their customers in one database round-trip regardless of how many
-         orders there are. An alternative, often even better, fix when you don't need the full related entity
-         is to use .Select() to project only the specific fields you actually need (e.g., just the customer's
-         name) directly in the original query, which also collapses everything into one query while
-         transferring less data.</p></details>
-    <details class="solution"><summary>Q2: What's the difference between tracked and no-tracking queries, and when should you use each?</summary>
-      <p>By default, every entity EF Core returns from a query is TRACKED: the DbContext keeps an internal
-         snapshot of the entity's original values so that later, when you modify properties on that entity and
-         call SaveChanges(), EF Core can detect exactly what changed and generate the appropriate UPDATE SQL.
-         This tracking has real cost — memory to hold the snapshots, and CPU work to compare and detect
-         changes — which is entirely wasted overhead for queries whose results you're only going to READ and
-         never modify, like most GET endpoints in a web API, reporting queries, or data displayed in a UI.
-         Calling .AsNoTracking() on a query tells EF Core to skip all of that bookkeeping — it materializes the
-         entities faster and with a smaller memory footprint, since there's no change-tracking snapshot kept
-         at all. The practical guidance is to use AsNoTracking() for any read-only query, and reserve the
-         default tracked behavior specifically for queries whose results you intend to modify and persist via
-         SaveChanges(). Because read-only queries vastly outnumber update queries in most applications, many
-         teams configure AsNoTracking() as the DbContext's default query-tracking behavior and explicitly opt
-         INTO tracking only where an update path genuinely needs it, rather than opting out case by case.</p></details>
-    <details class="solution"><summary>Q3: Why is it important to apply filtering with .Where() before materializing a query, rather than after?</summary>
-      <p>An EF Core query built from an IQueryable&lt;T&gt; (like dbContext.Orders.Where(o => o.IsActive)) uses
-         DEFERRED execution and query translation: as long as you keep chaining LINQ operators without calling
-         a materializing method, EF Core is building up an EXPRESSION TREE that it can translate into SQL,
-         meaning the filtering, sorting, and projection all happen on the DATABASE SERVER, and only the
-         already-filtered, already-sorted result set is transferred back over the network into your
-         application's memory. If instead you call .ToList() (or another materializing call) FIRST — pulling
-         the entire table into an in-memory List&lt;T&gt; — and only THEN apply .Where()/.OrderBy() in plain C#
-         LINQ-to-Objects, you've forced the database to send you every single row regardless of whether you
-         actually need it, wasting network bandwidth, database I/O, and application memory proportional to the
-         full table size rather than just the rows you actually wanted. This distinction matters enormously at
-         scale: filtering a million-row table down to 20 matching rows via SQL WHERE is essentially free
-         compared to transferring all million rows over the network first and filtering them in application
-         memory afterward. The general rule is to keep building the IQueryable with Where/OrderBy/Select for
-         as long as possible, and only call a materializing method (ToList/ToListAsync/FirstOrDefault/Count)
-         once, at the very end, after all filtering and shaping has been expressed in a form EF Core can
-         translate to SQL.</p></details>
+    <details class="solution"><summary><strong>Q1 (Beginner):</strong> What does "change tracking" mean, and why does <code>SaveChanges</code> know what to update without you telling it?</summary>
+      <p>When a query materializes entities, the context stores a snapshot of each entity's original
+      values and keeps a reference in its change tracker. You then mutate the objects like normal C#.
+      <code>SaveChanges</code> compares current values against the snapshots, computes each entity's
+      state (Added/Modified/Deleted/Unchanged), and generates exactly the needed SQL statements,
+      wrapped in a single transaction. That's the unit-of-work pattern: the context represents "one
+      business operation's changes," committed atomically. It's also why read-only queries should skip
+      tracking (<code>AsNoTracking</code>) — the bookkeeping costs memory and time you'll never
+      use.</p></details>
+    <details class="solution"><summary><strong>Q2 (Beginner):</strong> What is the N+1 query problem? How do you detect and fix it in EF Core?</summary>
+      <p>Loading a list (1 query) and then accessing a navigation property per item, causing one
+      additional query per row — 1000 items = 1001 round-trips; pages get slower as data grows. Detect
+      it by logging SQL in development (<code>LogTo</code>) and watching for repeated identical queries
+      with different parameters, or via APM showing hundreds of queries per request. Fixes: eager-load
+      the navigations you traverse (<code>Include</code>/<code>ThenInclude</code>), or — usually better
+      — project exactly what the view needs with <code>Select</code>, which EF translates into one
+      joined/aggregated query. EF Core keeps lazy loading off by default precisely because it silently
+      manufactures this bug.</p></details>
+    <details class="solution"><summary><strong>Q3 (Mid):</strong> Why is DbContext scoped per request, and what specifically breaks when it's a singleton or shared across threads?</summary>
+      <p>A context is a unit of work with mutable, non-thread-safe state (the change tracker and an
+      active connection/transaction). As a singleton: the tracker accumulates every entity ever loaded
+      (unbounded memory, stale data served from the tracker), and concurrent requests hit the same
+      non-thread-safe object — causing "a second operation was started on this context" exceptions or
+      corrupted tracking. Shared across parallel tasks within one request, same crash. Scoped-per-request
+      gives each request an isolated, short-lived unit of work, disposed (connection released) when the
+      request ends — and it composes with DI's captive-dependency rule: never inject a context into a
+      singleton; background workers create their own scope per batch (di-hosting.html).</p></details>
+    <details class="solution"><summary><strong>Q4 (Mid):</strong> Explain optimistic concurrency in EF Core end to end: mechanism, what the developer handles, and when you'd prefer it over pessimistic locking.</summary>
+      <p>Add a concurrency token (e.g. a <code>[Timestamp]</code>/rowversion column the DB bumps on
+      every update). EF includes the token's <em>original</em> value in the UPDATE's WHERE clause; if
+      another transaction changed the row since you read it, the WHERE matches zero rows and EF throws
+      <code>DbUpdateConcurrencyException</code> instead of silently overwriting. The developer decides
+      the resolution: reload-and-retry (apply the change to fresh data), field-level merge, or bubble a
+      409 to the user ("this record was modified — review and resubmit"). Optimistic wins when
+      conflicts are rare — no locks held during user think-time, full read concurrency; pessimistic
+      locking (SELECT … FOR UPDATE inside a transaction) wins for hot contended rows where conflicts
+      are the norm and retry storms would be worse — e.g. inventory decrement, seat booking.</p></details>
+    <details class="solution"><summary><strong>Q5 (Senior):</strong> Design the migration/deployment strategy for a 24/7 service with 6 instances and a large table needing a column rename. No downtime allowed.</summary>
+      <p>Never let instances run DDL: migrations execute once in the pipeline (idempotent script or EF
+      bundle) before rollout, not <code>Migrate()</code> at startup. A rename is expand/contract, since
+      EF's scaffolded diff may produce drop+add (data loss) and a hard rename breaks the running
+      version: (1) Expand — migration adds the new column, nullable; review/edit the scaffold. (2)
+      Dual-write deploy — code writes both columns, reads old-preferring; ship to all instances. (3)
+      Backfill — batched <code>ExecuteUpdate</code>/SQL job copying old→new (batched to bound lock
+      time on the large table; concurrently-created rows are covered by dual-writes). (4) Flip reads to
+      the new column; verify. (5) Contract — after a bake period, deploy code that ignores the old
+      column, then a final migration drops it. Each step is individually roll-back-able by deploying
+      the previous code, because the schema always supports both the current and previous app
+      versions — that invariant is the whole strategy.</p></details>
+    <details class="solution"><summary><strong>Q6 (Senior):</strong> An endpoint using EF is slow. Walk through your diagnosis path and name the most likely fixes in order of probability.</summary>
+      <p>Get evidence first: enable query logging/APM for the endpoint and answer three questions —
+      how many queries, what SQL shape, how long each. Most likely findings, in order: (1) N+1 —
+      dozens/hundreds of small queries → Include or project (single biggest hit rate). (2) Missing
+      index — one query, table scan on the WHERE/JOIN column → check the DB's execution plan, add
+      <code>HasIndex</code> + migration. (3) Over-fetching — SELECT * of wide entities plus unneeded
+      Includes for a list view → DTO projection with just the columns, <code>AsNoTracking</code>. (4)
+      Cartesian explosion from multiple collection Includes → <code>AsSplitQuery</code>. (5) Client
+      evaluation/premature materialization — <code>ToList</code> mid-query → recompose on IQueryable.
+      (6) Only after query shape is right: contention/pool exhaustion (too few connections, long
+      transactions) and, rarely, EF overhead itself → compiled queries, context pooling, or raw SQL
+      for the one pathological query. The meta-answer interviewers want: read the generated SQL and
+      the execution plan before touching any C#.</p></details>
 
-    <div class="exercise"><strong>🏋️ Practice:</strong> enable EF Core SQL logging and reproduce an N+1 query with lazy loading over a loop, counting the actual queries executed; fix it with .Include() and confirm it drops to one query; compare AsNoTracking() vs tracked query memory/behavior for a read-only endpoint; write a query that filters in C# after ToList() and rewrite it to filter with .Where() before materializing, comparing the generated SQL; write a migration and inspect its Up()/Down() methods; sketch an expand/contract migration for renaming a column safely across two deploys.</div>
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (Easy):</strong> Write the query for "the 10 most recent paid orders of customer X, as DTOs (id, total, item count), read-only" — with every relevant good practice from this lesson.
+      <details class="solution"><summary>Solution</summary><pre>var orders = await db.Orders
+    .Where(o =&gt; o.CustomerId == customerId &amp;&amp; o.Status == OrderStatus.Paid)
+    .OrderByDescending(o =&gt; o.CreatedAt)
+    .Take(10)
+    .Select(o =&gt; new OrderDto(o.Id, o.Total, o.Items.Count))   // projection: 3 cols,
+    .ToListAsync(ct);                                          // nav counted IN SQL
+// Practices: filter/order/limit all translated to SQL (nothing materialized early);
+// DTO projection (no entities, no tracking needed — projections are inherently
+// untracked, so AsNoTracking is implicit here); async with a flowed token;
+// Items.Count inside Select becomes a subquery/JOIN COUNT — no N+1.</pre></details></div>
+    <div class="exercise"><strong>2 (Easy):</strong> This page renders a customer list with their order counts and last order date, and it's slow. Count the queries it runs for 500 customers, then fix it to one.
+<pre>var customers = await db.Customers.ToListAsync();
+foreach (var c in customers) {
+    model.Add(new Row(c.Name, c.Orders.Count, c.Orders.Max(o =&gt; o.CreatedAt)));
+}</pre>
+      <details class="solution"><summary>Solution</summary><pre>// Query count: 1 (customers) + 500 (Orders loaded per customer for .Count) = 501.
+// (With lazy loading off, it's worse: c.Orders is EMPTY/null → silent wrong data —
+//  both failure modes come from traversing navigations post-materialization.)
+var model = await db.Customers
+    .Select(c =&gt; new Row(
+        c.Name,
+        c.Orders.Count,
+        c.Orders.Max(o =&gt; (DateTime?)o.CreatedAt)))   // nullable: customer w/ 0 orders
+    .ToListAsync(ct);
+// ONE query — EF translates the navigation aggregates into a grouped JOIN.
+// The (DateTime?) cast matters: Max over an empty set is NULL in SQL; the nullable
+// cast makes that legal instead of throwing (same trick as linq.html's Sum).</pre></details></div>
+    <div class="exercise"><strong>3 (Medium):</strong> Implement "decrement stock and create the order atomically; oversell must be impossible even under concurrent checkouts." Show the transaction and explain where optimistic concurrency fits.
+      <details class="solution"><summary>Solution</summary><pre>public async Task&lt;Order&gt; CheckoutAsync(string sku, int qty, CancellationToken ct)
+{
+    for (int attempt = 1; ; attempt++)
+    {
+        try
+        {
+            var stock = await db.Stock.FirstAsync(s =&gt; s.Sku == sku, ct);
+            if (stock.Quantity &lt; qty) throw new OutOfStockException(sku);
+
+            stock.Quantity -= qty;                     // tracked change
+            var order = new Order { Sku = sku, Qty = qty };
+            db.Orders.Add(order);
+            await db.SaveChangesAsync(ct);             // ONE transaction: UPDATE + INSERT.
+            return order;                              // Stock has a RowVersion token ↓
+        }
+        catch (DbUpdateConcurrencyException) when (attempt &lt; 3)
+        {
+            db.ChangeTracker.Clear();                  // drop stale state, re-read, retry
+        }
+    }
+}
+// Why this is oversell-proof: Stock carries a [Timestamp] RowVersion. Two concurrent
+// checkouts both read Quantity=5; both try UPDATE ... WHERE RowVersion=@orig; the
+// DB serializes them — the second's WHERE matches 0 rows → concurrency exception →
+// retry re-reads Quantity=3 and re-checks the guard. The check-then-act is made
+// atomic by token + retry, without holding locks during the read.
+// Alternative for HOT skus: pessimistic (SELECT ... FOR UPDATE inside an explicit
+// transaction) or a set-based guard:
+//   ExecuteUpdate(s =&gt; s.SetProperty(x =&gt; x.Quantity, x =&gt; x.Quantity - qty))
+//     on .Where(x =&gt; x.Sku == sku &amp;&amp; x.Quantity &gt;= qty) → 0 rows = out of stock.</pre></details></div>
+    <div class="exercise"><strong>4 (Medium):</strong> The scaffolded migration for renaming <code>Users.Login</code> → <code>Users.Email</code> contains <code>DropColumn("Login")</code> + <code>AddColumn("Email")</code>. What's wrong, and what do you ship instead (single-instance app, brief maintenance window allowed)?
+      <details class="solution"><summary>Solution</summary><pre>// WRONG: drop+add DESTROYS every value in Login — EF's model diff can't know
+// "rename" from "delete one property, add another". Migrations are code: REVIEW &amp; EDIT.
+public partial class RenameLoginToEmail : Migration
+{
+    protected override void Up(MigrationBuilder mb)
+        =&gt; mb.RenameColumn(name: "Login", table: "Users", newName: "Email");
+    protected override void Down(MigrationBuilder mb)
+        =&gt; mb.RenameColumn(name: "Email", table: "Users", newName: "Login");
+}
+// RenameColumn preserves data (sp_rename / ALTER ... RENAME under the hood).
+// Ship: take the maintenance window, run the migration via idempotent script
+// (dotnet ef migrations script --idempotent), deploy the code that uses Email.
+// (Zero-downtime multi-instance would need expand/contract instead — Q5 —
+//  but with a window and one instance, the direct rename is the lazy CORRECT fix.)</pre></details></div>
+    <div class="exercise"><strong>5 (Hard):</strong> A nightly job archives ~2M old orders by loading them, setting <code>Status = Archived</code>, and calling SaveChanges in a loop. It takes 4 hours and OOMs sometimes. Rewrite it, then explain the caveat your rewrite introduces.
+      <details class="solution"><summary>Solution</summary><pre>// PROBLEMS: 2M tracked entities (snapshots → OOM risk — memory.html), 2M UPDATE
+// statements, hours of round-trips, growing change tracker slowing every SaveChanges.
+
+// REWRITE — set-based, batched (bound transaction size / lock time):
+public async Task ArchiveOldOrdersAsync(CancellationToken ct)
+{
+    const int batch = 50_000;
+    int total = 0, affected;
+    do
+    {
+        affected = await db.Orders
+            .Where(o =&gt; o.Status == OrderStatus.Completed
+                     &amp;&amp; o.CompletedAt &lt; DateTime.UtcNow.AddYears(-1))
+            .OrderBy(o =&gt; o.Id).Take(batch)             // batched: short transactions,
+            .ExecuteUpdateAsync(s =&gt;                    // no lock-the-table-for-minutes
+                s.SetProperty(o =&gt; o.Status, OrderStatus.Archived), ct);
+        total += affected;
+        _log.LogInformation("Archived {N} (running total {T})", affected, total);
+    } while (affected == batch &amp;&amp; !ct.IsCancellationRequested);
+}
+// Nothing is loaded or tracked: each batch is ONE UPDATE ... WHERE ... in the DB.
+// 4 hours → minutes; memory flat.
+// CAVEAT: ExecuteUpdate bypasses the change tracker AND all EF-level behaviors —
+// any tracked Order instances in this context are now stale, no domain events/
+// interceptors/audit hooks fire, and updated-at columns must be set explicitly in
+// SetProperty. Fine for a maintenance job; NOT a substitute for tracked updates
+// inside business workflows that rely on those behaviors.</pre></details></div>
+    <div class="exercise"><strong>6 (Hard):</strong> Your team's integration tests use the InMemory provider and are green, but production hit three bugs the tests missed: a unique-constraint violation, a transaction that didn't roll back, and a LINQ query that threw "could not be translated". Explain why InMemory missed each, and set up the better harness.
+      <details class="solution"><summary>Solution</summary><pre>// WHY INMEMORY MISSED THEM (it is a fake object store, not a database):
+// 1. Unique constraint — InMemory doesn't enforce relational constraints (unique
+//    indexes, FKs): duplicate insert "succeeds" in tests, violates in Postgres.
+// 2. Transactions — InMemory ignores them (BeginTransaction is a no-op shell):
+//    the "rolled back" write persisted in the test, hiding the missing rollback path.
+// 3. Translation — InMemory executes LINQ as LINQ-to-Objects: EVERYTHING is
+//    "translatable". The real provider's SQL translator rejected the expression.
+
+// BETTER HARNESS — Testcontainers: the real engine, throwaway per test class:
+public class DbFixture : IAsyncLifetime
+{
+    private readonly PostgreSqlContainer _pg = new PostgreSqlBuilder()
+        .WithImage("postgres:16-alpine").Build();
+    public ShopContext CreateContext() =&gt; new(new DbContextOptionsBuilder&lt;ShopContext&gt;()
+        .UseNpgsql(_pg.GetConnectionString()).Options);
+
+    public async Task InitializeAsync()
+    {
+        await _pg.StartAsync();
+        await using var db = CreateContext();
+        await db.Database.MigrateAsync();       // REAL schema via REAL migrations —
+    }                                           // which also tests the migrations!
+    public Task DisposeAsync() =&gt; _pg.DisposeAsync().AsTask();
+}
+
+[Collection("db")]                              // share the container across the class
+public class OrderRepositoryTests(DbFixture fx)
+{
+    [Fact]
+    public async Task Duplicate_sku_violates_unique_index()
+    {
+        await using var db = fx.CreateContext();
+        db.Products.Add(new Product { Sku = "X" });
+        await db.SaveChangesAsync();
+        db.Products.Add(new Product { Sku = "X" });
+        await Assert.ThrowsAsync&lt;DbUpdateException&gt;(() =&gt; db.SaveChangesAsync());
+    }   // now the test sees what production sees
+}
+// Cost: Docker + ~2s container start per run (amortized via fixture). Worth it:
+// constraints, transactions, translation, and migrations are all REAL.
+// (SQLite in-memory is the lighter option when your SQL stays inside its dialect.)</pre></details></div>
 
     <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li>N+1 queries (lazy-loading a navigation property inside a loop) are EF Core's #1 production performance bug — fix with .Include() (eager load) or .Select() (project only what's needed).</li>
-      <li>Use .AsNoTracking() for read-only queries to skip unnecessary change-tracking overhead; reserve tracking for queries you'll actually SaveChanges().</li>
-      <li>Apply Where/OrderBy/Select on the IQueryable BEFORE materializing (ToList/ToListAsync) so filtering happens as SQL on the database, not in application memory after pulling everything.</li>
-      <li>Always use the async EF Core methods (ToListAsync, etc.) in web applications — synchronous calls block threads during I/O.</li>
-      <li>Migrations are version-controlled schema changes with Up()/Down(); destructive changes (renames/drops) need expand/contract across deploys, mirroring the CI/CD deployment-strategies lesson's DB-migration trap.</li>
+      <li>DbContext = query translator + unit of work: tracked entities diff at <code>SaveChanges</code> into one transaction; scoped per request; never shared across threads.</li>
+      <li>Keep queries on the server: compose on <code>IQueryable</code>, project to DTOs (<code>Select</code>), page and aggregate in SQL, materialize last; read the generated SQL as a habit.</li>
+      <li>N+1 is the ORM bug: <code>Include</code> what you traverse or project instead; <code>AsSplitQuery</code> for multi-collection includes; lazy loading stays off.</li>
+      <li>Writes: <code>SaveChanges</code> is atomic; concurrency tokens + <code>DbUpdateConcurrencyException</code> handling prevent silent last-write-wins; <code>ExecuteUpdate/Delete</code> for set-based bulk work (bypasses the tracker — knowingly).</li>
+      <li>Migrations are reviewed code, applied once per deploy from the pipeline; zero-downtime = expand/contract; rollback = forward migration.</li>
+      <li>Performance order: fix query shape (N+1, projections, indexes) before EF machinery (pooling, compiled queries); test against a real database (Testcontainers), not the InMemory provider.</li>
     </ul></div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="di-hosting.html">← Dependency Injection & Hosting</a>
-      <a class="btn" href="performance-aot.html">Next: Performance, NativeAOT & Trimming →</a>
+      <a class="btn btn-outline" href="di-hosting.html">← Dependency Injection &amp; the Generic Host</a>
+      <a class="btn" href="testing.html">Next: Testing with xUnit →</a>
     </div>
   </main>
 </div>
 
-<script src="../../js/sidebar.js"></script>
-<script src="nav.js"></script>
+<script src="../../js/sidebar.js"></script><script src="nav.js"></script>
 </body>
 </html>
