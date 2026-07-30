@@ -64,7 +64,33 @@ Target **~500–700 lines (~35–50KB)** per lesson. Structure:
 | — | Java | ✅ **DONE (v4+ expanded, 2026-07-18)** — **45 lessons** at full depth. Original 40 across Foundations/OOP/Core Libraries/Modern Java/Concurrency/JVM&Perf/Professional, **+5 new: Annotations & Reflection, Regular Expressions (Core Libraries); The Module System/JPMS (Modern Java); Concurrency Patterns & Pitfalls capstone (Concurrency); Benchmarking & JMH (JVM & Performance)**. Link-audited clean; quiz 10/200/0 (sets 5 & 7 retuned for the new topics; benchmarking already in set 8). All pushed & live. |
 | 15 | Angular | ✅ **DONE (v4, 2026-07-19)** — **23 lessons** at mastery depth across 8 sections: Foundations ×4 (index=Components & Standalone, data-binding=Templates, directives=Control Flow, pipes), Components & Reactivity ×4 (component-communication, lifecycle, signals, change-detection), Services & DI ×2 (services-di, di-advanced), RxJS ×2 (rxjs, rxjs-patterns), Forms ×3 (template-forms, forms=Reactive, form-validation incl. CVA), Routing & HTTP ×3 (routing, guards-lazy, http), State ×2 (state-management, ngrx), Production ×3 (testing, performance, enterprise=SSR/i18n/security/monorepo). 12 rewritten in place + 11 new files. Modern Angular throughout: standalone, signals, @if/@for, functional guards/interceptors, zoneless, httpResource. Link-audited clean; quiz retuned (9 swaps: linkedSignal/resource, multi-providers, inject-context, catchError placement, takeUntilDestroyed, lifecycle, CVA, track identity) — 10/200/0. |
 | 16 | .NET (C#) | ✅ **DONE (v4, 2026-07-27)** — **23 lessons** at mastery depth across 6 sections: Foundations ×5 (index=How It Runs, types, control-flow, strings, methods), Object-Oriented C# ×5 (oop, inheritance, records-structs, generics, pattern-matching), Core Libraries ×4 (collections-generics, linq, delegates-events, exceptions-nullability), Async & Concurrency ×3 (async-await, **async-patterns** new, **threading** new), Runtime & Performance ×2 (memory, performance-aot), Professional ×4 (di-hosting, efcore, testing, **modern-csharp** new capstone). 12 rewritten in place + 11 new files. Modern throughout: primary constructors, collection expressions, required/init, TimeProvider, Channels, ExecuteUpdate/Delete, source generators, NativeAOT. Link-audited clean (0 broken); pager chain verified against nav order end to end; quiz banks retuned (14 swaps) — 10/200/0. |
-| 5–19 | all others | ⏳ pending (still at v3 depth) — user-directed order: **ASP.NET Core next** |
+| 19 | System Design | 🚧 **IN PROGRESS (v4, started 2026-07-30)** — 3 of 36 done: `estimation` (3→30KB), `cap-theorem` (4→42KB), `consistent-hashing` (3→43KB). Uses the **tradeoff-driven SD format** (below), not the language-track format. |
+| 5–18 | all others | ⏳ pending (still at v3 depth) — see damage-order queue below |
+
+### ⚠️ Order changed 2026-07-30 (user: "junior, mid and senior can't refer to this — content not up to the mark")
+
+Strict site order 1→19 polished 8 tracks while the highest-value ones stayed at v3. Audit of actual page sizes showed the site is really **two sites**: 8 v4 tracks at 22–32KB/lesson with 12 `<details>` blocks, and 12 v3 tracks at 5–13KB with 3. Worst offender was System Design — 34 lessons at 5KB median with **zero** exercises, zero graded interview Qs, zero Common Mistakes, despite being the most senior-referenced track on the site.
+
+**New queue, by damage (user-confirmed):**
+1. **System Design** (36) — worst gap, senior-critical, 20 unused source PDFs 🚧 in progress
+2. **Python** (12), **SQL** (12) — highest junior/mid traffic, 7–9KB
+3. **LeetCode** (21) — 11KB, needs graded sets + batch-2 patterns
+4. **ASP.NET Core** (12, 13KB), **Node.js** (10 lessons @ 24KB — deep but NARROW, needs *more lessons* not deeper ones)
+5. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB)
+
+### Tradeoff-driven SD lesson format (System Design only — supersedes the language-track recipe for this track)
+Language tracks hit depth via tiered interview Qs + graded coding exercises. System Design needs a different shape — same shell/sidebar/pager and same 12-`<details>` volume, but:
+1. "What you'll master" intro + prerequisites line
+2. **Mental model** before mechanics — and where a popular framing is *wrong*, say so explicitly (CAP's pick-2-of-3, "balanced keys = balanced load")
+3. **Worked arithmetic, not asserted claims** — show the modulo remap table, show the QPS→servers chain, and state a **design consequence after every number**
+4. `mistake-pair` divs for ❌ unbacked vs ✅ derived reasoning
+5. **Deep dives on the mechanism** (how reconciliation actually works, how data moves at join time), plus **alternatives with when-NOT-to-use** — the strongest senior signal
+6. Common Mistakes table, 7–8 rows
+7. 6 tiered interview Qs (2 🟢 beginner / 2 🟡 mid / 2 🔴 senior) — senior answers are multi-paragraph and name the trade-off being accepted
+8. 6 graded exercises easy→hard; solutions show the *reasoning chain*, and the hard ones often end by **renegotiating the requirement** (approximate rank beats exact rank; cap retention; question the spec)
+9. Key Takeaways (8–10 bullets) + pager
+
+Validate: `for t in div details pre table; do` open/close counts must match; expect `details=12 exercises=6`, 24KB+.
 
 Quizzes: existing 200-Q banks stay; extend/retune only after a track's lessons are done, if question topics drifted.
 
