@@ -18,68 +18,646 @@
 
   <main class="content">
     <h1>Design Key-Value Store (Dynamo) <span class="level-badge level-ultra">Case Study</span></h1>
-    <p>This is the "synthesis" case study — it pulls together Consistent Hashing, CAP theorem trade-offs, and
-       Replication into one coherent design, following the architecture of Amazon's DynamoDB paper. If you
-       understand this case study, you understand how the Fundamentals section's lessons compose into a real
-       system.</p>
 
-    <h2>Requirements</h2>
-    <p><strong>Functional:</strong> put(key, value), get(key) — simple API. <strong>Non-functional:</strong>
-       HIGH AVAILABILITY (Amazon's original motivation: a shopping cart must accept writes even during a
-       partition — "always writable"), horizontal scalability, tunable consistency.</p>
+    <p><strong>What you'll master:</strong> the synthesis case study — how consistent hashing, quorums, vector
+       clocks, anti-entropy and LSM storage compose into one coherent system. You'll be able to derive the N/W/R
+       trade-off rather than quoting it, explain why <em>sloppy</em> quorums break the R+W&gt;N guarantee people
+       assume, trace a vector-clock conflict to its resolution, and justify an LSM tree over a B-tree from the
+       write pattern.</p>
+    <p><em>Prerequisites:</em> <a href="consistent-hashing.html">Consistent Hashing</a>,
+       <a href="cap-theorem.html">CAP Theorem</a>, <a href="replication.html">Replication</a>,
+       <a href="bloom-merkle.html">Bloom Filters &amp; Merkle Trees</a>. This lesson assumes all four.</p>
 
-    <h2>Data Partitioning — Consistent Hashing</h2>
-    <pre>// Directly reuses the Consistent Hashing lesson: keys and nodes both hash onto a RING. A key is
-// stored on the first node clockwise from its hash position. Adding/removing a node only
-// remaps the keys in ITS immediate neighborhood — not the whole keyspace.
-// VIRTUAL NODES (each physical node maps to many points on the ring) solve uneven load distribution —
-// without them, a physical node could randomly own a disproportionate arc of the ring.</pre>
+    <div class="note">🎯 <strong>What this problem is really testing.</strong> Whether the fundamentals compose in
+      your head. Every component here is covered elsewhere in the track; the signal is whether you can assemble
+      them, justify each choice against the stated requirement (<em>always writable</em>), and identify where the
+      standard answers have subtleties — particularly that a sloppy quorum does <em>not</em> give you the
+      consistency that R+W&gt;N implies.</div>
 
-    <h2>Replication — N, W, R (the Quorum Model)</h2>
-    <pre>N = replication factor (e.g., 3) — each key is stored on 3 nodes (the next N-1 clockwise from its
-    primary position on the ring)
-W = write quorum — a write is considered SUCCESSFUL once W replicas acknowledge it
-R = read quorum  — a read queries R replicas and returns the most recent value (via version/timestamp)
+    <h2>1. Requirements</h2>
+    <table class="tbl">
+      <tr><th>Functional</th><th>Non-functional</th></tr>
+      <tr><td><code>put(key, value)</code>, <code>get(key)</code></td><td><strong>"Always writable"</strong> — the original Amazon requirement: a shopping cart must accept writes even during a partition</td></tr>
+      <tr><td>No range scans, no joins, no transactions</td><td>Incremental horizontal scalability — add one node at a time</td></tr>
+      <tr><td>Values are opaque blobs (~KB)</td><td>Tunable consistency per operation</td></tr>
+      <tr><td>—</td><td>Symmetric, decentralised — no special nodes, no coordinator</td></tr>
+    </table>
 
-// The tunable consistency guarantee:  W + R > N  ⟹  every read overlaps with the most recent write
-// (at least one node in the read set MUST have seen the latest write) — STRONG consistency.
-// W + R ≤ N ⟹ reads might miss the latest write — EVENTUAL consistency, but higher availability/lower latency.
-Example: N=3, W=2, R=2 → W+R=4 > N=3 → strong consistency, tolerates 1 node being slow/down per operation
-Example: N=3, W=1, R=1 → fastest, most available, but a read can return STALE data</pre>
-    <div class="note">🎯 <strong>This IS the CAP theorem, made concrete and TUNABLE per-operation.</strong>
-      Rather than a single global CP-or-AP choice, Dynamo lets you dial the trade-off per read/write via N/W/R
-      — a critical-path write (e.g., "add to cart") might use W=1 for low latency, while a security-sensitive
-      read might use R=N for maximum consistency. Being able to state "we'd tune W and R differently per
-      operation, here's why" is a strong senior-level signal.</div>
+    <p><strong>The requirement that drives everything is "always writable."</strong> Rejecting an add-to-cart
+       because a replica is unreachable costs a sale, whereas briefly showing a slightly stale cart costs nothing.
+       That's an explicit <strong>AP</strong> choice from <a href="cap-theorem.html">CAP</a>, and every subsequent
+       decision — leaderless writes, quorums, vector clocks, hinted handoff — follows from it. If the requirement
+       were "never oversell inventory", the correct design would be entirely different.</p>
 
-    <h2>Conflict Resolution — Vector Clocks</h2>
-    <pre>// With MULTIPLE writers (no single leader) and network partitions, concurrent writes to the SAME
-// key on DIFFERENT replicas can genuinely CONFLICT — which one is "correct"? A simple timestamp
-// (last-write-wins) can silently lose data. Dynamo uses VECTOR CLOCKS to detect true conflicts:
-key: "cart123", value: [milk, eggs], vector clock: {nodeA: 1}
-  → nodeA writes "+bread" → {nodeA: 2}
-  → MEANWHILE nodeB (network partition) writes "+butter" from the SAME starting version → {nodeB: 1}
-// Neither vector clock "descends from" the other — this is a GENUINE CONFLICT, not just a race won by
-// one side. The system returns BOTH versions to the client/application, which resolves it (e.g., "merge
-// cart contents" — a shopping cart naturally supports simple union-merge semantics).</pre>
+    <h2>2. Architecture Overview</h2>
+    <pre>Every node is IDENTICAL — no leader, no coordinator, no special roles.
+A client can contact any node, which acts as coordinator for that request.
 
-    <h2>Handling Node Failures — Hinted Handoff & Anti-Entropy</h2>
-    <pre>HINTED HANDOFF: if a replica is temporarily down during a write, another node stores the write
-  as a "hint" and delivers it to the original replica once it recovers — maintains availability
-  without permanently losing the write.
-ANTI-ENTROPY (Merkle trees — see the Bloom/Merkle lesson): periodically compare replicas' data using
-  Merkle tree root hashes to detect and repair DIVERGENCE (missed writes, corruption) — without
-  comparing every key individually.</pre>
+   Client ──► any node (coordinator)
+                 │
+                 ├─ hash(key) → position on the ring
+                 ├─ identify the N replicas (preference list)
+                 └─ dispatch to them in parallel; wait for W or R acks
 
-    <h2>Interview Follow-ups to Expect</h2>
-    <p>• How do you handle a "hot key" that far exceeds any single node's capacity? (further partition/shard
-       that specific key's data, or cache it aggressively in front of the store)<br>
-       • Why choose vector clocks over simple last-write-wins? (LWW silently discards concurrent writes;
-       vector clocks detect true conflicts and let the application resolve them meaningfully — appropriate
-       when data loss is unacceptable)<br>
-       • How does this design embody the CAP theorem's AP choice? (during a partition, EVERY reachable node
-       still accepts writes — availability over strict consistency — reconciled later via vector clocks +
-       anti-entropy)</p>
+Component stack, all covered in the fundamentals:
+   PARTITIONING     consistent hashing with virtual nodes
+   REPLICATION      N replicas = next N distinct physical nodes clockwise
+   CONSISTENCY      tunable quorums (N, W, R)
+   CONFLICTS        vector clocks → sibling versions → app-level merge
+   TEMP FAILURE     hinted handoff
+   PERM FAILURE     anti-entropy via Merkle trees
+   MEMBERSHIP       gossip
+   STORAGE          LSM tree per node</pre>
+
+    <h2>3. Partitioning and Replica Placement</h2>
+    <p>Consistent hashing with virtual nodes, exactly as in
+       <a href="consistent-hashing.html">that lesson</a> — but the replica placement detail is where designs go
+       wrong:</p>
+    <pre>A key's PREFERENCE LIST = walk clockwise from hash(key), collecting
+the first N nodes.
+
+THE BUG: with virtual nodes, consecutive ring positions often belong
+to the SAME physical node. Naively taking "the next 3 vnodes" can give
+you 3 copies on 1 machine — you believe you have RF=3 and you have 1.
+It is invisible until that machine dies.
+
+CORRECT: skip vnodes whose physical node is already in the list.
+BETTER:  also skip nodes in a failure domain already represented, so
+         the 3 replicas land in 3 different racks/AZs. Three copies in
+         one rack all die together in one power event.</pre>
+
+    <p>Virtual nodes also matter for <em>recovery</em>: without them, a dead node's entire range lands on one
+       successor, which may then also fall over. With ~150 vnodes per node, the load scatters across the whole
+       cluster, and a replacement node rebuilds by streaming from many peers in parallel rather than serially from
+       one.</p>
+
+    <h2>4. The Core Design Decision: Quorums (N, W, R)</h2>
+    <pre>N = replication factor        (copies of each key)
+W = write quorum              (acks required before a write succeeds)
+R = read quorum               (replicas consulted on a read)
+
+If R + W &gt; N, the read and write sets MUST overlap on at least one
+node — so a read is guaranteed to see the most recent acknowledged
+write.</pre>
+
+    <table class="tbl">
+      <tr><th>Config (N=3)</th><th>Property</th><th>Use for</th></tr>
+      <tr><td>W=2, R=2</td><td>R+W=4&gt;3 — overlap guaranteed; tolerates 1 node down for both reads and writes</td><td><strong>The balanced default</strong></td></tr>
+      <tr><td>W=1, R=1</td><td>Fastest and most available; reads may be stale</td><td>Shopping cart adds, view counters, session data — "always writable" wins</td></tr>
+      <tr><td>W=3, R=1</td><td>Fast reads, slow writes; <em>writes fail if any replica is down</em></td><td>Read-heavy, rarely-written config — but note the availability trap</td></tr>
+      <tr><td>W=1, R=3</td><td>Fast writes, slow reads</td><td>Write-heavy ingestion where reads are rare</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>The subtlety that most answers miss: R+W&gt;N gives you <em>recency</em>, not
+      linearizability.</strong> Quorum overlap guarantees a read touches a replica holding the latest
+      acknowledged write. It does <em>not</em> order two concurrent writes — with no leader, two clients writing
+      simultaneously both succeed, and you get siblings (or, under last-write-wins, silent data loss). It also
+      doesn't make a partial write atomic: a write acked by 2 of 3 that then fails leaves a value some later read
+      may or may not see, and there is no rollback. <strong>Quorums give recency; consensus gives ordering</strong>
+      — and if you need the latter, you need Paxos/Raft and roughly 4× the latency.</div>
+
+    <h2>5. Deep Dive: Sloppy Quorums and Hinted Handoff</h2>
+    <p>Strict quorums would violate "always writable" — if 2 of a key's 3 replicas are unreachable, a W=2 write
+       fails. Dynamo's answer changes the guarantee in a way worth understanding precisely:</p>
+
+    <pre>SLOPPY QUORUM: if a preference-list node is unreachable, write to the
+next healthy node on the ring instead, tagged with a HINT naming the
+intended recipient.
+
+   Key's preference list: [A, B, C].  B is down.
+   Write goes to A, C, and D — where D stores it with
+   "hint: this belongs to B".
+   When B recovers, D hands the data off and deletes its copy.
+
+   → the write SUCCEEDS during the failure. Always writable. ✓</pre>
+
+    <p><strong>What it costs, and this is the part to state:</strong> during a sloppy write, the data is not on the
+       nodes a reader will consult. A subsequent R=2 read of [A, B, C] may reach A and C — fine here — but in a
+       worse case reads the two nodes that never received it. <strong>So R+W&gt;N no longer guarantees overlap.</strong>
+       The guarantee degrades from "reads see the latest write" to "reads see it eventually, once handoff
+       completes." Sloppy quorums buy availability by weakening exactly the property strict quorums provide, and
+       many candidates cite R+W&gt;N without realising their design has already forfeited it.</p>
+
+    <p><strong>Hinted handoff's failure mode:</strong> if the node holding hints dies before delivering them, those
+       writes are lost from the intended replica until anti-entropy repairs them from another copy. Hints are a
+       fast path, not a durability guarantee — which is why anti-entropy remains necessary rather than optional.</p>
+
+    <h2>6. Deep Dive: Vector Clocks and Conflict Resolution</h2>
+    <p>With no leader, two clients can write the same key concurrently on different replicas. Someone must decide
+       what happened — and the first job is <em>detecting</em> whether there's a genuine conflict at all.</p>
+
+    <pre>A vector clock is a set of (node, counter) pairs recording which
+replicas have seen which versions.
+
+   put("cart") on A     → v1: [milk]            vc {A:1}
+   put on A (+bread)    → v2: [milk, bread]     vc {A:2}
+                          {A:2} DESCENDS from {A:1} → v2 supersedes v1.
+                          No conflict; discard v1.
+
+   PARTITION: client 1 writes via A, client 2 via B, both from v1.
+   A: [milk, bread]   vc {A:2}
+   B: [milk, butter]  vc {A:1, B:1}
+
+   Compare: is {A:2} ≥ {A:1,B:1} in every position?  A:2≥1 ✓ but B:0&lt;1 ✗
+            is {A:1,B:1} ≥ {A:2}?                    A:1&lt;2 ✗
+   NEITHER descends from the other → GENUINE CONCURRENT WRITE.
+   → return BOTH siblings to the client.
+
+   Client merges (a cart is a set — union is the natural semantic):
+   [milk, bread, butter]  vc {A:2, B:1}   ← descends from both</pre>
+
+    <table class="tbl">
+      <tr><th>Resolution strategy</th><th>Behaviour</th><th>Cost</th></tr>
+      <tr><td><strong>Last-write-wins</strong></td><td>Highest timestamp survives</td><td>Trivial, and <em>silently discards</em> a concurrent write. Also depends on synchronised clocks — skew can make an older write win permanently. Cassandra's default.</td></tr>
+      <tr><td><strong>Vector clocks + app merge</strong></td><td>Detect true concurrency; hand siblings to the application</td><td>No silent loss, but the app must know how to merge. Vector clocks also grow with the number of writing nodes (Dynamo truncates the oldest entries, which can produce false conflicts).</td></tr>
+      <tr><td><strong>CRDTs</strong></td><td>Data types that merge deterministically by construction</td><td>No conflict handling needed at all — but only for operations fitting the algebra, and they carry metadata (tombstones).</td></tr>
+    </table>
+
+    <p><strong>Why a shopping cart is the canonical example:</strong> its merge is a set union, which is
+       commutative, associative and idempotent — so merging is unambiguous. The famous consequence is that a
+       <em>deleted</em> item can reappear, because an "add" from one replica merges with a "remove" from another
+       and the add wins. Amazon accepted that deliberately: a resurrected item is an annoyance, a lost sale is
+       revenue. <strong>Naming that trade — and that it was a business decision, not a technical accident — is the
+       strongest thing you can say about this design.</strong></p>
+
+    <h2>7. Deep Dive: The Storage Engine (LSM vs B-tree)</h2>
+    <p>Each node needs local storage, and the choice follows directly from the write pattern:</p>
+
+    <div class="mistake-pair">
+      <div><strong>B-tree (traditional RDBMS)</strong>
+      <pre>Writes update pages IN PLACE.
+→ random I/O per write
+→ page splits, fragmentation
+→ read: O(log n), usually
+  one seek — EXCELLENT
+
+Good when reads dominate and
+writes are moderate.</pre></div>
+      <div><strong>LSM tree (Dynamo, Cassandra)</strong>
+      <pre>Writes go to an in-memory
+memtable + append-only WAL.
+Flushed to immutable SSTables;
+merged by compaction.
+
+→ writes are SEQUENTIAL — very
+  fast, no random I/O
+→ reads may check several
+  SSTables — slower
+
+Good when writes dominate.</pre></div>
+    </div>
+
+    <pre>Why LSM here: the design accepts writes even during failures ("always
+writable"), so write throughput is the priority. Sequential appends
+also suit both SSDs and spinning disks far better than random updates.
+
+The read cost is mitigated by exactly the structures from the
+fundamentals:
+   BLOOM FILTER per SSTable → "definitely not in this file", skipping
+      disk seeks for files that can't contain the key. A false positive
+      costs one wasted seek; a false NEGATIVE would return wrong data,
+      which is why the guarantee direction matters.
+   Sparse index + block cache for the files that remain.
+
+The real cost of LSM is COMPACTION: background merging of SSTables
+consumes I/O and CPU, and competes with live traffic. "Compaction
+storms" are the classic Cassandra operational problem, and the reason
+these systems need I/O headroom rather than running near capacity.</pre>
+
+    <h2>8. Failure Handling: The Full Picture</h2>
+    <table class="tbl">
+      <tr><th>Failure</th><th>Mechanism</th><th>Detail</th></tr>
+      <tr><td>Replica briefly down</td><td><strong>Hinted handoff</strong></td><td>A substitute node holds the write and replays it on recovery. Fast, but lost if the hint-holder dies</td></tr>
+      <tr><td>Replica down for a long time</td><td><strong>Anti-entropy</strong></td><td>Merkle-tree comparison per token range finds divergence in O(log n) exchanges and transfers only differing blocks</td></tr>
+      <tr><td>Divergence on a read</td><td><strong>Read repair</strong></td><td>A quorum read seeing mismatched versions writes the newest back to the stale replica — opportunistic repair on the hot path</td></tr>
+      <tr><td>Node permanently dead</td><td><strong>Ring rebalance</strong></td><td>Its vnodes are reassigned; replacements stream from surviving replicas in parallel</td></tr>
+      <tr><td>Membership changes</td><td><strong>Gossip</strong></td><td>O(log n) propagation with no coordinator — see <a href="heartbeat-gossip.html">Heartbeat &amp; Gossip</a></td></tr>
+    </table>
+
+    <p><strong>The tombstone trap</strong>, which is the operational hazard specific to this architecture: deletes
+       are stored as <em>tombstones</em> (a delete has to be replicated like any other write, or a replica that
+       missed it would resurrect the row). Tombstones are garbage-collected after a grace period — and if
+       anti-entropy hasn't run within that window, a replica that never saw the delete still holds the row, sees
+       the other replicas lacking it, and "repairs" by copying the <strong>deleted data back</strong>. That's why
+       repair frequency must be tied to the tombstone grace period as a hard operational rule, not a
+       recommendation.</p>
+
+    <h2>9. Bottlenecks and Scaling</h2>
+    <table class="tbl">
+      <tr><th>What breaks</th><th>Fix</th></tr>
+      <tr><td>Hot key exceeding one node</td><td>Sharding cannot help — one key maps to one preference list. Cache in front, or split the key (<code>key#0..9</code>)</td></tr>
+      <tr><td>Wide partitions (one key with millions of values)</td><td>Add a bucketing component to the key so one partition can't grow unbounded</td></tr>
+      <tr><td>Compaction competing with traffic</td><td>Throttle compaction; run at &lt;70% I/O; choose the compaction strategy to match the workload</td></tr>
+      <tr><td>Anti-entropy cost</td><td>Repair per token range on a rolling schedule, throttled, and always inside the tombstone grace period</td></tr>
+      <tr><td>Vector clocks growing unbounded</td><td>Truncate the oldest entries (accepting occasional false conflicts), or use server-side timestamps where LWW is acceptable</td></tr>
+      <tr><td>Read latency from many SSTables</td><td>Bloom filters, tuned compaction, and more aggressive caching</td></tr>
+    </table>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it's wrong</th><th>Do this instead</th></tr>
+      <tr><td>Claiming R+W&gt;N gives strong consistency</td><td>It gives <em>recency</em>. Concurrent writes are still unordered, and partial writes have no rollback</td><td>Say "quorums give recency; consensus gives ordering" — and use LWT/Paxos if you need the latter</td></tr>
+      <tr><td>Forgetting that sloppy quorums break R+W&gt;N</td><td>A sloppy write lands on nodes outside the preference list, so the read set may not overlap it</td><td>State the degradation explicitly: available now, consistent after handoff</td></tr>
+      <tr><td>Taking the next N <em>vnodes</em> as replicas</td><td>Consecutive vnodes often belong to one physical node — "RF=3" silently becomes 1 copy on 1 machine</td><td>Skip duplicate physical nodes, and skip failure domains already represented</td></tr>
+      <tr><td>Using last-write-wins without saying what it costs</td><td>Silently discards concurrent writes and depends on synchronised clocks</td><td>Vector clocks with app-level merge, or CRDTs, where loss is unacceptable</td></tr>
+      <tr><td>Running repair less often than the tombstone grace period</td><td>Deleted data gets "repaired" back into existence</td><td>Tie repair frequency to the grace period as a hard rule</td></tr>
+      <tr><td>Choosing a B-tree engine for a write-heavy store</td><td>Random in-place updates cap write throughput and fragment the index</td><td>LSM tree — sequential writes, with Bloom filters mitigating read cost</td></tr>
+      <tr><td>Ignoring compaction in capacity planning</td><td>Compaction competes with live traffic for I/O; running near capacity causes latency spikes</td><td>Provision I/O headroom; throttle compaction</td></tr>
+      <tr><td>Setting W=N "for safety"</td><td>The write fails if <em>any</em> replica is down — worse availability than a single node, per the <a href="replication.html">coupling trap</a></td><td>W=quorum, so you tolerate failures while retaining overlap</td></tr>
+      <tr><td>Proposing this store for transactional data</td><td>No multi-key transactions, no joins, no strong ordering by default</td><td>Match the store to the access pattern — this is for high-availability key-value workloads</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution">
+      <summary>🟢 <em>Beginner</em> — Explain N, W and R, and what R+W&gt;N buys you.</summary>
+      <p><strong>N</strong> is the replication factor — how many copies of each key exist. <strong>W</strong> is the
+         write quorum — how many replicas must acknowledge before a write is considered successful.
+         <strong>R</strong> is the read quorum — how many replicas are consulted on a read.</p>
+      <p><strong>R+W&gt;N guarantees the read and write sets overlap</strong> on at least one node. With N=3, W=2,
+         R=2: a write is on at least 2 nodes and a read consults 2 of 3, so by pigeonhole at least one node in the
+         read set holds the latest write. Version numbers then identify which returned value is newest.</p>
+      <pre>N=3, W=2, R=2 → 4 &gt; 3 → overlap; tolerates one node down. The default.
+N=3, W=1, R=1 → 2 ≤ 3 → no overlap; fastest and most available,
+                        reads may be stale.
+N=3, W=3, R=1 → overlap, but the write fails if ANY replica is down.</pre>
+      <p><strong>The important caveat</strong> is that this gives <em>recency</em>, not linearizability. Overlap
+         ensures a read observes the most recent <em>acknowledged</em> write; it says nothing about ordering two
+         writes that happen concurrently, and it doesn't make a partially-completed write atomic. For genuine
+         ordering you need consensus, at roughly 4× the latency.</p>
+      <p>Note also that W=N is usually a mistake: requiring every replica makes writes <em>less</em> available than
+         a single node, because any one failure blocks them.</p>
+    </details>
+
+    <details class="solution">
+      <summary>🟢 <em>Beginner</em> — Why does this design use consistent hashing rather than <code>hash(key) % N</code>?</summary>
+      <p>Because the requirement is <strong>incremental scalability</strong> — adding or removing one node at a
+         time — and modulo hashing makes that catastrophic.</p>
+      <p>With <code>hash(key) % N</code>, changing N changes the mapping for essentially every key: going from 10
+         nodes to 11 remaps ~90% of the keyspace. In a storage system that means physically moving 90% of the data
+         while serving traffic — effectively impossible.</p>
+      <p><strong>Consistent hashing remaps only ~1/N of keys</strong>, and crucially those keys all come from a
+         single neighbour on the ring, so exactly one node streams data to the joining node while the rest of the
+         cluster is untouched.</p>
+      <p><strong>Virtual nodes</strong> matter for two further reasons here. First, random placement of a few
+         physical nodes produces very uneven ring arcs — one node could own 40% of the keyspace. With ~150 vnodes
+         each, distribution smooths to within a few percent. Second, and more important for a storage system, when
+         a node dies its ranges scatter across <em>all</em> surviving nodes rather than dumping entirely on one
+         successor — so recovery load is shared, and a replacement rebuilds by streaming from many peers in
+         parallel.</p>
+      <p>The ring also gives replica placement naturally: the preference list is simply the next N distinct
+         physical nodes clockwise, so replication falls out of the partitioning scheme rather than needing separate
+         machinery.</p>
+    </details>
+
+    <details class="solution">
+      <summary>🟡 <em>Mid</em> — What is a sloppy quorum, and what does it cost?</summary>
+      <p>A <strong>strict quorum</strong> requires W acknowledgements from the key's actual preference list. If
+         enough of those nodes are unreachable, the write fails — which directly contradicts the "always writable"
+         requirement.</p>
+      <p>A <strong>sloppy quorum</strong> instead accepts acknowledgements from the first W <em>healthy</em> nodes
+         on the ring, even if they aren't the designated replicas. The substitute stores the data with a
+         <strong>hint</strong> naming the intended owner and hands it off when that node recovers.</p>
+      <pre>Preference list [A, B, C]; B is down.
+Write goes to A, C and D, where D holds it tagged "belongs to B".
+The write SUCCEEDS. Availability preserved. ✓</pre>
+      <p><strong>The cost is that R+W&gt;N no longer guarantees overlap.</strong> The data now lives partly on a node
+         that no reader will consult, so a subsequent read of the preference list can miss it entirely. The
+         guarantee degrades from "a read sees the latest acknowledged write" to "a read sees it eventually, once
+         handoff completes."</p>
+      <p>That's the subtlety worth naming: many designs cite R+W&gt;N as their consistency argument while also
+         enabling sloppy quorums, without noticing the two are in tension. It's a deliberate trade — availability
+         now, consistency shortly — but it should be stated rather than assumed away.</p>
+      <p><strong>A second failure mode:</strong> hinted handoff is not durable. If D dies before delivering its
+         hints, those writes never reach B and are recoverable only from A or C via anti-entropy. Hints are a fast
+         path, which is exactly why background repair remains necessary.</p>
+    </details>
+
+    <details class="solution">
+      <summary>🟡 <em>Mid</em> — Trace a vector clock conflict and explain how it's resolved.</summary>
+      <pre>Start: put("cart") via node A → v1: [milk], vc {A:1}
+
+Network partition. Two clients write concurrently from v1:
+  via A:  [milk, bread]    vc {A:2}
+  via B:  [milk, butter]   vc {A:1, B:1}
+
+Partition heals. Compare the clocks:
+  Does {A:2} dominate {A:1,B:1}?   A: 2≥1 ✓   B: 0≥1 ✗   → no
+  Does {A:1,B:1} dominate {A:2}?   A: 1≥2 ✗              → no
+  Neither descends from the other → GENUINE CONCURRENT WRITE.</pre>
+      <p><strong>Detection is the vector clock's job; resolution is not.</strong> The store returns both siblings to
+         the client, because only the application knows the semantics of the data.</p>
+      <p><strong>For a shopping cart the merge is a set union:</strong> <code>[milk, bread, butter]</code> with
+         clock <code>{A:2, B:1}</code>, which now descends from both siblings so the conflict is closed. Union
+         works because it's commutative, associative and idempotent — order of merging doesn't matter.</p>
+      <p><strong>The famous consequence:</strong> an item deleted on one replica can reappear, because the "add"
+         sibling merges with the "remove" sibling and the add wins. Amazon accepted that deliberately — a
+         resurrected item is an annoyance a customer can fix, while a lost item is a lost sale. That it was a
+         <em>business</em> decision, not an oversight, is the point of the example.</p>
+      <p><strong>Contrast with last-write-wins:</strong> LWW would keep whichever write had the later timestamp and
+         silently discard the other, so one customer's addition simply vanishes. It's one line of code versus
+         sibling handling, and it also depends on synchronised clocks — skew can make an older write win
+         permanently.</p>
+      <p><strong>The practical caveat:</strong> vector clocks grow with the number of nodes that write a key.
+         Dynamo truncates the oldest entries, which can produce false conflicts (siblings reported for writes that
+         were actually ordered) — safe, since a false conflict causes an unnecessary merge rather than data loss.</p>
+    </details>
+
+    <details class="solution">
+      <summary>🔴 <em>Senior</em> — Justify the storage engine choice, and name its operational cost.</summary>
+      <p>An <strong>LSM tree</strong>, because the design is write-optimised by requirement — it accepts writes even
+         during failures, so write throughput is the priority.</p>
+      <p><strong>The mechanism:</strong> writes go to an in-memory memtable plus an append-only write-ahead log —
+         sequential I/O, no seeks. The memtable is periodically flushed to an immutable SSTable, and background
+         compaction merges SSTables to reclaim space and bound read cost.</p>
+      <pre>B-tree:  in-place page updates → RANDOM I/O per write, page splits,
+         fragmentation. Reads are excellent (one seek, O(log n)).
+LSM:     append-only → SEQUENTIAL writes, far higher throughput.
+         Reads may consult several SSTables → slower.</pre>
+      <p><strong>Read cost is mitigated</strong> by a <a href="bloom-merkle.html">Bloom filter</a> per SSTable
+         answering "definitely not here", which eliminates disk seeks for files that cannot contain the key — plus
+         a sparse index and block cache for those that remain. Note the guarantee direction matters: a false
+         positive costs one wasted seek, whereas a false negative would return wrong data.</p>
+      <p><strong>The operational cost is compaction,</strong> and it's the thing that actually bites in
+         production:</p>
+      <p>• It consumes I/O and CPU continuously, competing with live traffic — so you must provision headroom and
+         throttle it, rather than running near capacity.<br>
+         • <strong>Write amplification:</strong> a value may be rewritten several times as it moves through
+         compaction levels, so the disk sees multiples of your logical write volume.<br>
+         • <strong>"Compaction storms"</strong> — a burst of compaction saturating I/O and spiking read latency —
+         are the classic Cassandra incident.<br>
+         • <strong>Strategy matters:</strong> size-tiered compaction favours writes but leaves more SSTables to
+         read; levelled compaction favours reads at higher write amplification. That choice should follow the
+         workload, and getting it wrong is a common source of unexplained latency.</p>
+      <p><strong>The framing:</strong> LSM trades predictable background work for much higher write throughput.
+         That's the right trade when writes dominate and you can afford I/O headroom — and the wrong one for a
+         read-dominated workload on constrained hardware, where a B-tree's simplicity wins.</p>
+    </details>
+
+    <details class="solution">
+      <summary>🔴 <em>Senior</em> — When is this architecture the wrong choice?</summary>
+      <p>It's a specialised design that buys availability at real cost, so it's wrong whenever those costs aren't
+         worth paying:</p>
+      <p><strong>1. When you need transactions across keys.</strong> There are none. An operation touching two keys
+         atomically — transferring money, decrementing inventory while creating an order — cannot be expressed. You
+         would need sagas and compensation, which is far more application complexity than a relational database
+         transaction.</p>
+      <p><strong>2. When queries aren't key lookups.</strong> No joins, no range scans, no ad-hoc filtering.
+         "Find all orders over £100 last week" requires either a full scan or a separately maintained index. If the
+         access patterns aren't known up front and stable, this is the wrong model.</p>
+      <p><strong>3. When correctness beats availability.</strong> The AP choice means accepting stale reads and
+         concurrent-write conflicts. For inventory decrements, account balances or uniqueness constraints, that's
+         unacceptable — you want <a href="cap-theorem.html">linearizability</a>, which means consensus.</p>
+      <p><strong>4. When the application can't merge conflicts.</strong> The design pushes resolution to the
+         application. A shopping cart merges naturally by union; a bank balance does not — "£100 and £150
+         concurrently" has no sensible merge. If your data lacks a natural merge semantic, you're choosing between
+         silent LWW loss and unresolvable siblings.</p>
+      <p><strong>5. When the scale doesn't justify it.</strong> This is genuinely the most common case. A single
+         Postgres instance with replicas handles workloads far larger than most people assume, and it gives you
+         transactions, joins, indexes and strong consistency for free. Adopting a Dynamo-style store at moderate
+         scale means paying all the operational cost — compaction tuning, repair scheduling, tombstone management,
+         conflict resolution — for capacity you don't need.</p>
+      <p><strong>What I'd say in an interview:</strong> this architecture is right for high-volume,
+         key-addressable, availability-critical workloads where the application can tolerate eventual consistency
+         and resolve conflicts meaningfully — session stores, shopping carts, user preferences, activity feeds,
+         time-series ingestion. Reaching for it by default is over-engineering, and recognising that is more
+         valuable than reciting the design.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise">
+      <strong>Exercise 1 (Easy):</strong> With N=5, list every (W,R) pair satisfying R+W&gt;N, and pick one for a
+      write-heavy log and one for a read-heavy config store.
+      <details class="solution"><summary>Solution</summary>
+      <pre>R+W &gt; 5 requires R+W ≥ 6:
+   W=1,R=5   W=2,R=4   W=3,R=3   W=4,R=2   W=5,R=1
+   (and any larger combination)</pre>
+      <p><strong>Write-heavy log → W=1, R=5.</strong> Writes ack from a single replica, so ingestion is fast and
+         stays available while up to 4 nodes are down. The rare read pays the cost. In practice a log might drop
+         the overlap requirement entirely (W=1, R=1), since stale reads of log data are usually harmless.</p>
+      <p><strong>Read-heavy config store → W=4, R=2.</strong> Config changes are rare, so expensive writes are
+         acceptable; reads happen constantly and must be fast.</p>
+      <p><strong>Why not W=5, R=1</strong> — the tempting answer? Requiring all five replicas means <em>any</em>
+         single node being down blocks all writes. That's the coupling trap from the
+         <a href="replication.html">replication lesson</a>: requiring all of N multiplies failure probability, so
+         W=N makes writes less available than a single node. W=4 keeps fast reads while tolerating one failure.</p>
+      <p><strong>The general rule:</strong> put the cost on the rarer operation, then check the failure tolerance
+         you've implicitly chosen. Every quorum choice is simultaneously a latency decision and an availability
+         decision.</p>
+      </details>
+    </div>
+
+    <div class="exercise">
+      <strong>Exercise 2 (Easy):</strong> A key's preference list is computed by taking the next 3 vnodes
+      clockwise. Why is that a bug?
+      <details class="solution"><summary>Solution</summary>
+      <p>Because <strong>consecutive vnodes frequently belong to the same physical node.</strong> With 10 machines
+         × 150 vnodes each, the next three positions on the ring are quite likely to include two or three vnodes
+         from one machine.</p>
+      <pre>Intended: RF=3 → three copies on three machines.
+Reality:  three vnodes might map to  [node-7, node-7, node-3]
+          → only TWO physical copies
+          or worse: [node-7, node-7, node-7] → ONE copy.
+
+You believe you can survive two failures. You cannot survive one.
+And it is completely invisible until that machine dies.</pre>
+      <p><strong>The fix</strong> is to walk clockwise while <em>skipping vnodes whose physical node is already in
+         the preference list</em> — the "preference list" construction from the Dynamo paper — so you collect N
+         distinct machines rather than N ring positions.</p>
+      <p><strong>The stronger fix</strong> extends this to failure domains: skip nodes in a rack or availability
+         zone already represented, so the three replicas land in three independent failure domains. Three copies in
+         one rack all die together in a single power or switch failure, which is the correlated-failure problem
+         from <a href="estimation.html">estimation</a> — independent-failure maths gives beautiful availability
+         numbers that reality doesn't honour.</p>
+      <p>This also constrains your replication factor: RF=3 across only 2 AZs is unsatisfiable if you require one
+         replica per AZ, so topology and RF have to be chosen together.</p>
+      </details>
+    </div>
+
+    <div class="exercise">
+      <strong>Exercise 3 (Medium):</strong> Implement vector clock comparison — returning BEFORE, AFTER, EQUAL or
+      CONCURRENT.
+      <details class="solution"><summary>Solution</summary>
+      <pre>def compare(vc1, vc2):
+    """Compare two vector clocks: dicts of {node_id: counter}.
+    Returns 'BEFORE', 'AFTER', 'EQUAL', or 'CONCURRENT'."""
+    # A dominates B if A[n] &gt;= B[n] for EVERY node n present in either.
+    nodes = set(vc1) | set(vc2)
+    vc1_greater = False        # vc1 exceeds vc2 somewhere
+    vc2_greater = False        # vc2 exceeds vc1 somewhere
+
+    for n in nodes:
+        a, b = vc1.get(n, 0), vc2.get(n, 0)
+        if a &gt; b: vc1_greater = True
+        if b &gt; a: vc2_greater = True
+
+    if vc1_greater and vc2_greater: return 'CONCURRENT'   # genuine conflict
+    if vc1_greater:                 return 'AFTER'        # vc1 descends
+    if vc2_greater:                 return 'BEFORE'       # vc2 descends
+    return 'EQUAL'
+
+
+def merge(vc1, vc2):
+    """Clock for a value merged from both: element-wise maximum."""
+    return {n: max(vc1.get(n, 0), vc2.get(n, 0)) for n in set(vc1) | set(vc2)}
+
+
+def demo():
+    assert compare({'A': 2}, {'A': 1}) == 'AFTER'
+    assert compare({'A': 1}, {'A': 2}) == 'BEFORE'
+    assert compare({'A': 1}, {'A': 1}) == 'EQUAL'
+    # The case that matters: neither dominates → true concurrency
+    assert compare({'A': 2}, {'A': 1, 'B': 1}) == 'CONCURRENT'
+    # A missing node counts as 0, not as "unknown"
+    assert compare({'A': 1, 'B': 1}, {'A': 1}) == 'AFTER'
+    assert merge({'A': 2}, {'A': 1, 'B': 1}) == {'A': 2, 'B': 1}
+    print("ok — vector clock comparison")
+
+if __name__ == "__main__":
+    demo()</pre>
+      <p><strong>The key insight in the algorithm:</strong> track <em>both</em> directions of dominance in one pass.
+         If each clock exceeds the other at some node, neither descends from the other — that is the definition of
+         concurrency, and it's exactly the case that must produce siblings rather than a silent overwrite.</p>
+      <p><strong>Treating a missing node as 0 is deliberate:</strong> a node absent from a clock has simply never
+         written that key, which is equivalent to counter 0. Getting this wrong (treating absence as "unknown" and
+         bailing out) makes the comparison report false conflicts everywhere.</p>
+      <p><strong>The merge is element-wise maximum</strong>, producing a clock that dominates both inputs — so once
+         the application merges the values, the resulting version supersedes both siblings and the conflict is
+         resolved rather than perpetuated.</p>
+      <p>In production you'd also bound clock size: Dynamo truncates the oldest (node, counter) entries past a
+         limit, accepting occasional false conflicts — safe, because a false conflict causes an unnecessary merge
+         rather than data loss.</p>
+      </details>
+    </div>
+
+    <div class="exercise">
+      <strong>Exercise 4 (Medium):</strong> A node is down for 3 hours. Trace exactly how it catches up when it
+      returns.
+      <details class="solution"><summary>Solution</summary>
+      <p>Three mechanisms operate at different timescales, and they're complementary rather than redundant:</p>
+      <p><strong>1. Hinted handoff — the fast path (seconds to minutes).</strong> While the node was down, writes
+         destined for it went to substitute nodes tagged with hints. On recovery, gossip propagates that the node
+         is back, and hint-holders replay the stored writes to it. This recovers the majority of missed data
+         quickly and cheaply.</p>
+      <p><em>Limitation:</em> hints are usually capped by time and volume — after several hours, hint-holders stop
+         accumulating them (otherwise a long outage would exhaust their disks). At 3 hours, some hints may already
+         have been dropped, which is precisely why the next mechanism exists.</p>
+      <p><strong>2. Read repair — opportunistic (immediate, for hot data).</strong> As reads arrive, a quorum read
+         that returns mismatched versions triggers a write-back of the newest value to the stale replica. Keys that
+         are actually being read get repaired essentially for free, on the hot path — so the data users care about
+         converges first.</p>
+      <p><em>Limitation:</em> it only fixes keys that happen to be read. Cold data stays stale indefinitely.</p>
+      <p><strong>3. Anti-entropy — the backstop (scheduled, hours).</strong> Merkle-tree comparison per token range
+         finds every remaining difference in O(log n) hash exchanges and streams only the differing blocks. This is
+         the mechanism that guarantees eventual convergence for data nobody reads.</p>
+      <pre>Exchange root hashes per token range → equal? done (O(1)).
+Differ → descend, pruning matching subtrees → transfer only the
+differing blocks. Full repair is expensive (it reads all data),
+so it runs on a rolling, throttled schedule.</pre>
+      <p><strong>The critical operational constraint:</strong> repair must complete within the <em>tombstone grace
+         period</em>. If the returning node missed a DELETE and the tombstone is garbage-collected elsewhere before
+         repair runs, anti-entropy sees the row present on one replica and absent on others — and "repairs" by
+         copying the deleted data <strong>back into existence</strong>. Deleted records resurrect. This is why
+         Cassandra ties repair frequency to <code>gc_grace_seconds</code> as a hard rule rather than a
+         recommendation.</p>
+      <p><strong>One more consideration:</strong> if the node was down long enough to have diverged nearly
+         everywhere, a Merkle diff visits almost every node and costs more than simply bootstrapping it from
+         scratch. The operational decision rule is <em>repair when differences are few, rebuild when they're
+         many</em>.</p>
+      </details>
+    </div>
+
+    <div class="exercise">
+      <strong>Exercise 5 (Hard):</strong> Design the shopping cart on top of this store. Handle the "deleted item
+      reappears" problem.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The naive model causes the problem.</strong> If the cart is stored as a set of items and merged by
+         union, then a remove on one replica concurrent with any write on another loses to the union — the removed
+         item comes back.</p>
+      <pre>Replica A: cart = {milk, eggs}      user removes eggs → {milk}
+Replica B: cart = {milk, eggs}      user adds bread     → {milk, eggs, bread}
+Merge (union):                      {milk, eggs, bread}
+→ "eggs" is back. The removal was silently undone.</pre>
+      <p><strong>Fix: model the cart as an OR-Set (observed-remove set)</strong> — store adds and removes as
+         separate facts with unique tags, rather than storing a set of current members:</p>
+      <pre>adds:    {(milk, tag1), (eggs, tag2), (bread, tag4)}
+removes: {tag2}                       ← removes reference the TAG it observed
+
+current = adds whose tags are not in removes = {milk, bread}   ✓</pre>
+      <p>Now the merge is a union of both sets, which is still commutative and associative, but a remove
+         <em>persists</em> because it names the specific add it cancelled. Eggs stays removed.</p>
+      <p><strong>The residual case, stated honestly:</strong> if a user removes eggs on one device while
+         <em>adding</em> eggs on another concurrently, the new add has a different tag that no remove references —
+         so eggs remains in the cart. That's arguably correct (the user did add it), and it's the OR-Set's
+         documented bias: <em>concurrent add wins over remove</em>. Every CRDT has such a bias, and knowing yours is
+         part of choosing it.</p>
+      <p><strong>Quantity, which the set model ignores:</strong> for "2 × milk", use a PN-Counter per item (a
+         per-replica pair of increment and decrement counters, merged by taking the max of each) rather than a
+         single number, since a plain integer has no meaningful merge.</p>
+      <p><strong>Practical additions:</strong></p>
+      <p>• <strong>Garbage-collect tombstones</strong> — removed tags accumulate forever otherwise. Prune them once
+         all replicas have observed the remove (or at checkout, when the cart is emptied anyway).<br>
+         • <strong>Set N=3, W=1, R=2</strong> — "always writable" is the requirement, so an add must never be
+         rejected; reads consult two replicas to catch most divergence.<br>
+         • <strong>Validate at checkout, not in the cart.</strong> Stock availability and pricing are checked when
+         the order is placed, against a <a href="cap-theorem.html">linearizable</a> store. The cart can be
+         eventually consistent precisely because it is <em>not</em> the system of record — that separation is what
+         makes the whole AP design acceptable.</p>
+      </details>
+    </div>
+
+    <div class="exercise">
+      <strong>Exercise 6 (Hard):</strong> Your cluster reports 99.9% availability, but one customer's writes fail
+      regularly. Diagnose.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Aggregate availability hiding a localised failure</strong> — the cluster average is dominated by
+         customers whose keys are healthy, so a subset failing entirely barely moves the number. The clue is that
+         it's one <em>customer</em>, meaning their keys share something.</p>
+      <p><strong>Candidate causes, in order:</strong></p>
+      <p><strong>1. Their keys map to a degraded preference list.</strong> If two of the three nodes owning their
+         key range are down or overloaded, a W=2 write fails <em>for those keys only</em>. Everyone else is fine.
+         <em>Check:</em> compute the preference list for the failing keys and inspect the health of exactly those
+         nodes. This is the most likely cause and the easiest to miss, because node-level dashboards look mostly
+         green.</p>
+      <p><strong>2. A hot partition.</strong> If this customer is large and their data concentrates on one
+         partition — a wide partition, or a key with a low-cardinality prefix — that node saturates and times out
+         under load while the rest of the cluster idles. <em>Check:</em> per-node request rates and partition
+         sizes. <em>Fix:</em> add a bucketing component to the key so their data spreads.</p>
+      <p><strong>3. Wide partitions causing timeouts.</strong> One partition holding millions of values makes reads
+         and compactions on it slow enough to breach timeouts. This is a schema problem, not a capacity problem —
+         adding nodes won't help, because the partition stays whole.</p>
+      <p><strong>4. Correlated placement.</strong> If their replicas landed in one rack or AZ (the preference-list
+         bug from Exercise 2), a single domain failure takes out all copies of their data while cluster-wide
+         availability barely registers it.</p>
+      <p><strong>5. Their quorum settings differ</strong> — a stricter W for this tenant, or a client library
+         configured with W=N, which fails whenever any replica is down.</p>
+      <p><strong>The measurement lesson, which is the real point:</strong> cluster-wide availability is the wrong
+         SLI. Per the <a href="observability.html">observability lesson</a>, aggregate metrics average away
+         localised failure. You need availability measured <strong>per tenant and per token range</strong>, because
+         "99.9% overall" and "one customer at 60%" are simultaneously true — and only the second one generates
+         support tickets. I'd add per-tenant success-rate alerting as the durable fix, independent of whichever
+         cause turns out to be responsible today.</p>
+      </details>
+    </div>
+
+    <div class="takeaways">
+      <h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>"Always writable" is the requirement that drives everything</strong> — the AP choice makes leaderless writes, quorums, vector clocks and hinted handoff all follow.</li>
+        <li><strong>R+W&gt;N gives recency, not linearizability.</strong> Concurrent writes remain unordered and partial writes have no rollback.</li>
+        <li><strong>Sloppy quorums break the R+W&gt;N guarantee</strong> by placing data outside the preference list — available now, consistent after handoff.</li>
+        <li><strong>Replica placement must skip duplicate physical nodes and failure domains</strong>, or "RF=3" silently becomes one copy on one machine.</li>
+        <li><strong>Vector clocks detect concurrency; they don't resolve it.</strong> Resolution belongs to the application, because only it knows the merge semantics.</li>
+        <li><strong>Last-write-wins silently discards data</strong> and trusts synchronised clocks — acceptable only where losing a concurrent write is genuinely fine.</li>
+        <li><strong>The reappearing-item trade was a business decision:</strong> a resurrected item costs less than a lost sale. Name the bias of whatever CRDT you choose.</li>
+        <li><strong>LSM trees suit write-heavy stores</strong> (sequential appends), with Bloom filters mitigating the read cost — and compaction as the ongoing operational tax.</li>
+        <li><strong>Hinted handoff is a fast path, not durability.</strong> Anti-entropy is the guarantee.</li>
+        <li><strong>Repair must run inside the tombstone grace period</strong>, or deleted data is resurrected by the repair process itself.</li>
+        <li><strong>Aggregate availability hides per-tenant failure</strong> — measure per tenant and per token range.</li>
+        <li><strong>This is the wrong store for transactions, joins, or correctness-critical data</strong> — and usually over-engineering below very large scale.</li>
+      </ul>
+    </div>
 
     <div class="pager">
       <a class="btn btn-outline" href="design-id-generator.html">← Design Unique ID Generator</a>
