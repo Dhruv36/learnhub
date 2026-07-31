@@ -72,6 +72,10 @@ def check_file(path):
             frag = body[bad.start():bad.start() + 40].replace("\n", " ")
             errors.append(f"line ~{line}: unescaped '<' in <pre>: {frag!r}")
 
+    # Redirect stubs (old combined lessons kept so external links survive) are
+    # not lessons: they carry no sidebar/nav and are meant to be tiny.
+    is_stub = 'http-equiv="refresh"' in src
+
     # Structural expectations for a v4 lesson.
     stats = {
         "kb":        len(src) // 1024,
@@ -81,7 +85,7 @@ def check_file(path):
         "takeaways": src.count('class="takeaways"'),
         "pager":     src.count('class="pager"'),
     }
-    if name != "quiz.html":
+    if name != "quiz.html" and not is_stub:
         if stats["kb"] < 20:
             warnings.append(f"only {stats['kb']}KB (v4 target 20KB+)")
         if stats["solution"] < 12:
@@ -96,9 +100,14 @@ def check_file(path):
             if required not in src:
                 errors.append(f"missing asset reference: {required}")
 
-    # Internal links must resolve.
+    # Internal links must resolve. Code samples inside <pre> are illustrative
+    # (lessons teach relative paths with hrefs like "/menu.html" that are not
+    # real site links), so strip pre blocks before scanning.
     d = os.path.dirname(path)
-    for m in re.finditer(r'href="([^"#?:]+\.html)([^"]*)"', src):
+    # Blank out pre bodies rather than deleting them, so line numbers still match.
+    linkable = re.sub(r"<pre>.*?</pre>",
+                      lambda m: "\n" * m.group(0).count("\n"), src, flags=re.S)
+    for m in re.finditer(r'href="([^"#?:]+\.html)([^"]*)"', linkable):
         target = m.group(1)
         if target.startswith("http"):
             continue
