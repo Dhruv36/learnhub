@@ -112,7 +112,9 @@ def check_file(path):
 
 def main():
     root = sys.argv[1]
-    files = sys.argv[2:] or sorted(
+    # explicit names are relative to root, same as the directory listing below —
+    # otherwise `validate.py tutorials/python index.html` silently checks ./index.html
+    files = [os.path.join(root, f) for f in sys.argv[2:]] or sorted(
         os.path.join(root, f) for f in os.listdir(root) if f.endswith(".html"))
     total_err = 0
     for path in files:
