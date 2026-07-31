@@ -15,7 +15,7 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 3 | JavaScript | 16 | 200 | ✅ DONE |
 | 4 | React | 12 | 200 | ✅ DONE |
 | 5 | Node.js | 12 | 200 | ✅ DONE |
-| 6 | Python | 12 | 200 | ✅ DONE |
+| 6 | Python | 12 | 200 | ✅ v3 done · 🔄 v4 1/12 |
 | 7 | Java | 12 | 200 | ✅ DONE |
 | 8 | SQL | 12 | 200 | ✅ DONE |
 | 9 | MongoDB | 12 | 200 | ✅ DONE |
@@ -28,7 +28,7 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 16 | .NET (C#) | 23 (v4) | 200 | ✅ DONE |
 | 17 | ASP.NET Core | 12 | 200 | ✅ DONE |
 | 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | ✅ DONE |
-| 19 | System Design | 44 lessons (Fundamentals ×11 + Deep Dives ×6 + Case Studies ×12 + Senior/Staff ×7) | 200 | ✅ DONE |
+| 19 | System Design | 36 lessons (Fundamentals ×11 + Deep Dives ×6 + Case Studies ×12 + Senior/Staff ×7) | 200 | ✅ DONE (v4) |
 
 **v3 build-out done: 19 full tracks (3,800 quiz questions), all committed & pushed.**
 
@@ -40,7 +40,7 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 **Decisions (user-confirmed via AskUserQuestion):**
 1. **Expand curriculum** — split combined topics into focused lessons at 3–5× depth (not deepen-in-place). E.g., JS "Closures & this" → 4 separate lessons. Tracks grow from ~12–16 to ~30+ lessons.
-2. **Work in site order, tracks 1→19**: HTML → CSS → JavaScript → React → Node.js → Python → Java → SQL → MongoDB → Redis → Docker → Kubernetes → AWS → CI/CD → Angular → .NET → ASP.NET Core → LeetCode → System Design. Complete each track fully before moving on.
+2. ~~**Work in site order, tracks 1→19**~~ — **SUPERSEDED 2026-07-30 by the damage-order queue below.** Site order polished 8 tracks while the highest-value ones sat at v3. Still true: complete each track fully before moving on.
 
 ### v4 mastery lesson format (supersedes v3 skeleton for lesson depth; same HTML shell/header/sidebar/pager)
 Target **~500–700 lines (~35–50KB)** per lesson. Structure:
@@ -65,7 +65,24 @@ Target **~500–700 lines (~35–50KB)** per lesson. Structure:
 | 15 | Angular | ✅ **DONE (v4, 2026-07-19)** — **23 lessons** at mastery depth across 8 sections: Foundations ×4 (index=Components & Standalone, data-binding=Templates, directives=Control Flow, pipes), Components & Reactivity ×4 (component-communication, lifecycle, signals, change-detection), Services & DI ×2 (services-di, di-advanced), RxJS ×2 (rxjs, rxjs-patterns), Forms ×3 (template-forms, forms=Reactive, form-validation incl. CVA), Routing & HTTP ×3 (routing, guards-lazy, http), State ×2 (state-management, ngrx), Production ×3 (testing, performance, enterprise=SSR/i18n/security/monorepo). 12 rewritten in place + 11 new files. Modern Angular throughout: standalone, signals, @if/@for, functional guards/interceptors, zoneless, httpResource. Link-audited clean; quiz retuned (9 swaps: linkedSignal/resource, multi-providers, inject-context, catchError placement, takeUntilDestroyed, lifecycle, CVA, track identity) — 10/200/0. |
 | 16 | .NET (C#) | ✅ **DONE (v4, 2026-07-27)** — **23 lessons** at mastery depth across 6 sections: Foundations ×5 (index=How It Runs, types, control-flow, strings, methods), Object-Oriented C# ×5 (oop, inheritance, records-structs, generics, pattern-matching), Core Libraries ×4 (collections-generics, linq, delegates-events, exceptions-nullability), Async & Concurrency ×3 (async-await, **async-patterns** new, **threading** new), Runtime & Performance ×2 (memory, performance-aot), Professional ×4 (di-hosting, efcore, testing, **modern-csharp** new capstone). 12 rewritten in place + 11 new files. Modern throughout: primary constructors, collection expressions, required/init, TimeProvider, Channels, ExecuteUpdate/Delete, source generators, NativeAOT. Link-audited clean (0 broken); pager chain verified against nav order end to end; quiz banks retuned (14 swaps) — 10/200/0. |
 | 19 | System Design | ✅ **DONE (v4, 2026-07-30)** — **all 36 lessons rebuilt**, 30–61KB each (1.8 MB total), every one with 12 `<details>` (6 tiered interview Qs + 6 graded exercises), Common Mistakes table and Key Takeaways. **Whole track passes `python validate.py tutorials/system-design` with 0 errors.** §1 Fundamentals 11/11 · §2 Deep Dives 6/6 · §3 Case Studies 12/12 · §4 Senior/Staff 7/7. Uses the **tradeoff-driven SD format**; case studies use the **case-study format** (both below). Quiz bank still the v3 200-Q set — retune to the v4 curriculum when convenient. |
-| 5–18 | all others | ⏳ pending (still at v3 depth) — see damage-order queue below |
+| 6 | Python | 🔄 **IN PROGRESS (started 2026-07-30)** — **1/12 lessons** at v4. Track order: `index` → control-flow → data-structures → strings-io → oop → comprehensions-generators → decorators-context → modules-packaging → typing → concurrency → testing → fastapi. Uses the **language-track v4 format** (6 Parts → Common Mistakes → 6 tiered Qs → 6 graded exercises → Takeaways), *not* the SD tradeoff format. **Note:** v3 Python content was thin but *correct* (name/object model explained properly) — this track is expansion, not reconstruction, so it should move faster than System Design did. |
+| 5, 7–18 | all others | ⏳ pending (still at v3 depth) — see damage-order queue below |
+
+#### Python v4 — per-lesson status
+| # | Lesson | v3 | v4 | Status |
+|---|--------|----|----|--------|
+| 1 | index.html (Syntax, Types & Variables) | 8KB | **35KB** | ✅ det=12 ex=6 tbl=5, 0 errors. Parts: name/object model · core types · strong+dynamic typing · idioms · **deep dive: mutable default argument** · **deep dive: copying**. |
+| 2 | control-flow.html (Control Flow & Functions) | 8KB | — | ⏳ **NEXT** |
+| 3 | data-structures.html | 8KB | — | ⏳ |
+| 4 | strings-io.html | 7KB | — | ⏳ |
+| 5 | oop.html (OOP & Dataclasses) | 9KB | — | ⏳ |
+| 6 | comprehensions-generators.html | 8KB | — | ⏳ |
+| 7 | decorators-context.html | 9KB | — | ⏳ |
+| 8 | modules-packaging.html | 8KB | — | ⏳ |
+| 9 | typing.html (Type Hints) | 8KB | — | ⏳ |
+| 10 | concurrency.html (GIL, Threads, Async) | 9KB | — | ⏳ |
+| 11 | testing.html (pytest) | 8KB | — | ⏳ |
+| 12 | fastapi.html (Production APIs) | 9KB | — | ⏳ |
 
 ### ⚠️ Order changed 2026-07-30 (user: "junior, mid and senior can't refer to this — content not up to the mark")
 
@@ -73,10 +90,12 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 
 **New queue, by damage (user-confirmed):**
 1. ~~**System Design** (36)~~ ✅ **COMPLETE 2026-07-30** — 36/36 at 30–61KB, 0 validation errors
-2. **Python** (12), **SQL** (12) — highest junior/mid traffic, 7–9KB
+2. 🔄 **Python** (1/12 done) ← **CURRENT**, then **SQL** (12) — highest junior/mid traffic, 7–9KB
 3. **LeetCode** (21) — 11KB, needs graded sets + batch-2 patterns
 4. **ASP.NET Core** (12, 13KB), **Node.js** (10 lessons @ 24KB — deep but NARROW, needs *more lessons* not deeper ones)
 5. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB)
+
+**Remaining after Python: 10 tracks.** Quiz banks across *every* v4 track (HTML, CSS, JS, React, Angular, .NET, System Design) are still the v3 200-Q sets — not broken, but drifted from the expanded curricula. Retune pass deferred until lessons are done.
 
 ### Tradeoff-driven SD lesson format (System Design only — supersedes the language-track recipe for this track)
 Language tracks hit depth via tiered interview Qs + graded coding exercises. System Design needs a different shape — same shell/sidebar/pager and same 12-`<details>` volume, but:
@@ -101,7 +120,17 @@ Same shell and same volume (12 `<details>` = 6 tiered Qs + 6 graded exercises, 2
 7. **Bottlenecks & scaling** — what breaks first at 10×, and the fix
 8. Common Mistakes → 6 tiered interview Qs → 6 graded exercises → Key Takeaways → pager
 
-**Validate every lesson with `python validate.py tutorials/system-design [file...]`** (in repo root). It parses the HTML, checks tag nesting, catches unescaped `<` inside `<pre>`, verifies required asset refs and v4 structure counts, and resolves every internal link. Expect `[ ok ]` and `0 errors`.
+### ✅ validate.py — required check on every lesson, every track
+
+**Run from repo root: `python validate.py tutorials/<track> [file.html ...]`**
+- Arg 1 is the **directory**; extra args are filenames **relative to it** (`validate.py tutorials/python index.html`). Omit filenames to check the whole track.
+- Checks: HTML tag nesting, **unescaped `<` inside `<pre>`**, required asset refs, v4 structure counts (`det=12 ex=6`), and resolves every internal link.
+- Expect `[ ok ] name  NNkB  det=12 ex=6 tbl=N` and `0 errors`. Exits 1 on any error.
+- On Windows, prefix with `PYTHONIOENCODING=utf-8` or the emoji/em-dashes crash the console writer (cp1252) — a *reporting* failure, not a file problem.
+
+**This is not optional ceremony — it caught 6 real bugs in System Design** that source review missed, including an unescaped `<` that silently swallowed a document from line 200 to `</main>`, and an `<a>` tag nested inside a `<pre>`. Browsers fail these silently.
+
+> **Fixed 2026-07-30:** explicit filenames weren't joined to the root dir, so `validate.py tutorials/python index.html` silently checked `./index.html` (the site homepage) and reported bogus missing-asset errors. A checker that inspects the wrong file while reporting confidently is worse than none — re-verify this behaviour if the script is ever refactored.
 
 Quizzes: existing 200-Q banks stay; extend/retune only after a track's lessons are done, if question topics drifted.
 
