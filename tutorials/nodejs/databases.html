@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Databases &amp; ORMs — Node.js — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../../playground/index.html">Playground</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Databases &amp; ORMs <span class="level-badge level-adv">Data &amp; Auth</span></h1>
+    <p><strong>What you'll master:</strong> connection pooling and why its size is a capacity decision,
+       parameterized queries, transactions with correct isolation, the N+1 problem and its fixes, migrations
+       that can run against a live system, and choosing between a driver, a query builder, and an ORM.
+       Prerequisites: <a href="validation-errors.html">Validation &amp; Error Handling</a>,
+       <a href="async-patterns.html">Async Patterns</a>. See also the
+       <a href="../sql/index.html">SQL track</a> for query-level depth.</p>
+
+    <h2>Part 1 — The Connection Pool Is Your Real Concurrency Limit</h2>
+    <pre>import pg from "pg";
+
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,                        // ← the number that governs your throughput
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 5_000, // fail fast when the pool is exhausted
+});
+
+// A TCP connection + auth handshake costs milliseconds — far more than the
+// query itself for typical OLTP work. So you keep connections open and lend
+// them out. Every query borrows one and must return it.
+//
+// max is a CAPACITY DECISION, not a tuning knob to raise when things are slow:
+//   • Postgres has a server-side max_connections (often 100). Your pods
+//     multiply: 20 pods × max 10 = 200 connections > the server limit, and
+//     the failure mode is "too many clients already" under peak load —
+//     precisely when you need the database most.
+//   • Each Postgres connection is a backend process with its own memory.
+//     More connections past the point of saturation makes throughput WORSE,
+//     not better: the database spends time context-switching instead of
+//     working.
+//   • A common starting point is ((core_count × 2) + effective_spindles)
+//     TOTAL across all clients — then measure. Small pools with queueing
+//     usually beat large pools with contention.
+//
+// This is why PgBouncer exists: it multiplexes many client connections onto
+// few server connections, and in serverless environments (where instance
+// count is unbounded) it is effectively mandatory.
+
+const { rows } = await pool.query("SELECT * FROM orders WHERE id = $1", [id]);
+// pool.query borrows and returns automatically — prefer it. Manual connect()
+// requires a finally block, and a missed release leaks a connection until
+// the pool is empty and every request hangs.</pre>
+
+    <h2>Part 2 — Parameterized Queries, Always</h2>
+    <pre>// ❌ String interpolation is SQL injection. Always. No exceptions.
+const q = `SELECT * FROM users WHERE email = '${email}'`;
+// email = "x' OR '1'='1" → returns every user
+// email = "x'; DROP TABLE users; --" → the classic
+
+// ✅ Parameters are sent SEPARATELY from the SQL text:
+await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+// The driver sends the query and the values in different protocol fields, so
+// the database parses the SQL structure BEFORE it ever sees your data. A
+// value can therefore never become syntax — that is the actual guarantee,
+// and it is why parameterization beats escaping (which depends on getting
+// every edge case right, forever).
+
+// Parameters work for VALUES only — not identifiers:
+await pool.query(`SELECT * FROM ${table}`);              // ❌ still injection
+await pool.query("SELECT * FROM $1", [table]);           // ❌ syntax error
+const SAFE_TABLES = { orders: "orders", users: "users" };
+const t = SAFE_TABLES[req.query.table];                  // ✅ allowlist lookup
+if (!t) throw new AppError("Unknown table", { status: 400 });
+
+// Same for ORDER BY and column names — allowlist, never interpolate. This is
+// the identical rule as the sort parameter in the REST lesson, and it is the
+// most common real injection vector left in modern codebases, because people
+// know to parameterize values and forget identifiers cannot be.
+
+// Bulk inserts: build the placeholder list, not the values.
+const values = orders.flatMap((o) => [o.userId, o.total]);
+const placeholders = orders.map((_, i) => `($${i * 2 + 1}, $${i * 2 + 2})`).join(",");
+await pool.query(`INSERT INTO orders (user_id, total) VALUES ${placeholders}`, values);
+// One round trip instead of N. The generated SQL text contains only
+// placeholders; every user value still travels as a parameter.</pre>
+
+    <h2>Part 3 — Transactions</h2>
+    <pre>// A transaction must run on ONE connection — this is the detail that makes
+// naive helper functions silently wrong.
+async function transfer(fromId, toId, amount) {
+  const client = await pool.connect();        // ← check out a single connection
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      "UPDATE accounts SET balance = balance - $2 WHERE id = $1 AND balance >= $2 RETURNING balance",
+      [fromId, amount]);
+    if (rows.length === 0) throw new AppError("Insufficient funds", { status: 409 });
+    await client.query("UPDATE accounts SET balance = balance + $2 WHERE id = $1", [toId, amount]);
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});   // rollback may itself fail
+    throw err;
+  } finally {
+    client.release();              // ← the finally is NOT optional
+  }
+}
+// Using pool.query() for BEGIN/UPDATE/COMMIT would send each statement to a
+// possibly DIFFERENT connection: the BEGIN opens a transaction on one, the
+// UPDATE runs unprotected on another, and the COMMIT commits nothing. It
+// "works" in development because an idle pool keeps handing back the same
+// connection — then corrupts data under load. A genuinely nasty bug class.
+
+// Note the balance check is IN the UPDATE (`AND balance >= $2`), not a
+// separate SELECT. A read-then-write leaves a race window where two
+// concurrent transfers both see sufficient funds; letting the database
+// evaluate the condition while holding the row lock closes it.
+
+// Isolation levels — what your transaction is protected from:
+//   READ COMMITTED  (Postgres default) — no dirty reads. Two reads in the
+//                   same transaction can still differ.
+//   REPEATABLE READ — a repeated read returns the same rows; Postgres also
+//                   prevents write skew via serialization failures.
+//   SERIALIZABLE    — as if transactions ran one at a time. Strongest, and
+//                   it can ABORT your transaction with a serialization
+//                   failure that you MUST be prepared to retry.
+await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+// Choosing SERIALIZABLE without retry logic converts a correctness win into
+// intermittent 500s under contention.</pre>
+
+    <div class="note"><strong>Keep transactions short, and never await unrelated I/O inside one.</strong>
+      An open transaction holds locks and, in Postgres, pins the oldest snapshot the vacuum process can
+      reclaim. A transaction that awaits an HTTP call to a payment provider holds row locks for the entire
+      network round trip — so a slow upstream becomes database-wide lock contention and table bloat. Do
+      external I/O before or after, never inside.</div>
+
+    <h2>Part 4 — The N+1 Problem</h2>
+    <pre>// The single most common performance bug in ORM code.
+const orders = await Order.findAll({ limit: 50 });          // 1 query
+for (const order of orders) {
+  order.user = await User.findByPk(order.userId);           // + 50 queries
+}
+// 51 round trips. At 2ms each that is ~100ms of pure latency, and it grows
+// linearly with page size — so it is invisible on 5 rows in development and
+// catastrophic on 500 in production.
+
+// Fix 1 — JOIN (one query, denormalized rows):
+const rows = await pool.query(`
+  SELECT o.*, u.name AS user_name, u.email AS user_email
+  FROM orders o JOIN users u ON u.id = o.user_id
+  ORDER BY o.created_at DESC LIMIT 50`);
+// Best when you need a few columns from the related table. Costs: repeated
+// user data per row, and JOINs across many tables get expensive.
+
+// Fix 2 — batch the second query (two queries, "dataloader" pattern):
+const orders = await getOrders();
+const userIds = [...new Set(orders.map((o) => o.userId))];      // dedupe!
+const users = await pool.query("SELECT * FROM users WHERE id = ANY($1)", [userIds]);
+const byId = new Map(users.rows.map((u) => [u.id, u]));
+orders.forEach((o) => { o.user = byId.get(o.userId); });
+// Constant 2 queries regardless of page size. This is what DataLoader
+// automates for GraphQL, and what an ORM's `include`/`with` does internally.
+
+// Fix 3 — let the ORM do it, but VERIFY:
+const orders = await Order.findAll({ include: [User], limit: 50 });
+// Turn on query logging in development and count the statements. ORMs make
+// N+1 easy to write and invisible to read — the query log is the only
+// reliable way to know what actually ran. Assertions on query count in
+// integration tests catch regressions that code review will not.</pre>
+
+    <h2>Part 5 — Driver vs Query Builder vs ORM</h2>
+    <pre>// Raw driver (pg, mysql2) — you write SQL.
+await pool.query("SELECT * FROM orders WHERE user_id = $1", [userId]);
+//   + full control, zero abstraction to fight, best performance ceiling
+//   − manual mapping, string SQL scattered through the codebase
+
+// Query builder (Kysely, Knex) — SQL structure, typed composition.
+const orders = await db.selectFrom("orders").selectAll()
+  .where("user_id", "=", userId).orderBy("created_at", "desc").limit(50).execute();
+//   + composable (conditional filters without string concatenation), type-safe
+//   + the generated SQL is predictable — you can reason about it
+//   − still no identity map, no change tracking
+
+// ORM (Prisma, TypeORM, Sequelize, Drizzle) — objects and relations.
+const orders = await prisma.order.findMany({
+  where: { userId }, include: { user: true }, take: 50,
+});
+//   + fast development, migrations, relations, strong typing (Prisma)
+//   − the abstraction leaks exactly when it matters: complex queries,
+//     window functions, CTEs, bulk operations, and performance tuning
+//   − easy to write O(n) queries that look like O(1) code
+
+// How to actually choose:
+//   • CRUD-heavy product with a normal schema → ORM. Development speed is
+//     the dominant cost and the abstraction fits.
+//   • Reporting, analytics, complex joins → query builder or raw SQL.
+//   • Mixed (most real systems) → ORM for the 90%, escape hatch for the 10%.
+//     Every serious ORM has a raw-query API; using it is not a defeat.
+// The non-negotiable: whatever you pick, you must be able to SEE the SQL it
+// generates. A tool whose output you cannot inspect is one you cannot debug
+// or optimize at 3am.</pre>
+
+    <h2>Part 6 — Migrations</h2>
+    <pre>// Migrations are versioned, ordered, committed schema changes — never manual
+// ALTER TABLE against production, because that state exists nowhere in git
+// and cannot be reproduced in staging.
+
+// migrations/20260731120000_add_status_to_orders.sql
+ALTER TABLE orders ADD COLUMN status text NOT NULL DEFAULT 'pending';
+CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status);
+
+// Rules that keep a migration safe on a live system:
+//
+// 1. EXPAND / CONTRACT for anything destructive. To rename a column:
+//    (a) add the new column, (b) write to both, (c) backfill in batches,
+//    (d) move reads over, (e) stop writing the old one, (f) drop it — in
+//    SEPARATE deploys. A rename in one migration breaks every running
+//    instance of the old code the instant it applies. Same pattern as the
+//    API field rename in the REST lesson, for the same reason.
+//
+// 2. CREATE INDEX CONCURRENTLY on large tables. A plain CREATE INDEX takes
+//    a lock that blocks writes for the duration — minutes of downtime on a
+//    big table. CONCURRENTLY cannot run inside a transaction, so most tools
+//    need that migration marked as non-transactional.
+//
+// 3. Backfill in BATCHES, not one UPDATE. A single UPDATE over ten million
+//    rows holds locks, bloats WAL, and can time out — losing all progress.
+//      UPDATE orders SET status='pending'
+//       WHERE id IN (SELECT id FROM orders WHERE status IS NULL LIMIT 1000);
+//    Loop with a pause between batches.
+//
+// 4. Adding a NOT NULL column with a default rewrote the whole table in
+//    older Postgres (&lt; 11). Know your version's behaviour before assuming
+//    a migration is instant.
+//
+// 5. Every migration needs a tested DOWN, or an explicit decision that it is
+//    forward-only. Discovering there is no rollback during an incident is
+//    not the moment to find out.</pre>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Interpolating values into SQL</td><td>SQL injection</td><td>Parameterized queries, always</td></tr>
+      <tr><td>Interpolating table/column names</td><td>Injection that parameterization cannot fix</td><td>Allowlist identifiers</td></tr>
+      <tr><td><code>pool.query</code> for BEGIN/COMMIT</td><td>Statements land on different connections; silent data corruption</td><td>One checked-out client for the whole transaction</td></tr>
+      <tr><td>Missing <code>client.release()</code></td><td>Pool leak — every request eventually hangs</td><td>Release in <code>finally</code></td></tr>
+      <tr><td>Raising pool <code>max</code> to fix slowness</td><td>Exhausts server <code>max_connections</code>; throughput drops</td><td>Size for total capacity; add PgBouncer</td></tr>
+      <tr><td>External HTTP calls inside a transaction</td><td>Row locks held for a network round trip; bloat and contention</td><td>Do I/O outside the transaction</td></tr>
+      <tr><td>Read-then-write for conditional updates</td><td>Race window; two concurrent writers both pass the check</td><td>Put the condition in the UPDATE's WHERE</td></tr>
+      <tr><td>Loops issuing per-row queries</td><td>N+1: latency grows linearly with page size</td><td>JOIN or batch with <code>ANY($1)</code></td></tr>
+      <tr><td><code>CREATE INDEX</code> on a large live table</td><td>Writes blocked for minutes</td><td><code>CONCURRENTLY</code>, outside a transaction</td></tr>
+      <tr><td>Rename in a single migration</td><td>Running instances of old code break instantly</td><td>Expand/contract across deploys</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Why use a connection pool instead of connecting per query?</summary>
+      <p>Establishing a connection requires a TCP handshake plus authentication, which typically costs more
+      than the query itself for ordinary OLTP work. A pool keeps a set of connections open and lends them out,
+      so per-query cost drops to borrowing from memory. It also bounds concurrency: without a pool, a traffic
+      spike opens unlimited connections and exhausts the database's <code>max_connections</code>, taking down
+      every client rather than just queueing.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> How do parameterized queries prevent injection?</summary>
+      <p>The SQL text and the parameter values travel in separate fields of the database protocol. The server
+      parses the statement structure before it ever sees the values, so a value cannot be reinterpreted as
+      syntax no matter what it contains. This is stronger than escaping, which relies on correctly handling
+      every edge case in every encoding forever. The important limitation is that parameters can only stand in
+      for values — table names, column names, and ORDER BY directions cannot be parameterized and must be
+      validated against an allowlist.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What is the N+1 problem and how do you detect it before production?</summary>
+      <p>One query fetches N rows, then a per-row query fetches each row's relation, producing N+1 round trips
+      where two would do. Latency grows linearly with page size, so it is invisible on the small datasets used
+      in development and severe in production. Fixes are a JOIN when you need a few columns from the relation,
+      or batching the second query with <code>WHERE id = ANY($1)</code> over deduplicated ids — the DataLoader
+      pattern — which keeps it at a constant two queries. Detection is the important half: enable query
+      logging in development, and assert on query counts in integration tests, because ORM code that causes
+      N+1 reads identically to code that does not. A test that fails when a loop starts issuing queries is the
+      only durable defence.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why must a transaction use a single checked-out client rather than <code>pool.query</code>?</summary>
+      <p>Because a transaction is state on one connection. <code>pool.query</code> may hand each statement a
+      different connection, so <code>BEGIN</code> opens a transaction on one connection, the writes execute
+      unprotected on others, and <code>COMMIT</code> commits an empty transaction. Nothing errors — the writes
+      happen, just without atomicity, so a failure midway leaves partial state. It is especially dangerous
+      because an idle development pool usually returns the same connection each time, making it work locally
+      and fail only under concurrent load.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A service is slow under load. Metrics show low CPU, low database CPU, but high request latency. Walk through the diagnosis.</summary>
+      <p>Low CPU on both sides with high latency means time is spent waiting rather than working, so I would
+      look for queueing. The prime suspect is connection pool exhaustion: if concurrent requests exceed pool
+      <code>max</code>, requests block waiting to borrow a connection, and that wait appears as request latency
+      while neither CPU shows load. I would confirm by instrumenting pool wait time and in-use count — an
+      exhausted pool is unambiguous in that metric and nearly invisible without it. Common causes are a leaked
+      connection from a missing <code>release()</code> in an error path, transactions held open across external
+      I/O, or genuinely insufficient pool size for the concurrency. The fix depends which: repair the leak, move
+      the I/O out of the transaction, or resize. Resizing needs care, since raising <code>max</code> per
+      instance multiplies across instances and can exceed the server's <code>max_connections</code>, converting
+      a latency problem into a hard outage — which is where PgBouncer belongs. Other candidates with the same
+      signature: lock contention (low CPU, waiting on row locks), a slow upstream inside the request path, or
+      an undersized worker pool. The general principle is that low utilization plus high latency is always a
+      queue somewhere, and the work is finding which queue.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Plan a zero-downtime migration renaming <code>orders.total</code> to <code>orders.total_cents</code> on a large live table.</summary>
+      <p>The constraint is that old and new application code run simultaneously during any rolling deploy, so
+      no single migration may make the schema incompatible with either. I would use expand/contract across
+      several deploys. First, add the new nullable column — additive and instant, with no table rewrite.
+      Second, deploy code that writes both columns and reads the old one, so new writes are complete while old
+      readers still work. Third, backfill historical rows in bounded batches with a pause between them, so
+      locks are short, WAL growth stays manageable, and a timeout loses one batch rather than all progress.
+      Fourth, deploy code that reads the new column and still writes both, then verify with a query that no
+      rows have a null or divergent value. Fifth, stop writing the old column. Finally, drop it, ideally after
+      a bake period long enough that a rollback is still possible. Any index on the new column is created
+      <code>CONCURRENTLY</code> so writes are never blocked. The reason a single-migration rename fails is
+      timing rather than SQL: the moment it applies, every instance still running the previous release
+      references a column that no longer exists, so the deploy breaks production before it finishes. It is the
+      same expand/contract reasoning as the API field rename — make the new thing available, migrate readers,
+      verify with data, then remove.</p></details>
+
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (easy):</strong> Rewrite safely: <code>pool.query(`SELECT * FROM users WHERE email = '${email}'`)</code>
+      <details class="solution"><summary>Solution</summary>
+      <pre>await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+// The SQL text is now a constant. No value of `email` can alter the parsed
+// structure, because values never pass through the parser at all.</pre></details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Why is this a pool leak, and what is the fix? <code>const c = await pool.connect(); const r = await c.query(sql); c.release(); return r;</code>
+      <details class="solution"><summary>Solution</summary>
+      <pre>// If c.query() throws, release() never runs — that connection is gone from
+// the pool forever. After `max` failures every request hangs waiting for a
+// connection that will never come back.
+const c = await pool.connect();
+try {
+  return await c.query(sql);
+} finally {
+  c.release();          // runs on both the success and the throw path
+}
+// For single statements, prefer pool.query(sql, params) — it borrows and
+// returns internally, so the leak is unrepresentable.</pre></details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Write a transaction that decrements stock and creates an order, failing atomically if stock is insufficient.
+      <details class="solution"><summary>Solution</summary>
+      <pre>async function placeOrder(userId, sku, qty) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // The condition lives in the UPDATE so the row lock covers the check —
+    // a separate SELECT would leave a race between reading and writing.
+    const { rows } = await client.query(
+      `UPDATE products SET stock = stock - $2
+        WHERE sku = $1 AND stock >= $2
+        RETURNING stock`, [sku, qty]);
+    if (rows.length === 0) {
+      throw new AppError("Insufficient stock", { status: 409, code: "out_of_stock" });
+    }
+
+    const { rows: [order] } = await client.query(
+      `INSERT INTO orders (user_id, sku, qty) VALUES ($1, $2, $3) RETURNING *`,
+      [userId, sku, qty]);
+
+    await client.query("COMMIT");
+    return order;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+// Every statement uses `client`, never `pool` — mixing them would take the
+// writes outside the transaction.</pre></details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Fix this N+1 without a JOIN, and explain why deduplication matters.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Before: 1 + N queries
+const orders = await getOrders(50);
+for (const o of orders) o.user = await getUser(o.userId);
+
+// After: exactly 2 queries, regardless of page size
+const orders = await getOrders(50);
+const ids = [...new Set(orders.map((o) => o.userId))];
+const { rows } = await pool.query("SELECT * FROM users WHERE id = ANY($1)", [ids]);
+const byId = new Map(rows.map((u) => [u.id, u]));
+for (const o of orders) o.user = byId.get(o.userId);
+
+// Deduplication matters because orders commonly share users — 50 orders may
+// reference 5 users. Without the Set you send 50 ids, making the database
+// match and return duplicate rows, and you pay for transferring the same
+// user repeatedly. With many-to-one relations the dedupe is often the
+// difference between a small query and a large one.</pre></details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Write a batched backfill that sets <code>status='pending'</code> on ten million rows without long locks.
+      <details class="solution"><summary>Solution</summary>
+      <pre>async function backfill(batchSize = 1000, pauseMs = 100) {
+  let total = 0;
+  for (;;) {
+    const { rowCount } = await pool.query(
+      `UPDATE orders SET status = 'pending'
+        WHERE id IN (
+          SELECT id FROM orders WHERE status IS NULL
+          ORDER BY id LIMIT $1
+          FOR UPDATE SKIP LOCKED        -- tolerate concurrent writers
+        )`, [batchSize]);
+
+    total += rowCount;
+    if (rowCount === 0) break;          // no rows left to update
+    await new Promise((r) => setTimeout(r, pauseMs));   // let replicas catch up
+  }
+  return total;
+}
+
+// Why each piece:
+// • Batching bounds lock duration and WAL growth per statement. A single
+//   ten-million-row UPDATE holds locks for minutes and, if it times out,
+//   rolls back ENTIRELY — losing all progress.
+// • The pause gives replication and autovacuum room; a tight loop can push
+//   replica lag up and bloat the table faster than vacuum reclaims it.
+// • SKIP LOCKED means a row being modified by live traffic is skipped rather
+//   than blocking the backfill.
+// • Restartable by construction: the WHERE clause is the progress marker,
+//   so re-running after a crash resumes rather than redoing work.</pre></details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> A report endpoint times out. The ORM generates a query joining five tables. Describe your investigation.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// 1. GET THE ACTUAL SQL. Enable ORM query logging. You cannot optimize a
+//    query you have not read, and the generated SQL frequently differs from
+//    what the code implies (extra joins for eager loads, SELECT * pulling
+//    large columns, an ORDER BY the ORM added for pagination stability).
+
+// 2. EXPLAIN (ANALYZE, BUFFERS) it. Read for:
+//    • Seq Scan on a large table   → missing or unusable index
+//    • rows estimate wildly off actual → stale statistics; ANALYZE the table
+//    • Nested Loop over many rows  → planner expected few; often the same
+//      bad estimate
+//    • high `shared read` vs `hit` → working set exceeds cache
+
+// 3. Check the index situation. A composite index must match the leading
+//    columns of the filter/sort to be usable; an index on (status) does not
+//    serve WHERE status=$1 ORDER BY created_at the way (status, created_at)
+//    does.
+
+// 4. Question the QUERY, then the REQUIREMENT — in that order:
+//    • Is SELECT * pulling columns nobody renders?
+//    • Are all five joins needed, or is one an eager-load default?
+//    • Does the report need exact real-time data? A five-table live join for
+//      a dashboard refreshed hourly is a materialized view refreshed on a
+//      schedule — turning a request-time cost into a background one.
+//    • Is this OLTP work at all? Analytical queries over the transactional
+//      database compete with user traffic for the same buffers; a read
+//      replica or a warehouse is often the real answer.
+
+// 5. If it must stay live: add the covering index, cap the time range,
+//    paginate with cursors, and set a statement_timeout so a pathological
+//    report degrades one request instead of saturating the pool.
+
+// The order matters — measure, then optimize the query, then question the
+// requirement. Adding indexes before reading EXPLAIN is guessing, and every
+// index has a write cost paid by every INSERT forever.</pre></details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
+      <li>Pool size is a capacity decision spanning every instance — raising it to fix slowness commonly exhausts the server's connection limit instead.</li>
+      <li>Parameterized queries make values unable to become syntax; identifiers cannot be parameterized and need allowlists.</li>
+      <li>A transaction lives on one connection — using the pool for <code>BEGIN</code>/<code>COMMIT</code> silently loses atomicity under load.</li>
+      <li>Release connections in <code>finally</code>, or an error path drains the pool one leak at a time.</li>
+      <li>Put conditions inside the <code>UPDATE</code> rather than a preceding <code>SELECT</code> to close read-then-write races.</li>
+      <li>Never hold a transaction open across external I/O: locks and snapshot pinning turn a slow upstream into database-wide contention.</li>
+      <li>N+1 is invisible at development scale — detect it with query logging and assert query counts in tests.</li>
+      <li>Choose driver, builder, or ORM by workload, but never choose a tool whose generated SQL you cannot inspect.</li>
+      <li>Live-system migrations follow expand/contract, use <code>CREATE INDEX CONCURRENTLY</code>, and backfill in restartable batches.</li>
+      <li>Low CPU with high latency always means a queue — usually the connection pool.</li>
+    </ul></div>
+
+    <div class="pager">
+      <a class="btn btn-outline" href="validation-errors.html">← Validation &amp; Error Handling</a>
+      <a class="btn" href="auth.html">Next: Authentication: Sessions &amp; JWT →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script><script src="nav.js"></script>
+</body>
+</html>
