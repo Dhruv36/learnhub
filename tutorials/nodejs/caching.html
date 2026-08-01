@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Caching &amp; Redis — Node.js — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../../playground/index.html">Playground</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Caching &amp; Redis <span class="level-badge level-adv">Data &amp; Auth</span></h1>
+    <p><strong>What you'll master:</strong> where caches belong, the cache-aside pattern and its invalidation
+       problem, stampede protection, Redis data structures beyond <code>GET</code>/<code>SET</code>,
+       distributed locks and their real guarantees, and HTTP caching that moves work out of your service
+       entirely. Prerequisites: <a href="databases.html">Databases &amp; ORMs</a>,
+       <a href="rest-api.html">REST API Design</a>. See also the
+       <a href="../redis/index.html">Redis track</a>.</p>
+
+    <h2>Part 1 — Cache-Aside, and the Two Hard Parts</h2>
+    <pre>async function getProduct(id) {
+  const key = `product:${id}`;
+  const hit = await redis.get(key);
+  if (hit) return JSON.parse(hit);              // 1. try cache
+
+  const product = await db.findProduct(id);     // 2. miss → source of truth
+  if (product) {
+    await redis.set(key, JSON.stringify(product), "EX", 300);   // 3. populate
+  }
+  return product;
+}
+// This is cache-aside (lazy loading): the application owns the cache. It is
+// the default pattern and the one worth knowing cold.
+
+// Properties that follow:
+//   ✅ only requested data is cached — no wasted memory
+//   ✅ a cache outage degrades to slow, not broken (if you handle errors)
+//   ❌ every miss pays cache + database latency
+//   ❌ data can be stale for up to the TTL
+
+// THE TWO HARD PARTS, and everything else in this lesson descends from them:
+//
+// 1. INVALIDATION — knowing when cached data became wrong. TTL is the lazy
+//    answer: accept staleness up to N seconds. Explicit invalidation on
+//    write is more correct but requires knowing every key affected by every
+//    write, which is where bugs live.
+//
+// 2. CONSISTENCY under concurrent writes — two requests can interleave a
+//    read, a database write, and a cache write in an order that leaves the
+//    cache holding a value the database never had (see Part 3).
+
+// ALWAYS make the cache optional at runtime:
+async function getProductSafe(id) {
+  try {
+    const hit = await redis.get(`product:${id}`);
+    if (hit) return JSON.parse(hit);
+  } catch (err) {
+    log.warn({ err }, "cache read failed");     // degrade, do not fail
+  }
+  return db.findProduct(id);
+}
+// A cache that can take the service down when it is unavailable has made
+// availability WORSE — you added a dependency to make things faster and
+// accidentally made it load-bearing.</pre>
+
+    <h2>Part 2 — TTL, Eviction, and What to Cache</h2>
+    <pre>// TTL is a correctness knob disguised as a performance knob: it is the
+// maximum time you accept serving wrong data.
+//   product catalogue     → minutes (rarely changes, staleness tolerable)
+//   user profile          → seconds-to-minutes
+//   inventory count       → seconds, or do not cache
+//   account balance       → do not cache; read the source of truth
+//   permissions/roles     → short, AND invalidate explicitly on change
+// "How wrong can this be before someone is harmed?" is the question. Money
+// and authorization answers are usually "not at all".
+
+// Eviction policy (redis.conf maxmemory-policy) matters as much as TTL:
+//   allkeys-lru     — evict least-recently-used. Right for a pure cache.
+//   volatile-lru    — only keys with a TTL. Right when Redis ALSO holds
+//                     non-cache data (sessions, queues) that must not vanish.
+//   noeviction      — reject writes when full. Right for a queue/store,
+//                     catastrophic for a cache (writes start erroring).
+// Mixing cache and durable data in one Redis instance with allkeys-lru is a
+// classic incident: your sessions get evicted under memory pressure and
+// every user is logged out at once.
+
+// Add jitter to TTLs so keys populated together do not expire together:
+const ttl = 300 + Math.floor(Math.random() * 60);
+await redis.set(key, value, "EX", ttl);
+// Without jitter, a deploy that warms 10,000 keys creates a synchronized
+// expiry 300 seconds later — a self-inflicted stampede on a timer.</pre>
+
+    <h2>Part 3 — Invalidation Strategies</h2>
+    <pre>// On write, you must choose. Each option has a real failure mode.
+
+// A) Delete the key (invalidate) — the safest default:
+await db.updateProduct(id, data);
+await redis.del(`product:${id}`);
+// Next read repopulates from the database. Simple, and a lost delete costs
+// you one TTL of staleness rather than permanent corruption.
+
+// B) Write-through (update the cache with the new value):
+await db.updateProduct(id, data);
+await redis.set(`product:${id}`, JSON.stringify(data), "EX", 300);
+// Keeps the cache warm, but it is the RACY one:
+//   T1 reads DB (v1) → T2 writes DB (v2) → T2 sets cache (v2)
+//                                        → T1 sets cache (v1)  ← stale wins
+// The cache now holds v1 while the database holds v2, and no TTL-length
+// bound applies to when someone notices. Delete-on-write does not have this
+// failure because a delete is idempotent and order-independent.
+
+// ORDER MATTERS: database first, then cache. If you invalidate first, a
+// concurrent read can repopulate from the old row before your write lands.
+
+// C) Versioned keys — sidestep invalidation entirely:
+const v = await redis.incr(`product:${id}:v`);      // bump on write
+const key = `product:${id}:${v}`;
+// Old versions simply age out by TTL. No delete needed, no race. Costs more
+// memory for a while, and every read needs the version lookup.
+
+// Invalidating GROUPS — never use KEYS in production:
+await redis.keys("product:*");       // ❌ O(n) over the entire keyspace,
+                                     //    blocks the single-threaded server
+for await (const keys of redis.scanIterator({ MATCH: "product:*", COUNT: 100 })) {
+  if (keys.length) await redis.del(keys);          // ✅ incremental
+}
+// Better: maintain a Set of member keys per group, or use versioned
+// prefixes so a single counter bump invalidates a whole group at once.</pre>
+
+    <div class="note"><strong>Cache stampede (thundering herd) is the failure that takes services down.</strong>
+      A popular key expires; a thousand concurrent requests all miss, and all thousand hit the database
+      simultaneously with the same query. The database saturates, responses slow, more requests pile up, and
+      the cache never repopulates because every attempt times out. The cache made you faster right up until it
+      made you unavailable — and the trigger is a routine expiry, not an attack.</div>
+
+    <h2>Part 4 — Stampede Protection</h2>
+    <pre>// Strategy 1 — single-flight in-process: collapse concurrent identical
+// misses within ONE Node process into a single database call.
+const inflight = new Map();
+
+async function getWithSingleFlight(key, loader) {
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  if (inflight.has(key)) return inflight.get(key);    // join the existing call
+
+  const promise = loader()
+    .then(async (value) => {
+      await redis.set(key, JSON.stringify(value), "EX", 300);
+      return value;
+    })
+    .finally(() => inflight.delete(key));             // ← always clean up
+
+  inflight.set(key, promise);
+  return promise;
+}
+// Cheap and effective, but per-process: 20 pods still produce 20 queries
+// instead of 1000. Usually that is enough.
+
+// Strategy 2 — distributed lock: exactly one process across the fleet
+// recomputes; the others wait briefly and re-read.
+const got = await redis.set(`lock:${key}`, id, "NX", "PX", 5000);
+if (got) { /* recompute, set, then release */ }
+else { await sleep(50); return getFromCacheOrWait(key); }
+
+// Strategy 3 — probabilistic early expiry (XFetch): refresh BEFORE expiry,
+// with probability rising as the TTL nears. Avoids a synchronized cliff
+// without any coordination at all:
+const shouldRefresh = Math.random() &lt; (elapsed / ttl) ** 3;
+
+// Strategy 4 — stale-while-revalidate: serve the stale value immediately and
+// refresh in the background. Best latency, and the cache never has a gap:
+const entry = JSON.parse(await redis.get(key) ?? "null");
+if (entry &amp;&amp; entry.expiresAt &lt; Date.now()) {
+  refreshInBackground(key).catch((err) => log.warn({ err }, "refresh failed"));
+}
+return entry?.value;                       // stale but instant
+// Store a logical expiry INSIDE the value with a longer physical TTL, so
+// "expired" is a property you can read rather than a key that vanished.</pre>
+
+    <h2>Part 5 — Redis Beyond GET/SET</h2>
+    <pre>// Redis is a data-structure server. Using it only as a string cache leaves
+// most of its value unused.
+
+// Hashes — update one field without rewriting the whole object:
+await redis.hSet(`user:${id}`, { name: "Ada", email: "ada@x.com" });
+await redis.hIncrBy(`user:${id}`, "loginCount", 1);
+
+// Sorted sets — leaderboards, rate limiting, time-ordered indexes:
+await redis.zAdd("leaderboard", { score: 4200, value: "user:42" });
+await redis.zRangeWithScores("leaderboard", 0, 9, { REV: true });   // top 10
+
+// A sliding-window rate limiter in three commands:
+const now = Date.now();
+await redis.zRemRangeByScore(key, 0, now - windowMs);   // drop old entries
+const count = await redis.zCard(key);
+if (count >= limit) throw new AppError("Rate limited", { status: 429 });
+await redis.zAdd(key, { score: now, value: `${now}:${randomUUID()}` });
+await redis.expire(key, Math.ceil(windowMs / 1000));
+// More accurate than a fixed window, which allows a 2× burst at the boundary
+// (limit requests at 0:59 and limit more at 1:01).
+
+// Sets — uniqueness and membership:
+await redis.sAdd(`post:${id}:voters`, userId);      // returns 0 if already there
+
+// Atomicity: MULTI batches commands, but for read-then-write logic you need
+// a Lua script, which Redis runs atomically:
+const script = `
+  local current = redis.call("GET", KEYS[1])
+  if current and tonumber(current) >= tonumber(ARGV[1]) then return 0 end
+  return redis.call("INCR", KEYS[1])`;
+await redis.eval(script, { keys: [key], arguments: [String(limit)] });
+// The check and the increment cannot interleave with another client's —
+// which a GET followed by an INCR from Node cannot guarantee.
+
+// Pipelining — one round trip instead of N (a latency win, not atomicity):
+const pipeline = redis.multi();
+ids.forEach((id) => pipeline.get(`product:${id}`));
+const results = await pipeline.exec();</pre>
+
+    <h2>Part 6 — HTTP Caching: the Cache You Do Not Run</h2>
+    <pre>// The cheapest request is the one that never reaches your service.
+res.set("cache-control", "public, max-age=300, stale-while-revalidate=60");
+res.set("etag", `"${hashOf(body)}"`);
+
+// Conditional requests — the client asks "has it changed?":
+if (req.headers["if-none-match"] === currentEtag) {
+  return res.status(304).end();      // no body: saves bandwidth, not compute
+}
+
+// Cache-Control directives that matter:
+//   public        — any cache (CDN, proxy) may store it
+//   private       — browser only; NEVER use public for per-user data, or a
+//                   shared CDN can serve one user's response to another.
+//                   This is a real and severe incident class.
+//   max-age=N     — fresh for N seconds
+//   s-maxage=N    — overrides max-age for SHARED caches specifically
+//   no-store      — never persist (auth responses, personal data)
+//   no-cache      — may store, but must revalidate before reuse
+//   stale-while-revalidate=N — serve stale up to N seconds while refreshing
+//                   in the background: the HTTP version of Part 4's pattern
+//   immutable     — content-hashed assets that will never change
+
+// Vary tells caches which request headers change the response:
+res.set("vary", "accept-encoding, authorization");
+// Omitting `authorization` on a personalized response is exactly how a CDN
+// serves user A's data to user B.
+
+// The layered picture, cheapest first:
+//   browser cache → CDN → your HTTP cache → Redis → database
+// Each layer absorbs load from the next. A correctly cached static asset
+// never touches your infrastructure at all.</pre>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Cache errors propagate to the client</td><td>A cache outage becomes a service outage</td><td>Catch and degrade to the source of truth</td></tr>
+      <tr><td>Write-through under concurrency</td><td>A stale writer can overwrite a newer value indefinitely</td><td>Delete-on-write; it is order-independent</td></tr>
+      <tr><td>Invalidating before writing the database</td><td>A concurrent read repopulates the old value</td><td>Database first, then invalidate</td></tr>
+      <tr><td>No stampede protection on hot keys</td><td>Expiry triggers a synchronized herd that saturates the database</td><td>Single-flight, locks, or stale-while-revalidate</td></tr>
+      <tr><td>Identical TTLs on bulk-populated keys</td><td>Synchronized mass expiry</td><td>Add random jitter</td></tr>
+      <tr><td><code>KEYS</code> in production</td><td>O(n) scan blocks the single-threaded server</td><td><code>SCAN</code>, key sets, or versioned prefixes</td></tr>
+      <tr><td>Read-then-write without a Lua script</td><td>Races between the check and the write</td><td>Lua for atomic read-modify-write</td></tr>
+      <tr><td>Cache and durable data in one instance with <code>allkeys-lru</code></td><td>Sessions and queues silently evicted under pressure</td><td>Separate instances, or <code>volatile-lru</code></td></tr>
+      <tr><td>Caching authorization decisions with a long TTL</td><td>Revoked access persists</td><td>Short TTL plus explicit invalidation</td></tr>
+      <tr><td><code>public</code> on a personalized response</td><td>A shared cache serves one user's data to another</td><td><code>private</code>, and set <code>Vary</code> correctly</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Describe cache-aside and its trade-offs.</summary>
+      <p>The application checks the cache, and on a miss reads the source of truth and populates the cache
+      before returning. Only requested data is cached, so memory is not wasted on unread rows, and if the cache
+      is unavailable the code can fall through to the database — provided you catch the error. The costs are
+      that every miss pays both cache and database latency, and that data can be stale for up to the TTL.
+      Invalidation on write is what bounds that staleness more tightly.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> Why should a cache read failure not fail the request?</summary>
+      <p>Because a cache is an optimization, and the source of truth is still available. If a Redis timeout
+      propagates as a 500, you have added a dependency that makes availability worse than having no cache at
+      all — the system is now down for a reason unrelated to whether it can actually serve the data. The
+      correct behaviour is to log the failure, fall through to the database, and accept the slower response.
+      The one caveat is capacity: if the database cannot handle full traffic without the cache, degrading
+      gracefully still requires load shedding, which is a deliberate design decision rather than an
+      accident.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What is a cache stampede and how do you prevent it?</summary>
+      <p>When a hot key expires, every concurrent request misses simultaneously and all of them execute the
+      same expensive query against the database. The database saturates, latency climbs, and because requests
+      now time out the cache may never repopulate — a routine expiry becomes an outage. Preventions:
+      single-flight, where concurrent identical misses in a process share one in-flight promise; a distributed
+      lock so exactly one process across the fleet recomputes while others wait and re-read; probabilistic
+      early refresh, which staggers recomputation before expiry; and stale-while-revalidate, serving the
+      previous value instantly while refreshing in the background, which additionally removes the latency spike
+      entirely. TTL jitter is the cheap prerequisite that stops bulk-populated keys expiring in
+      lockstep.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why prefer deleting a cache key on write over updating it?</summary>
+      <p>Because deletion is idempotent and order-independent, while updating is subject to a lost-update race:
+      if one request reads v1, another writes v2 and updates the cache, and then the first request writes its
+      stale v1 into the cache, the cache holds v1 while the database holds v2 — and nothing corrects it until
+      the TTL expires, if the TTL is even short. With delete-on-write the worst outcome of interleaving is an
+      extra cache miss. The general principle is that the safe operation is the one whose result does not
+      depend on ordering. Write order also matters: write the database first, then invalidate, otherwise a
+      concurrent read repopulates the old value before the write lands.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Design caching for a product page: catalogue data, per-user pricing, and live inventory. Justify each decision.</summary>
+      <p>These three have different staleness tolerances, so caching them uniformly is the mistake to avoid.
+      Catalogue data — names, descriptions, images — changes rarely and is identical for everyone, so it gets
+      a long TTL in Redis and is also cacheable at the CDN with <code>public</code>, which removes most traffic
+      from the service entirely. Per-user pricing is personalized, so it must never be in a shared cache: cache
+      it in Redis under a user-scoped key with a short TTL, and mark the HTTP response <code>private</code>
+      with an appropriate <code>Vary</code> so no CDN can store it — getting this wrong means serving one
+      customer's price to another, which is both a correctness and a privacy failure. Live inventory is the
+      one where staleness has real consequences, since showing an item in stock that is not causes failed
+      checkouts; I would either not cache it or cache for a couple of seconds purely as stampede protection,
+      and critically I would treat the displayed count as advisory while enforcing actual availability
+      transactionally at checkout with the condition in the UPDATE, because no cache TTL can make a read-time
+      check authoritative. Composition matters too: rendering these from one cached blob forces the shortest
+      TTL onto everything, so they should be separate cache entries assembled per request. Finally, hot
+      products need stampede protection and jittered TTLs, and every cache read degrades to the source on
+      error.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A team uses a Redis distributed lock to guarantee a job runs exactly once. What would you tell them?</summary>
+      <p>That a Redis lock gives mutual exclusion most of the time, not a correctness guarantee, and that
+      "exactly once" cannot be built on it. The specific failure: a process acquires the lock with a TTL,
+      stalls — garbage collection pause, network partition, a slow disk — long enough for the TTL to expire,
+      and a second process acquires the same lock. Now both believe they hold it and both run the job. Adding a
+      fencing token helps only if the protected resource can reject stale tokens, which requires support in
+      that resource. Redlock across multiple nodes is also contested and does not remove the timing assumption.
+      What I would recommend instead is designing the job to be idempotent, so a duplicate run is harmless — a
+      unique constraint on a natural key, an upsert, or an idempotency key like the payments pattern — and
+      using the lock purely as an optimization to avoid duplicated work rather than as a correctness mechanism.
+      If exactly-once truly matters, it needs a transactional guarantee where the effect lives: a database
+      transaction, a unique index, or a queue with proper delivery semantics and deduplication. Minimum
+      practical hardening for the lock itself: always set a TTL so a crash cannot hold it forever, release only
+      if you still own it via a Lua compare-and-delete rather than a bare DEL, and keep the critical section
+      much shorter than the TTL. The underlying principle is that distributed locks built on timeouts assume
+      bounded pauses, and that assumption is exactly what fails in the incidents you built the lock
+      for.</p></details>
+
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (easy):</strong> Write a cache-aside <code>getUser(id)</code> with a 60-second TTL that degrades on cache failure.
+      <details class="solution"><summary>Solution</summary>
+      <pre>async function getUser(id) {
+  const key = `user:${id}`;
+  try {
+    const hit = await redis.get(key);
+    if (hit) return JSON.parse(hit);
+  } catch (err) {
+    log.warn({ err, key }, "cache read failed");     // degrade, do not throw
+  }
+
+  const user = await db.findUser(id);
+  if (user) {
+    redis.set(key, JSON.stringify(user), "EX", 60)
+      .catch((err) => log.warn({ err }, "cache write failed"));
+  }
+  return user;
+}
+// The write is not awaited: populating the cache is best-effort and should
+// not add latency to the response or fail the request.</pre></details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Why is <code>KEYS product:*</code> dangerous, and what replaces it?
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Redis executes commands on a single thread. KEYS scans the ENTIRE keyspace
+// in one blocking operation, so on a few million keys every other client —
+// including your session lookups — stalls for the duration.
+for await (const keys of redis.scanIterator({ MATCH: "product:*", COUNT: 100 })) {
+  if (keys.length) await redis.del(keys);
+}
+// SCAN returns a cursor and works incrementally, so other commands interleave.
+// Better still, avoid the scan: keep a Set of member keys per group, or use a
+// version counter in the prefix so one INCR invalidates the whole group.</pre></details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Implement single-flight so concurrent misses for the same key trigger one database call.
+      <details class="solution"><summary>Solution</summary>
+      <pre>const inflight = new Map();
+
+export async function cached(key, ttl, loader) {
+  const hit = await redis.get(key).catch(() => null);
+  if (hit) return JSON.parse(hit);
+
+  if (inflight.has(key)) return inflight.get(key);   // join the in-flight call
+
+  const p = (async () => {
+    const value = await loader();
+    await redis.set(key, JSON.stringify(value), "EX", ttl + Math.floor(Math.random() * 30))
+      .catch(() => {});
+    return value;
+  })().finally(() => inflight.delete(key));          // cleanup on BOTH paths
+
+  inflight.set(key, p);
+  return p;
+}
+// The .finally is essential: without it a rejected load leaves a permanently
+// cached rejected promise, and every later request for that key fails.
+// Scope note: this collapses misses within ONE process. Across 20 pods you
+// still get up to 20 loads — usually acceptable, and far better than 1000.</pre></details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Implement a sliding-window rate limiter with a Redis sorted set.
+      <details class="solution"><summary>Solution</summary>
+      <pre>async function allow(userId, limit = 100, windowMs = 60_000) {
+  const key = `rl:${userId}`;
+  const now = Date.now();
+
+  const results = await redis.multi()
+    .zRemRangeByScore(key, 0, now - windowMs)      // drop entries out of window
+    .zCard(key)                                     // count what remains
+    .zAdd(key, { score: now, value: `${now}:${randomUUID()}` })
+    .expire(key, Math.ceil(windowMs / 1000))        // reclaim idle keys
+    .exec();
+
+  const count = results[1];
+  return count &lt; limit;
+}
+// The member includes a UUID because two requests in the same millisecond
+// would otherwise collide on value and count as one (sorted set members are
+// unique).
+// Sliding beats a fixed window because a fixed window permits a 2x burst
+// across the boundary: `limit` requests at 0:59 plus `limit` at 1:01.
+// Note this counts the current request before the limit check ordering —
+// for strict enforcement, do the check and add atomically in a Lua script.</pre></details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Implement stale-while-revalidate: serve stale instantly, refresh in the background, exactly one refresher.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Store a LOGICAL expiry inside the value, with a longer PHYSICAL TTL so the
+// key still exists after it goes stale.
+async function swr(key, logicalTtlMs, physicalTtlSec, loader) {
+  const raw = await redis.get(key).catch(() => null);
+
+  if (raw) {
+    const entry = JSON.parse(raw);
+    if (entry.expiresAt &lt;= Date.now()) {
+      // Stale: refresh in the background, but only ONE refresher fleet-wide.
+      redis.set(`lock:${key}`, "1", { NX: true, PX: 10_000 })
+        .then(async (won) => {
+          if (!won) return;
+          try {
+            const fresh = await loader();
+            await redis.set(key, JSON.stringify({
+              value: fresh, expiresAt: Date.now() + logicalTtlMs,
+            }), "EX", physicalTtlSec);
+          } finally {
+            await redis.del(`lock:${key}`).catch(() => {});
+          }
+        })
+        .catch((err) => log.warn({ err, key }, "background refresh failed"));
+    }
+    return entry.value;              // ← stale or fresh, returned IMMEDIATELY
+  }
+
+  const value = await loader();      // cold miss: must wait
+  await redis.set(key, JSON.stringify({
+    value, expiresAt: Date.now() + logicalTtlMs,
+  }), "EX", physicalTtlSec).catch(() => {});
+  return value;
+}
+// Why physical > logical TTL: if the key vanished at logical expiry there
+// would be nothing stale to serve, and you would be back to a stampede on a
+// cold miss. The gap between the two is your protection window.
+// The NX lock bounds refresh work to one process; note it is an optimization,
+// not a correctness guarantee — a duplicate refresh is harmless here, which
+// is exactly when a Redis lock is the right tool.</pre></details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> After adding caching, users intermittently see other users' data. Diagnose the likely causes and the fixes.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// This is a severe, reportable class of bug. Three likely causes:
+
+// 1. CACHE KEY MISSING THE USER DIMENSION — the most common.
+const key = `dashboard:${orgId}`;              // ❌ same key for every user
+const key = `dashboard:${orgId}:${userId}`;    // ✅ every input in the key
+// Rule: the key must include EVERY input that affects the output — user,
+// role, locale, feature flags, API version. If two requests can produce
+// different responses, they must not share a key.
+
+// 2. HTTP CACHE-CONTROL: public ON A PERSONALIZED RESPONSE.
+res.set("cache-control", "public, max-age=60");    // ❌ CDN stores it once
+res.set("cache-control", "private, max-age=60");   // ✅ browser only
+res.set("vary", "authorization");                  // ✅ if it must be shared
+// A shared CDN caching a personalized response will serve the first user's
+// body to everyone else — and it is invisible in your logs, because the
+// requests never reach you.
+
+// 3. A REQUEST-SCOPED VALUE STORED AT MODULE SCOPE.
+let currentUser;                     // ❌ shared across concurrent requests
+app.use((req) => { currentUser = req.user; });
+// Under concurrency, request B overwrites the variable while request A is
+// awaiting, and A resumes with B's user. Use req/AsyncLocalStorage instead.
+
+// Response procedure, in order:
+//   • purge the affected caches immediately (CDN and Redis) — stop the leak
+//     before diagnosing it
+//   • determine blast radius from CDN logs: which paths, how many distinct
+//     users, over what window
+//   • treat it as a data-exposure incident with the disclosure obligations
+//     that implies, not merely a bug
+//   • add a regression test that asserts two users receive different bodies
+//     for the same path, and an assertion that no personalized route ever
+//     emits cache-control: public</pre></details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
+      <li>Cache-aside is the default; always make cache failures degrade to the source of truth rather than fail the request.</li>
+      <li>TTL is a correctness decision — it is the maximum time you accept serving wrong data.</li>
+      <li>Delete on write rather than update: deletion is idempotent, so interleaving costs a miss instead of persistent staleness.</li>
+      <li>Write the database first, then invalidate; the reverse order lets a concurrent read repopulate stale data.</li>
+      <li>Stampedes turn a routine expiry into an outage — use single-flight, locks, early refresh, or stale-while-revalidate, and always jitter TTLs.</li>
+      <li>Never run <code>KEYS</code> in production; Redis is single-threaded and it blocks every other client.</li>
+      <li>Read-modify-write against Redis needs a Lua script — separate commands from Node can interleave.</li>
+      <li>Do not mix evictable cache data and durable data in one instance under <code>allkeys-lru</code>.</li>
+      <li>A cache key must contain every input that affects the response, or users will see each other's data.</li>
+      <li>Distributed locks give mutual exclusion, not exactly-once — design idempotent work and use locks as an optimization.</li>
+    </ul></div>
+
+    <div class="pager">
+      <a class="btn btn-outline" href="security.html">← Security (OWASP for Node)</a>
+      <a class="btn" href="config.html">Next: Configuration &amp; Secrets →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script><script src="nav.js"></script>
+</body>
+</html>
