@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deployment &amp; Hardening — Node.js — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../../playground/index.html">Playground</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Deployment &amp; Hardening <span class="level-badge level-ultra">Production Node</span></h1>
+    <p><strong>What you'll master:</strong> the capstone — packaging a Node service into a small, secure
+       container, deploying without dropping requests, migrating databases safely during rolling deploys,
+       and the production readiness checklist that assembles every lesson in this track into one system.
+       Prerequisites: <a href="scaling.html">Scaling</a>, <a href="config.html">Configuration &amp; Secrets</a>,
+       <a href="errors-logging.html">Logging &amp; Observability</a>.</p>
+
+    <h2>Part 1 — A Production Dockerfile</h2>
+    <pre># Multi-stage: build with full toolchain, ship only what runs.
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci                      # ci, not install — exact lockfile resolution
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production         # ← enables library production paths
+RUN apk add --no-cache tini     # a real init: see Part 2
+
+COPY package*.json ./
+RUN npm ci --omit=dev &amp;&amp; npm cache clean --force
+COPY --from=build /app/dist ./dist
+
+# Run as a NON-ROOT user. The node image ships one.
+USER node
+
+EXPOSE 3000
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/server.js"]
+
+# Why each choice matters:
+# • multi-stage keeps build tools, source, and dev dependencies out of the
+#   shipped image — smaller and a much smaller attack surface
+# • COPY package*.json BEFORE the source: Docker caches that layer, so
+#   dependencies are only reinstalled when the manifest changes. Copying
+#   source first invalidates the cache on every code change.
+# • npm ci --omit=dev: reproducible, production-only tree
+# • USER node: a container escape from a root process is far more dangerous.
+#   Many base images run as root by default — this is one line and it matters.
+# • NODE_ENV=production: Express and others disable dev-only work; forgetting
+#   it silently costs performance and can leak stack traces.
+# • Do NOT bake secrets with ARG/ENV — they persist in image layers and are
+#   visible in `docker history`. Inject at runtime.
+# • .dockerignore must exclude node_modules, .git, .env, tests.</pre>
+
+    <h2>Part 2 — PID 1, Signals, and Why Your Shutdown Never Ran</h2>
+    <pre># The most common reason graceful shutdown "doesn't work" in containers.
+CMD node server.js          # ✅ exec form: node IS pid 1, receives SIGTERM
+CMD "node server.js"        # ❌ shell form: /bin/sh is pid 1 and does NOT
+                            #    forward signals — your handler never fires,
+                            #    and the container is SIGKILLed after the
+                            #    grace period. Every deploy drops requests.
+
+# PID 1 also has a second job: reaping orphaned child processes. Node does
+# not do this, so if your service spawns children you accumulate zombies.
+# `tini` is a 10KB init that forwards signals correctly and reaps children:
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/server.js"]
+# Kubernetes offers shareProcessNamespace and some runtimes inject an init,
+# but tini is explicit and portable.
+
+# Verify it actually works rather than assuming — this catches the bug:
+#   docker run --name t myimage
+#   docker stop t          # sends SIGTERM, waits 10s, then SIGKILL
+#   docker logs t          # you MUST see your shutdown log lines
+# If the container dies instantly with no shutdown output, signals are not
+# reaching Node.
+
+# Kubernetes timing must line up with the shutdown sequence from the scaling
+# lesson, or the orchestrator kills you mid-drain:
+#   terminationGracePeriodSeconds: 45   # > your total shutdown budget
+#   preStop: sleep 5                    # let endpoints propagate first
+# The readiness-fail-then-wait step exists because kube-proxy and the load
+# balancer update asynchronously; without it, traffic arrives at a closing
+# socket and users see connection errors on every deploy.</pre>
+
+    <div class="note"><strong>Set memory limits explicitly, in both places.</strong>
+      V8's default heap does not know about your container limit, so the process can grow past it and be
+      OOM-killed by the kernel — abruptly, mid-request, with no stack trace and no graceful shutdown. Set
+      <code>--max-old-space-size</code> to roughly 75% of the container limit
+      (<code>NODE_OPTIONS=--max-old-space-size=768</code> for a 1GB container), so V8 does aggressive GC and
+      throws a catchable heap error instead of vanishing.</div>
+
+    <h2>Part 3 — Deployment Strategies</h2>
+    <pre>// ROLLING (the Kubernetes default): replace instances gradually.
+//   + no extra infrastructure, simple
+//   − BOTH VERSIONS RUN SIMULTANEOUSLY. This is the constraint that governs
+//     database migrations and API changes (Part 4).
+//   maxSurge: 1, maxUnavailable: 0    ← never drop below full capacity
+
+// BLUE-GREEN: run the new version alongside, switch traffic at once.
+//   + instant rollback (switch back), only one version serves at a time
+//   − double the infrastructure during the switch; long-lived connections
+//     still need draining
+
+// CANARY: route a small percentage to the new version, watch, then ramp.
+//   + catches problems with a fraction of users affected
+//   + the only strategy that validates against real production traffic
+//   − needs traffic splitting and per-version metrics to be worth anything
+//   The key: define ABORT CRITERIA before you start (error rate, p99), and
+//   automate the rollback. A canary nobody watches is just a slow rollout.
+
+// What makes any of them safe:
+//   1. health checks that actually reflect readiness (config lesson)
+//   2. graceful shutdown that drains (scaling lesson)
+//   3. backward-compatible database and API changes (Part 4)
+//   4. a tested rollback path — including for migrations
+//   5. deploys small enough to attribute a regression to one change
+
+// ROLLBACK IS NOT SYMMETRIC, and this surprises people: code rolls back in
+// seconds, but a migration that dropped a column cannot be undone by
+// redeploying the old image. That asymmetry is exactly why schema changes
+// must be backward compatible — the rollback path is the reason, not
+// tidiness.</pre>
+
+    <h2>Part 4 — Migrations During a Rolling Deploy</h2>
+    <pre>// THE CONSTRAINT: during a rolling deploy, version N and N+1 run at the same
+// time against the SAME database. Every schema change must therefore be
+// compatible with both — this single fact determines the whole procedure.
+
+// ❌ Breaks immediately: the old code still selects `total`.
+ALTER TABLE orders RENAME COLUMN total TO total_cents;
+
+// ✅ EXPAND / CONTRACT across separate deploys (same pattern as the API
+//    field rename in the REST lesson, and for the same reason):
+//
+//   Deploy 1 — EXPAND: add the new column, nullable. Additive and instant;
+//              both versions work because nothing is removed.
+//                ALTER TABLE orders ADD COLUMN total_cents integer;
+//   Deploy 2 — write BOTH columns, read the old one.
+//   Backfill  — in batches, restartable (databases lesson).
+//   Deploy 3 — read the new column, still write both.
+//   Deploy 4 — stop writing the old column.
+//   Deploy 5 — CONTRACT: drop it, after a bake period long enough that
+//              rolling back remains possible.
+//
+// Five deploys for a rename looks excessive until the first time a
+// single-step rename takes production down mid-rollout.
+
+// WHERE MIGRATIONS RUN — a real decision with real failure modes:
+//   ❌ on application startup: with N replicas, N processes race to migrate.
+//      Advisory locks make it survivable, but a slow migration then blocks
+//      every pod's startup and your readiness probes fail fleet-wide.
+//   ✅ as a separate step before the rollout — a Kubernetes Job, an init
+//      container, or a CI step gated on success. One runner, one outcome,
+//      and the deploy halts if it fails.
+
+// Operations that lock and how to avoid it (Postgres):
+CREATE INDEX CONCURRENTLY ...;          -- not plain CREATE INDEX
+ALTER TABLE ... ADD COLUMN ... ;        -- fine; adding a DEFAULT is instant in PG 11+
+ALTER TABLE ... ADD CONSTRAINT ... NOT VALID;   -- then VALIDATE separately
+SET lock_timeout = '3s';                -- fail fast rather than queueing
+// A migration that waits on a lock can block every subsequent query on that
+// table — a brief lock wait becomes a full outage as connections pile up.</pre>
+
+    <h2>Part 5 — The Production Readiness Checklist</h2>
+    <pre>// This is the whole track, assembled. Before a service takes real traffic:
+
+// CORRECTNESS &amp; SECURITY
+//   □ input validated at every boundary with a schema        (validation)
+//   □ parameterized queries; identifiers allowlisted         (databases)
+//   □ authorization checks the OBJECT, not just the route    (security)
+//   □ secrets from a manager, injected at runtime            (config)
+//   □ helmet, CORS allowlist, rate limiting                  (middleware)
+//   □ dependencies audited; lockfile committed; npm ci       (security)
+//   □ container runs as non-root, no secrets in layers       (Part 1)
+
+// RESILIENCE
+//   □ timeouts on EVERY outbound call                        (http)
+//   □ bounded body size, pagination caps, request timeouts   (http)
+//   □ graceful shutdown: readiness → drain → close → exit    (scaling)
+//   □ circuit breakers / fallbacks on non-critical deps      (scaling)
+//   □ backpressure: fast 503 beats slow timeout              (scaling)
+//   □ queue jobs idempotent, bounded retries, DLQ            (scaling)
+//   □ connection pool sized for TOTAL instances              (databases)
+
+// OBSERVABILITY
+//   □ structured logs, secrets redacted, request ids         (logging)
+//   □ RED metrics with bounded label cardinality             (logging)
+//   □ event loop lag monitored                               (performance)
+//   □ liveness ≠ readiness                                   (config)
+//   □ SLO-based alerts with runbooks                         (logging)
+
+// OPERATIONS
+//   □ migrations backward compatible, run as a separate step (Part 4)
+//   □ rollback tested, including for schema changes          (Part 3)
+//   □ memory limits set in BOTH the container and V8         (Part 2)
+//   □ signals reach PID 1 — verified, not assumed            (Part 2)
+//   □ load tested at expected peak × 2                       (performance)
+
+// The honest note: nobody ships with every box ticked. The value is in
+// deciding CONSCIOUSLY which ones you are accepting risk on, and writing
+// that down — an accepted risk is a decision, an unnoticed gap is an
+// incident waiting for traffic.</pre>
+
+    <h2>Part 6 — The First Incident</h2>
+    <pre>// Production readiness includes knowing what to do when it breaks.
+
+// TRIAGE ORDER — stop the bleeding before understanding it:
+//   1. Is it getting worse? Mitigate FIRST, diagnose after. Rolling back a
+//      recent deploy is usually the fastest mitigation available, and you do
+//      not need to know the cause to do it.
+//   2. What changed? Deploys, config changes, feature flags, traffic shape,
+//      an upstream's deploy. Most incidents follow a change.
+//   3. What is the blast radius? All users or one tenant? One region? One
+//      endpoint? This narrows the cause dramatically.
+//   4. Only then: root cause.
+
+// The signals to read first, in order:
+//   • error rate and p99 by route      — what are users experiencing?
+//   • recent deploys/flag changes      — what changed?
+//   • event loop lag                   — are we blocked?
+//   • pool wait time / queue depth     — are we saturated?
+//   • upstream error rates             — is it actually ours?
+
+// MITIGATIONS that do not require a diagnosis: roll back, disable a feature
+// flag, scale out, shed low-priority traffic, raise a cache TTL, fail over
+// a dependency. Reaching for one of these early is a sign of maturity, not
+// of giving up.
+
+// AFTERWARDS — a blameless postmortem. The questions worth answering:
+//   • timeline: when did it start, when did we notice, when was it fixed?
+//     The gap between start and notice is a monitoring gap.
+//   • why did detection take that long? (usually the biggest lesson)
+//   • what made diagnosis slow? Missing instrumentation is an action item.
+//   • what would have PREVENTED it, and what would have CONTAINED it?
+//     Both matter; containment is often cheaper than prevention.
+//   • concrete, assigned, dated action items — not "be more careful"
+//
+// The purpose is fixing systems, not people. A postmortem that identifies
+// who made a mistake has found the least useful fact available: humans will
+// keep making mistakes, so the durable fixes are the guardrails that make
+// the mistake harmless — a test, a type, a limit, an alert.</pre>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Shell-form <code>CMD</code></td><td>Node never receives SIGTERM; every deploy drops requests</td><td>Exec form, plus <code>tini</code> as init</td></tr>
+      <tr><td>No V8 heap limit in a memory-limited container</td><td>Kernel OOM-kill mid-request, no trace</td><td><code>--max-old-space-size</code> ≈ 75% of the limit</td></tr>
+      <tr><td>Running the container as root</td><td>A container escape becomes host root</td><td><code>USER node</code></td></tr>
+      <tr><td>Secrets via <code>ARG</code>/<code>ENV</code> at build</td><td>Recoverable from image layers forever</td><td>Inject at runtime</td></tr>
+      <tr><td>Copying source before <code>package.json</code></td><td>Dependency layer cache invalidated on every commit</td><td>Manifest first, then <code>npm ci</code>, then source</td></tr>
+      <tr><td>Migrations on application startup</td><td>N replicas race; slow migrations block every pod</td><td>A separate, gated migration step</td></tr>
+      <tr><td>Destructive migrations during rolling deploys</td><td>The still-running old version breaks immediately</td><td>Expand/contract across deploys</td></tr>
+      <tr><td>Plain <code>CREATE INDEX</code> on a large table</td><td>Writes blocked; queries queue into an outage</td><td><code>CONCURRENTLY</code> with <code>lock_timeout</code></td></tr>
+      <tr><td>Grace period shorter than shutdown</td><td>SIGKILL mid-drain undoes graceful shutdown</td><td><code>terminationGracePeriodSeconds</code> &gt; shutdown budget</td></tr>
+      <tr><td>Assuming rollback works for migrations</td><td>Code reverts; the dropped column does not come back</td><td>Backward-compatible schema changes; test rollback</td></tr>
+      <tr><td>Canary deploys nobody watches</td><td>A slow rollout with none of the safety</td><td>Pre-defined abort criteria and automated rollback</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Why use a multi-stage Docker build for a Node service?</summary>
+      <p>So the shipped image contains only what is needed to run. The build stage holds the full toolchain,
+      source, and dev dependencies; the runtime stage copies just the built output and production dependencies.
+      That makes the image substantially smaller — faster pulls and faster scaling — and shrinks the attack
+      surface, since compilers, test fixtures, and build tooling are not present in production. It also keeps
+      build-time artifacts, which may include credentials, out of the final layers entirely.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> Why must <code>CMD</code> use the exec form?</summary>
+      <p>Because the shell form runs your process as a child of <code>/bin/sh</code>, which becomes PID 1 and
+      does not forward signals. When the orchestrator sends SIGTERM, Node never receives it, so the graceful
+      shutdown handler never runs and the container is SIGKILLed after the grace period — dropping every
+      in-flight request on every deploy. The exec form makes Node PID 1 so it receives signals directly. It is
+      worth verifying rather than assuming, by stopping a container and confirming shutdown log lines
+      appear.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why can't you rename a database column in a single migration during a rolling deploy?</summary>
+      <p>Because a rolling deploy runs both versions simultaneously against one database. The instant the
+      rename applies, every still-running instance of the old code references a column that no longer exists,
+      so production breaks partway through the rollout. The safe path is expand/contract: add the new column,
+      deploy code writing both, backfill in batches, deploy code reading the new one, stop writing the old, and
+      only then drop it — each step compatible with the versions running around it. The deeper reason is
+      rollback asymmetry: code reverts in seconds, but a dropped column does not come back by redeploying an
+      old image.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why set <code>--max-old-space-size</code> when the container already has a memory limit?</summary>
+      <p>Because V8 sizes its heap from its own defaults and has no awareness of the cgroup limit, so it will
+      happily grow past it. When it does, the kernel OOM-kills the process instantly — no shutdown handler, no
+      stack trace, no log line explaining why, and any in-flight requests simply vanish. Setting the heap to
+      roughly 75% of the container limit means V8 does aggressive garbage collection as it approaches the
+      ceiling and, if it truly runs out, throws a JavaScript heap error you can log and act on. The 25% margin
+      covers non-heap memory: buffers, native allocations, and the runtime itself.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Design a deployment pipeline for a Node service where downtime is unacceptable.</summary>
+      <p>I would build it around the fact that safety comes from constraints on the changes rather than from
+      the deployment mechanism alone. In CI: lint, unit and integration tests against a real database in a
+      container, a dependency audit, and a container build scanned for vulnerabilities — all gates, not
+      reports. Migrations run as a separate step before the rollout, gated on success, so a failed migration
+      halts the deploy rather than leaving half the fleet on an incompatible schema; and every migration must
+      be backward compatible with the currently deployed version, which I would enforce in review because no
+      tool catches it reliably. The rollout itself is rolling with surge and zero unavailable, or canary with
+      pre-defined abort criteria on error rate and p99 and an automated rollback, since a canary nobody watches
+      provides no safety. Each instance must fail readiness before draining, wait for endpoint propagation,
+      then close — with the grace period set longer than the shutdown budget. Post-deploy, watch the SLO burn
+      rate for a bake period before promoting further, and keep the previous image ready for immediate
+      rollback. Around all of it: small, frequent deploys, because attribution is what makes rollback a
+      decision rather than a guess, and feature flags so shipping code and releasing behaviour are separate
+      events — the flag is usually a faster mitigation than a rollback. The part teams most often miss is
+      testing the rollback path itself, including for schema changes; a rollback plan that has never been
+      exercised is a hypothesis.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> You inherit a Node service with no observability, no tests, and frequent incidents. What is your first month?</summary>
+      <p>I would sequence by what reduces risk fastest rather than by what is most satisfying to fix. Week one
+      is visibility, because you cannot improve what you cannot see and every later decision depends on data:
+      structured logging with request ids, RED metrics, event loop lag, and alerts on user-visible symptoms
+      with runbooks. That alone usually shortens incidents substantially, since most of the time is spent
+      finding the problem rather than fixing it. Week two is stopping the bleeding on the recurring incidents:
+      instrument to find the top few causes and fix those specifically, while adding the cheap protective
+      measures that prevent whole classes of failure — timeouts on outbound calls, body size limits, graceful
+      shutdown, and correct health checks. These are small changes with disproportionate effect. Week three is
+      a safety net for change: integration tests covering the critical paths first, particularly money and auth,
+      plus a regression test for every incident already seen, since those are proven-fragile areas. That makes
+      further changes safe rather than adding coverage for its own sake. Week four is the deployment path:
+      reproducible builds, migrations as a gated step, a tested rollback, and smaller deploys. Throughout, I
+      would keep a running list of known risks with severity, because an inherited system always has more
+      problems than time and the useful artifact is a prioritized, visible list rather than a private worry.
+      What I would deliberately not do early is a rewrite or a large refactor: without tests and observability
+      there is no way to know whether it improved anything, and it competes with the work that actually reduces
+      incident frequency now.</p></details>
+
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (easy):</strong> Write a multi-stage Dockerfile for a Node service.
+      <details class="solution"><summary>Solution</summary>
+      <pre>FROM node:22-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+RUN apk add --no-cache tini
+COPY package*.json ./
+RUN npm ci --omit=dev &amp;&amp; npm cache clean --force
+COPY --from=build /app/dist ./dist
+USER node
+EXPOSE 3000
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/server.js"]
+
+# .dockerignore:
+#   node_modules
+#   .git
+#   .env
+#   **/*.test.js</pre></details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Why does <code>CMD "node server.js"</code> break graceful shutdown?
+      <details class="solution"><summary>Solution</summary>
+      <pre># The quoted form is the SHELL form: Docker runs /bin/sh -c "node server.js".
+# /bin/sh is PID 1 and does not forward SIGTERM to its child, so Node's
+# process.on("SIGTERM") handler never runs. The container appears to ignore
+# `docker stop`, then dies to SIGKILL after the grace period — dropping
+# in-flight requests on every deploy.
+CMD ["node", "server.js"]        # exec form: node is PID 1
+
+# Verify rather than assume:
+#   docker run --name t myimage
+#   docker stop t
+#   docker logs t     # shutdown lines MUST appear</pre></details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Plan the deploy sequence for adding a required <code>currency</code> column to <code>orders</code>.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- Deploy 1: ADD NULLABLE. Additive, so old code is unaffected.
+ALTER TABLE orders ADD COLUMN currency text;
+
+-- Deploy 2: code writes currency on every insert/update, still tolerates
+-- null when reading. Both versions now function.
+
+-- Backfill in restartable batches (databases lesson):
+UPDATE orders SET currency = 'usd'
+ WHERE id IN (SELECT id FROM orders WHERE currency IS NULL LIMIT 1000);
+-- loop with a pause until zero rows affected
+
+-- Deploy 3: code requires currency when reading. Safe only once the
+-- backfill is verified complete:
+--   SELECT count(*) FROM orders WHERE currency IS NULL;  → must be 0
+
+-- Deploy 4: enforce at the database level. NOT VALID first so the ALTER
+-- does not scan the whole table while holding a lock:
+ALTER TABLE orders ADD CONSTRAINT orders_currency_not_null
+  CHECK (currency IS NOT NULL) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_currency_not_null;
+
+-- Why not ALTER COLUMN SET NOT NULL directly: it takes an ACCESS EXCLUSIVE
+-- lock and scans every row, blocking all reads and writes on a large table.
+-- The two-step CHECK approach validates without blocking traffic.</pre></details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Configure Kubernetes probes and lifecycle for a service whose shutdown takes up to 20 seconds.
+      <details class="solution"><summary>Solution</summary>
+      <pre>spec:
+  terminationGracePeriodSeconds: 45      # MUST exceed total shutdown time
+  containers:
+    - name: api
+      env:
+        - name: NODE_OPTIONS
+          value: "--max-old-space-size=768"    # ~75% of the 1Gi limit
+      resources:
+        limits: { memory: "1Gi", cpu: "1" }
+      livenessProbe:                      # process wedged? → restart
+        httpGet: { path: /health/live, port: 3000 }
+        periodSeconds: 10
+        failureThreshold: 3
+      readinessProbe:                     # can it serve? → route traffic
+        httpGet: { path: /health/ready, port: 3000 }
+        periodSeconds: 5
+        failureThreshold: 2
+      lifecycle:
+        preStop:
+          exec: { command: ["sleep", "5"] }   # endpoint propagation
+
+# Reasoning:
+# • preStop sleep runs BEFORE SIGTERM, giving kube-proxy and the load
+#   balancer time to remove this pod from rotation. Without it, traffic
+#   arrives while the app is already closing.
+# • grace period 45s > preStop 5s + shutdown 20s, with margin. If it were
+#   shorter, SIGKILL would arrive mid-drain and undo the graceful shutdown.
+# • liveness must NOT check dependencies: a database blip would restart
+#   every pod simultaneously, turning degradation into an outage.
+# • the V8 heap limit prevents a silent kernel OOM-kill.</pre></details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A deploy caused a 3-minute outage. Write the postmortem structure and identify likely systemic gaps.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// STRUCTURE
+// 1. Summary — one paragraph: what users experienced, duration, impact.
+//    Written for someone who was not there.
+// 2. Timeline (UTC, with evidence): deploy started, first error, first
+//    alert, human engaged, mitigation applied, resolved.
+// 3. Impact: requests failed, users affected, revenue, SLO budget consumed.
+// 4. Root cause — the technical chain, not a person.
+// 5. What went well: mitigations, tooling, or people that helped. Worth
+//    recording so it is preserved rather than accidentally removed later.
+// 6. Action items: specific, assigned, dated.
+
+// THE GAPS THE TIMELINE USUALLY EXPOSES, which matter more than the cause:
+// • DETECTION: how long between first error and first alert? If users
+//   reported it before monitoring did, that is the top action item —
+//   detection gaps affect every future incident, not just this one.
+// • ATTRIBUTION: was it obvious the deploy caused it? If not, deploy
+//   markers on dashboards are a cheap, high-value fix.
+// • MITIGATION SPEED: was rollback attempted immediately, or was there a
+//   long diagnosis phase first? Mitigate-before-diagnose is a cultural fix.
+// • BLAST RADIUS: 3 minutes of TOTAL outage means the bad version took all
+//   traffic at once. A canary or a slower rollout with abort criteria would
+//   have limited it to a small percentage of users.
+// • PRE-PRODUCTION: why did tests and staging pass? Often the difference is
+//   data scale, real traffic patterns, or a migration that only exists in
+//   production.
+
+// LIKELY ACTION ITEMS
+//   □ canary rollout with automated abort on error rate    [owner, date]
+//   □ deploy markers on latency/error dashboards           [owner, date]
+//   □ alert on error rate within 60s (currently 5m window) [owner, date]
+//   □ regression test for the specific failure             [owner, date]
+//   □ document mitigate-first in the on-call runbook       [owner, date]
+
+// Deliberately NOT an action item: "be more careful during deploys." It is
+// unfalsifiable, unassignable, and assumes the failure was attention rather
+// than a system that permitted a bad version to take 100% of traffic
+// undetected for three minutes. The system permitted it; fix the system.</pre></details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Audit a Node service for production readiness. What do you check, and in what order?
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Order by (likelihood of failure × blast radius), not by convenience.
+
+// 1. CAN IT FAIL SAFELY? — the highest-value questions.
+//    □ SIGTERM handled AND reaching PID 1 (verify with docker stop)
+//    □ timeouts on every outbound call — unbounded waiting is the most
+//      common cause of a dependency outage becoming a full outage
+//    □ body size limits, pagination caps, request timeouts
+//    □ liveness does NOT check dependencies
+//    □ V8 heap limit set relative to the container limit
+
+// 2. CAN IT BE ATTACKED CHEAPLY?
+//    □ authorization checks the object, not just the route (IDOR)
+//    □ parameterized queries; allowlisted identifiers
+//    □ input validated at boundaries with schemas
+//    □ secrets injected at runtime, not in layers or git
+//    □ container runs non-root; lockfile committed; npm ci
+
+// 3. CAN YOU SEE IT FAIL?
+//    □ structured logs with request ids, secrets redacted
+//    □ RED metrics with bounded cardinality
+//    □ event loop lag monitored
+//    □ alerts on user-visible symptoms, each with a runbook
+
+// 4. CAN YOU CHANGE IT SAFELY?
+//    □ migrations backward compatible and run as a gated step
+//    □ rollback tested, including schema changes
+//    □ integration tests on money and auth paths
+//    □ deploys small enough to attribute regressions
+
+// 5. WILL IT HOLD UNDER LOAD?
+//    □ connection pool sized across ALL instances, not per instance
+//    □ no in-memory state that breaks with replicas
+//    □ backpressure and load shedding
+//    □ load tested at 2× expected peak
+
+// Deliverable: not a pass/fail, but a RANKED risk register — each gap with
+// severity, effort, and an explicit accept-or-fix decision. Every real
+// service ships with known gaps; the difference between a mature team and a
+// fragile one is whether those gaps are chosen and written down or simply
+// undiscovered. Start with the cheapest items in category 1: timeouts and
+// graceful shutdown are usually a few hours of work and prevent a
+// disproportionate share of real incidents.</pre></details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
+      <li>Multi-stage builds, non-root users, and runtime-injected secrets are the baseline for a production container.</li>
+      <li>Exec-form <code>CMD</code> plus an init like <code>tini</code> is what makes graceful shutdown actually run — verify it rather than assuming.</li>
+      <li>Set V8's heap limit relative to the container limit, or the kernel OOM-kills you with no trace.</li>
+      <li>Rolling deploys run two versions at once, which is the constraint governing every schema and API change.</li>
+      <li>Expand/contract exists because rollback is asymmetric: code reverts in seconds, dropped columns do not.</li>
+      <li>Run migrations as a separate gated step, never on application startup where replicas race.</li>
+      <li>Grace periods must exceed your shutdown budget, and readiness must fail before draining begins.</li>
+      <li>Mitigate before diagnosing — rollback, flags, and shedding do not require knowing the cause.</li>
+      <li>The gap between an incident starting and being noticed is usually the most valuable finding in a postmortem.</li>
+      <li>Every service ships with known gaps; maturity is choosing and recording them rather than discovering them during an incident.</li>
+    </ul></div>
+
+    <div class="pager">
+      <a class="btn btn-outline" href="scaling.html">← Scaling: Clusters &amp; Workers</a>
+      <a class="btn" href="quiz.html">Finish: Node.js Quizzes →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script><script src="nav.js"></script>
+</body>
+</html>

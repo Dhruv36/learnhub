@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scaling: Clusters &amp; Workers — Node.js — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../../playground/index.html">Playground</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Scaling: Clusters &amp; Workers <span class="level-badge level-ultra">Production Node</span></h1>
+    <p><strong>What you'll master:</strong> using every core with <code>cluster</code>, offloading CPU-bound
+       work to worker threads, what statelessness actually requires, background jobs and queues, and the
+       protective patterns — backpressure, circuit breakers, load shedding — that decide whether overload
+       degrades or collapses. Prerequisites:
+       <a href="performance.html">Performance &amp; Profiling</a>,
+       <a href="caching.html">Caching &amp; Redis</a>.</p>
+
+    <h2>Part 1 — One Process Uses One Core</h2>
+    <pre>// A Node process runs JavaScript on a single thread, so on an 8-core machine
+// a single process leaves 7 cores idle. Two ways to fix that:
+
+import cluster from "node:cluster";
+import { availableParallelism } from "node:os";
+
+if (cluster.isPrimary) {
+  const n = availableParallelism();          // ← respects cgroup CPU limits,
+  for (let i = 0; i &lt; n; i++) cluster.fork();  //   unlike os.cpus().length
+
+  cluster.on("exit", (worker, code, signal) => {
+    log.warn({ pid: worker.process.pid, code, signal }, "worker died");
+    if (!worker.exitedAfterDisconnect) cluster.fork();     // replace it
+  });
+} else {
+  app.listen(3000);          // every worker listens on the SAME port
+}
+// The primary creates the listening socket and distributes connections;
+// workers are separate PROCESSES with separate memory and separate heaps.
+
+// availableParallelism() over os.cpus().length matters in containers: a pod
+// limited to 2 CPUs on a 64-core node sees 64 from os.cpus(), forks 64
+// workers, and thrashes on context switching while using its 2-core share.
+// This is one of the most common Node-in-Kubernetes misconfigurations.
+
+// CLUSTER VS CONTAINER REPLICAS — a real architectural choice:
+//   cluster: one container uses all its cores; fewer containers to schedule;
+//            but the primary is a single point of failure and the whole
+//            container is one scheduling/restart unit.
+//   replicas: the orchestrator handles restarts, rolling updates, and
+//            per-instance health; scaling is uniform with the platform.
+// In Kubernetes the common guidance is one Node process per container with
+// a ~1 CPU limit and more replicas — let the platform do the multiplexing it
+// is already designed for. Use cluster on bare VMs, or where container
+// overhead per process is a real cost.
+
+// Critical consequence: WORKERS SHARE NOTHING. In-memory caches, rate-limit
+// counters, and sessions are per-worker, so with 8 workers an in-memory
+// rate limit of 100 is effectively 800, and a user hitting worker 3 cannot
+// see state written by worker 5. Shared state must live in Redis.</pre>
+
+    <h2>Part 2 — Worker Threads for CPU-Bound Work</h2>
+    <pre>// cluster scales I/O across cores. It does NOT help with a single expensive
+// computation — that still blocks one worker's event loop, and every request
+// that worker is serving. Worker threads are for CPU-bound work.
+
+import { Worker } from "node:worker_threads";
+
+function runTask(data) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker("./cpu-task.js", { workerData: data });
+    worker.once("message", resolve);
+    worker.once("error", reject);
+    worker.once("exit", (code) => {
+      if (code !== 0) reject(new Error(`Worker exited with ${code}`));
+    });
+  });
+}
+
+// cpu-task.js
+import { parentPort, workerData } from "node:worker_threads";
+parentPort.postMessage(expensiveComputation(workerData));
+
+// USE A POOL — spawning a thread per task costs ~10–30ms of startup plus a
+// fresh V8 isolate's memory, which usually exceeds the work you are
+// offloading:
+import Piscina from "piscina";
+const pool = new Piscina({ filename: "./cpu-task.js", maxThreads: 4 });
+const result = await pool.run(data);
+
+// What actually belongs on a worker thread:
+//   ✅ image/video processing, PDF generation, compression of large buffers,
+//      cryptographic key derivation, big JSON/CSV parsing, ML inference
+//   ❌ database queries, HTTP calls, file reads — these are already async
+//      and non-blocking; moving them to a thread adds overhead for nothing
+//
+// The distinction is CPU-bound versus I/O-bound. Node is already excellent
+// at I/O concurrency; threads exist solely to keep CPU work off the loop.
+
+// Data transfer between threads is by STRUCTURED CLONE — a copy, whose cost
+// scales with size. For large buffers, transfer ownership instead of copying:
+worker.postMessage(buffer, [buffer.buffer]);   // zero-copy; sender loses it
+// Or use SharedArrayBuffer for genuinely shared memory (and then you own
+// the synchronization problem, with Atomics).</pre>
+
+    <div class="note"><strong>Threads do not make blocking code safe — they relocate it.</strong>
+      A worker thread has its own event loop, so a synchronous computation there blocks that thread, not the
+      main one. That is the entire benefit. But a pool of four threads saturated by four long tasks queues the
+      fifth, so throughput is still bounded and you have simply moved the queue. Worker threads buy
+      responsiveness for the main loop, not unlimited CPU.</div>
+
+    <h2>Part 3 — Statelessness Is What Makes Scaling Possible</h2>
+    <pre>// Horizontal scaling requires that any instance can serve any request. That
+// fails the moment an instance holds state a later request depends on.
+
+// ❌ State that breaks with more than one instance:
+const sessions = new Map();          // user hits another instance → logged out
+const cache = new Map();             // N instances = N cold caches, N× misses
+let requestCount = 0;                // per-instance count, not a system total
+const rateLimits = new Map();        // limit × instances, as in Part 1
+const uploads = "/tmp/uploads";      // the next request lands elsewhere
+
+// ✅ Externalize it:
+//   sessions      → Redis (see the auth lesson)
+//   cache         → Redis, with per-instance memory as an optional L1
+//   counters      → Redis INCR, or a metrics backend
+//   rate limits   → Redis (the sorted-set limiter from the caching lesson)
+//   uploads       → S3/object storage
+//   scheduled jobs→ a queue with a single consumer, or a distributed lock —
+//                   otherwise every instance runs the 3am cron simultaneously
+
+// STICKY SESSIONS are the tempting shortcut. They work, and they cost you:
+// uneven load distribution, a deploy or a crash losing whatever that
+// instance held, and autoscaling that cannot rebalance existing connections.
+// Prefer externalizing state; keep stickiness for genuinely connection-bound
+// protocols like WebSockets, where the connection itself is the state.
+
+// WebSockets specifically need a broadcast path across instances, because a
+// socket lives on exactly one instance:
+//   client A ↔ instance 1        client B ↔ instance 2
+//   A sends a message for B → instance 1 must reach instance 2
+// Use a Redis pub/sub adapter (socket.io-redis) or a dedicated realtime
+// service. Without it, messages work perfectly in development with one
+// instance and silently fail for half the users in production.</pre>
+
+    <h2>Part 4 — Background Jobs and Queues</h2>
+    <pre>// The single most effective scaling move: take work off the request path.
+// The user waits for the write, not for everything downstream of it.
+
+import { Queue, Worker } from "bullmq";
+const queue = new Queue("emails", { connection: redis });
+
+// Producer — inside the request, fast:
+app.post("/orders", async (req, res) => {
+  const order = await createOrder(req.body);
+  await queue.add("order-confirmation", { orderId: order.id }, {
+    attempts: 3,
+    backoff: { type: "exponential", delay: 1000 },
+    removeOnComplete: 1000,          // bound the completed set, or Redis grows
+  });
+  res.status(201).json(order);       // returns without waiting for the email
+});
+
+// Consumer — a separate process, scaled independently:
+new Worker("emails", async (job) => {
+  await sendEmail(job.data.orderId);
+}, { connection: redis, concurrency: 5 });
+
+// What belongs on a queue: emails, thumbnails, PDF generation, webhooks,
+// search indexing, analytics, report generation — anything the user does not
+// need before their response.
+
+// DESIGN RULES THAT MATTER:
+// 1. JOBS MUST BE IDEMPOTENT. Every queue redelivers on worker crash or
+//    timeout, so at-least-once is the realistic guarantee. A job that
+//    charges a card must be safe to run twice — the idempotency-key pattern
+//    from the REST lesson applies directly.
+// 2. PASS IDS, NOT OBJECTS. Enqueue { orderId }, not the whole order: the
+//    payload stays small and the worker reads current data rather than a
+//    snapshot that may be stale by the time it runs.
+// 3. BOUND RETRIES and route failures to a DEAD-LETTER QUEUE. Infinite
+//    retries on a permanently failing job burn capacity forever and hide
+//    the failure.
+// 4. MONITOR QUEUE DEPTH. Growing depth means consumers cannot keep up —
+//    it is the earliest signal of a capacity problem, and it appears long
+//    before user-visible latency does.
+// 5. SEPARATE QUEUES BY PRIORITY. A flood of analytics jobs must not delay
+//    password-reset emails.</pre>
+
+    <h2>Part 5 — Protecting Yourself Under Load</h2>
+    <pre>// Scaling is not only about handling more; it is about failing well when you
+// cannot. Without these, overload turns into collapse.
+
+// BACKPRESSURE — refuse work you cannot do, rather than queueing it forever:
+let inFlight = 0;
+app.use((req, res, next) => {
+  if (inFlight >= 200) {
+    res.set("retry-after", "2");
+    return res.status(503).json({ error: "overloaded" });
+  }
+  inFlight++;
+  res.on("close", () => inFlight--);
+  next();
+});
+// Accepting unbounded work is how a slowdown becomes an outage: queued
+// requests consume memory and time out anyway, so you do the work AND fail.
+// A fast 503 is strictly better than a slow timeout for everyone.
+
+// CIRCUIT BREAKER — stop calling a dependency that is clearly down:
+//   CLOSED    → calls pass through; count failures
+//   OPEN      → fail immediately without calling (saves the timeout)
+//   HALF-OPEN → after a cooldown, let one probe through; close on success
+// The value is not just protecting the upstream — it converts slow failures
+// into instant ones, which stops YOUR threads and sockets piling up waiting
+// on something that will not answer.
+
+// LOAD SHEDDING BY PRIORITY — drop the cheap stuff first:
+if (overloaded && req.priority === "low") return res.status(503).end();
+// Serving checkout while shedding analytics is a better outage than serving
+// everything slowly and failing checkout too.
+
+// TIMEOUTS EVERYWHERE — from the http lesson: unbounded waiting is unbounded
+// resource consumption. Every outbound call needs AbortSignal.timeout().
+
+// AUTOSCALING signals, in rough order of usefulness for Node:
+//   • event loop lag / p99 latency — closest to user experience
+//   • queue depth for consumers
+//   • RPS per instance where load is uniform
+//   • CPU — a poor primary signal for I/O-bound services, which can be
+//     saturated on connections at 20% CPU
+// Scale-up should be fast and scale-down slow, or you oscillate; and
+// autoscaling cannot help if the bottleneck is a shared database, which is
+// why the connection-pool math from the databases lesson binds here too.</pre>
+
+    <h2>Part 6 — Graceful Shutdown at Scale</h2>
+    <pre>// Every scaling event — deploy, autoscale-down, node drain — terminates
+// instances. Done wrong, each one drops requests.
+
+async function shutdown(signal) {
+  log.info({ signal }, "shutting down");
+
+  ready = false;                      // 1. FAIL READINESS FIRST
+  await sleep(5_000);                 //    let the LB notice and drain
+
+  server.close(() => log.info("http closed"));   // 2. stop accepting
+  server.closeIdleConnections();                 //    release idle keep-alives
+
+  await worker?.close();              // 3. finish in-flight JOBS, stop taking new
+  await pool.end();                   // 4. close DB connections cleanly
+  await redis.quit();
+
+  process.exit(0);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+setTimeout(() => process.exit(1), 30_000).unref();   // hard cap
+
+// STEP 1 IS THE ONE PEOPLE MISS. Load balancers and kube-proxy notice
+// readiness changes on a polling interval — often several seconds. Closing
+// the server immediately on SIGTERM means traffic still arrives at a socket
+// that is no longer accepting, producing connection-refused errors during
+// every single deploy. The sleep is not a hack; it is waiting for a
+// distributed system to converge.
+
+// For cluster, shut down workers with overlap so capacity never drops to
+// zero (a rolling restart in miniature):
+for (const worker of Object.values(cluster.workers)) {
+  worker.disconnect();                 // stop new connections to this worker
+  await once(worker, "exit");          // wait before moving to the next
+}
+
+// Queue consumers need the same care: BullMQ's close() waits for active jobs
+// to finish. Killing a worker mid-job means the job is redelivered — which
+// is fine precisely because you made jobs idempotent (Part 4), and painful
+// if you did not.</pre>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td><code>os.cpus().length</code> inside a container</td><td>Forks dozens of workers for a 2-CPU limit; thrashing</td><td><code>availableParallelism()</code></td></tr>
+      <tr><td>In-memory sessions or caches with multiple instances</td><td>Users randomly logged out; N cold caches</td><td>Externalize to Redis</td></tr>
+      <tr><td>In-memory rate limiting across workers</td><td>The effective limit is limit × instances</td><td>A shared Redis counter</td></tr>
+      <tr><td>Worker threads for database or HTTP calls</td><td>Overhead with no benefit — that work is already async</td><td>Threads only for CPU-bound work</td></tr>
+      <tr><td>A new <code>Worker</code> per task</td><td>Startup cost exceeds the work being offloaded</td><td>A thread pool (Piscina)</td></tr>
+      <tr><td>Non-idempotent queue jobs</td><td>Redelivery duplicates charges and emails</td><td>Design for at-least-once</td></tr>
+      <tr><td>Enqueuing whole objects</td><td>Large payloads and stale snapshots</td><td>Enqueue ids; read current state in the worker</td></tr>
+      <tr><td>Unbounded retries with no dead-letter queue</td><td>Poison jobs consume capacity forever</td><td>Bounded attempts, then DLQ</td></tr>
+      <tr><td>Accepting unlimited concurrent requests</td><td>Overload becomes collapse instead of degradation</td><td>Backpressure with a fast 503</td></tr>
+      <tr><td>Closing the server immediately on SIGTERM</td><td>Connection-refused errors on every deploy</td><td>Fail readiness, wait, then close</td></tr>
+      <tr><td>Scheduled jobs running on every instance</td><td>The nightly job runs N times</td><td>A leader lock or a dedicated scheduler</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Why does a single Node process not use all CPU cores?</summary>
+      <p>Because JavaScript execution happens on one thread. Node handles I/O concurrently through libuv's
+      thread pool and the operating system, but your code runs on a single thread, so on an eight-core machine
+      one process can saturate at most one core with JavaScript. Using the rest requires multiple processes —
+      via <code>cluster</code> or multiple container replicas — or worker threads for specific CPU-bound
+      tasks.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between <code>cluster</code> and worker threads?</summary>
+      <p><code>cluster</code> forks separate processes that share a listening socket, so incoming connections
+      are distributed across cores — it scales I/O-bound request handling. Worker threads run inside one
+      process with their own event loops and are for CPU-bound computation you want off the main thread.
+      Processes share no memory, which is safer but makes communication expensive; threads can share memory via
+      <code>SharedArrayBuffer</code> and transfer buffers without copying. The rule of thumb is cluster for
+      serving more requests, threads for individual expensive computations.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What breaks when you scale a stateful service from one instance to many?</summary>
+      <p>Anything held in process memory stops being globally true. In-memory sessions mean a user routed to
+      another instance appears logged out. In-memory caches multiply cold misses and can serve divergent data.
+      In-memory rate limiting becomes limit times instance count, so the effective limit is whatever you
+      configured multiplied by however many pods happen to be running. Counters become per-instance rather than
+      system-wide. Uploads written to local disk are invisible to the next request. Scheduled jobs run once per
+      instance instead of once. WebSocket connections live on one instance, so broadcasting requires a pub/sub
+      layer. The fix is externalizing state to Redis or object storage; sticky sessions are the shortcut that
+      works but costs you even load distribution and resilience to instance loss.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why must queue jobs be idempotent?</summary>
+      <p>Because queues deliver at least once in practice. If a worker crashes, times out, or loses its
+      connection after doing the work but before acknowledging, the job is redelivered and runs again. Exactly-once
+      delivery is not achievable in a distributed system without cooperation from the effect itself, so the
+      practical approach is to make repeated execution harmless — a unique constraint on a natural key, an
+      upsert, or an idempotency key recorded transactionally with the effect. Otherwise a routine worker
+      restart double-charges a customer or sends duplicate emails.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A service runs 20 replicas but latency degrades badly under peak load while CPU stays at 30%. What is happening?</summary>
+      <p>Low CPU with high latency means waiting rather than computing, so I would look for a shared bottleneck
+      that adding replicas cannot relieve — and may be worsening. The most likely candidate is the database:
+      twenty replicas each with a connection pool multiply into a connection count that can exceed the server's
+      limit, at which point queries queue and every replica waits, so scaling out made contention worse rather
+      than better. Pool wait time and database-side active connections confirm this quickly, and PgBouncer plus
+      correctly sized pools is the fix. Other candidates with the same signature: a shared Redis or upstream
+      service saturating, lock contention on hot rows, or event loop lag from synchronous work, which would
+      show as high lag with low CPU. I would also check whether the load balancer is distributing evenly, since
+      sticky sessions or long-lived connections can concentrate traffic on a few replicas while the rest sit
+      idle — the aggregate CPU average would still look low. The general principle is that horizontal scaling
+      only helps when the bottleneck is per-instance capacity; when the constraint is shared, more instances
+      increase contention. Identifying which kind of bottleneck you have is the first diagnostic step, and low
+      utilization with high latency is nearly always the shared kind.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Design the architecture for an image-upload service handling thousands of uploads per minute with resizing.</summary>
+      <p>The organizing decision is separating the fast path from the expensive path. On upload I would stream
+      the file directly to object storage rather than buffering it in the process — ideally with a pre-signed
+      URL so the bytes never traverse the API at all, which removes the largest cost from my service entirely.
+      The API then records metadata and enqueues a processing job, returning 202 with a resource id. Resizing
+      happens in a separate worker fleet consuming that queue, scaled independently on queue depth, since
+      processing capacity and request capacity have completely different profiles. Within a worker, the resize
+      itself is CPU-bound and goes on a worker thread pool so the consumer's event loop stays responsive for
+      job management and heartbeats. Jobs carry the storage key rather than image data, are idempotent so
+      redelivery on crash is harmless, have bounded retries with a dead-letter queue for corrupt files, and
+      write derived images back to object storage with a CDN in front so reads never touch my
+      infrastructure. Clients learn about completion by polling status or a webhook. Protective measures
+      matter at this volume: upload size limits, per-user rate limiting in Redis, backpressure returning 503
+      when in-flight work exceeds capacity, and queue depth alerting as the early warning that consumers are
+      falling behind. What I would specifically avoid is resizing synchronously during the request, which
+      couples user-visible latency to CPU work and means a traffic spike either times out or exhausts memory —
+      the failure mode that makes this a common interview question.</p></details>
+
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (easy):</strong> Write a cluster setup that uses all available cores and restarts dead workers.
+      <details class="solution"><summary>Solution</summary>
+      <pre>import cluster from "node:cluster";
+import { availableParallelism } from "node:os";
+
+if (cluster.isPrimary) {
+  const count = availableParallelism();
+  log.info({ count }, "forking workers");
+  for (let i = 0; i &lt; count; i++) cluster.fork();
+
+  cluster.on("exit", (worker, code, signal) => {
+    log.warn({ pid: worker.process.pid, code, signal }, "worker exited");
+    // Do NOT refork on intentional shutdown, or the process never exits.
+    if (!worker.exitedAfterDisconnect) cluster.fork();
+  });
+} else {
+  const server = app.listen(3000);
+  process.on("SIGTERM", () => server.close(() => process.exit(0)));
+}
+// availableParallelism() respects container CPU limits; os.cpus().length
+// reports the host's cores and over-forks badly inside a pod.</pre></details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Why does an in-memory rate limiter break under cluster?
+      <details class="solution"><summary>Solution</summary>
+      <pre>const hits = new Map();          // ❌ per-PROCESS, not per-service
+// With 8 workers, each keeps its own counter and the load balancer spreads
+// a user's requests across all of them — so a "100 per minute" limit
+// permits up to 800, and which limit a request hits is essentially random.
+
+// Shared counter in Redis instead (the sliding window from the caching lesson):
+const count = await redis.incr(`rl:${userId}`);
+if (count === 1) await redis.expire(`rl:${userId}`, 60);
+if (count > 100) throw new AppError("Rate limited", { status: 429 });
+// The same reasoning applies to every in-memory counter, cache, and session
+// store the moment there is more than one instance.</pre></details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Move a CPU-heavy resize off the event loop using a thread pool.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// resize-worker.js
+import sharp from "sharp";
+export default async function ({ buffer, width }) {
+  return sharp(buffer).resize(width).webp().toBuffer();
+}
+
+// server.js
+import Piscina from "piscina";
+const pool = new Piscina({
+  filename: new URL("./resize-worker.js", import.meta.url).href,
+  maxThreads: Math.max(1, availableParallelism() - 1),   // leave one for I/O
+});
+
+app.post("/resize", async (req, res) => {
+  const buffer = await readBody(req, 10 * 1024 * 1024);
+  const out = await pool.run({ buffer, width: 800 });
+  res.type("image/webp").send(out);
+});
+
+// Why a pool: each Worker costs ~10-30ms of startup and a fresh V8 isolate,
+// so spawning per request would often cost more than the resize itself.
+// Leaving a core for the main thread keeps request handling responsive
+// while the pool is saturated.
+// Note the pool bounds concurrency: the 5th simultaneous resize queues.
+// That is intended — it is backpressure rather than unbounded memory use.</pre></details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Convert a synchronous email send into a queued job with retries and a DLQ.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Before: the user waits for SMTP, and a provider outage fails the order.
+await sendEmail(order);
+res.status(201).json(order);
+
+// After — producer:
+await queue.add("order-confirmation", { orderId: order.id }, {
+  attempts: 5,
+  backoff: { type: "exponential", delay: 2000 },   // 2s, 4s, 8s, 16s
+  removeOnComplete: 1000,        // keep the last 1000; unbounded grows Redis
+  removeOnFail: false,           // keep failures for inspection
+});
+res.status(201).json(order);     // returns immediately
+
+// Consumer, in its own process:
+new Worker("emails", async (job) => {
+  const order = await db.findOrder(job.data.orderId);   // read CURRENT state
+  if (order.confirmationSentAt) return;                 // idempotency guard
+  await sendEmail(order);
+  await db.markConfirmationSent(order.id);
+}, { connection: redis, concurrency: 5 });
+
+new Worker("emails").on("failed", async (job, err) => {
+  if (job.attemptsMade >= job.opts.attempts) {
+    await deadLetter.add("failed-email", { ...job.data, error: err.message });
+    log.error({ jobId: job.id, err }, "email permanently failed");
+  }
+});
+// The idempotency guard matters because retries and redelivery both happen:
+// without it, a crash after sending but before acknowledging sends twice.</pre></details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Implement a circuit breaker and explain each state transition.
+      <details class="solution"><summary>Solution</summary>
+      <pre>class CircuitBreaker {
+  #failures = 0;
+  #state = "CLOSED";
+  #openedAt = 0;
+
+  constructor({ threshold = 5, cooldownMs = 30_000, timeoutMs = 3_000 } = {}) {
+    Object.assign(this, { threshold, cooldownMs, timeoutMs });
+  }
+
+  async call(fn) {
+    if (this.#state === "OPEN") {
+      if (Date.now() - this.#openedAt &lt; this.cooldownMs) {
+        throw new AppError("Circuit open", { status: 503, code: "upstream_down" });
+      }
+      this.#state = "HALF_OPEN";        // cooldown elapsed: allow ONE probe
+    }
+
+    try {
+      const result = await fn(AbortSignal.timeout(this.timeoutMs));
+      this.#failures = 0;
+      this.#state = "CLOSED";           // success closes it
+      return result;
+    } catch (err) {
+      this.#failures++;
+      if (this.#state === "HALF_OPEN" || this.#failures >= this.threshold) {
+        this.#state = "OPEN";           // probe failed, or threshold crossed
+        this.#openedAt = Date.now();
+      }
+      throw err;
+    }
+  }
+}
+
+// CLOSED → OPEN: consecutive failures crossed the threshold. Stop calling.
+// OPEN → HALF_OPEN: the cooldown elapsed; permit one probe to test recovery.
+// HALF_OPEN → CLOSED: the probe succeeded; resume normal operation.
+// HALF_OPEN → OPEN: the probe failed; wait another cooldown. This is what
+//   prevents a recovering upstream from being flooded the instant it
+//   responds once — the failure mode of naive retry-everything designs.
+//
+// The primary benefit is converting SLOW failures into INSTANT ones. Without
+// it, every request waits the full timeout on a dead dependency, so your own
+// handlers, sockets, and memory pile up — a downstream outage propagates
+// upstream. Pair it with a fallback where the dependency is non-critical.</pre></details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design graceful shutdown for a service that serves HTTP and consumes a queue. Explain the ordering.
+      <details class="solution"><summary>Solution</summary>
+      <pre>let ready = true;
+let shuttingDown = false;
+
+app.get("/health/ready", (req, res) =>
+  res.status(ready ? 200 : 503).json({ ready }));
+
+async function shutdown(signal) {
+  if (shuttingDown) return;              // SIGTERM can arrive twice
+  shuttingDown = true;
+  log.info({ signal }, "shutdown starting");
+
+  // 1. FAIL READINESS, THEN WAIT. The load balancer polls on an interval,
+  //    so closing now would refuse connections it is still routing. This
+  //    sleep is waiting for a distributed system to converge, not a hack.
+  ready = false;
+  await sleep(5_000);
+
+  // 2. Stop accepting HTTP; let in-flight requests finish.
+  await new Promise((resolve) => server.close(resolve));
+  server.closeIdleConnections();         // else idle keep-alives block close
+
+  // 3. Stop taking new JOBS but let active ones finish. Jobs are usually
+  //    longer than requests, so this comes after HTTP — the process must
+  //    stay alive for them either way.
+  await queueWorker.close();
+
+  // 4. Only now close shared resources: steps 2 and 3 still needed them.
+  //    Closing the pool earlier would fail the very requests you are
+  //    draining.
+  await pool.end();
+  await redis.quit();
+
+  log.info("shutdown complete");
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+// Hard cap: never let shutdown hang forever. unref() so this timer does not
+// itself keep the process alive.
+setTimeout(() => {
+  log.error("shutdown timed out — forcing exit");
+  process.exit(1);
+}, 30_000).unref();
+
+// The ordering principle throughout: stop accepting NEW work from the
+// outside in, let existing work drain, then release resources last. Getting
+// it backwards — closing the database first — turns a graceful shutdown into
+// a burst of 500s for the requests you were trying to protect.
+// The grace period must also be shorter than the orchestrator's
+// terminationGracePeriodSeconds, or SIGKILL arrives mid-drain and undoes it.</pre></details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
+      <li>One Node process uses one core for JavaScript — <code>cluster</code> or replicas are how you use the rest.</li>
+      <li>Use <code>availableParallelism()</code>, not <code>os.cpus().length</code>, or containers over-fork badly.</li>
+      <li>Worker threads are for CPU-bound work only; database and HTTP calls are already non-blocking.</li>
+      <li>Always pool worker threads — per-task spawning usually costs more than the work offloaded.</li>
+      <li>Statelessness is the precondition for horizontal scaling: sessions, caches, counters, and limits must be external.</li>
+      <li>Moving work to a queue is usually the highest-leverage scaling change available.</li>
+      <li>Queue jobs must be idempotent, carry ids rather than objects, and have bounded retries with a dead-letter queue.</li>
+      <li>Backpressure, circuit breakers, and load shedding decide whether overload degrades or collapses.</li>
+      <li>Fail readiness and wait before closing the server, or every deploy produces connection errors.</li>
+      <li>When latency is high but CPU is low, the bottleneck is shared — adding instances makes it worse.</li>
+    </ul></div>
+
+    <div class="pager">
+      <a class="btn btn-outline" href="performance.html">← Performance &amp; Profiling</a>
+      <a class="btn" href="production.html">Next: Deployment &amp; Hardening →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script><script src="nav.js"></script>
+</body>
+</html>

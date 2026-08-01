@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Performance &amp; Profiling — Node.js — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../../playground/index.html">Playground</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Performance &amp; Profiling <span class="level-badge level-ultra">Production Node</span></h1>
+    <p><strong>What you'll master:</strong> measuring before optimizing, event loop lag as the defining Node
+       metric, CPU profiling with flame graphs, finding and fixing memory leaks with heap snapshots, the
+       async pitfalls that quietly serialize your code, and knowing when the answer is architectural rather
+       than micro-optimization. Prerequisites:
+       <a href="event-loop.html">The Event Loop &amp; libuv</a>,
+       <a href="errors-logging.html">Logging &amp; Observability</a>.</p>
+
+    <h2>Part 1 — Measure First, Always</h2>
+    <pre>// The rule that saves the most time: find the bottleneck before touching
+// anything. Intuition about performance is wrong often enough that
+// optimizing unmeasured code usually means adding complexity for nothing.
+
+// Establish the ORDER OF MAGNITUDE before you profile — it tells you which
+// layer can possibly matter:
+//   L1 cache reference            ~1 ns
+//   main memory reference       ~100 ns
+//   V8 function call             ~2 ns
+//   JSON.parse of 1KB            ~2 µs
+//   Redis GET (same DC)       ~200 µs
+//   Postgres simple query    ~1–5 ms
+//   HTTP call to another svc ~5–50 ms
+//   Disk seek (spinning)        ~10 ms
+//
+// A handler doing one database query (2ms) and 500 array operations (~50µs)
+// spends 97% of its time waiting on the database. Optimizing the array work
+// cannot produce more than a 3% improvement no matter how clever it is —
+// this is Amdahl's law, and it is why measurement comes first.
+
+// Where the time actually goes in most Node services, in order:
+//   1. waiting on I/O (database, upstreams) — usually dominant
+//   2. serialization (JSON.stringify of large payloads)
+//   3. blocking the event loop with synchronous work
+//   4. garbage collection pressure from excessive allocation
+//   5. actual algorithmic cost in your own code — usually last
+// Notice that four of the five are not "slow JavaScript".
+
+// Quick local timing before reaching for a profiler:
+console.time("query"); await db.query(sql); console.timeEnd("query");
+// Structured, keeps working in production:
+const t = process.hrtime.bigint();
+// ...
+metrics.observe(Number(process.hrtime.bigint() - t) / 1e6);</pre>
+
+    <h2>Part 2 — Event Loop Lag: the Defining Metric</h2>
+    <pre>// Node runs your JavaScript on ONE thread. Any synchronous work delays
+// EVERY pending callback — so one slow function makes every concurrent
+// request slower, regardless of what those requests are doing.
+
+import { monitorEventLoopDelay } from "node:perf_hooks";
+const h = monitorEventLoopDelay({ resolution: 10 });
+h.enable();
+setInterval(() => {
+  metrics.gauge("event_loop_lag_p99_ms", h.percentile(99) / 1e6);
+  h.reset();
+}, 10_000);
+
+// Interpretation:
+//   < 10ms   healthy
+//   10–50ms  something is blocking; investigate
+//   > 100ms  users feel it on every request
+//
+// This is the first metric to check when latency rises with normal CPU:
+// high lag means blocking, low lag with high latency means waiting on I/O
+// (which points at dependencies or the connection pool instead).
+
+// The usual culprits, all of which look innocent:
+JSON.parse(hugeString);              // synchronous, O(size), no yield point
+crypto.pbkdf2Sync(...);              // sync crypto — use the async form
+fs.readFileSync(path);               // fine at startup, never per request
+zlib.gzipSync(buffer);               // same
+array.sort()                         // on a very large array
+/(a+)+$/.test(userInput);            // ReDoS — can block for minutes
+for (const x of millionItems) { ... } // a big synchronous loop
+
+// Yielding inside unavoidable long loops keeps the process responsive:
+for (let i = 0; i &lt; items.length; i++) {
+  process(items[i]);
+  if (i % 1000 === 0) await new Promise((r) => setImmediate(r));  // let I/O run
+}
+// setImmediate yields to the loop's check phase, so pending I/O callbacks
+// get their turn. This makes the total slower but keeps the service alive —
+// usually the right trade for a request-serving process.</pre>
+
+    <div class="note"><strong>Throughput and latency are different goals and often conflict.</strong>
+      Batching database writes raises throughput while adding latency to each individual write. Yielding to the
+      event loop lowers throughput for one job while protecting latency for everyone else. Decide which one
+      the workload actually needs before optimizing, because a change that improves one usually costs the
+      other — and "faster" without saying which is how teams optimize in the wrong direction.</div>
+
+    <h2>Part 3 — CPU Profiling and Flame Graphs</h2>
+    <pre>// Capture a profile:
+node --cpu-prof --cpu-prof-dir=./prof server.js    # writes on exit
+// or in production, on demand, without a restart:
+//   node --inspect  →  chrome://inspect  →  Performance → Record
+// or programmatically, so you can trigger it from an endpoint:
+import inspector from "node:inspector/promises";
+const session = new inspector.Session();
+session.connect();
+await session.post("Profiler.enable");
+await session.post("Profiler.start");
+// ... under load ...
+const { profile } = await session.post("Profiler.stop");
+
+// READING A FLAME GRAPH — the skill that matters more than the tooling:
+//   • x-axis is NOT time; it is aggregated samples, sorted alphabetically
+//   • WIDTH = total time in that function and everything it called
+//   • height = stack depth, not cost — a tall narrow tower is cheap
+//   • look for WIDE PLATEAUS: a wide frame with no wide children is where
+//     time is actually spent (self time). That is your target.
+//   • wide frames deep in library code usually mean YOUR code is calling
+//     them too often, not that the library is slow
+
+// Common shapes and what they mean:
+//   a wide JSON.stringify        → serializing too much; trim the payload
+//   wide GC frames               → allocation pressure, not a GC bug
+//   wide regex frames            → catastrophic backtracking
+//   wide crypto frames           → sync crypto on the request path
+//   many thin frames, no plateau → the cost is I/O, not CPU. Stop profiling
+//                                  CPU and look at traces and pool metrics.
+
+// Benchmark honestly when comparing implementations:
+import { Bench } from "tinybench";
+const bench = new Bench({ time: 1000 });
+bench.add("map+filter", () => items.map(f).filter(g));
+bench.add("single reduce", () => items.reduce(h, []));
+await bench.run();
+// Microbenchmarks lie readily: V8 can optimize away work whose result is
+// unused, and a tight loop over the same data is cache-warm in a way
+// production never is. Trust an end-to-end measurement over a microbench
+// whenever they disagree.</pre>
+
+    <h2>Part 4 — Memory Leaks</h2>
+    <pre>// A leak is memory still REACHABLE that will never be used again — so the
+// garbage collector correctly refuses to free it. The signature is a heap
+// floor that rises across GC cycles rather than returning to a baseline.
+
+// The four classic Node leaks:
+// 1. AN UNBOUNDED CACHE — the most common by far.
+const cache = new Map();
+cache.set(key, value);                     // ❌ nothing ever removes entries
+// Fix: an LRU with a size cap, or a TTL. "It is just a small object" times
+// millions of distinct keys is a heap.
+
+// 2. LISTENERS ADDED PER REQUEST TO A LONG-LIVED EMITTER:
+app.use((req, res, next) => {
+  bus.on("update", () => res.write("..."));   // ❌ never removed
+  next();
+});
+// Every request adds a listener that keeps req/res alive forever. Node's
+// "possible EventEmitter memory leak detected" warning at 11 listeners is
+// pointing at exactly this. Fix: remove on res.on("close"), or use `once`.
+
+// 3. TIMERS AND INTERVALS THAT ARE NEVER CLEARED — an interval keeps its
+//    closure (and everything it captures) alive for the process lifetime.
+
+// 4. CLOSURES CAPTURING MORE THAN INTENDED:
+function makeHandler(bigBuffer) {
+  const id = bigBuffer.id;                 // only `id` is needed
+  return () => console.log(id);            // ✅ captures just id
+  // return () => console.log(bigBuffer.id);  ❌ retains the whole buffer
+}
+
+// FINDING ONE — compare heap snapshots, do not guess:
+//   1. node --inspect, open DevTools → Memory
+//   2. take a snapshot at steady state
+//   3. apply load, force GC, take a second snapshot
+//   4. use "Comparison" view sorted by size delta
+//   5. select a suspicious object → RETAINERS pane shows WHAT KEEPS IT
+//      ALIVE. That retainer chain is the answer; everything else is noise.
+// Programmatic capture for production:
+import v8 from "node:v8";
+v8.writeHeapSnapshot(`/tmp/heap-${Date.now()}.heapsnapshot`);
+// Note this pauses the process and writes a file the size of your heap —
+// safe on one instance taken out of rotation, disruptive on all of them.
+
+// Not every rise is a leak: V8 grows the heap lazily and does not return
+// memory to the OS eagerly. Judge by the floor AFTER GC over hours, not by
+// RSS over minutes.</pre>
+
+    <h2>Part 5 — Async Patterns That Cost Real Time</h2>
+    <pre>// SERIAL AWAITS IN A LOOP — the most common accidental slowdown:
+for (const id of ids) {
+  results.push(await fetchUser(id));       // ❌ 100 ids × 50ms = 5 SECONDS
+}
+const results = await Promise.all(ids.map(fetchUser));   // ✅ ~50ms
+// But unbounded parallelism is its own failure: 10,000 concurrent requests
+// exhausts sockets, the connection pool, and upstream rate limits. Bound it:
+import pLimit from "p-limit";
+const limit = pLimit(10);
+const results = await Promise.all(ids.map((id) => limit(() => fetchUser(id))));
+// Concurrency is a resource. Unbounded is not "fast", it is "unbounded".
+
+// INDEPENDENT AWAITS RUN SEQUENTIALLY FOR NO REASON:
+const user = await getUser(id);            // 50ms
+const orders = await getOrders(id);        // 50ms → 100ms total
+const [user, orders] = await Promise.all([getUser(id), getOrders(id)]);  // 50ms
+// Only serialize when the second call genuinely needs the first's result.
+
+// Promise.all vs allSettled — a correctness choice, not a style one:
+//   all        rejects on the FIRST failure; the others still run but their
+//              results are discarded. Right when you need everything.
+//   allSettled always resolves with per-item status. Right when partial
+//              results are useful — the graceful degradation pattern.
+
+// N+1 AT THE APPLICATION LAYER — same shape as the database N+1:
+const enriched = await Promise.all(orders.map(async (o) => ({
+  ...o, user: await getUser(o.userId),          // ❌ one call per order
+})));
+const users = await getUsersByIds([...new Set(orders.map((o) => o.userId))]);
+// ✅ one batched call, then a Map lookup — the DataLoader pattern.
+
+// STREAM INSTEAD OF BUFFERING for large payloads: memory stays constant and
+// time-to-first-byte drops from "after everything" to milliseconds. See the
+// streams lesson — it is a performance technique as much as a memory one.</pre>
+
+    <h2>Part 6 — When the Answer Is Not Micro-Optimization</h2>
+    <pre>// Ranked by typical payoff, largest first. Note that the first four are not
+// code changes at all:
+//
+// 1. DO LESS WORK. Cache the result. Do not compute what nobody reads.
+//    Paginate. Return fewer fields. The fastest code is code not run.
+// 2. DO IT LATER. Move non-critical work off the request path into a queue:
+//    emails, thumbnails, analytics, webhooks. The user waits for the write,
+//    not for everything downstream of it.
+// 3. DO IT CLOSER. A CDN, an HTTP cache, or a read replica removes the
+//    request from your service entirely.
+// 4. FIX THE DATABASE. Missing indexes, N+1 queries, and unbounded result
+//    sets dominate real-world latency far more often than JavaScript does.
+// 5. SCALE OUT. More instances — cheap, if the service is stateless.
+// 6. OPTIMIZE THE CODE. Real, but usually the smallest lever, and the one
+//    people reach for first.
+//
+// Node-specific escape hatches when CPU genuinely is the bottleneck:
+//   • WORKER THREADS for CPU-bound work (image processing, compression,
+//     large parses) — keeps the main loop free. See the scaling lesson.
+//   • CLUSTER / multiple instances to use all cores.
+//   • A native addon or a different runtime for a genuinely hot kernel —
+//     rare, and worth reaching for only with a profile that justifies it.
+
+// Cheap wins that are usually worth taking:
+app.use(compression());                    // gzip/brotli responses
+res.set("cache-control", "public, max-age=300");
+// Keep-alive on outbound HTTP (undici pools by default) avoids paying a TCP
+// handshake per upstream call.
+// Choose a faster JSON serializer only after proving serialization is hot —
+// fast-json-stringify is a real win for large fixed-schema payloads and
+// pure overhead for small ad-hoc ones.</pre>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Optimizing before measuring</td><td>Complexity added where it cannot help (Amdahl's law)</td><td>Profile first; optimize the widest frame</td></tr>
+      <tr><td>Synchronous work on the request path</td><td>Blocks every concurrent request, not just this one</td><td>Async APIs; yield in long loops; worker threads</td></tr>
+      <tr><td>Ignoring event loop lag</td><td>The clearest Node health signal goes unwatched</td><td>Monitor and alert on it</td></tr>
+      <tr><td><code>await</code> inside a loop over independent work</td><td>Latency multiplies by the item count</td><td><code>Promise.all</code> with bounded concurrency</td></tr>
+      <tr><td>Unbounded <code>Promise.all</code></td><td>Exhausts sockets, pools, and upstream rate limits</td><td>A concurrency limiter</td></tr>
+      <tr><td>Sequential independent awaits</td><td>Latency adds instead of overlapping</td><td><code>Promise.all</code> when there is no dependency</td></tr>
+      <tr><td>Caches with no bound or TTL</td><td>The most common Node memory leak</td><td>LRU with a size cap or expiry</td></tr>
+      <tr><td>Per-request listeners on shared emitters</td><td>Retains req/res forever; the 11-listener warning</td><td>Remove on <code>close</code>, or use <code>once</code></td></tr>
+      <tr><td>Judging leaks by RSS over minutes</td><td>False positives — V8 grows lazily and frees late</td><td>Watch the post-GC heap floor over hours</td></tr>
+      <tr><td>Trusting microbenchmarks</td><td>V8 optimizes away unused work; caches stay warm</td><td>Prefer end-to-end measurement</td></tr>
+      <tr><td>Buffering large payloads in memory</td><td>Memory scales with payload × concurrency</td><td>Stream them</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Why does one slow synchronous function affect every request?</summary>
+      <p>Because Node executes JavaScript on a single thread. While a synchronous function runs, the event loop
+      cannot process any other callback, so every pending request — regardless of what it needs — waits for it
+      to finish. This is why synchronous crypto, <code>readFileSync</code>, or a large <code>JSON.parse</code>
+      on the request path degrades the whole service rather than just the request that triggered it, and why
+      event loop lag is the metric that reveals it.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What is wrong with <code>for (const id of ids) await fetch(id)</code>?</summary>
+      <p>It serializes independent work: each iteration waits for the previous request to complete, so total
+      latency is the sum rather than the maximum. With 100 ids at 50ms each that is five seconds instead of
+      about fifty milliseconds. Since the calls do not depend on one another, they should run concurrently with
+      <code>Promise.all</code> — though with a concurrency limit, because unbounded parallelism creates its own
+      failure mode by exhausting sockets, the connection pool, and upstream rate limits.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> How do you read a flame graph?</summary>
+      <p>Width is the total time spent in a function including everything it called, and height is stack depth
+      rather than cost — so a tall narrow tower is cheap while a wide shallow frame is expensive. The x-axis is
+      not time; frames are aggregated samples sorted alphabetically. What you look for is wide plateaus: a wide
+      frame whose children are not wide, meaning the time is spent in that function itself. Wide frames inside
+      library code usually indicate your code calling it too often rather than the library being slow. If there
+      is no plateau at all and the graph is a mass of thin frames, CPU is not the bottleneck and you should be
+      looking at I/O traces and pool saturation instead.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> How do you distinguish a memory leak from normal heap growth?</summary>
+      <p>By watching the heap floor after garbage collection over hours rather than resident memory over
+      minutes. V8 grows the heap lazily and does not return memory to the operating system eagerly, so RSS
+      rising is expected and proves nothing. A leak shows as a post-GC baseline that climbs steadily and never
+      returns to its earlier level. To confirm and locate it, take a heap snapshot at steady state, apply load,
+      force a collection, take a second snapshot, and compare by size delta — then inspect the retainers of the
+      growing objects, since the retainer chain identifies what is holding them and that is the actual
+      bug.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> An endpoint has p50 of 40ms and p99 of 3s. Where do you look?</summary>
+      <p>The gap itself is the clue: the typical path is fast, so the code is not uniformly slow — something
+      intermittent affects a minority of requests, and that pattern points at queueing or variance rather than
+      algorithmic cost. I would work through candidates in order of likelihood. Connection pool saturation
+      produces exactly this shape, since most requests get a connection immediately while a few wait behind
+      others; pool wait time as a metric confirms or eliminates it quickly. Event loop lag is next: periodic
+      blocking work, garbage collection pauses, or a synchronous operation on an uncommon path delays whatever
+      happens to be pending. Then data-dependent cost — a query that is fast for typical users and slow for the
+      one with fifty thousand orders, or a missing index that only matters past a certain row count, which is
+      why breaking latency down by user or tenant is often revealing. Cache misses are another: p50 is a hit and
+      p99 is the miss path, which also means a cache stampede can be hiding here. External dependency variance
+      and retries contribute similarly. Diagnostically, I would sample traces from the slow tail specifically
+      rather than uniformly, since random sampling mostly captures fast requests; tail-based sampling exists for
+      this. I would also check whether the p99 is concentrated in particular instances, which would suggest one
+      unhealthy pod rather than a systemic issue. The general principle is that a wide p50-to-p99 gap is a
+      variance problem, and variance usually means waiting rather than computing.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A service needs to handle 10× traffic. How do you approach it?</summary>
+      <p>First establish what breaks first rather than optimizing broadly, because scaling is bounded by the
+      earliest constraint and everything else is wasted effort until that one moves. A load test at increasing
+      multiples reveals the actual limit, and it is rarely the thing people expect — usually the database
+      connection pool, the database itself, or a shared dependency rather than Node's CPU. Then I would work
+      through the ladder in payoff order. Do less work: caching at the HTTP layer and in Redis, pagination
+      caps, trimming response payloads. Do it later: move non-critical work off the request path into a queue,
+      since a 10× increase in requests need not mean 10× synchronous work. Do it closer: CDN for anything
+      cacheable, read replicas for read-heavy queries. Fix the database, which at 10× is where most services
+      actually fail — index review, N+1 elimination, and connection pooling through PgBouncer, since naive pool
+      sizing multiplied across ten times the instances will exceed the server's connection limit and turn a
+      capacity problem into an outage. Only then scale out horizontally, which requires the service to be
+      genuinely stateless, and confirm autoscaling responds faster than traffic ramps. Throughout, I would
+      protect the system from the load it cannot serve: rate limiting, bounded concurrency to upstreams,
+      circuit breakers, and load shedding so that exceeding capacity degrades gracefully instead of collapsing.
+      That last part is what separates a system that handles 10× from one that merely does not fall over at
+      9×.</p></details>
+
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (easy):</strong> Rewrite to run concurrently and explain the latency change.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Before — sequential, latency is the SUM:
+const user = await getUser(id);        // 50ms
+const orders = await getOrders(id);    // 50ms
+const prefs = await getPrefs(id);      // 50ms   → 150ms total
+
+// After — concurrent, latency is the MAX:
+const [user, orders, prefs] = await Promise.all([
+  getUser(id), getOrders(id), getPrefs(id),
+]);                                    // → ~50ms
+
+// Valid only because the three calls are independent. If getOrders needed
+// user.accountId, that pair must stay sequential — you can still overlap
+// the independent part:
+const [user, prefs] = await Promise.all([getUser(id), getPrefs(id)]);
+const orders = await getOrders(user.accountId);</pre></details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Why is <code>Promise.all(ids.map(fetchUser))</code> risky with 10,000 ids?
+      <details class="solution"><summary>Solution</summary>
+      <pre>// It starts 10,000 concurrent operations at once. Consequences:
+//   • socket/file-descriptor exhaustion (EMFILE)
+//   • the database connection pool is overwhelmed; unrelated requests queue
+//   • upstream rate limits trigger, so most calls fail and retry storms form
+//   • peak memory holds 10,000 in-flight promises and their responses
+import pLimit from "p-limit";
+const limit = pLimit(20);
+const users = await Promise.all(ids.map((id) => limit(() => fetchUser(id))));
+// Bounded concurrency is nearly as fast — throughput saturates well before
+// 10,000 — with none of the failure modes. Tune the limit to the slowest
+// dependency's capacity, not to the number of items.</pre></details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Add event loop lag monitoring that alerts when the process is blocked.
+      <details class="solution"><summary>Solution</summary>
+      <pre>import { monitorEventLoopDelay } from "node:perf_hooks";
+
+const histogram = monitorEventLoopDelay({ resolution: 10 });
+histogram.enable();
+
+setInterval(() => {
+  const p99Ms = histogram.percentile(99) / 1e6;      // nanoseconds → ms
+  const meanMs = histogram.mean / 1e6;
+  metrics.gauge("event_loop_lag_p99_ms", p99Ms);
+  metrics.gauge("event_loop_lag_mean_ms", meanMs);
+
+  if (p99Ms > 100) {
+    log.warn({ p99Ms, meanMs }, "event loop blocked");
+  }
+  histogram.reset();                                  // per-window statistics
+}, 10_000).unref();      // ← don't keep the process alive for metrics
+
+// p99 rather than mean: blocking is bursty, and a 500ms stall once a minute
+// averages away to nothing while being exactly what users feel.
+// The alert threshold should be an SLO decision — 100ms of added latency on
+// every concurrent request is already user-visible.</pre></details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Identify and fix the leak.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Leaking version:
+const emitter = new EventEmitter();          // module scope: lives forever
+app.get("/stream", (req, res) => {
+  emitter.on("tick", () => res.write("data\n"));    // ❌ never removed
+});
+// Each request adds a listener holding a closure over `res`, which retains
+// the request, its socket, and its buffers — for the process lifetime.
+// Node's "possible EventEmitter memory leak detected (11 listeners)" warning
+// is pointing straight at this.
+
+app.get("/stream", (req, res) => {
+  const onTick = () => res.write("data\n");
+  emitter.on("tick", onTick);
+  res.on("close", () => emitter.off("tick", onTick));   // ✅ always cleaned up
+});
+// res.on("close") fires on both normal completion and client disconnect, so
+// it covers every exit path — unlike "finish", which only fires on success.</pre></details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A CSV export endpoint blocks the server for 8 seconds. Redesign it.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// Before — three full materializations plus synchronous CPU work:
+const rows = await db.query("SELECT * FROM orders");   // all rows in memory
+const csv = rows.map(toCsvLine).join("\n");            // + a second copy
+res.send(csv);                                          // + a third
+
+// Two distinct problems: memory scales with rows × concurrency, and the
+// map/join is synchronous CPU work that blocks EVERY other request.
+
+// After — stream end to end, constant memory, non-blocking:
+import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
+
+app.get("/export", async (req, res) => {
+  res.writeHead(200, {
+    "content-type": "text/csv",
+    "content-disposition": 'attachment; filename="orders.csv"',
+  });
+
+  const cursor = db.queryStream("SELECT * FROM orders");   // DB cursor
+  const toCsv = new Transform({
+    objectMode: true,
+    transform(row, _enc, cb) { cb(null, toCsvLine(row) + "\n"); },
+  });
+
+  try {
+    await pipeline(cursor, toCsv, res, { signal: AbortSignal.timeout(300_000) });
+  } catch (err) {
+    if (err.code !== "ERR_STREAM_PREMATURE_CLOSE") throw err;   // client left
+  }
+});
+
+// Why this fixes both: the cursor holds a page of rows rather than all of
+// them, the transform processes one row per tick so the loop stays
+// responsive, and backpressure paces database reads to the client's download
+// speed. Time-to-first-byte drops from 8s to milliseconds.
+//
+// If per-row work were genuinely CPU-heavy, the next step is a worker thread
+// or an offline job writing to object storage and emailing a link — at which
+// point the endpoint returns 202 with a job id. Streaming is the right answer
+// when the work is I/O-shaped; a queue is the right answer when it is not.</pre></details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Memory grows steadily and pods restart on OOM every few hours. Investigate.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// 1. CONFIRM IT IS A LEAK, not lazy heap growth. V8 grows on demand and
+//    returns memory to the OS reluctantly, so rising RSS alone proves
+//    nothing. Track heapUsed AFTER GC over hours: a leak shows a rising
+//    FLOOR, not a rising peak.
+setInterval(() => {
+  const { heapUsed, heapTotal, rss, external } = process.memoryUsage();
+  log.info({ heapUsed, heapTotal, rss, external }, "memory");
+}, 60_000).unref();
+//    Also check `external` and ArrayBuffers — Buffer leaks live outside the
+//    JS heap and are invisible in heapUsed, which misleads people for hours.
+
+// 2. CORRELATE with deploys and traffic. If it started with a release,
+//    the diff is the fastest path to the answer. If growth tracks request
+//    volume, it is per-request retention; if it grows on idle, it is a
+//    timer or subscription.
+
+// 3. SNAPSHOT AND COMPARE — the definitive step:
+//    • take one at steady state, apply load, force GC, take another
+//    • DevTools → Memory → Comparison, sort by size delta
+//    • select the growing constructor, read the RETAINERS pane
+//    The retainer chain names the container holding the memory: a Map at
+//    module scope, an emitter's listener array, a closure in a pending
+//    promise. That chain IS the bug; everything else is inference.
+//    In production, do this on ONE instance removed from rotation —
+//    writeHeapSnapshot pauses the process and writes a heap-sized file.
+
+// 4. CHECK THE USUAL SUSPECTS while snapshots run: unbounded Map/Set caches,
+//    per-request listeners on long-lived emitters, uncleared intervals,
+//    accumulating arrays of logs/metrics, promises that never settle (their
+//    closures are retained forever), and closures capturing large buffers.
+
+// 5. MITIGATE while fixing: --max-old-space-size to fail fast and predictably
+//    rather than being OOM-killed mid-request, and a memory-based alert so
+//    restarts are graceful. These buy time; they are not fixes.
+
+// The disciplined point: OOM restarts are a symptom with many causes, and
+// snapshot comparison is the only step that turns guessing into knowing.
+// Every other step narrows where to look.</pre></details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
+      <li>Measure before optimizing — Amdahl's law bounds any improvement by the fraction of time you are actually targeting.</li>
+      <li>Event loop lag is the defining Node metric: high lag means blocking, low lag with high latency means waiting on I/O.</li>
+      <li>Any synchronous work on the request path degrades every concurrent request, not just its own.</li>
+      <li>In flame graphs, look for wide plateaus — width is cost, height is only stack depth.</li>
+      <li>Serial awaits over independent work multiply latency; <code>Promise.all</code> with bounded concurrency fixes it without exhausting resources.</li>
+      <li>Unbounded caches and per-request listeners on shared emitters are the two most common Node leaks.</li>
+      <li>Judge leaks by the post-GC heap floor over hours, and locate them through snapshot comparison and retainer chains.</li>
+      <li>Buffer leaks live outside the JS heap — watch <code>external</code> as well as <code>heapUsed</code>.</li>
+      <li>Doing less work, deferring work, and fixing the database almost always beat optimizing JavaScript.</li>
+      <li>Throughput and latency trade against each other — decide which the workload needs before optimizing.</li>
+    </ul></div>
+
+    <div class="pager">
+      <a class="btn btn-outline" href="testing.html">← Testing Node Services</a>
+      <a class="btn" href="scaling.html">Next: Scaling: Clusters &amp; Workers →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script><script src="nav.js"></script>
+</body>
+</html>
