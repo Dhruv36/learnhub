@@ -20,15 +20,24 @@ class Checker(HTMLParser):
         self.stack = []
         self.errors = []
         self.counts = {}
+        self.opened = set()
 
     def handle_starttag(self, tag, attrs):
         self.counts[tag] = self.counts.get(tag, 0) + 1
+        self.opened.add(tag)
         if tag in VOID or tag not in CHECK:
             return
         self.stack.append((tag, self.getpos()[0]))
 
     def handle_endtag(self, tag):
-        if tag in VOID or tag not in CHECK:
+        if tag in VOID:
+            return
+        if tag not in CHECK:
+            # A closing tag for something we never open is almost always a
+            # typo (</note> for </div>); browsers drop it silently.
+            if tag not in self.opened:
+                self.errors.append(
+                    f"line {self.getpos()[0]}: unknown closing tag </{tag}>")
             return
         if not self.stack:
             self.errors.append(f"line {self.getpos()[0]}: stray </{tag}>")
