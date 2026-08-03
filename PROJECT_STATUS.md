@@ -65,6 +65,8 @@ Target **~500–700 lines (~35–50KB)** per lesson. Structure:
 | 15 | Angular | ✅ **DONE (v4, 2026-07-19)** — **23 lessons** at mastery depth across 8 sections: Foundations ×4 (index=Components & Standalone, data-binding=Templates, directives=Control Flow, pipes), Components & Reactivity ×4 (component-communication, lifecycle, signals, change-detection), Services & DI ×2 (services-di, di-advanced), RxJS ×2 (rxjs, rxjs-patterns), Forms ×3 (template-forms, forms=Reactive, form-validation incl. CVA), Routing & HTTP ×3 (routing, guards-lazy, http), State ×2 (state-management, ngrx), Production ×3 (testing, performance, enterprise=SSR/i18n/security/monorepo). 12 rewritten in place + 11 new files. Modern Angular throughout: standalone, signals, @if/@for, functional guards/interceptors, zoneless, httpResource. Link-audited clean; quiz retuned (9 swaps: linkedSignal/resource, multi-providers, inject-context, catchError placement, takeUntilDestroyed, lifecycle, CVA, track identity) — 10/200/0. |
 | 16 | .NET (C#) | ✅ **DONE (v4, 2026-07-27)** — **23 lessons** at mastery depth across 6 sections: Foundations ×5 (index=How It Runs, types, control-flow, strings, methods), Object-Oriented C# ×5 (oop, inheritance, records-structs, generics, pattern-matching), Core Libraries ×4 (collections-generics, linq, delegates-events, exceptions-nullability), Async & Concurrency ×3 (async-await, **async-patterns** new, **threading** new), Runtime & Performance ×2 (memory, performance-aot), Professional ×4 (di-hosting, efcore, testing, **modern-csharp** new capstone). 12 rewritten in place + 11 new files. Modern throughout: primary constructors, collection expressions, required/init, TimeProvider, Channels, ExecuteUpdate/Delete, source generators, NativeAOT. Link-audited clean (0 broken); pager chain verified against nav order end to end; quiz banks retuned (14 swaps) — 10/200/0. |
 | 19 | System Design | ✅ **DONE (v4, 2026-07-30)** — **all 36 lessons rebuilt**, 30–61KB each (1.8 MB total), every one with 12 `<details>` (6 tiered interview Qs + 6 graded exercises), Common Mistakes table and Key Takeaways. **Whole track passes `python validate.py tutorials/system-design` with 0 errors.** §1 Fundamentals 11/11 · §2 Deep Dives 6/6 · §3 Case Studies 12/12 · §4 Senior/Staff 7/7. Uses the **tradeoff-driven SD format**; case studies use the **case-study format** (both below). Quiz bank still the v3 200-Q set — retune to the v4 curriculum when convenient. |
+| 5 | Node.js | ✅ **DONE (v4, 2026-07-31)** — **25 lessons** at v4 depth (27KB median), commit `fe2219f`. Was "deep but narrow" at 10 lessons; expanded rather than deepened, as planned. |
+| 17 | ASP.NET Core | 🔄 **IN PROGRESS (started 2026-07-31)** — **1/23 lessons** at v4 (`index.html` 30KB). nav.js already written for the full 23-lesson / 6-section curriculum, so the shape is decided; 11 existing files need rebuilds + 11 new files. Commit `1fd4571`. |
 | 6 | Python | 🔄 **IN PROGRESS (started 2026-07-30)** — **1/12 lessons** at v4. Track order: `index` → control-flow → data-structures → strings-io → oop → comprehensions-generators → decorators-context → modules-packaging → typing → concurrency → testing → fastapi. Uses the **language-track v4 format** (6 Parts → Common Mistakes → 6 tiered Qs → 6 graded exercises → Takeaways), *not* the SD tradeoff format. **Note:** v3 Python content was thin but *correct* (name/object model explained properly) — this track is expansion, not reconstruction, so it should move faster than System Design did. |
 | 5, 7–18 | all others | ⏳ pending (still at v3 depth) — see damage-order queue below |
 
@@ -90,12 +92,13 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 
 **New queue, by damage (user-confirmed):**
 1. ~~**System Design** (36)~~ ✅ **COMPLETE 2026-07-30** — 36/36 at 30–61KB, 0 validation errors
-2. 🔄 **Python** (1/12 done) ← **CURRENT**, then **SQL** (12) — highest junior/mid traffic, 7–9KB
-3. **LeetCode** (21) — 11KB, needs graded sets + batch-2 patterns
-4. **ASP.NET Core** (12, 13KB), **Node.js** (10 lessons @ 24KB — deep but NARROW, needs *more lessons* not deeper ones)
-5. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB)
+2. ~~**Node.js**~~ ✅ **COMPLETE 2026-07-31** — 10 → 25 lessons @ 27KB median
+3. 🔄 **ASP.NET Core** (1/23 done) ← **CURRENT** — nav.js written, 11 rebuilds + 11 new remain
+4. 🔄 **Python** (1/12 done), then **SQL** (12) — highest junior/mid traffic, 7–9KB
+5. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
+6. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
 
-**Remaining after Python: 10 tracks.** Quiz banks across *every* v4 track (HTML, CSS, JS, React, Angular, .NET, System Design) are still the v3 200-Q sets — not broken, but drifted from the expanded curricula. Retune pass deferred until lessons are done.
+**Remaining: 10 tracks (~120 lessons).** Quiz banks across *every* v4 track (HTML, CSS, JS, React, Angular, .NET, System Design) are still the v3 200-Q sets — not broken, but drifted from the expanded curricula. Retune pass deferred until lessons are done.
 
 ### Tradeoff-driven SD lesson format (System Design only — supersedes the language-track recipe for this track)
 Language tracks hit depth via tiered interview Qs + graded coding exercises. System Design needs a different shape — same shell/sidebar/pager and same 12-`<details>` volume, but:
