@@ -96,10 +96,32 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 3. ~~**ASP.NET Core**~~ ✅ **COMPLETE 2026-08-04** — 23/23 lessons, 0 validation errors
 4. ~~**Python**~~ ✅ **COMPLETE 2026-08-04** — 12/12 lessons, 0 validation errors
 5. 🔄 **SQL** (12 @ 7–9KB) ← **CURRENT** — highest junior/mid traffic
-6. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
-7. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
+6. 🆕 **Database Concepts & Architecture** — NEW track (see below)
+7. 🆕 **Vector Databases & RAG** — NEW track (see below)
+8. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
+9. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
 
-**Remaining: ~100 lessons across 3 tracks** (SQL 12 + LeetCode 21 + infra six ~70 under the approved expansion, ~40 if deepened in place).
+**Remaining: ~130 lessons across 5 tracks** (SQL 9 + DB Concepts ~14 + Vector/RAG ~14 + LeetCode 21 + infra six ~70 under the approved expansion, ~40 if deepened in place).
+
+### 🆕 Two new Database-section tracks (user-requested 2026-08-04)
+
+Both are **new tracks built directly at v4 depth** (no v3 to rebuild), added to the `Databases` section of the root `index.html` alongside SQL / MongoDB / Redis. Sequenced **after SQL, before LeetCode** (user-confirmed).
+
+**A. Database Concepts & Architecture** (`tutorials/database-concepts/`)
+Scope confirmed by user: **"based on design perspective and storage engine internals"** — i.e. data-modelling/physical-design decisions *plus* how the engine actually works underneath. Deliberately **excludes** distribution topics (CAP, replication, consensus, sharding) — those already exist in System Design and must not be duplicated. Draft curriculum:
+1. *Storage Foundations* — Pages/Heap Files & Row Layout · B+Trees · LSM-Trees & Write-Optimised Storage · Buffer Pool & Page Cache
+2. *Durability & Concurrency* — WAL, Checkpoints & Crash Recovery · MVCC & Snapshot Isolation · Locking, Latches & Deadlocks
+3. *Query Processing* — Parser/Rewriter/Planner · Cost Models & Statistics · Join & Aggregation Algorithms
+4. *Design Perspective* — Physical Schema Design for the Engine · OLTP vs OLAP & Row vs Columnar · Engine Landscape (Postgres/MySQL/SQLite/DuckDB) · Choosing a Database
+
+**B. Vector Databases & RAG** (`tutorials/vector-databases/`)
+Scope confirmed: **vector stores + RAG patterns** (the full practical track, incl. evaluation and production ops). Draft curriculum:
+1. *Foundations* — Embeddings & Vector Space · Similarity Metrics & Normalisation · The Curse of Dimensionality
+2. *Indexing & Search* — Exact kNN vs ANN · HNSW Deep Dive · IVF, PQ & Quantisation · Tuning Recall vs Latency
+3. *The Landscape* — pgvector & SQL-Native · Dedicated Stores (Pinecone/Qdrant/Weaviate/Milvus) · Metadata Filtering & Hybrid Search (BM25 + vector)
+4. *RAG in Production* — Chunking & Ingestion · Retrieval Pipeline & Reranking · Evaluating Retrieval · Scaling, Cost & Ops
+
+Both need: `nav.js`, `quiz.html` + `quiz-bank-1.js`/`quiz-bank-2.js` (10 sets × 20 Qs), a card in root `index.html` → `#databases`, and every lesson at `det=12 ex=6`.
 
 ### ⚠ Open decision: infra six scope
 User approved full curriculum expansion (12 → ~20 lessons each, ~70 lessons total) on 2026-08-03. After writing 16 ASP.NET lessons at this depth, the build recommendation is to **deepen in place at 12 lessons each (~40 lessons)** instead: Docker, Redis and CI/CD do not have 20 lessons of genuinely distinct material the way Java or System Design did, and padding would show. Raised with the user; not yet re-decided. Default to the approved expansion unless told otherwise.
