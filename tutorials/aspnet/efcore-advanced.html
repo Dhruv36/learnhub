@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EF Core: Change Tracking &amp; Transactions — ASP.NET Core — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../../playground/index.html">Playground</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>EF Core: Change Tracking &amp; Transactions <span class="level-badge level-ultra">Data</span></h1>
+    <p><strong>What you'll master:</strong> what the change tracker actually stores and why that decides your
+       query performance, the unit-of-work boundary <code>SaveChanges</code> really provides, concurrency
+       control that prevents lost updates, when an explicit transaction is required and when it is redundant,
+       and the atomicity problem that appears the moment you write to a database and a message broker in the
+       same operation. Prerequisites: <a href="efcore-data.html">EF Core: Modelling &amp; Querying</a> and
+       <a href="di-config.html">Dependency Injection</a>.</p>
+
+    <h2>Part 1 — What the Change Tracker Holds</h2>
+    <pre>// Every entity returned by a tracking query is stored in the DbContext's
+// change tracker, along with a SNAPSHOT of its original property values.
+// SaveChanges compares current values against that snapshot to generate SQL.
+
+var order = await db.Orders.FirstAsync(o =&gt; o.Id == 42);   // TRACKED
+order.Status = "paid";                                     // just a field write
+await db.SaveChangesAsync();                               // → UPDATE ... SET status
+
+// You never called Update(). The tracker noticed. That is the whole model:
+// it holds two copies of every tracked entity and diffs them.
+
+// THE FIVE ENTITY STATES:
+db.Entry(order).State
+//   Detached   not tracked at all
+//   Unchanged  tracked, matches its snapshot
+//   Added      will INSERT
+//   Modified   at least one property differs from the snapshot
+//   Deleted    will DELETE
+
+// THE COST, which is the part that matters in production:
+//   • one snapshot copy per entity — roughly doubles memory per row loaded
+//   • DetectChanges walks EVERY tracked entity comparing EVERY property
+//   • that walk is O(entities × properties), and it runs on SaveChanges,
+//     and on most queries against the same context
+//
+// Loading 10,000 rows to display them costs 10,000 snapshots and a full
+// property-by-property scan you gain nothing from.
+
+// ✓ AsNoTracking for reads you will not modify — the single highest-value
+//   habit in EF Core:
+var summaries = await db.Orders
+    .AsNoTracking()                          // no snapshots, no DetectChanges
+    .Where(o =&gt; o.CreatedAt &gt;= from)
+    .Select(o =&gt; new OrderSummary(o.Id, o.Total))   // project narrower still
+    .ToListAsync(ct);
+
+// Make it the DEFAULT and opt in to tracking where you actually mutate:
+builder.Services.AddDbContext&lt;AppDbContext&gt;(o =&gt; o
+    .UseNpgsql(conn)
+    .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking));
+// Then: db.Orders.AsTracking().FirstAsync(...) when you intend to write.
+// This inverts the default so the expensive behaviour is the deliberate one.
+
+// IDENTITY RESOLUTION — the tracker guarantees one instance per key per
+// context, which is occasionally surprising:
+var a = await db.Orders.FirstAsync(o =&gt; o.Id == 42);
+var b = await db.Orders.FirstAsync(o =&gt; o.Id == 42);   // second query runs...
+ReferenceEquals(a, b);   // ...but returns the SAME OBJECT — true
+
+// So a second query does NOT refresh an already-tracked entity's values.
+// Changes made in the database since the first load are silently ignored.
+// To genuinely refresh:
+await db.Entry(a).ReloadAsync(ct);</pre>
+
+    <h2>Part 2 — SaveChanges as a Unit of Work</h2>
+    <pre>// SaveChanges wraps ALL pending changes in a single transaction
+// automatically. You do not need BeginTransaction for this:
+order.Status = "paid";
+db.Payments.Add(new Payment { OrderId = order.Id, Amount = order.Total });
+customer.LoyaltyPoints += 10;
+
+await db.SaveChangesAsync(ct);
+// → BEGIN; UPDATE orders; INSERT payments; UPDATE customers; COMMIT
+// All three succeed or none do. One round trip's worth of atomicity, free.
+
+// THE CORRESPONDING RULE: calling SaveChanges repeatedly inside a loop
+// destroys that atomicity AND the performance:
+foreach (var line in lines)
+{
+    db.OrderLines.Add(line);
+    await db.SaveChangesAsync(ct);      // ✗ N transactions, N round trips
+}
+// If line 7 fails, lines 1-6 are already committed and the order is
+// half-created with no way to tell.
+
+foreach (var line in lines) db.OrderLines.Add(line);
+await db.SaveChangesAsync(ct);          // ✓ one transaction, one round trip
+
+// ORDERING: EF determines statement order from dependencies (principal rows
+// before dependent rows), not from the order you called Add. You cannot rely
+// on Add order to control what happens first.
+
+// SAVECHANGES IS NOT IDEMPOTENT. If it throws, the tracker retains its state
+// with entities still Added/Modified. Calling it again may retry the whole
+// set — which after a transient network failure might double-insert if the
+// first attempt actually committed. Retry at the OPERATION level (reload,
+// reapply, save) rather than by calling SaveChanges twice on the same context.
+
+// INTERCEPTING THE UNIT OF WORK — auditing that cannot be forgotten:
+public sealed class AuditInterceptor(TimeProvider clock) : SaveChangesInterceptor
+{
+    public override ValueTask&lt;InterceptionResult&lt;int&gt;&gt; SavingChangesAsync(
+        DbContextEventData eventData, InterceptionResult&lt;int&gt; result,
+        CancellationToken ct = default)
+    {
+        foreach (var entry in eventData.Context!.ChangeTracker.Entries&lt;IAuditable&gt;())
+        {
+            if (entry.State is EntityState.Added)
+                entry.Entity.CreatedAt = clock.GetUtcNow();
+            if (entry.State is EntityState.Added or EntityState.Modified)
+                entry.Entity.UpdatedAt = clock.GetUtcNow();
+        }
+        return base.SavingChangesAsync(eventData, result, ct);
+    }
+}
+builder.Services.AddDbContext&lt;AppDbContext&gt;((sp, o) =&gt; o
+    .UseNpgsql(conn)
+    .AddInterceptors(sp.GetRequiredService&lt;AuditInterceptor&gt;()));
+// This runs INSIDE the same transaction as the data change, which is exactly
+// the property an audit filter in the HTTP pipeline cannot give you.</pre>
+
+    <div class="note"><strong>Key insight:</strong> the <code>DbContext</code> is a unit of work <em>and</em> an
+      identity map, and its scoped lifetime is what makes both correct. One context per request means the
+      tracker's contents are bounded by one operation and disposed with it. A context that lives longer —
+      captured by a singleton, or created outside a background loop — accumulates tracked entities
+      indefinitely, so <code>DetectChanges</code> gets progressively slower and memory grows until restart.
+      Long-lived contexts are the most common EF Core performance failure in background services, and the
+      symptom is a worker that gets slower over days rather than one that fails.</div>
+
+    <h2>Part 3 — Optimistic Concurrency</h2>
+    <pre>// THE LOST UPDATE: two requests read order 42, both modify it, both save.
+// The second overwrites the first with no error and no trace.
+
+// The fix is a version column the database changes on every update:
+public sealed class Order
+{
+    public int Id { get; set; }
+    public string Status { get; set; } = "";
+
+    [Timestamp]                                  // SQL Server rowversion
+    public byte[] RowVersion { get; set; } = [];
+}
+// PostgreSQL uses the system xmin column instead:
+modelBuilder.Entity&lt;Order&gt;().UseXminAsConcurrencyToken();
+
+// EF then adds the version to every UPDATE's WHERE clause:
+//   UPDATE orders SET status = 'paid'
+//   WHERE id = 42 AND row_version = 0x00000000000007D1
+//
+// If someone else updated the row, row_version changed, ZERO rows match, and
+// EF raises DbUpdateConcurrencyException. The write is refused rather than
+// silently winning.
+
+try
+{
+    await db.SaveChangesAsync(ct);
+}
+catch (DbUpdateConcurrencyException ex)
+{
+    foreach (var entry in ex.Entries)
+    {
+        var current = await entry.GetDatabaseValuesAsync(ct);
+
+        if (current is null)
+        {
+            // The row was DELETED by someone else — a different situation
+            // from a concurrent edit, and it needs a different answer.
+            return Result.Fail("The order no longer exists.");
+        }
+
+        // THREE RESOLUTION STRATEGIES, and the choice is a business decision:
+
+        // a) CLIENT WINS — overwrite. Only safe when this user's intent
+        //    genuinely supersedes the other's.
+        entry.OriginalValues.SetValues(current);
+
+        // b) STORE WINS — discard our change and reload.
+        await entry.ReloadAsync(ct);
+
+        // c) MERGE — the honest answer for most domains: surface the
+        //    conflict and let a human decide, because silently picking a
+        //    winner destroys someone's work either way.
+        return Result.Conflict(current.ToObject());
+    }
+}
+
+// PROPERTY-LEVEL CONCURRENCY, when only one field is contended:
+modelBuilder.Entity&lt;Product&gt;()
+    .Property(p =&gt; p.Stock)
+    .IsConcurrencyToken();
+// Now only concurrent changes to Stock conflict. Two users editing the
+// description and the price respectively both succeed, which is usually what
+// you want — full-row versioning makes unrelated edits collide.
+
+// THE ALTERNATIVE FOR PURE COUNTERS — let the database do the arithmetic and
+// avoid the read-modify-write entirely:
+await db.Products
+    .Where(p =&gt; p.Id == id &amp;&amp; p.Stock &gt;= quantity)
+    .ExecuteUpdateAsync(s =&gt; s.SetProperty(p =&gt; p.Stock, p =&gt; p.Stock - quantity), ct);
+// One atomic statement, no concurrency exception possible, and the WHERE
+// clause enforces the invariant. Check the returned row count: 0 means
+// insufficient stock.</pre>
+
+    <h2>Part 4 — Explicit Transactions</h2>
+    <pre>// You need BeginTransaction only when one SaveChanges is not enough:
+//   • several SaveChanges calls that must be atomic together
+//   • mixing EF with raw ADO.NET or Dapper on the same connection
+//   • you need a specific isolation level
+
+await using var transaction = await db.Database.BeginTransactionAsync(ct);
+try
+{
+    order.Status = "paid";
+    await db.SaveChangesAsync(ct);              // does NOT commit — enlisted
+
+    await db.Database.ExecuteSqlAsync(
+        $"INSERT INTO audit_log (order_id, action) VALUES ({order.Id}, 'paid')", ct);
+
+    await transaction.CommitAsync(ct);
+}
+catch
+{
+    await transaction.RollbackAsync(ct);        // implicit on dispose too
+    throw;
+}
+
+// ISOLATION LEVELS — the practical summary:
+await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+//
+//   ReadUncommitted  dirty reads. Essentially never correct.
+//   ReadCommitted    the default nearly everywhere. Prevents dirty reads;
+//                    allows non-repeatable reads and phantoms.
+//   RepeatableRead   re-reading a row gives the same value; phantoms possible.
+//   Serializable     full isolation, most blocking, most deadlocks.
+//   Snapshot         readers never block writers (PostgreSQL default
+//                    behaviour, opt-in on SQL Server).
+//
+// RAISING the isolation level is rarely the right fix for a race. Optimistic
+// concurrency or a single atomic statement usually solves it with less
+// contention — Serializable trades a rare lost update for frequent deadlocks
+// and worse throughput.
+
+// EXECUTION STRATEGY + EXPLICIT TRANSACTIONS — a real trap:
+builder.Services.AddDbContext&lt;AppDbContext&gt;(o =&gt;
+    o.UseNpgsql(conn, npg =&gt; npg.EnableRetryOnFailure()));   // retries!
+
+// With retries enabled, BeginTransaction throws: the strategy cannot retry a
+// block it does not own. Wrap the whole unit so it can be re-executed:
+var strategy = db.Database.CreateExecutionStrategy();
+await strategy.ExecuteAsync(async () =&gt;
+{
+    await using var tx = await db.Database.BeginTransactionAsync(ct);
+    order.Status = "paid";
+    await db.SaveChangesAsync(ct);
+    await tx.CommitAsync(ct);
+});
+// CRITICAL: the delegate may run MORE THAN ONCE. Anything inside it must be
+// safe to repeat — no sending emails, no publishing messages, no incrementing
+// in-memory counters.
+
+// SAVEPOINTS for partial rollback within a transaction:
+await transaction.CreateSavepointAsync("before_lines", ct);
+try { await ProcessLinesAsync(ct); }
+catch { await transaction.RollbackToSavepointAsync("before_lines", ct); }</pre>
+
+    <h2>Part 5 — Bulk Operations and the Tracker</h2>
+    <pre>// ✗ THE LOAD-MODIFY-SAVE ANTI-PATTERN for bulk changes:
+var expired = await db.Sessions.Where(s =&gt; s.ExpiresAt &lt; now).ToListAsync(ct);
+db.Sessions.RemoveRange(expired);
+await db.SaveChangesAsync(ct);
+// Loads every row into memory, snapshots each one, then issues one DELETE
+// per row. For 500,000 sessions this is 500,000 round trips and gigabytes of
+// tracked entities.
+
+// ✓ ExecuteDelete / ExecuteUpdate — one statement, no tracking, no loading:
+await db.Sessions
+    .Where(s =&gt; s.ExpiresAt &lt; now)
+    .ExecuteDeleteAsync(ct);                    // DELETE FROM sessions WHERE ...
+
+await db.Products
+    .Where(p =&gt; p.CategoryId == categoryId)
+    .ExecuteUpdateAsync(s =&gt; s
+        .SetProperty(p =&gt; p.Price, p =&gt; p.Price * 1.1m)
+        .SetProperty(p =&gt; p.UpdatedAt, _ =&gt; DateTimeOffset.UtcNow), ct);
+
+// WHAT THESE BYPASS — and it is a real list, not a footnote:
+//   • the change tracker is NOT updated, so entities already loaded in this
+//     context now hold stale values
+//   • SaveChanges interceptors do NOT run, so audit timestamps set by an
+//     interceptor are silently skipped
+//   • concurrency tokens are NOT checked
+//   • navigation properties and cascade configuration are NOT considered —
+//     the database's own FK cascade rules apply instead
+//
+// They execute IMMEDIATELY, outside any pending SaveChanges. To include one
+// in a larger atomic unit, use an explicit transaction.
+
+// BULK INSERT — EF batches automatically, but the tracker is still the cost:
+db.Orders.AddRange(tenThousandOrders);
+await db.SaveChangesAsync(ct);            // batched, but 10,000 snapshots first
+// Tune the batch size for the provider and payload:
+o.UseNpgsql(conn, npg =&gt; npg.MaxBatchSize(500));
+// For genuinely large loads, use the provider's native path — PostgreSQL
+// COPY via Npgsql's binary import, or SqlBulkCopy — which bypasses EF
+// entirely and is often an order of magnitude faster.
+
+// CLEARING THE TRACKER in a long-running loop, when you must load entities:
+foreach (var batch in batches)
+{
+    await ProcessAsync(batch, ct);
+    await db.SaveChangesAsync(ct);
+    db.ChangeTracker.Clear();             // ← without this, memory grows
+}
+// Better still: a fresh context per batch via IDbContextFactory, which also
+// bounds connection lifetime.</pre>
+
+    <h2>Part 6 — Atomicity Across a Database and a Broker</h2>
+    <pre>// THE PROBLEM that has no clean solution and must be designed around:
+await db.SaveChangesAsync(ct);                 // 1. commits
+await bus.PublishAsync(new OrderPlaced(order.Id), ct);   // 2. might fail
+//
+// If step 2 fails, the order exists and no downstream system knows.
+// Swapping the order is not better:
+await bus.PublishAsync(...);                   // 1. succeeds
+await db.SaveChangesAsync(ct);                 // 2. fails
+// Now consumers react to an order that does not exist.
+//
+// There is no two-phase commit between a database and a broker in practice —
+// distributed transactions are unavailable, slow, or both.
+
+// ✓ THE TRANSACTIONAL OUTBOX — the standard answer:
+public sealed class OutboxMessage
+{
+    public Guid Id { get; set; }
+    public string Type { get; set; } = "";
+    public string Payload { get; set; } = "";
+    public DateTimeOffset OccurredAt { get; set; }
+    public DateTimeOffset? ProcessedAt { get; set; }
+}
+
+// 1. Write the message in the SAME transaction as the data:
+db.Orders.Add(order);
+db.Outbox.Add(new OutboxMessage
+{
+    Id = Guid.CreateVersion7(),
+    Type = nameof(OrderPlaced),
+    Payload = JsonSerializer.Serialize(new OrderPlaced(order.Id)),
+    OccurredAt = clock.GetUtcNow()
+});
+await db.SaveChangesAsync(ct);        // ← ONE atomic commit. Both or neither.
+
+// 2. A background worker publishes and marks processed:
+public sealed class OutboxPublisher(
+    IServiceScopeFactory scopes, IMessageBus bus) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            using var scope = scopes.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+
+            var pending = await db.Outbox
+                .Where(m =&gt; m.ProcessedAt == null)
+                .OrderBy(m =&gt; m.OccurredAt)
+                .Take(100)
+                .ToListAsync(ct);
+
+            foreach (var message in pending)
+            {
+                await bus.PublishAsync(message.Type, message.Payload, ct);
+                message.ProcessedAt = clock.GetUtcNow();
+                await db.SaveChangesAsync(ct);
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), ct);
+        }
+    }
+}
+
+// THE GUARANTEE THIS GIVES — and its precise limit:
+//   AT-LEAST-ONCE delivery. If the process dies between publishing and
+//   marking processed, the message is published AGAIN on restart.
+//   Exactly-once is not achievable here, so CONSUMERS MUST BE IDEMPOTENT.
+//   That is not a caveat to note and forget — it is a hard requirement the
+//   design pushes onto every consumer, and it must be stated when the
+//   contract is agreed.
+
+// A SIMPLER OPTION when the message can be reconstructed: publish nothing and
+// let consumers poll or subscribe to database change feeds (CDC). Fewer
+// moving parts, at the cost of latency and coupling to the schema.</pre>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Tracking queries for read-only data</td><td>Double memory and a full <code>DetectChanges</code> scan for nothing</td><td><code>AsNoTracking</code>, or make it the global default</td></tr>
+      <tr><td><code>SaveChanges</code> inside a loop</td><td>N transactions and N round trips; partial commits on failure</td><td>One <code>SaveChanges</code> after the loop</td></tr>
+      <tr><td>Long-lived <code>DbContext</code></td><td>Tracker grows unbounded; worker slows over days</td><td>Scoped lifetime; <code>ChangeTracker.Clear()</code> or a context per batch</td></tr>
+      <tr><td>No concurrency token on contended rows</td><td>Silent lost updates</td><td><code>[Timestamp]</code> / <code>UseXminAsConcurrencyToken</code></td></tr>
+      <tr><td>Catching <code>DbUpdateConcurrencyException</code> and retrying blindly</td><td>Overwrites the other user's change — the bug the token existed to stop</td><td>Decide client-wins, store-wins or surface the conflict</td></tr>
+      <tr><td><code>BeginTransaction</code> with <code>EnableRetryOnFailure</code></td><td>Throws — the strategy cannot retry a block it does not own</td><td>Wrap in <code>CreateExecutionStrategy().ExecuteAsync</code></td></tr>
+      <tr><td>Non-repeatable work inside an execution strategy delegate</td><td>Emails sent twice; messages published twice</td><td>Only database work inside; side effects after commit</td></tr>
+      <tr><td>Load-modify-save for bulk updates</td><td>Loads every row; one statement per row</td><td><code>ExecuteUpdate</code> / <code>ExecuteDelete</code></td></tr>
+      <tr><td>Assuming <code>ExecuteUpdate</code> runs interceptors</td><td>Audit columns silently not set; concurrency not checked</td><td>Set them explicitly in the <code>SetProperty</code> call</td></tr>
+      <tr><td>Publishing to a broker after <code>SaveChanges</code></td><td>Committed data with no event, or events for uncommitted data</td><td>Transactional outbox</td></tr>
+      <tr><td>Assuming the outbox gives exactly-once</td><td>Consumers double-process on redelivery</td><td>At-least-once by design — require idempotent consumers</td></tr>
+      <tr><td>Expecting a second query to refresh a tracked entity</td><td>Identity resolution returns the stale instance</td><td><code>ReloadAsync</code>, or query with <code>AsNoTracking</code></td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What does the change tracker do, and why use <code>AsNoTracking</code>?</summary>
+      <p>When a tracking query returns entities, the <code>DbContext</code> stores each one along with a
+      snapshot of its original property values. On <code>SaveChanges</code> it compares current values against
+      those snapshots to work out which rows changed and generate the corresponding SQL — which is why
+      modifying a property is enough and you never call <code>Update</code>. The cost is a second copy of every
+      entity in memory plus a property-by-property comparison across everything tracked.
+      <code>AsNoTracking</code> skips both, so for read-only queries — a list page, a report, anything
+      projected straight to a DTO — it is meaningfully faster and lighter, with no downside because nothing is
+      going to be saved.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> Do you need <code>BeginTransaction</code> to make several changes atomic?</summary>
+      <p>Usually not. A single <code>SaveChanges</code> call wraps every pending change — inserts, updates and
+      deletes across any number of entities and tables — in one transaction automatically, so they all commit
+      or all roll back. An explicit transaction is only needed when a single <code>SaveChanges</code> is not
+      sufficient: several <code>SaveChanges</code> calls that must be atomic together, mixing EF with raw SQL
+      or Dapper on the same connection, or requiring a specific isolation level. The corresponding mistake is
+      calling <code>SaveChanges</code> inside a loop, which breaks that automatic atomicity into one
+      transaction per iteration and leaves partial state behind on failure.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> How does optimistic concurrency work in EF Core, and what are the resolution options?</summary>
+      <p>You designate a concurrency token — a SQL Server <code>rowversion</code> via <code>[Timestamp]</code>,
+      PostgreSQL's <code>xmin</code>, or any property marked <code>IsConcurrencyToken</code>. EF includes that
+      token's original value in the <code>WHERE</code> clause of every generated <code>UPDATE</code> and
+      <code>DELETE</code>. If another writer changed the row in between, the token no longer matches, zero rows
+      are affected, and EF raises <code>DbUpdateConcurrencyException</code>. From there the resolution is a
+      business decision, not a technical default: client-wins overwrites the stored values, store-wins
+      discards the current change and reloads, or you surface the conflict to a human with both versions. The
+      important part is that blindly retrying is the wrong answer, because it silently reintroduces exactly
+      the lost update the token was added to prevent.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What do <code>ExecuteUpdate</code> and <code>ExecuteDelete</code> bypass?</summary>
+      <p>They translate directly to a single SQL statement without loading entities, which is why they are the
+      right tool for bulk changes — but that also means they bypass most of EF's machinery. The change tracker
+      is not updated, so any entity already loaded in the context now holds stale values.
+      <code>SaveChanges</code> interceptors do not run, so audit columns populated by an interceptor are
+      silently skipped and must be set explicitly in the <code>SetProperty</code> call. Concurrency tokens are
+      not checked. And EF's cascade configuration is not applied, so deletion behaviour falls back to whatever
+      the database's foreign keys specify. They also execute immediately rather than as part of a pending
+      <code>SaveChanges</code>, so including one in a larger atomic unit requires an explicit
+      transaction.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A background worker gets progressively slower over several days. Diagnose.</summary>
+      <p>The signature — degradation over time rather than a failure — points at an unbounded change tracker.
+      The likely cause is a <code>DbContext</code> created once outside the processing loop, or injected into
+      a singleton worker, so every entity loaded across every iteration stays tracked for the process
+      lifetime. Two costs compound: memory grows with each iteration, and <code>DetectChanges</code> walks
+      every tracked entity comparing every property on each <code>SaveChanges</code>, so the per-iteration
+      cost is linear in everything processed so far, making it quadratic overall. That produces exactly the
+      "fine on Monday, unusable by Thursday" profile. The fix is a scope per unit of work — resolve the
+      context from <code>IServiceScopeFactory</code> inside the loop so it is disposed each iteration — or a
+      fresh context from <code>IDbContextFactory</code> per batch. If a single context genuinely must span
+      iterations, <code>ChangeTracker.Clear()</code> after each save bounds the growth. I would also check
+      whether the queries need tracking at all, since a worker that reads and transforms without writing
+      should be using <code>AsNoTracking</code> and would never have accumulated anything. To confirm before
+      changing code, <code>db.ChangeTracker.Entries().Count()</code> logged per iteration shows the growth
+      directly.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> An order must be saved and an event published atomically. How do you achieve that?</summary>
+      <p>You cannot, in the strict sense — there is no practical two-phase commit between a relational database
+      and a message broker, so the honest goal is to eliminate the window where the two can disagree rather
+      than to pretend it does not exist. Saving then publishing loses the event if the publish fails;
+      publishing then saving emits events for data that never committed. The standard solution is the
+      transactional outbox: the event is written as a row in an outbox table within the same transaction as
+      the order itself, so the commit is genuinely atomic and either both exist or neither does. A background
+      publisher then reads unprocessed outbox rows, publishes them, and marks them processed. The property
+      this buys is that no committed order can ever lack its event. The property it explicitly does not buy is
+      exactly-once delivery: if the process dies between publishing and marking the row processed, the message
+      is republished on restart, so delivery is at-least-once and every consumer must be idempotent. That
+      requirement has to be stated when the message contract is agreed rather than discovered later, because
+      retrofitting idempotency onto existing consumers is far harder than designing for it. Operationally the
+      outbox needs monitoring — depth and age of unprocessed rows — since a stalled publisher is invisible in
+      the API's own metrics while downstream systems silently fall behind, and it needs periodic pruning of
+      processed rows or the table becomes the largest in the database. Where the latency budget allows and the
+      consumer can tolerate coupling to the schema, change data capture is a lower-moving-parts alternative
+      that gets the same atomicity for free.</p></details>
+
+    <h2>🏋️ Graded Exercises</h2>
+    <div class="exercise"><strong>1 (easy):</strong> Rewrite a read-only query listing 10,000 orders so it does the least possible work.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// ✗ Before — tracks 10,000 entities and materialises every column:
+var orders = await db.Orders
+    .Where(o =&gt; o.CreatedAt &gt;= from)
+    .ToListAsync(ct);
+
+// ✓ After:
+var orders = await db.Orders
+    .AsNoTracking()                              // no snapshots, no DetectChanges
+    .Where(o =&gt; o.CreatedAt &gt;= from)
+    .OrderByDescending(o =&gt; o.CreatedAt)
+    .Select(o =&gt; new OrderSummary(                // only the columns needed
+        o.Id, o.Status, o.Total, o.CreatedAt))
+    .Take(100)                                    // and bound the result
+    .ToListAsync(ct);
+
+// Three independent wins:
+//   AsNoTracking  — halves memory and skips the change-detection scan
+//   Select        — SELECT id, status, total, created_at instead of every
+//                   column, which also avoids loading large text/blob fields
+//   Take          — an unbounded list query is a latent outage
+//
+// Note: a projection with Select is ALREADY untracked for the projected type,
+// but AsNoTracking still matters for the entity it projects from.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> A method calls <code>SaveChangesAsync</code> inside a loop over order lines. Explain both problems and fix it.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// ✗ Before:
+foreach (var line in request.Lines)
+{
+    db.OrderLines.Add(new OrderLine { OrderId = order.Id, ... });
+    await db.SaveChangesAsync(ct);
+}
+
+// PROBLEM 1 — CORRECTNESS: each SaveChanges is its own transaction. If line 7
+// fails, lines 1-6 are already committed and the order exists in a
+// half-created state with no marker saying so.
+//
+// PROBLEM 2 — PERFORMANCE: N round trips to the database instead of one, and
+// DetectChanges runs on every call over a growing tracked set.
+
+// ✓ After:
+foreach (var line in request.Lines)
+    db.OrderLines.Add(new OrderLine { OrderId = order.Id, ... });
+
+await db.SaveChangesAsync(ct);      // ONE transaction, batched statements
+
+// All lines commit together or none do, and EF batches the inserts into as
+// few round trips as the provider allows.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Add optimistic concurrency to <code>Order</code> and handle the conflict by surfacing both versions.
+      <details class="solution"><summary>Solution</summary>
+      <pre>public sealed class Order
+{
+    public int Id { get; set; }
+    public string Status { get; set; } = "";
+    public decimal Total { get; set; }
+
+    [Timestamp]                       // SQL Server; PostgreSQL: UseXminAsConcurrencyToken
+    public byte[] RowVersion { get; set; } = [];
+}
+
+public async Task&lt;Result&lt;Order, Conflict&gt;&gt; UpdateAsync(
+    int id, byte[] expectedVersion, UpdateOrder changes, CancellationToken ct)
+{
+    var order = await db.Orders.FirstOrDefaultAsync(o =&gt; o.Id == id, ct);
+    if (order is null) return Result.NotFound();
+
+    // Tell EF which version we BELIEVE we are updating — this is what the
+    // client read, not what is currently in the database.
+    db.Entry(order).Property(o =&gt; o.RowVersion).OriginalValue = expectedVersion;
+
+    order.Status = changes.Status;
+    order.Total = changes.Total;
+
+    try
+    {
+        await db.SaveChangesAsync(ct);
+        return order;
+    }
+    catch (DbUpdateConcurrencyException ex)
+    {
+        var entry = ex.Entries.Single();
+        var databaseValues = await entry.GetDatabaseValuesAsync(ct);
+
+        if (databaseValues is null)
+            return Result.NotFound();          // deleted, not merely changed
+
+        // SURFACE the conflict rather than picking a winner. Both the
+        // attempted change and the current state go back to the caller, so a
+        // human decides — silently choosing either one destroys real work.
+        return Result.Conflict(new ConflictDetails(
+            Attempted: order,
+            Current: (Order)databaseValues.ToObject()));
+    }
+}
+
+// WHY NOT JUST RETRY: retrying reloads the current values and reapplies our
+// change on top, which overwrites the other user's edit — exactly the lost
+// update the concurrency token was added to prevent.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Expire 500,000 old sessions efficiently, and state what your approach skips.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// ✗ Load-modify-save: 500,000 entities tracked, 500,000 DELETE statements.
+var expired = await db.Sessions.Where(s =&gt; s.ExpiresAt &lt; now).ToListAsync(ct);
+db.Sessions.RemoveRange(expired);
+await db.SaveChangesAsync(ct);
+
+// ✓ One statement, nothing loaded, nothing tracked:
+var deleted = await db.Sessions
+    .Where(s =&gt; s.ExpiresAt &lt; now)
+    .ExecuteDeleteAsync(ct);
+
+// WHAT THIS SKIPS — all of it deliberate here, but each must be checked:
+//   • the change tracker is not updated (irrelevant: nothing was loaded)
+//   • SaveChanges interceptors do not run (no audit row for these deletes —
+//     if sessions require deletion auditing, this approach is WRONG)
+//   • concurrency tokens are not checked (fine: expiry is time-based, not
+//     contended)
+//   • EF cascade config is not applied; the database's FK rules govern
+//     (so check whether child rows depend on sessions)
+
+// AT THIS VOLUME, BATCH IT. A single statement deleting 500,000 rows holds
+// locks and grows the transaction log enough to affect other traffic:
+int batch;
+do
+{
+    batch = await db.Sessions
+        .Where(s =&gt; s.ExpiresAt &lt; now)
+        .OrderBy(s =&gt; s.Id)
+        .Take(10_000)
+        .ExecuteDeleteAsync(ct);
+
+    await Task.Delay(100, ct);        // let other work through
+} while (batch &gt; 0);
+
+// Each batch is its own transaction — acceptable for a cleanup job that is
+// safe to resume, and much kinder to concurrent traffic than one long lock.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Combine EF writes with a raw SQL statement atomically, under a provider with retry enabled.
+      <details class="solution"><summary>Solution</summary>
+      <pre>builder.Services.AddDbContext&lt;AppDbContext&gt;(o =&gt;
+    o.UseNpgsql(conn, npg =&gt; npg.EnableRetryOnFailure(3)));
+
+// ✗ NAIVE — throws InvalidOperationException:
+await using var tx = await db.Database.BeginTransactionAsync(ct);
+// "The configured execution strategy 'NpgsqlRetryingExecutionStrategy' does
+//  not support user-initiated transactions."
+//
+// WHY: the strategy retries a failed operation, but it cannot retry a
+// transaction whose scope it does not control — it has no way to know what
+// else happened inside it or how to undo it.
+
+// ✓ Give the strategy ownership of the WHOLE unit so it can re-run it:
+var strategy = db.Database.CreateExecutionStrategy();
+
+await strategy.ExecuteAsync(async () =&gt;
+{
+    await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+    order.Status = "paid";
+    db.Payments.Add(new Payment { OrderId = order.Id, Amount = order.Total });
+    await db.SaveChangesAsync(ct);            // enlisted, not committed
+
+    // Raw SQL on the SAME connection and transaction:
+    await db.Database.ExecuteSqlAsync(
+        $"UPDATE inventory SET reserved = reserved + {order.Quantity} "
+      + $"WHERE product_id = {order.ProductId}", ct);
+
+    await tx.CommitAsync(ct);
+});
+
+// THE CRITICAL CONSTRAINT: this delegate may execute MORE THAN ONCE. Only
+// database work belongs inside it. These would be duplicated on a retry:
+//   ✗ await email.SendAsync(...)          → the customer gets two emails
+//   ✗ await bus.PublishAsync(...)         → consumers see the event twice
+//   ✗ _counter++                          → in-memory state diverges
+//   ✗ await http.PostAsync(paymentApi)    → a second charge
+//
+// Side effects go AFTER the strategy returns, once the commit is known to
+// have succeeded:
+await strategy.ExecuteAsync(async () =&gt; { /* db only */ });
+await bus.PublishAsync(new OrderPaid(order.Id), ct);   // ← outside
+//
+// And note that publishing here still has the atomicity gap from Part 6 — if
+// this line fails the commit already happened. The outbox pattern is what
+// closes it, and it works precisely because the outbox row is written INSIDE
+// the retryable database-only block.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Implement a transactional outbox and state exactly what guarantee it provides.
+      <details class="solution"><summary>Solution</summary>
+      <pre>// ── THE TABLE ────────────────────────────────────────────────────────────
+public sealed class OutboxMessage
+{
+    public Guid Id { get; set; }                  // UUIDv7 → time-ordered
+    public string Type { get; set; } = "";
+    public string Payload { get; set; } = "";
+    public DateTimeOffset OccurredAt { get; set; }
+    public DateTimeOffset? ProcessedAt { get; set; }
+    public int Attempts { get; set; }
+}
+
+modelBuilder.Entity&lt;OutboxMessage&gt;()
+    .HasIndex(m =&gt; new { m.ProcessedAt, m.OccurredAt })
+    .HasFilter("processed_at IS NULL");            // partial index: hot rows only
+
+// ── THE WRITE — one atomic commit ────────────────────────────────────────
+db.Orders.Add(order);
+db.Outbox.Add(new OutboxMessage
+{
+    Id = Guid.CreateVersion7(),
+    Type = nameof(OrderPlaced),
+    Payload = JsonSerializer.Serialize(new OrderPlaced(order.Id, order.Total)),
+    OccurredAt = clock.GetUtcNow()
+});
+await db.SaveChangesAsync(ct);
+// The order and its event are in the SAME transaction. There is no state in
+// which one exists without the other.
+
+// ── THE PUBLISHER ────────────────────────────────────────────────────────
+public sealed class OutboxPublisher(
+    IServiceScopeFactory scopes,
+    IMessageBus bus,
+    TimeProvider clock,
+    ILogger&lt;OutboxPublisher&gt; log) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            using var scope = scopes.CreateScope();      // scope per iteration
+            var db = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+
+            try
+            {
+                // FOR UPDATE SKIP LOCKED lets several publisher instances run
+                // concurrently without processing the same row twice.
+                var pending = await db.Outbox
+                    .FromSql($@"SELECT * FROM outbox_messages
+                                WHERE processed_at IS NULL
+                                ORDER BY occurred_at
+                                LIMIT 100
+                                FOR UPDATE SKIP LOCKED")
+                    .ToListAsync(ct);
+
+                foreach (var message in pending)
+                {
+                    await bus.PublishAsync(message.Type, message.Payload, ct);
+                    message.ProcessedAt = clock.GetUtcNow();
+                }
+
+                if (pending.Count &gt; 0) await db.SaveChangesAsync(ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                log.LogError(ex, "Outbox publish failed; retrying.");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), ct);
+        }
+    }
+}
+
+// ── THE GUARANTEE, PRECISELY ─────────────────────────────────────────────
+// ✓ PROVIDES: no committed order ever lacks its event. The database is the
+//   single source of truth for both, committed together.
+//
+// ✗ DOES NOT PROVIDE: exactly-once delivery. If the process dies AFTER
+//   bus.PublishAsync and BEFORE SaveChanges marks it processed, the message
+//   is published again on restart.
+//
+// → THEREFORE: delivery is AT-LEAST-ONCE and every consumer MUST be
+//   idempotent. This is a hard requirement pushed onto every consumer, and it
+//   belongs in the message contract agreed up front — retrofitting
+//   idempotency onto existing consumers is far more expensive than designing
+//   for it. Include a stable message id so consumers can deduplicate.
+
+// ── OPERATIONAL REQUIREMENTS, easy to forget ─────────────────────────────
+//   • MONITOR unprocessed depth and oldest OccurredAt. A stalled publisher is
+//     invisible in API metrics while downstream silently falls behind.
+//   • PRUNE processed rows on a schedule or this becomes the largest table.
+//   • CAP Attempts and move poison messages to a dead-letter table, or one
+//     unserialisable payload blocks the queue forever.
+//   • ORDERING is only per-publisher; with SKIP LOCKED and multiple instances
+//     there is no global order. If consumers need ordering per aggregate,
+//     partition by aggregate id.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>The change tracker keeps a snapshot of every tracked entity — roughly double memory plus a full property scan on <code>SaveChanges</code>.</li>
+        <li><code>AsNoTracking</code> on read-only queries is the highest-value habit in EF Core; consider making it the global default.</li>
+        <li>One <code>SaveChanges</code> is already a transaction over every pending change — calling it in a loop breaks atomicity and multiplies round trips.</li>
+        <li>Identity resolution means a second query returns the already-tracked instance, so it does not refresh stale values; use <code>ReloadAsync</code>.</li>
+        <li>Concurrency tokens turn silent lost updates into <code>DbUpdateConcurrencyException</code> — and blind retry reintroduces the exact bug they prevent.</li>
+        <li>Property-level tokens let unrelated edits succeed; a single atomic <code>ExecuteUpdate</code> avoids the conflict entirely for counters.</li>
+        <li><code>BeginTransaction</code> with <code>EnableRetryOnFailure</code> requires an execution strategy, and its delegate may run more than once — database work only.</li>
+        <li><code>ExecuteUpdate</code>/<code>ExecuteDelete</code> skip the tracker, interceptors, concurrency tokens and EF cascade rules.</li>
+        <li>Long-lived contexts degrade over time rather than failing — scope per unit of work, or <code>ChangeTracker.Clear()</code>.</li>
+        <li>The transactional outbox guarantees no committed data lacks its event, but delivery is at-least-once, so consumers must be idempotent.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="efcore-data.html">← EF Core: Modelling &amp; Querying</a>
+      <a href="caching.html">Caching &amp; Output Caching →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
