@@ -67,24 +67,24 @@ Target **~500–700 lines (~35–50KB)** per lesson. Structure:
 | 19 | System Design | ✅ **DONE (v4, 2026-07-30)** — **all 36 lessons rebuilt**, 30–61KB each (1.8 MB total), every one with 12 `<details>` (6 tiered interview Qs + 6 graded exercises), Common Mistakes table and Key Takeaways. **Whole track passes `python validate.py tutorials/system-design` with 0 errors.** §1 Fundamentals 11/11 · §2 Deep Dives 6/6 · §3 Case Studies 12/12 · §4 Senior/Staff 7/7. Uses the **tradeoff-driven SD format**; case studies use the **case-study format** (both below). Quiz bank still the v3 200-Q set — retune to the v4 curriculum when convenient. |
 | 5 | Node.js | ✅ **DONE (v4, 2026-07-31)** — **25 lessons** at v4 depth (27KB median), commit `fe2219f`. Was "deep but narrow" at 10 lessons; expanded rather than deepened, as planned. |
 | 17 | ASP.NET Core | ✅ **DONE (v4, 2026-08-04)** — **all 23 lessons** at v4 depth, 30–52KB each, every one `det=12 ex=6`. **Whole track passes `python validate.py tutorials/aspnet` with 0 errors.** §1 Foundations 5/5 (index, minimal-apis, routing, model-binding, configuration) · §2 The Pipeline 4/4 (middleware, di-config, filters, validation-errors) · §3 Building APIs 4/4 (controllers-mvc, api-design, versioning, openapi) · §4 Data 3/3 (efcore-data, efcore-advanced, caching) · §5 Security &amp; Realtime 4/4 (authn-authz, authorization, security, signalr) · §6 Production 4/4 (caching-background=Background Services, testing, clean-architecture, production-readiness). **Re-scoped v3 files:** `di-config` is DI-only (config split out), `validation-errors` is error-handling-only (validation moved to model-binding), `caching-background` is Background Services only (caching split out), `efcore-data` is modelling/querying only (change tracking split out). `routing-binding.html` became a redirect stub → routing + model-binding. Quiz bank still the v3 200-Q set — retune when convenient. |
-| 6 | Python | 🔄 **IN PROGRESS (started 2026-07-30)** — **1/12 lessons** at v4. Track order: `index` → control-flow → data-structures → strings-io → oop → comprehensions-generators → decorators-context → modules-packaging → typing → concurrency → testing → fastapi. Uses the **language-track v4 format** (6 Parts → Common Mistakes → 6 tiered Qs → 6 graded exercises → Takeaways), *not* the SD tradeoff format. **Note:** v3 Python content was thin but *correct* (name/object model explained properly) — this track is expansion, not reconstruction, so it should move faster than System Design did. |
+| 6 | Python | ✅ **DONE (v4, 2026-08-04)** — **all 12 lessons** at v4 depth, 35–58KB each, every one `det=12 ex=6`. **Whole track passes `python validate.py tutorials/python` with 0 errors.** Order: index (Syntax/Types/Variables) → control-flow → data-structures → strings-io → oop → comprehensions-generators → decorators-context → modules-packaging → typing → concurrency → testing → fastapi. Uses the **language-track v4 format** (6 Parts → Common Mistakes → 6 tiered Qs → 6 graded exercises → Takeaways), *not* the SD tradeoff format. Rebuilt in place — the v3 content was thin but correct, so this was expansion rather than reconstruction, and no redirect stubs were needed. Quiz bank still the v3 200-Q set — retune when convenient. |
 | 5, 7–18 | all others | ⏳ pending (still at v3 depth) — see damage-order queue below |
 
-#### Python v4 — per-lesson status
-| # | Lesson | v3 | v4 | Status |
+#### Python v4 — per-lesson status (all ✅, 0 validation errors)
+| # | Lesson | v3 | v4 | Focus |
 |---|--------|----|----|--------|
-| 1 | index.html (Syntax, Types & Variables) | 8KB | **35KB** | ✅ det=12 ex=6 tbl=5, 0 errors. Parts: name/object model · core types · strong+dynamic typing · idioms · **deep dive: mutable default argument** · **deep dive: copying**. |
-| 2 | control-flow.html (Control Flow & Functions) | 8KB | — | ⏳ **NEXT** |
-| 3 | data-structures.html | 8KB | — | ⏳ |
-| 4 | strings-io.html | 7KB | — | ⏳ |
-| 5 | oop.html (OOP & Dataclasses) | 9KB | — | ⏳ |
-| 6 | comprehensions-generators.html | 8KB | — | ⏳ |
-| 7 | decorators-context.html | 9KB | — | ⏳ |
-| 8 | modules-packaging.html | 8KB | — | ⏳ |
-| 9 | typing.html (Type Hints) | 8KB | — | ⏳ |
-| 10 | concurrency.html (GIL, Threads, Async) | 9KB | — | ⏳ |
-| 11 | testing.html (pytest) | 8KB | — | ⏳ |
-| 12 | fastapi.html (Production APIs) | 9KB | — | ⏳ |
+| 1 | index.html (Syntax, Types & Variables) | 8KB | **35KB** | name/object model · core types · strong+dynamic typing · idioms · deep dives: mutable default argument, copying |
+| 2 | control-flow.html (Control Flow & Functions) | 8KB | **38KB** | truthiness · loops · 5 parameter kinds · LEGB/closures/late-binding · pattern matching · exceptions as control flow |
+| 3 | data-structures.html | 8KB | **42KB** | complexity per operation · dicts/sets/hashability · tuples & immutability · collections · sorting · choosing by access pattern |
+| 4 | strings-io.html | 7KB | **42KB** | immutability & O(n²) concat · format mini-language · str vs bytes & encoding · `with`/modes/streaming · pathlib · atomic writes |
+| 5 | oop.html (OOP & Dataclasses) | 9KB | **48KB** | attribute lookup & shared class attrs · dunder protocols · dataclass slots/frozen · MRO & super() · properties/descriptors · composition |
+| 6 | comprehensions-generators.html | 8KB | **47KB** | comprehension forms · iterator protocol & exhaustion · generators as frames · lazy pipelines · itertools · send/throw/close |
+| 7 | decorators-context.html | 9KB | **50KB** | wraps & the 5 omissions · 3-layer factories · lru_cache method leak · `__exit__` returning True · @contextmanager · ExitStack |
+| 8 | modules-packaging.html | 8KB | **47KB** | import once & side effects · sys.path shadowing · circular imports (4 fixes) · venv + lockfile chain · src layout · build/publish |
+| 9 | typing.html (Type Hints) | 8KB | **49KB** | erasure · narrowing & assert_never · Protocol · generics & invariance · Literal/TypedDict/NewType · mypy vs Pydantic · rollout plan |
+| 10 | concurrency.html (GIL, Threads, Async) | 9KB | **53KB** | what the GIL locks · decision table w/ numbers · asyncio & blocking calls · `+=` is not atomic · pickling boundary · cancellation/timeouts |
+| 11 | testing.html (pytest) | 8KB | **55KB** | assertion introspection · parametrise boundaries · fixtures & scope · transaction-rollback DB · patch-where-used & autospec · flakiness |
+| 12 | fastapi.html (Production APIs) | 9KB | **58KB** | types as contract · request/response model split · DI & overrides · async def vs def · BOLA/authz · errors/config/observability · deploy |
 
 ### ⚠️ Order changed 2026-07-30 (user: "junior, mid and senior can't refer to this — content not up to the mark")
 
@@ -94,11 +94,12 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 1. ~~**System Design** (36)~~ ✅ **COMPLETE 2026-07-30** — 36/36 at 30–61KB, 0 validation errors
 2. ~~**Node.js**~~ ✅ **COMPLETE 2026-07-31** — 10 → 25 lessons @ 27KB median
 3. ~~**ASP.NET Core**~~ ✅ **COMPLETE 2026-08-04** — 23/23 lessons, 0 validation errors
-4. 🔄 **Python** (1/12 done) ← **CURRENT**, then **SQL** (12) — highest junior/mid traffic, 7–9KB
-5. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
-6. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
+4. ~~**Python**~~ ✅ **COMPLETE 2026-08-04** — 12/12 lessons, 0 validation errors
+5. 🔄 **SQL** (12 @ 7–9KB) ← **CURRENT** — highest junior/mid traffic
+6. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
+7. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
 
-**Remaining: ~112 lessons across 6 tracks.**
+**Remaining: ~100 lessons across 3 tracks** (SQL 12 + LeetCode 21 + infra six ~70 under the approved expansion, ~40 if deepened in place).
 
 ### ⚠ Open decision: infra six scope
 User approved full curriculum expansion (12 → ~20 lessons each, ~70 lessons total) on 2026-08-03. After writing 16 ASP.NET lessons at this depth, the build recommendation is to **deepen in place at 12 lessons each (~40 lessons)** instead: Docker, Redis and CI/CD do not have 20 lessons of genuinely distinct material the way Java or System Design did, and padding would show. Raised with the user; not yet re-decided. Default to the approved expansion unless told otherwise.
