@@ -18,7 +18,9 @@ must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair.
 
 **Then, in order:** Database Concepts & Architecture (new) → Vector Databases & RAG (new) → LeetCode (21) → infra six.
 
-**Open decision still unresolved:** infra-six scope — approved expansion (~70 lessons) vs recommended deepen-in-place (~40). Defaults to expansion. Decide before starting Docker.
+**Decisions settled 2026-08-05 (user, via AskUserQuestion):**
+- **Infra-six scope: FULL EXPANSION** (~20 lessons each, ~70 total). The deepen-in-place recommendation was declined; build out the curricula.
+- **Quiz banks: retune per track, as each track's lessons finish** — no longer deferred to the end. A track is not "done" until its bank validates `10 200 0` against the v4 curriculum.
 
 ---
 
