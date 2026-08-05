@@ -6,6 +6,22 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
+## ▶️ RESUME HERE (last updated 2026-08-05)
+
+**Current task:** SQL v4 rebuild — **7/12 done**. Next file: `tutorials/sql/transactions.html` (Constraints & Transactions), then indexes → isolation → optimization → scaling.
+
+**How to work:** rebuild each lesson in place at v4 depth, then
+```
+PYTHONIOENCODING=utf-8 python validate.py tutorials/sql <file>.html
+```
+must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair.
+
+**Then, in order:** Database Concepts & Architecture (new) → Vector Databases & RAG (new) → LeetCode (21) → infra six.
+
+**Open decision still unresolved:** infra-six scope — approved expansion (~70 lessons) vs recommended deepen-in-place (~40). Defaults to expansion. Decide before starting Docker.
+
+---
+
 ## Track completion
 
 | # | Track | Lessons | Quiz Qs | Status |
@@ -15,9 +31,9 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 3 | JavaScript | 16 | 200 | ✅ DONE |
 | 4 | React | 12 | 200 | ✅ DONE |
 | 5 | Node.js | 12 | 200 | ✅ DONE |
-| 6 | Python | 12 | 200 | ✅ v3 done · 🔄 v4 1/12 |
+| 6 | Python | 12 | 200 | ✅ **v4 DONE 12/12** (2026-08-04) |
 | 7 | Java | 12 | 200 | ✅ DONE |
-| 8 | SQL | 12 | 200 | ✅ DONE |
+| 8 | SQL | 12 | 200 | ✅ v3 done · 🔄 **v4 7/12** |
 | 9 | MongoDB | 12 | 200 | ✅ DONE |
 | 10 | Redis | 11 | 200 | ✅ DONE |
 | 11 | Docker | 12 | 200 | ✅ DONE |
@@ -26,11 +42,14 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 | 14 | CI/CD | 12 | 200 | ✅ DONE |
 | 15 | Angular | 12 | 200 | ✅ DONE |
 | 16 | .NET (C#) | 23 (v4) | 200 | ✅ DONE |
-| 17 | ASP.NET Core | 12 | 200 | ✅ DONE |
-| 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | ✅ DONE |
+| 17 | ASP.NET Core | 23 (v4) | 200 | ✅ **v4 DONE 23/23** (2026-08-04) |
+| 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | ✅ v3 done · ⏳ v4 pending |
 | 19 | System Design | 36 lessons (Fundamentals ×11 + Deep Dives ×6 + Case Studies ×12 + Senior/Staff ×7) | 200 | ✅ DONE (v4) |
+| 20 | 🆕 Database Concepts & Architecture | ~14 (planned) | 200 (to write) | ⏳ **NEW TRACK — not started** |
+| 21 | 🆕 Vector Databases & RAG | ~14 (planned) | 200 (to write) | ⏳ **NEW TRACK — not started** |
 
 **v3 build-out done: 19 full tracks (3,800 quiz questions), all committed & pushed.**
+**Tracks 20–21 are new (user-requested 2026-08-04) and built directly at v4 depth — no v3 stage.**
 
 ---
 
@@ -95,13 +114,33 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 2. ~~**Node.js**~~ ✅ **COMPLETE 2026-07-31** — 10 → 25 lessons @ 27KB median
 3. ~~**ASP.NET Core**~~ ✅ **COMPLETE 2026-08-04** — 23/23 lessons, 0 validation errors
 4. ~~**Python**~~ ✅ **COMPLETE 2026-08-04** — 12/12 lessons, 0 validation errors
-5. 🔄 **SQL** (12 @ 7–9KB) ← **CURRENT** — highest junior/mid traffic
+5. 🔄 **SQL** — **7/12 done** ← **CURRENT** (per-lesson table below)
 6. 🆕 **Database Concepts & Architecture** — NEW track (see below)
 7. 🆕 **Vector Databases & RAG** — NEW track (see below)
 8. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
 9. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
 
-**Remaining: ~130 lessons across 5 tracks** (SQL 9 + DB Concepts ~14 + Vector/RAG ~14 + LeetCode 21 + infra six ~70 under the approved expansion, ~40 if deepened in place).
+**Remaining: ~125 lessons across 5 tracks** (SQL 5 + DB Concepts ~14 + Vector/RAG ~14 + LeetCode 21 + infra six ~70 under the approved expansion, ~40 if deepened in place).
+
+#### SQL v4 — per-lesson status (as of 2026-08-05)
+Rebuilt in place, no redirect stubs needed. Every done lesson `det=12 ex=6`, 0 validation errors.
+
+| # | Lesson | v3 | v4 | Status / focus |
+|---|--------|----|----|----------------|
+| 1 | index.html (SELECT & Filtering) | 8KB | **49KB** | ✅ declarative thinking · logical order of execution · NULL & 3-valued logic · sargability · CASE/types · SELECT * hygiene |
+| 2 | aggregates.html (Sorting, Limiting & Aggregates) | 7KB | **47KB** | ✅ NULL in aggregates · GROUP BY rule & MySQL ONLY_FULL_GROUP_BY · WHERE vs HAVING · FILTER/pivots · ROLLUP · empty-group problem · keyset pagination |
+| 3 | joins.html | 8KB | **52KB** | ✅ join types & why Venn misleads · ON vs WHERE · anti/semi-joins · **fan-out** · self-join/LATERAL · N+1 · nested-loop/hash/merge |
+| 4 | dml.html (INSERT/UPDATE/DELETE) | 8KB | **54KB** | ✅ affected-row-count discipline · COPY/RETURNING · upserts & concurrency · chunked deletes · soft delete · MVCC write mechanics |
+| 5 | subqueries-ctes.html | 8KB | **50KB** | ✅ all subquery forms · correlated/decorrelation · NOT IN landmine · CTE optimisation fence (PG12 change) · recursive + cycle guards · LATERAL · data-modifying CTEs |
+| 6 | window-functions.html | 8KB | **49KB** | ✅ OVER anatomy · ranking trio · **frames: ROWS vs RANGE, default-frame traps** · LAG/LEAD · gaps-and-islands · execution order · when LATERAL wins |
+| 7 | schema-design.html | 9KB | **57KB** | ✅ keys (surrogate/natural/UUIDv4-vs-v7) · normal forms by anomaly · deliberate denormalisation + drift checks · types/constraints · temporal modelling · EAV/polymorphic anti-patterns |
+| 8 | transactions.html (Constraints & Transactions) | 9KB | — | ⏳ **NEXT** |
+| 9 | indexes.html (Indexes & Query Plans) | 9KB | — | ⏳ |
+| 10 | isolation.html (Isolation Levels & Locking) | 10KB | — | ⏳ |
+| 11 | optimization.html (Query Optimization) | 9KB | — | ⏳ |
+| 12 | scaling.html (Replication, Partitioning, Sharding) | 10KB | — | ⏳ |
+
+**SQL quiz bank:** still the v3 200-Q set — retune to the v4 curriculum when convenient (same deferred debt as ASP.NET/System Design/Node/Python).
 
 ### 🆕 Two new Database-section tracks (user-requested 2026-08-04)
 
