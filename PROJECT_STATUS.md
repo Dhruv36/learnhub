@@ -6,17 +6,28 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-05)
+## ▶️ RESUME HERE (last updated 2026-08-06)
 
-**Current task:** SQL v4 rebuild — **7/12 done**. Next file: `tutorials/sql/transactions.html` (Constraints & Transactions), then indexes → isolation → optimization → scaling.
+**Current task:** Database Concepts & Architecture — **all 15 lessons DONE**, quiz bank **still to write**.
+Next action: write `tutorials/database-concepts/quiz-bank-1.js` (sets 1–5) + `quiz-bank-2.js` (sets 6–10),
+20 Qs each with `explain` on every question, then validate `10 200 0`. `nav.js`, `quiz.html` and the
+root `index.html` card already exist.
 
-**How to work:** rebuild each lesson in place at v4 depth, then
+**How to work:** write each lesson at v4 depth, then
 ```
-PYTHONIOENCODING=utf-8 python validate.py tutorials/sql <file>.html
+PYTHONIOENCODING=utf-8 python validate.py tutorials/<track> <file>.html
 ```
-must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair.
+must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair. A forward link to the
+not-yet-written next lesson shows as a "broken link" error — that is expected and clears when the
+next file lands; re-run the whole-track validate at the end to confirm 0 errors.
 
-**Then, in order:** Database Concepts & Architecture (new) → Vector Databases & RAG (new) → LeetCode (21) → infra six.
+**Then, in order:** DB Concepts quiz bank → Vector Databases & RAG (new, 14 lessons + bank) →
+LeetCode v4 (21) → infra six (~70).
+
+**Quiz-bank recipe (per the 2026-08-05 decision — a track is not done without it):**
+sets are `{title:"Quiz N · Topic", desc, questions:[{q, options:[3], answer:<idx>, explain}×20]}`,
+wrapped in `window.QUIZ_SETS=window.QUIZ_SETS||[]; window.QUIZ_SETS.push(...)`. Set 10 = mixed mock exam.
+Validate with the node one-liner at the bottom of this file → must print `10 200 0`.
 
 **Decisions settled 2026-08-05 (user, via AskUserQuestion):**
 - **Infra-six scope: FULL EXPANSION** (~20 lessons each, ~70 total). The deepen-in-place recommendation was declined; build out the curricula.
@@ -35,7 +46,7 @@ must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair.
 | 5 | Node.js | 12 | 200 | ✅ DONE |
 | 6 | Python | 12 | 200 | ✅ **v4 DONE 12/12** (2026-08-04) |
 | 7 | Java | 12 | 200 | ✅ DONE |
-| 8 | SQL | 12 | 200 | ✅ v3 done · 🔄 **v4 7/12** |
+| 8 | SQL | 12 | 200 | ✅ **v4 DONE 12/12 + quiz retuned** (2026-08-05) |
 | 9 | MongoDB | 12 | 200 | ✅ DONE |
 | 10 | Redis | 11 | 200 | ✅ DONE |
 | 11 | Docker | 12 | 200 | ✅ DONE |
@@ -47,8 +58,8 @@ must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair.
 | 17 | ASP.NET Core | 23 (v4) | 200 | ✅ **v4 DONE 23/23** (2026-08-04) |
 | 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | ✅ v3 done · ⏳ v4 pending |
 | 19 | System Design | 36 lessons (Fundamentals ×11 + Deep Dives ×6 + Case Studies ×12 + Senior/Staff ×7) | 200 | ✅ DONE (v4) |
-| 20 | 🆕 Database Concepts & Architecture | ~14 (planned) | 200 (to write) | ⏳ **NEW TRACK — not started** |
-| 21 | 🆕 Vector Databases & RAG | ~14 (planned) | 200 (to write) | ⏳ **NEW TRACK — not started** |
+| 20 | 🆕 Database Concepts & Architecture | **15 (v4)** | ⏳ to write | 🔄 **lessons 15/15 DONE** (2026-08-06) · quiz bank pending |
+| 21 | 🆕 Vector Databases & RAG | ~14 (planned) | 200 (to write) | ⏳ **NEW TRACK — not started** (quiz.html scaffolded) |
 
 **v3 build-out done: 19 full tracks (3,800 quiz questions), all committed & pushed.**
 **Tracks 20–21 are new (user-requested 2026-08-04) and built directly at v4 depth — no v3 stage.**
@@ -116,13 +127,14 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 2. ~~**Node.js**~~ ✅ **COMPLETE 2026-07-31** — 10 → 25 lessons @ 27KB median
 3. ~~**ASP.NET Core**~~ ✅ **COMPLETE 2026-08-04** — 23/23 lessons, 0 validation errors
 4. ~~**Python**~~ ✅ **COMPLETE 2026-08-04** — 12/12 lessons, 0 validation errors
-5. 🔄 **SQL** — **7/12 done** ← **CURRENT** (per-lesson table below)
-6. 🆕 **Database Concepts & Architecture** — NEW track (see below)
-7. 🆕 **Vector Databases & RAG** — NEW track (see below)
+5. ~~**SQL**~~ ✅ **COMPLETE 2026-08-05** — 12/12 lessons (47–57KB) + quiz bank retuned to v4 (20 swaps)
+6. 🔄 **Database Concepts & Architecture** — ✅ **lessons 15/15 COMPLETE 2026-08-06** · ⏳ quiz bank pending ← **CURRENT**
+7. 🆕 **Vector Databases & RAG** — NEW track, not started (see below)
 8. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
 9. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
 
-**Remaining: ~125 lessons across 5 tracks** (SQL 5 + DB Concepts ~14 + Vector/RAG ~14 + LeetCode 21 + infra six ~70 under the approved expansion, ~40 if deepened in place).
+**Remaining: ~105 lessons across 4 tracks + 2 quiz banks**
+(DB Concepts bank + Vector/RAG 14 lessons & bank + LeetCode 21 + infra six ~70 under the approved expansion).
 
 #### SQL v4 — per-lesson status (as of 2026-08-05)
 Rebuilt in place, no redirect stubs needed. Every done lesson `det=12 ex=6`, 0 validation errors.
@@ -136,24 +148,28 @@ Rebuilt in place, no redirect stubs needed. Every done lesson `det=12 ex=6`, 0 v
 | 5 | subqueries-ctes.html | 8KB | **50KB** | ✅ all subquery forms · correlated/decorrelation · NOT IN landmine · CTE optimisation fence (PG12 change) · recursive + cycle guards · LATERAL · data-modifying CTEs |
 | 6 | window-functions.html | 8KB | **49KB** | ✅ OVER anatomy · ranking trio · **frames: ROWS vs RANGE, default-frame traps** · LAG/LEAD · gaps-and-islands · execution order · when LATERAL wins |
 | 7 | schema-design.html | 9KB | **57KB** | ✅ keys (surrogate/natural/UUIDv4-vs-v7) · normal forms by anomaly · deliberate denormalisation + drift checks · types/constraints · temporal modelling · EAV/polymorphic anti-patterns |
-| 8 | transactions.html (Constraints & Transactions) | 9KB | — | ⏳ **NEXT** |
-| 9 | indexes.html (Indexes & Query Plans) | 9KB | — | ⏳ |
-| 10 | isolation.html (Isolation Levels & Locking) | 10KB | — | ⏳ |
-| 11 | optimization.html (Query Optimization) | 9KB | — | ⏳ |
-| 12 | scaling.html (Replication, Partitioning, Sharding) | 10KB | — | ⏳ |
+| 8 | transactions.html (Constraints & Transactions) | 9KB | **52KB** | ✅ constraints make invalid states impossible · ACID promises & what they don't · savepoints & subtransaction overflow · lost update + 3 fixes · WAL/durability limits · txn in connection pools, outbox, idle-in-transaction |
+| 9 | indexes.html (Indexes & Query Plans) | 9KB | **56KB** | ✅ B-tree page arithmetic · sargability derived · selectivity & why a good index is ignored · composite order & INCLUDE/index-only · EXPLAIN incl. **loops multiplier** · stats/correlated columns · CONCURRENTLY |
+| 10 | isolation.html (Isolation Levels & Locking) | 10KB | **54KB** | ✅ anomalies as interleavings · levels vs the standard (PG≠MySQL) · MVCC snapshots · read-committed update anomaly · write skew & SSI · retry loops (40001/40P01, jitter) · lock queue & ACCESS EXCLUSIVE |
+| 11 | optimization.html (Query Optimization) | 9KB | **53KB** | ✅ measure by **total_exec_time** not mean · planner cost model & random_page_cost · sargable rewrites · NOT IN landmine · N+1 · keyset pagination · COUNT(*) strategies · work_mem per node · guardrails |
+| 12 | scaling.html (Replication, Partitioning, Sharding) | 10KB | **56KB** | ✅ what one node really does · replication lag as correctness (LSN/sticky reads) · partitioning ≠ write capacity · shard-key choice & shard maps · functional split before sharding · no-downtime migration |
 
-**SQL quiz bank:** still the v3 200-Q set — retune to the v4 curriculum when convenient (same deferred debt as ASP.NET/System Design/Node/Python).
+**SQL quiz bank:** ✅ **RETUNED 2026-08-05** — 20 swaps across sets 4/7/8/9 covering v4-only concepts (EXPLAIN loops multiplier, heap fetches on index-only scans, CREATE STATISTICS, random_page_cost on SSD, CONCURRENTLY, affected-row count, outbox, idle-in-transaction, SKIP LOCKED, 40001 retries with jitter, ACCESS EXCLUSIVE lock queue, pg_stat_statements by total time, per-role work_mem, LSN read-your-writes, DETACH retention, shard-map routing, functional split). Validates `10 200 0`, no duplicates.
 
 ### 🆕 Two new Database-section tracks (user-requested 2026-08-04)
 
 Both are **new tracks built directly at v4 depth** (no v3 to rebuild), added to the `Databases` section of the root `index.html` alongside SQL / MongoDB / Redis. Sequenced **after SQL, before LeetCode** (user-confirmed).
 
-**A. Database Concepts & Architecture** (`tutorials/database-concepts/`)
-Scope confirmed by user: **"based on design perspective and storage engine internals"** — i.e. data-modelling/physical-design decisions *plus* how the engine actually works underneath. Deliberately **excludes** distribution topics (CAP, replication, consensus, sharding) — those already exist in System Design and must not be duplicated. Draft curriculum:
-1. *Storage Foundations* — Pages/Heap Files & Row Layout · B+Trees · LSM-Trees & Write-Optimised Storage · Buffer Pool & Page Cache
-2. *Durability & Concurrency* — WAL, Checkpoints & Crash Recovery · MVCC & Snapshot Isolation · Locking, Latches & Deadlocks
-3. *Query Processing* — Parser/Rewriter/Planner · Cost Models & Statistics · Join & Aggregation Algorithms
-4. *Design Perspective* — Physical Schema Design for the Engine · OLTP vs OLAP & Row vs Columnar · Engine Landscape (Postgres/MySQL/SQLite/DuckDB) · Choosing a Database
+**A. Database Concepts & Architecture** (`tutorials/database-concepts/`) — ✅ **LESSONS 15/15 DONE 2026-08-06**
+Scope confirmed by user: **"based on design perspective and storage engine internals"** — i.e. data-modelling/physical-design decisions *plus* how the engine actually works underneath. Deliberately **excludes** distribution topics (CAP, replication, consensus, sharding) — those already exist in System Design and must not be duplicated.
+
+**As built** (whole track passes `python validate.py tutorials/database-concepts`, 0 errors, every lesson `det=12 ex=6` at 50–59KB):
+1. *Storage Foundations* ×5 — `index.html` (How a Database Stores Data: the 6 layers, memory/disk gap, pages, RUM) · `pages-heap-files.html` (slotted pages, row layout, **alignment padding**, ctid, **HOT updates**, TOAST) · `btrees.html` (fanout/depth arithmetic, splits, **sequential vs random key density**, B-link concurrency, index bloat) · `lsm-trees.html` (memtable/SSTable, **bloom filter sizing**, size-tiered vs levelled vs time-window compaction, tombstones) · `buffer-pool.html` (hit-rate non-linearity, pinning, **clock sweep & ring buffers**, checkpoint storms, PG 25% vs InnoDB 75%)
+2. *Durability & Concurrency* ×3 — `wal-recovery.html` (write-ahead + force-at-commit, **LSN's three jobs**, ARIES/repeating history, torn pages & full-page writes, fsync truth, group commit, one log → 4 features) · `mvcc.html` (visibility rule, **in-table vs undo-log**, vacuum blockers, **wraparound**, hint bits, snapshot ≠ serialisable) · `locking-latches.html` (locks vs latches, conflict matrix, **row locks stored in the tuple → no escalation**, deadlock detection, **lock queue outage**, advisory locks)
+3. *Query Processing* ×3 — `query-planner.html` (5 stages, rewriter/views/RLS/CTE inlining, join-order search & GEQO, pushdown, **generic plan failure**) · `cost-models.html` (**cost formula by hand**, MCV/histogram/n_distinct, **independence assumption**, error propagation, calibrating random_page_cost) · `join-algorithms.html` (3 algorithms + costs, **nested loop as estimate-error signature**, hash spill batches, aggregation strategies, key skew)
+4. *Design Perspective* ×4 — `physical-design.html` (**reversibility hierarchy**, key choice, row width, write-path design, partition key from query logs) · `oltp-olap.html` (row vs columnar arithmetic, **4 compression encodings**, vectorised execution, what columnar is bad at, the middle ground) · `engine-landscape.html` (**6 characterising questions**, Postgres/InnoDB/SQLite/DuckDB/LSM personalities) · `choosing-a-database.html` (6 workload dimensions, why PG is the default, decision tree, **costs evaluations miss**, PoC that can fail, ADRs)
+
+⏳ **REMAINING: the quiz bank only.** `nav.js`, `quiz.html` and the root `index.html` card are done and pushed.
 
 **B. Vector Databases & RAG** (`tutorials/vector-databases/`)
 Scope confirmed: **vector stores + RAG patterns** (the full practical track, incl. evaluation and production ops). Draft curriculum:
@@ -164,8 +180,15 @@ Scope confirmed: **vector stores + RAG patterns** (the full practical track, inc
 
 Both need: `nav.js`, `quiz.html` + `quiz-bank-1.js`/`quiz-bank-2.js` (10 sets × 20 Qs), a card in root `index.html` → `#databases`, and every lesson at `det=12 ex=6`.
 
-### ⚠ Open decision: infra six scope
-User approved full curriculum expansion (12 → ~20 lessons each, ~70 lessons total) on 2026-08-03. After writing 16 ASP.NET lessons at this depth, the build recommendation is to **deepen in place at 12 lessons each (~40 lessons)** instead: Docker, Redis and CI/CD do not have 20 lessons of genuinely distinct material the way Java or System Design did, and padding would show. Raised with the user; not yet re-decided. Default to the approved expansion unless told otherwise.
+### ✅ Settled decision: infra six scope (2026-08-05)
+**FULL EXPANSION — ~20 lessons each, ~70 total.** The build recommendation to deepen in place at 12 each (~40) was put to the user and **declined**; build out the curricula. Applies to Docker, Kubernetes, AWS, CI/CD, MongoDB and Redis.
+
+### Session note 2026-08-06
+SQL v4 finished (5 lessons: transactions → indexes → isolation → optimization → scaling) **and its quiz bank retuned** — the first track to satisfy the new "not done without the bank" rule. Then Database Concepts built from zero: nav.js, quiz.html, root index card, and all 15 lessons.
+
+**Two validator catches worth remembering** (both are silent-corruption bugs in browsers, invisible to source review): an `<a href>` inside a `<pre>` block, and a bare `<` in `DROP INDEX <the 4 unused>`. `validate.py` flagged both. Also fixed a stale `← CSS Track` nav link in `tutorials/sql/quiz.html` that had been copy-pasted from the CSS template.
+
+**Working note:** while writing a track in order, a forward `<a>` to the not-yet-written next lesson makes `validate.py` report a broken link. That is expected — it clears when the next file lands. Run the whole-track validate at the end to confirm 0 errors.
 
 ### Session note 2026-08-03
 16 ASP.NET lessons written in one session. Sustained rate is ~1 lesson per 15–20 min at 32–47KB each, so the remaining ~112 lessons span multiple sessions. Every lesson is committed at each checkpoint — resume from this file plus `git log --oneline`. The v4 lesson format is stable and proven across 5 sections; no format changes pending. Quiz banks across *every* v4 track (HTML, CSS, JS, React, Angular, .NET, System Design) are still the v3 200-Q sets — not broken, but drifted from the expanded curricula. Retune pass deferred until lessons are done.
