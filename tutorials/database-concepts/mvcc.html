@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MVCC &amp; Snapshot Isolation — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>MVCC &amp; Snapshot Isolation <span class="level-badge level-ultra">Durability &amp; Concurrency</span></h1>
+    <p><strong>What you'll master:</strong> the exact visibility rule that decides which version of a row a
+       transaction sees, and how <code>xmin</code>, <code>xmax</code> and a snapshot combine to produce it,
+       the two architectural choices for storing old versions — in the table like PostgreSQL or in an undo
+       log like InnoDB and Oracle — and the completely different operational problems each creates, why
+       vacuum exists and the precise mechanism by which one forgotten transaction bloats an entire database,
+       transaction ID wraparound and why it can shut a database down, hint bits and why the query
+       <em>after</em> a bulk load is unexpectedly slow, and how snapshot isolation differs from
+       serialisability. Prerequisites:
+       <a href="wal-recovery.html">WAL, Checkpoints &amp; Crash Recovery</a> and
+       <a href="pages-heap-files.html">Pages, Heap Files &amp; Row Layout</a>. The
+       <a href="../sql/isolation.html">SQL isolation lesson</a> covers the anomalies and levels from the
+       application's side; this is the machinery underneath.</p>
+
+    <h2>Part 1 — The Core Idea and the Visibility Rule</h2>
+    <pre>-- The problem MVCC solves: readers and writers contending for the same
+-- rows. A lock-based system makes one wait for the other, so a long
+-- analytical query blocks the write path — unacceptable.
+--
+-- The MVCC answer: never overwrite. Keep MULTIPLE VERSIONS of each row
+-- and let each transaction read the version appropriate to the moment it
+-- started. Readers and writers then never wait for each other, because
+-- they are looking at different physical data.
+
+-- ── EVERY TUPLE CARRIES ITS LIFETIME ────────────────────────────────────
+--   xmin — the transaction that CREATED this version
+--   xmax — the transaction that DELETED or SUPERSEDED it (0 if live)
+-- A version is "alive" during the interval [xmin, xmax).
+SELECT xmin, xmax, ctid, id, balance FROM accounts WHERE id = 1;
+--   xmin | xmax |  ctid  | id | balance
+--    842 |    0 | (0,1)  |  1 |     100
+
+UPDATE accounts SET balance = 50 WHERE id = 1;   -- txn 900
+SELECT xmin, xmax, ctid, id, balance FROM accounts WHERE id = 1;
+--    900 |    0 | (0,2)  |  1 |      50    ← a NEW tuple
+-- The old one still physically exists with xmax = 900. It is simply not
+-- visible to anyone whose snapshot excludes 900.
+
+-- ── THE SNAPSHOT ────────────────────────────────────────────────────────
+-- A snapshot is not a copy of data. It is three cheap facts:
+SELECT txid_current_snapshot();       -- 900:906:902,904
+--        xmin:xmax:xip_list
+--   xmin      lowest still-running txid — anything below is DECIDED
+--   xmax      first not-yet-assigned txid — anything ≥ is in the FUTURE
+--   xip_list  txids in between that were IN PROGRESS when we started
+
+-- ── THE VISIBILITY RULE (this is the whole algorithm) ───────────────────
+-- A tuple version is visible to my snapshot if:
+--   1. its xmin COMMITTED and is visible to my snapshot
+--        (xmin < snapshot.xmin, or xmin not in xip_list and < xmax)
+--      AND
+--   2. its xmax is 0, OR aborted, OR NOT visible to my snapshot
+--        (i.e. the deleting transaction had not committed when I started)
+--
+-- In words: I see a row if the transaction that created it had committed
+-- before I began, and the transaction that removed it had not.
+--
+-- ✓ CONSEQUENCES that follow immediately:
+--   • two transactions legitimately see DIFFERENT versions of one row,
+--     simultaneously, with no coordination
+--   • a reader never blocks a writer and a writer never blocks a reader
+--   • conflicts arise only WRITE-vs-WRITE
+--   • "reading a row" is never a simple fetch — it is a fetch plus a
+--     visibility check, per version, per tuple
+
+-- ── WHERE THE SNAPSHOT IS TAKEN DECIDES THE ISOLATION LEVEL ─────────────
+-- READ COMMITTED    a NEW snapshot at the start of EVERY STATEMENT
+-- REPEATABLE READ   ONE snapshot at the first statement, held throughout
+-- That single difference produces every behavioural distinction between
+-- the two levels (SQL isolation lesson). The mechanism is identical;
+-- only the snapshot lifetime changes.</pre>
+
+    <h2>Part 2 — Two Architectures for Old Versions</h2>
+    <pre>-- Every MVCC engine must decide WHERE superseded versions live. There
+-- are two answers, and the choice determines the engine's entire
+-- operational personality.
+
+-- ── APPROACH A: VERSIONS IN THE TABLE (PostgreSQL) ──────────────────────
+-- An UPDATE writes a NEW TUPLE into the heap and marks the old one with
+-- xmax. Both physically occupy space in the table.
+--   ✓ UPDATE and DELETE are cheap — just append and mark
+--   ✓ ROLLBACK is nearly FREE: the new versions are simply never
+--     visible. No undo work at all, which is why Postgres recovery is
+--     redo-only (previous lesson).
+--   ✓ old versions are read at full speed — they are ordinary tuples
+--   ✗ the table GROWS with every update, and needs VACUUM to reclaim
+--   ✗ indexes must be updated for the new tuple's location (lesson 2's
+--     HOT optimisation exists precisely to avoid this)
+--   ✗ sequential scans read dead tuples and discard them
+
+-- ── APPROACH B: VERSIONS IN AN UNDO LOG (InnoDB, Oracle, MySQL) ─────────
+-- An UPDATE modifies the row IN PLACE and writes the PREVIOUS value into
+-- a separate undo log. Each row header points to its undo record, which
+-- points to older ones — a version chain.
+--   ✓ the table holds only CURRENT rows, so no bloat and no vacuum
+--   ✓ current-version reads are fast — no dead tuples to skip
+--   ✓ secondary indexes need no update when a non-indexed column changes
+--   ✗ ROLLBACK is EXPENSIVE — the undo log must be applied in reverse
+--   ✗ reading an OLD version means walking the undo chain: the longer a
+--     transaction runs, the more links it must traverse, so reads get
+--     progressively slower
+--   ✗ the undo tablespace can grow without bound and, in extreme cases,
+--     fill the disk
+
+-- ── THE SAME PROBLEM, TWO SYMPTOMS ──────────────────────────────────────
+-- A long-running transaction hurts BOTH designs, because both must
+-- retain every version that transaction might still need. But it looks
+-- completely different:
+--   PostgreSQL  → tables and indexes BLOAT; vacuum cannot advance
+--   InnoDB      → undo chains lengthen; READS get slower and slower
+-- ⚠ Same root cause, opposite-looking incident. Knowing which
+--   architecture you are on tells you which symptom to look for — and
+--   this is one of the most practically useful things in this lesson.
+
+-- ── SEE THE VERSIONS ────────────────────────────────────────────────────
+-- Postgres:
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT lp, t_xmin, t_xmax, t_ctid
+FROM heap_page_items(get_raw_page('accounts', 0));
+--  lp | t_xmin | t_xmax | t_ctid
+--   1 |    842 |    900 | (0,2)    ← dead: superseded, points to its heir
+--   2 |    900 |      0 | (0,2)    ← live
+-- InnoDB:
+SELECT * FROM information_schema.innodb_trx;    -- and the undo length
+SHOW ENGINE INNODB STATUS;                      -- "History list length"
+-- ⚠ A growing History list length is InnoDB's equivalent of rising
+--   n_dead_tup. Alert on it.</pre>
+    <div class="note">🔀 <strong>One architectural choice, two entirely different operational worlds.</strong>
+      PostgreSQL keeps old versions in the table, so it needs vacuum and suffers bloat; InnoDB keeps them in
+      an undo log, so it needs no vacuum but suffers lengthening undo chains that slow reads. Neither is
+      better — they moved the same cost to different places. When you diagnose a database, knowing which
+      choice it made tells you which failure to look for first, and that alone shortens most investigations.</div>
+
+    <h2>Part 3 — Vacuum: Why It Exists and How It Fails</h2>
+    <pre>-- Dead tuples must be reclaimed or the table grows forever. That is
+-- vacuum's job, and it has three distinct responsibilities people often
+-- conflate.
+
+-- ── WHAT VACUUM ACTUALLY DOES ───────────────────────────────────────────
+-- 1. RECLAIM SPACE from dead tuples — marks it reusable and records it
+--    in the free space map. Does NOT shrink the file.
+-- 2. UPDATE THE VISIBILITY MAP — marks pages where all tuples are
+--    visible to everyone. This is what enables INDEX-ONLY SCANS (SQL
+--    indexes lesson) and lets future vacuums skip untouched pages.
+-- 3. FREEZE OLD TUPLES to prevent transaction ID wraparound (Part 4).
+-- Only the first is what most people mean by "vacuum", and the third is
+-- the one that can take a database offline.
+
+-- ── THE RULE THAT CAUSES EVERY VACUUM INCIDENT ──────────────────────────
+-- Vacuum may only remove a version that NO POSSIBLE SNAPSHOT still
+-- needs. Concretely: nothing newer than the OLDEST RUNNING TRANSACTION.
+--
+-- ⚠ THAT IS DATABASE-WIDE. A transaction that began an hour ago holding
+--   a snapshot prevents cleanup of dead tuples in tables it has never
+--   touched and will never read. One idle session freezes garbage
+--   collection everywhere.
+SELECT pid, now() - xact_start AS age, state, left(query, 50)
+FROM pg_stat_activity WHERE xact_start IS NOT NULL
+ORDER BY xact_start LIMIT 5;
+
+-- ── THE THREE THINGS THAT HOLD THE HORIZON BACK ─────────────────────────
+-- 1. A LONG-RUNNING or IDLE-IN-TRANSACTION session
+SELECT pid, now()-xact_start FROM pg_stat_activity
+WHERE state = 'idle in transaction' ORDER BY xact_start;
+-- 2. An INACTIVE REPLICATION SLOT (previous lesson) — it pins the
+--    horizon just as a transaction does
+SELECT slot_name, active, xmin, catalog_xmin FROM pg_replication_slots;
+-- 3. An ORPHANED PREPARED TRANSACTION — a two-phase commit nobody
+--    resolved. Invisible in pg_stat_activity, which is why it is missed.
+SELECT gid, prepared, owner FROM pg_prepared_xacts;
+-- ✓ CHECK ALL THREE. Diagnosing bloat by looking only at
+--   pg_stat_activity is the most common way to miss the cause.
+-- (A hot_standby_feedback replica also holds the primary's horizon —
+--  worth knowing when a reporting replica causes primary bloat.)
+
+-- ── MEASURING THE DAMAGE ────────────────────────────────────────────────
+SELECT relname, n_live_tup, n_dead_tup,
+       round(100.0*n_dead_tup/NULLIF(n_live_tup+n_dead_tup,0),1) AS dead_pct,
+       last_autovacuum, autovacuum_count
+FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 5;
+
+-- ── TUNING AUTOVACUUM ───────────────────────────────────────────────────
+-- Default: trigger when dead tuples exceed 20% of the table.
+--   autovacuum_vacuum_scale_factor = 0.2
+-- ⚠ On a 200-million-row table that means 40 MILLION dead tuples before
+--   it even starts. The default is sized for small tables and is far too
+--   lax for large ones — set it per table:
+ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.01,
+                        autovacuum_vacuum_cost_limit = 2000);
+-- cost_limit governs how much work per round; the default throttles
+-- vacuum so heavily that on a busy large table it can never catch up.
+
+-- ── VACUUM DOES NOT SHRINK FILES ────────────────────────────────────────
+VACUUM;              -- space reusable internally; file size unchanged
+VACUUM FULL;         -- rewrites the table. ACCESS EXCLUSIVE lock = outage
+--   pg_repack       -- ✓ same result, ONLINE. The production answer.
+-- ⚠ This surprises people every time: "I vacuumed and the disk is still
+--   full." Vacuum's contract is reuse, not release.</pre>
+
+    <h2>Part 4 — Transaction ID Wraparound</h2>
+    <pre>-- The most alarming failure mode in PostgreSQL, and it follows directly
+-- from how visibility works.
+
+-- ── THE PROBLEM ─────────────────────────────────────────────────────────
+-- Transaction ids are 32-bit: about 4.2 billion values. Comparisons are
+-- MODULAR — for any xid, 2 billion ids are "in the past" and 2 billion
+-- are "in the future", arranged on a circle.
+--
+-- If a tuple's xmin were allowed to fall more than 2 billion
+-- transactions behind, it would suddenly appear to be in the FUTURE, and
+-- become INVISIBLE. Rows would silently vanish. That is unacceptable, so
+-- Postgres prevents it rather than risking it.
+
+-- ── THE FIX: FREEZING ─────────────────────────────────────────────────
+-- Vacuum marks sufficiently old, definitely-visible tuples as FROZEN,
+-- meaning "visible to everyone, forever, regardless of xid comparison".
+-- A frozen tuple's age no longer matters.
+SHOW vacuum_freeze_min_age;        -- 50 million
+SHOW autovacuum_freeze_max_age;    -- 200 million — a FORCED vacuum
+                                   -- triggers here even if the table is
+                                   -- otherwise quiet
+
+-- ── WHAT HAPPENS IF FREEZING FALLS BEHIND ───────────────────────────────
+SELECT datname, age(datfrozenxid) AS xid_age,
+       round(100.0*age(datfrozenxid)/2000000000, 1) AS pct_to_shutdown
+FROM pg_database ORDER BY 2 DESC;
+--  10 million     normal
+-- 200 million     autovacuum forces an anti-wraparound vacuum
+-- 1 billion       ⚠ investigate now
+-- 2 billion       WARNING: database is not accepting commands
+--                 → THE DATABASE STOPS ACCEPTING WRITES. Recovery
+--                   requires single-user mode and a full vacuum, which
+--                   on a large database takes HOURS of downtime.
+
+-- ── WHY IT HAPPENS ──────────────────────────────────────────────────────
+-- Always the same causes: a very long transaction, an abandoned
+-- replication slot, an orphaned prepared transaction, or autovacuum
+-- throttled so hard it cannot keep up. Note these are the SAME causes as
+-- bloat — wraparound is the extreme end of the same failure.
+SELECT c.relname, age(c.relfrozenxid) AS age
+FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE c.relkind IN ('r','m') AND n.nspname NOT IN ('pg_catalog')
+ORDER BY 2 DESC LIMIT 10;
+-- Per-table, so you can find and vacuum the specific offender:
+VACUUM (FREEZE, VERBOSE) the_old_table;
+
+-- ── WHAT MITIGATES IT ───────────────────────────────────────────────────
+-- • ALERT on age(datfrozenxid) > 1 billion. This is a slow-moving,
+--   entirely predictable failure — reaching shutdown means nobody was
+--   watching a number that took weeks to climb.
+-- • PG 9.6+: the visibility map tracks all-frozen pages, so repeat
+--   freeze scans skip untouched pages instead of rescanning everything.
+-- • PG 14+: `VACUUM` is far less likely to be cancelled by conflicting
+--   lock requests during anti-wraparound work.
+-- • 64-bit xids exist in some forks (and are a perennial upstream
+--   proposal) but are not in core PostgreSQL.</pre>
+
+    <h2>Part 5 — Hint Bits, Clog, and the Cost of Reading</h2>
+    <pre>-- The visibility rule asks "did transaction 842 commit?" — but the tuple
+-- header does not store that. So where does the answer come from?
+
+-- ── THE COMMIT LOG (clog / pg_xact) ─────────────────────────────────────
+-- A compact array, TWO BITS per transaction: in progress, committed,
+-- aborted, or sub-committed. Checking visibility means a clog lookup —
+-- cheap, but not free, and it is a shared structure under contention.
+
+-- ── HINT BITS: CACHING THE ANSWER IN THE TUPLE ──────────────────────────
+-- The first reader to determine a transaction's fate writes the answer
+-- into the tuple's own header as a HINT BIT
+-- (HEAP_XMIN_COMMITTED / HEAP_XMIN_INVALID). Subsequent readers skip the
+-- clog lookup entirely.
+--
+-- ⚠ THE CONSEQUENCE THAT CONFUSES EVERYONE: setting a hint bit MODIFIES
+--   THE PAGE, marking it dirty. So a pure SELECT can generate write I/O.
+--
+--   INSERT 10,000,000 rows;
+--   SELECT count(*) FROM t;   -- ← SLOW, and writes gigabytes
+--   SELECT count(*) FROM t;   -- ← fast, no writes
+--
+-- The first read after a bulk load sets hint bits across every page and
+-- dirties them all. This is why "the first query after a load is
+-- inexplicably slow and the disk lights up" — a genuinely common source
+-- of confusion in benchmarking.
+-- ✓ Run VACUUM (or at least a full scan) after a bulk load, so the cost
+--   is paid by a maintenance job rather than by a user's query.
+-- ⚠ Hint bits are NOT WAL-logged (they are recoverable from the clog),
+--   so they can be lost on a crash and re-derived. That is deliberate —
+--   logging them would be far more expensive than recomputing them.
+
+-- ── SUBTRANSACTIONS AND THE 64-SUBXID CLIFF ─────────────────────────────
+-- Each SAVEPOINT allocates a SUBTRANSACTION id. A backend caches up to
+-- 64 of them cheaply; beyond that it SPILLS to disk (pg_subtrans), and
+-- every visibility check by every OTHER backend may then need an extra
+-- lookup.
+-- ⚠ This produces a spectacular, non-obvious failure: a loop that opens
+--   a nested transaction per row — Django's atomic() inside atomic(),
+--   Rails' requires_new, SQLAlchemy's begin_nested() — creates tens of
+--   thousands of subtransactions in one transaction and can collapse
+--   throughput ACROSS THE WHOLE DATABASE, not just that job.
+--   The fix is to validate up front or commit per batch, never to nest
+--   a savepoint per iteration.
+SELECT pid, backend_xid, backend_xmin FROM pg_stat_activity
+WHERE backend_xid IS NOT NULL;
+
+-- ── WHY A READ IS NEVER JUST A READ ─────────────────────────────────────
+-- Fetching one row under MVCC can involve: locating the page, walking
+-- the version chain, checking xmin and xmax against the snapshot,
+-- consulting the clog for each undecided transaction, possibly setting
+-- hint bits (a write), and possibly checking pg_subtrans. The cost is
+-- usually trivial — but it explains why SELECT can dirty pages, why the
+-- first post-load query is slow, and why long transactions degrade
+-- everything.</pre>
+
+    <h2>Part 6 — Snapshot Isolation Is Not Serialisability</h2>
+    <pre>-- MVCC gives SNAPSHOT ISOLATION cheaply. Snapshot isolation is strong —
+-- it prevents dirty reads, non-repeatable reads and phantoms — but it is
+-- NOT serialisable, and the gap has a name.
+
+-- ── WRITE SKEW: THE ANOMALY MVCC CANNOT SEE ─────────────────────────────
+-- Invariant: at least one doctor on call.
+--   T1: SELECT count(*) WHERE on_call → 2. UPDATE doctor 1 → off.
+--   T2: SELECT count(*) WHERE on_call → 2. UPDATE doctor 2 → off.
+--   Both commit. Zero doctors on call.
+--
+-- ⚠ WHY MVCC MISSES IT: conflict detection is WRITE-vs-WRITE. These
+--   transactions wrote DIFFERENT ROWS, so there is no write-write
+--   conflict to detect. Each read a consistent snapshot; the problem
+--   lives in the relationship between what one READ and what the other
+--   WROTE — a dependency snapshot isolation does not track.
+
+-- ── SSI: SERIALISABLE SNAPSHOT ISOLATION ────────────────────────────────
+-- Postgres's SERIALIZABLE adds read/write DEPENDENCY TRACKING on top of
+-- snapshot isolation. It records which transactions read data that
+-- others wrote (rw-antidependencies), looks for the "dangerous
+-- structure" — two consecutive rw-edges — that can only occur in a
+-- non-serialisable schedule, and aborts a participant.
+--   ✓ True serialisability with NO read locks; readers still never block
+--   ✗ predicate-tracking memory (SIReadLock entries), and FALSE
+--     POSITIVES — some aborted transactions would have been fine
+--   ✗ requires a retry loop on SQLSTATE 40001, and EVERY participating
+--     transaction must use SERIALIZABLE or the protection is void
+
+-- ── WHERE POSTGRES AND INNODB DIVERGE, AGAIN ────────────────────────────
+-- Postgres REPEATABLE READ: an UPDATE against a row modified since the
+--   snapshot ABORTS with a serialisation failure. Lost updates are
+--   impossible; the application must retry.
+-- InnoDB REPEATABLE READ: an UPDATE reads the LATEST committed row
+--   rather than the snapshot version, so it silently succeeds — and a
+--   LOST UPDATE is possible.
+-- ⚠ Identical level name, opposite safety property. Code that is correct
+--   on one engine can silently corrupt data on the other, which is why
+--   reasoning from the level name alone is unsafe.
+
+-- ── AND THE PRACTICAL ESCALATION ────────────────────────────────────────
+-- Cheapest sufficient tool first (SQL isolation lesson):
+--   1. a single atomic UPDATE, when the new value derives from the old
+--   2. a database CONSTRAINT — UNIQUE, CHECK, EXCLUDE — needs no
+--      coordination at all
+--   3. SELECT ... FOR UPDATE on the rows the decision reads, turning an
+--      invisible read/write dependency into a visible write-write one
+--   4. SERIALIZABLE with retries, for invariants spanning rows you
+--      cannot enumerate
+-- Most teams jump from 1 to 4 and skip the two options that solve the
+-- majority of real cases with no abort rate.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ "MVCC means no concurrency problems"</strong>
+        <pre>"Readers don't block, so we're
+ fine."
+"Snapshot isolation is basically
+ serialisable."
+"Vacuum is automatic, ignore it."
+"Same isolation level, same
+ behaviour on any database."
+→ Write skew in production and a
+  400GB table of 90GB of data.</pre></div>
+      <div><strong>✅ Knowing the mechanism</strong>
+        <pre>"Conflicts are write-write only,
+ so write skew needs SERIALIZABLE
+ or explicit locking."
+"Vacuum can't advance past the
+ oldest transaction — check
+ sessions, slots AND prepared
+ xacts."</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Leaving transactions open (<code>idle in transaction</code>)</td><td>Vacuum blocked database-wide; bloat in untouched tables</td><td><code>idle_in_transaction_session_timeout</code>; keep transactions short</td></tr>
+      <tr><td>Checking only <code>pg_stat_activity</code> for the vacuum blocker</td><td>Misses inactive replication slots and prepared transactions</td><td>Check all three sources of a held-back horizon</td></tr>
+      <tr><td>Expecting <code>VACUUM</code> to shrink the file</td><td>Disk stays full; confusion about whether it worked</td><td>Vacuum makes space reusable; <code>pg_repack</code> releases it</td></tr>
+      <tr><td>Default autovacuum settings on huge tables</td><td>40 million dead tuples accumulate before it triggers</td><td>Per-table <code>autovacuum_vacuum_scale_factor</code> and cost limit</td></tr>
+      <tr><td>Ignoring <code>age(datfrozenxid)</code></td><td>Wraparound protection shuts the database down</td><td>Alert above 1 billion — this failure takes weeks and is fully predictable</td></tr>
+      <tr><td>Benchmarking the first query after a bulk load</td><td>Hint-bit setting makes a pure <code>SELECT</code> write gigabytes</td><td><code>VACUUM</code> after loading, then measure</td></tr>
+      <tr><td>Nesting a savepoint per loop iteration</td><td>Subtransaction overflow degrades the whole database</td><td>Validate up front, or commit per batch</td></tr>
+      <tr><td>Assuming snapshot isolation is serialisable</td><td>Write skew silently breaks multi-row invariants</td><td>Constraints, explicit locking, or <code>SERIALIZABLE</code> with retries</td></tr>
+      <tr><td>Assuming isolation-level names mean the same thing everywhere</td><td>Correct on Postgres, loses updates on MySQL</td><td>Verify the interleaving on your engine</td></tr>
+      <tr><td>Running reporting with <code>hot_standby_feedback</code> and long queries</td><td>The replica holds the primary's vacuum horizon</td><td>Understand the trade; consider a delayed replica or a snapshot export</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What is MVCC and what problem does it solve?</summary>
+      <p>Multi-version concurrency control means an update never overwrites a row in place. Instead the engine
+         keeps multiple versions, each tagged with the transaction that created it and the transaction that
+         superseded it, and every transaction takes a snapshot describing which other transactions it should
+         consider committed. The snapshot decides which version of each row that transaction can see.</p>
+      <p>The problem it solves is contention between readers and writers. Under lock-based concurrency a long
+         analytical query would block writes to the rows it touches, or be blocked by them, which makes
+         mixed workloads impractical. With MVCC a reader sees an older consistent version while a writer
+         creates a newer one, so neither waits for the other. Conflicts arise only between two writers.</p>
+      <p>That property is why a single database can serve reporting and transactional traffic at the same
+         time. The cost is that old versions accumulate and must eventually be cleaned up — by vacuum in
+         PostgreSQL, or by purging the undo log in InnoDB — and that cleanup is where the operational
+         difficulty lives.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> How does the database decide which version of a row you can see?</summary>
+      <p>Each version carries two transaction ids: <code>xmin</code>, the transaction that created it, and
+         <code>xmax</code>, the transaction that deleted or superseded it. A snapshot records the lowest
+         still-running transaction id, the first id not yet assigned, and the list of transactions that were
+         in progress when the snapshot was taken.</p>
+      <p>The rule is then straightforward. A version is visible if the transaction that created it had
+         committed before my snapshot was taken, and the transaction that removed it either does not exist,
+         aborted, or had not yet committed when I started. In plain terms: I see a row if it existed at my
+         snapshot's moment and had not been deleted by then.</p>
+      <p>Where the snapshot is taken determines the isolation level. Read Committed takes a fresh snapshot at
+         the start of every statement, so two reads within one transaction can differ. Repeatable Read takes
+         one snapshot at the first statement and holds it for the whole transaction. The visibility machinery
+         is identical; only the snapshot's lifetime changes, and that single difference produces every
+         behavioural distinction between the levels.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Contrast PostgreSQL's and InnoDB's approach to storing old versions.</summary>
+      <p>PostgreSQL keeps old versions in the table itself. An update writes a new tuple into the heap and
+         marks the old one as superseded, so both physically occupy space. InnoDB updates the row in place
+         and writes the previous value into a separate undo log, with each row pointing to a chain of undo
+         records.</p>
+      <p>The consequences diverge sharply. In PostgreSQL, updates and deletes are cheap and rollback is
+         essentially free, because uncommitted versions are simply never visible and no undo work is
+         required — which is why its crash recovery is redo-only. The price is that tables grow with every
+         update and require vacuum to reclaim space, sequential scans read and discard dead tuples, and
+         indexes must be updated to point at the new tuple location, which is exactly what the HOT
+         optimisation tries to avoid.</p>
+      <p>In InnoDB the table holds only current rows, so there is no bloat and no vacuum, and reads of the
+         current version are fast. But rollback is expensive because the undo log must be applied in reverse,
+         and reading an older version means walking the undo chain — so the longer a transaction runs, the
+         more links every read must traverse and the slower it gets. The undo tablespace can also grow
+         without bound.</p>
+      <p>What I find most useful practically is that a long-running transaction damages both, but presents
+         completely differently: PostgreSQL bloats, InnoDB's reads slow down as history lists grow. Same root
+         cause, opposite-looking incident, so knowing which architecture you are on tells you which symptom
+         to look for first.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why can one idle transaction bloat an entire database?</summary>
+      <p>Because vacuum may only remove a row version that no possible snapshot still needs, and the bound on
+         that is the oldest running transaction. Any version newer than that transaction's snapshot might
+         still be required by it, so cleanup cannot advance past it.</p>
+      <p>The part that surprises people is that this is database-wide rather than scoped to whatever the idle
+         session touched. A transaction that issued <code>BEGIN</code> an hour ago and then went to sleep
+         holds a snapshot, and that snapshot prevents reclamation of dead tuples in every table, including
+         ones it has never read and never will. So a single forgotten session — typically an error path that
+         returned without rolling back, or a connection pool handing out a session mid-transaction — causes
+         every update in the system to leave permanent garbage for as long as it lives.</p>
+      <p>Two other things hold the horizon back in exactly the same way and are frequently missed. An
+         inactive replication slot pins it, because the consumer might still need those versions, and an
+         orphaned prepared transaction from an unresolved two-phase commit does too — and the latter does not
+         appear in <code>pg_stat_activity</code> at all, so it is invisible to the obvious check. A replica
+         running long queries with <code>hot_standby_feedback</code> enabled is a fourth route.</p>
+      <p>The defences are a server-side <code>idle_in_transaction_session_timeout</code>, monitoring the
+         oldest transaction age and inactive slots, and treating slot creation as something with a
+         corresponding teardown step. It is worth internalising because the extreme version of this same
+         failure is transaction id wraparound, which stops the database entirely.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Explain transaction ID wraparound and how you would prevent it.</summary>
+      <p>PostgreSQL transaction ids are 32-bit, so there are about 4.2 billion of them, and visibility
+         comparisons are modular — for any given id, roughly two billion others are considered past and two
+         billion future, arranged on a circle. If a tuple's creating transaction id were allowed to fall more
+         than two billion transactions behind the current one, it would wrap around and start appearing to be
+         in the future, which would make the row invisible. Data would silently disappear.</p>
+      <p>The mechanism that prevents this is freezing. Vacuum marks sufficiently old tuples that are visible
+         to everyone as frozen, meaning permanently visible regardless of id comparison, so their age stops
+         mattering. Autovacuum forces an anti-wraparound vacuum once a table's age reaches
+         <code>autovacuum_freeze_max_age</code>, two hundred million by default, even on a table with no
+         other activity.</p>
+      <p>If freezing nonetheless falls behind, PostgreSQL refuses to assign new transaction ids as it
+         approaches the limit and stops accepting writes — choosing an outage over silent corruption, which
+         is the right call but a severe one. Recovering means single-user mode and a full vacuum, which on a
+         large database is hours of downtime.</p>
+      <p>The causes are the same ones that cause bloat: a very long transaction, an abandoned replication
+         slot, an orphaned prepared transaction, or autovacuum throttled so heavily it cannot keep up.
+         Wraparound is really the extreme end of the vacuum-blocked failure rather than a separate
+         phenomenon.</p>
+      <p>Prevention is mostly monitoring, because this failure develops over weeks and is entirely
+         predictable. I would alert on <code>age(datfrozenxid)</code> above about a billion, track per-table
+         <code>relfrozenxid</code> age to identify specific offenders, tune autovacuum cost limits so it can
+         actually keep pace on large tables, and enforce timeouts on idle transactions. Reaching shutdown
+         means nobody was watching a number that climbed slowly for a month, so the real fix is
+         organisational as much as technical.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Why is snapshot isolation not serialisable, and what would you do about it?</summary>
+      <p>Snapshot isolation gives each transaction a consistent view and detects conflicts between writers,
+         which eliminates dirty reads, non-repeatable reads and — in PostgreSQL's implementation — phantoms.
+         What it cannot see is write skew: two transactions that each read an overlapping set of rows, check
+         a condition involving them, and then write <em>different</em> rows. Individually each is correct;
+         together they break an invariant spanning the rows.</p>
+      <p>The reason is that conflict detection is write-versus-write. Neither transaction modified a row the
+         other modified, so there is nothing to conflict on. The problem lives in the relationship between
+         what one transaction read and what the other wrote, and snapshot isolation does not track read
+         dependencies at all.</p>
+      <p>PostgreSQL's <code>SERIALIZABLE</code> closes the gap with serialisable snapshot isolation, which
+         records read/write antidependencies between transactions and aborts one when it detects the
+         structure that cannot occur in any serial order. It preserves the key MVCC property that readers do
+         not block, at the cost of predicate-tracking memory and false-positive aborts. It also requires a
+         retry loop on serialisation failure and, importantly, every participating transaction must use it —
+         one Read Committed writer voids the protection for everyone.</p>
+      <p>In practice I would escalate through cheaper options first. If the new value derives from the old,
+         a single atomic <code>UPDATE</code> removes the problem entirely. If the invariant fits a row or a
+         conflict rule, a <code>CHECK</code>, <code>UNIQUE</code> or <code>EXCLUDE</code> constraint enforces
+         it with no coordination and cannot be bypassed by any writer. If the decision depends on specific
+         rows, taking <code>FOR UPDATE</code> locks on them converts the invisible read/write dependency into
+         an ordinary write-write conflict that every level detects. <code>SERIALIZABLE</code> is the right
+         answer when the invariant genuinely spans rows you cannot enumerate in advance.</p>
+      <p>I would also flag the cross-engine hazard: PostgreSQL's Repeatable Read aborts a writer whose row
+         changed since its snapshot, so lost updates are impossible, while InnoDB's Repeatable Read reads the
+         latest committed row on update and permits them. Same level name, opposite safety property — so
+         reasoning from the name rather than testing the interleaving on the actual engine is how this class
+         of bug reaches production.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Watch versions accumulate and disappear.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE TABLE t (id int PRIMARY KEY, v text);
+INSERT INTO t VALUES (1, 'first');
+
+SELECT lp, t_xmin, t_xmax, t_ctid FROM heap_page_items(get_raw_page('t',0));
+--  lp | t_xmin | t_xmax | t_ctid
+--   1 |    842 |      0 | (0,1)      ← one live version
+
+-- ── UPDATE CREATES A VERSION, IT DOES NOT REPLACE ONE ───────────────────
+UPDATE t SET v = 'second' WHERE id = 1;
+UPDATE t SET v = 'third'  WHERE id = 1;
+SELECT lp, t_xmin, t_xmax, t_ctid FROM heap_page_items(get_raw_page('t',0));
+--   1 |    842 |    843 | (0,2)      ← dead, points to its successor
+--   2 |    843 |    844 | (0,3)      ← dead
+--   3 |    844 |      0 | (0,3)      ← live
+-- Three physical tuples for ONE logical row. The t_ctid chain links each
+-- version to the next — that chain is both MVCC and, when it stays on
+-- one page with no indexed column changed, a HOT update (lesson 2).
+
+-- ── TWO SESSIONS SEE DIFFERENT VERSIONS, SIMULTANEOUSLY ─────────────────
+-- Session 1:
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT v FROM t WHERE id=1;              -- 'third'
+-- Session 2:
+UPDATE t SET v = 'fourth' WHERE id=1;    -- commits immediately
+-- Session 1 again:
+SELECT v FROM t WHERE id=1;              -- STILL 'third' ✓
+SELECT txid_current_snapshot();          -- its snapshot excludes 845
+COMMIT;
+SELECT v FROM t WHERE id=1;              -- 'fourth'
+-- ⚠ Session 1 was NEVER BLOCKED. It read an older physical version while
+--   session 2 wrote a new one. That is the whole payoff of MVCC.
+
+-- ── VACUUM RECLAIMS, BUT DOES NOT SHRINK ────────────────────────────────
+SELECT pg_size_pretty(pg_relation_size('t'));       -- 8192 bytes
+VACUUM t;
+SELECT lp, t_xmin, t_xmax FROM heap_page_items(get_raw_page('t',0));
+--   1 |      0 |      0        ← slot freed and reusable
+--   2 |      0 |      0
+--   4 |    845 |      0        ← the live version
+SELECT pg_size_pretty(pg_relation_size('t'));       -- still 8192
+-- ✓ Space is reusable INSIDE the page. The FILE is unchanged. That is
+--   vacuum's contract, and forgetting it is why "I vacuumed and the disk
+--   is still full" is such a common complaint.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove one idle transaction blocks vacuum everywhere.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE a (id int PRIMARY KEY, v text);
+CREATE TABLE b (id int PRIMARY KEY, v text);
+INSERT INTO a SELECT g, 'x' FROM generate_series(1,100000) g;
+INSERT INTO b SELECT g, 'x' FROM generate_series(1,100000) g;
+VACUUM ANALYZE a, b;
+
+-- ── SESSION 1: open a transaction against table `a` ONLY ────────────────
+BEGIN;
+SELECT count(*) FROM a;        -- touches `a`, never mentions `b`
+-- ...and leave it open...
+
+-- ── SESSION 2: churn table `b` ──────────────────────────────────────────
+UPDATE b SET v = 'y';          -- 100,000 dead tuples
+UPDATE b SET v = 'z';          -- 100,000 more
+VACUUM b;
+SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname='b';
+--  100000 | 200000        ← VACUUM RECLAIMED NOTHING
+-- ⚠ Session 1 never read `b`, never will, and is holding its cleanup
+--   hostage. The snapshot horizon is DATABASE-WIDE.
+
+VACUUM (VERBOSE) b;
+-- INFO: "200000 dead row versions cannot be removed yet,
+--        oldest xmin: 918442"
+-- The database tells you exactly why, if you ask verbosely.
+
+-- ── FIND THE CULPRIT — CHECK ALL THREE SOURCES ──────────────────────────
+SELECT pid, now()-xact_start AS age, state, left(query,40)
+FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start;
+--  4471 | 00:04:12 | idle in transaction | SELECT count(*) FROM a
+SELECT slot_name, active, xmin FROM pg_replication_slots;   -- also pins it
+SELECT gid, prepared FROM pg_prepared_xacts;                -- INVISIBLE in
+                                                            -- pg_stat_activity
+-- ✓ Checking only pg_stat_activity is the most common way to miss the
+--   cause. A prepared transaction shows up nowhere else.
+
+-- ── RESOLVE ─────────────────────────────────────────────────────────────
+-- session 1:
+COMMIT;
+-- session 2:
+VACUUM b;
+SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname='b';   -- 0 ✓
+
+-- ── PREVENT ─────────────────────────────────────────────────────────────
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';
+SELECT pg_reload_conf();
+-- Alert on: oldest xact_start age, inactive slots, prepared xacts.
+-- Left unchecked, this exact mechanism escalates from bloat to
+-- transaction id wraparound, which stops the database entirely.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Observe the hint-bit write amplification.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── LOAD DATA AND MEASURE THE FIRST READ ───────────────────────────────
+CREATE TABLE t (id bigint, v text);
+INSERT INTO t SELECT g, repeat('x',100) FROM generate_series(1,5000000) g;
+
+SELECT pg_stat_reset_single_table_counters('t'::regclass);
+SELECT pg_current_wal_lsn() AS w1 \gset
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM t;
+--  Seq Scan  Buffers: shared hit=8402 read=64110 dirtied=72512
+--  Execution Time: 4,102 ms
+--                          ↑↑↑ DIRTIED 72,512 pages — on a SELECT!
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'w1'));
+--  1.2 MB (the pages themselves aren't WAL-logged; hint bits are
+--          recoverable from the clog, so they are deliberately not
+--          logged — that would cost far more than recomputing them)
+
+-- ── THE SECOND READ ─────────────────────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM t;
+--  Buffers: shared hit=72512 read=0 dirtied=0
+--  Execution Time: 890 ms         ← 4.6× faster, no dirtying
+
+-- ── WHY ─────────────────────────────────────────────────────────────────
+-- The visibility check asks "did transaction 842 commit?" The tuple
+-- header does not store that, so the first reader consults the clog and
+-- CACHES the answer as a HINT BIT in the tuple header. Writing that bit
+-- modifies the page, marking it dirty — so those pages must later be
+-- written to disk by the background writer or a checkpoint.
+-- ✓ A pure SELECT generated gigabytes of eventual write I/O.
+
+-- ── THE PRACTICAL CONSEQUENCES ──────────────────────────────────────────
+-- 1. BENCHMARKING: the first query after a bulk load is unrepresentative
+--    in both time and I/O. Discard it, or vacuum first.
+-- 2. PRODUCTION: after a large import, the first user query pays this
+--    cost. Pay it in a maintenance window instead:
+VACUUM (ANALYZE) t;      -- sets hint bits AND freezes AND updates the
+                         -- visibility map (enabling index-only scans)
+-- 3. This is also why disk write activity spikes after a load even
+--    though "nothing is writing" — a genuinely confusing symptom until
+--    you know the mechanism.
+
+-- ── PROVE VACUUM PAYS IT FOR YOU ────────────────────────────────────────
+TRUNCATE t;
+INSERT INTO t SELECT g, repeat('x',100) FROM generate_series(1,5000000) g;
+VACUUM t;                                     -- pay the cost here
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM t;
+--  Buffers: shared hit=1204 read=71308 dirtied=0     ← no dirtying ✓
+--  And note: an index-only scan is now possible, because vacuum also
+--  marked pages all-visible in the visibility map.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Monitor and mitigate transaction ID wraparound risk.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── THE NUMBER THAT MATTERS ─────────────────────────────────────────────
+SELECT datname, age(datfrozenxid) AS xid_age,
+       round(100.0*age(datfrozenxid)/2147483648, 1) AS pct_to_shutdown
+FROM pg_database ORDER BY 2 DESC;
+--  datname | xid_age     | pct_to_shutdown
+--  app     | 1,412,004,221 |            65.8      ⚠ ACT NOW
+--
+--  thresholds:
+--    < 200M    normal
+--    200M      autovacuum forces anti-wraparound vacuums
+--    1B        investigate urgently
+--    2B        DATABASE STOPS ACCEPTING WRITES
+
+-- ── FIND THE SPECIFIC OFFENDERS ─────────────────────────────────────────
+SELECT c.relname, age(c.relfrozenxid) AS age,
+       pg_size_pretty(pg_relation_size(c.oid)) AS size,
+       s.last_autovacuum
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+WHERE c.relkind IN ('r','m','t') AND n.nspname NOT IN ('pg_catalog','information_schema')
+ORDER BY age(c.relfrozenxid) DESC LIMIT 10;
+--  relname       | age          | size   | last_autovacuum
+--  archive_2019  | 1,410,882,001| 840 GB | (null)     ← never vacuumed
+--  orders        |   204,118,442|  62 GB | 2026-08-04
+-- ⚠ A large, WRITE-INACTIVE table is the classic wraparound culprit.
+--   Autovacuum triggers on dead tuples, and a table nobody updates
+--   generates none — so only the freeze-age trigger ever visits it, and
+--   if that is throttled it can be missed for years.
+
+-- ── WHY IS IT BEHIND? SAME THREE SUSPECTS AS BLOAT ──────────────────────
+SELECT pid, now()-xact_start AS age FROM pg_stat_activity
+WHERE xact_start IS NOT NULL ORDER BY xact_start LIMIT 3;
+SELECT slot_name, active, xmin FROM pg_replication_slots;
+SELECT gid, prepared FROM pg_prepared_xacts;
+-- Wraparound is not a separate failure — it is the extreme end of
+-- "vacuum cannot advance".
+
+-- ── FIX ─────────────────────────────────────────────────────────────────
+-- 1. Remove the blocker (terminate the session / drop the dead slot /
+--    resolve the prepared transaction).
+-- 2. Freeze the offending table explicitly, at high priority:
+SET vacuum_cost_delay = 0;                    -- do not throttle
+VACUUM (FREEZE, VERBOSE) archive_2019;
+-- ⚠ On 840GB this takes hours and generates heavy I/O. Schedule it, and
+--   do NOT wait until 1.9 billion to start.
+-- 3. Let autovacuum keep up in future:
+ALTER SYSTEM SET autovacuum_freeze_max_age = 150000000;
+ALTER SYSTEM SET autovacuum_vacuum_cost_limit = 3000;   -- default 200
+ALTER SYSTEM SET autovacuum_max_workers = 6;
+ALTER TABLE archive_2019 SET (autovacuum_freeze_max_age = 100000000);
+
+-- ── IF IT ALREADY STOPPED ───────────────────────────────────────────────
+-- ERROR: database is not accepting commands to avoid wraparound data
+--        loss in database "app"
+pg_ctl stop
+postgres --single -D $PGDATA app
+  backend> VACUUM FREEZE;      -- hours of downtime on a large database
+-- ✓ Postgres chose an OUTAGE over silent data loss. That is the right
+--   call, and it is why the alert matters.
+
+-- ── THE ALERT THAT MAKES ALL OF THIS UNNECESSARY ────────────────────────
+--   WARN  age(datfrozenxid) > 1,000,000,000
+--   CRIT  age(datfrozenxid) > 1,500,000,000
+-- This number climbs over WEEKS. Reaching shutdown is always a
+-- monitoring failure, never a surprise.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Diagnose a slow database from MVCC symptoms alone.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYMPTOMS: reads slow across the board. Disk 3× the expected size.
+-- CPU low, I/O high. Started ~6 weeks ago. Restarting helps for an hour.
+
+-- ── STEP 1: IS IT BLOAT? ────────────────────────────────────────────────
+SELECT relname, n_live_tup, n_dead_tup,
+       round(100.0*n_dead_tup/NULLIF(n_live_tup+n_dead_tup,0),1) AS dead_pct,
+       pg_size_pretty(pg_relation_size(relid)) AS size,
+       last_autovacuum
+FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 5;
+--  orders | 210,000,000 | 680,000,000 | 76.4 | 412 GB | 2026-06-24
+-- ✓ CONFIRMED. 76% dead, and autovacuum last succeeded six weeks ago —
+--   matching exactly when the slowdown began.
+
+-- ── STEP 2: WHY CAN VACUUM NOT ADVANCE? CHECK ALL FOUR ──────────────────
+SELECT pid, now()-xact_start AS age, state, backend_xmin, left(query,40)
+FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start LIMIT 3;
+--  (nothing older than a few seconds)          ← NOT the cause
+SELECT slot_name, active, xmin,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))
+FROM pg_replication_slots;
+--  analytics_cdc | f | 918442 | 640 GB         ← ★ FOUND IT
+SELECT gid, prepared FROM pg_prepared_xacts;    -- empty
+SHOW hot_standby_feedback;                      -- also worth checking
+
+-- ⚠ An inactive replication slot pins the snapshot horizon EXACTLY as a
+--   long transaction does. Its xmin of 918442 has been frozen for six
+--   weeks, so every UPDATE in the entire database since then has left
+--   permanent garbage. And it is retaining 640GB of WAL as a second
+--   symptom — two failure modes from one forgotten slot.
+--   This is why checking only pg_stat_activity misses it.
+
+-- ── STEP 3: THE DOWNSTREAM EFFECTS EXPLAIN EVERY SYMPTOM ────────────────
+SELECT sum(blks_hit)*100/NULLIF(sum(blks_hit+blks_read),0)
+FROM pg_stat_database WHERE datname=current_database();   -- 68%
+-- 412GB of physical data holding 95GB of live rows means the working set
+-- no longer fits in RAM → cache hit rate collapsed → high I/O, low CPU.
+-- "Restarting helps for an hour" is the cache slowly re-warming and then
+-- thrashing again. Every symptom traces to the slot.
+
+SELECT age(datfrozenxid) FROM pg_database WHERE datname=current_database();
+--  1,180,000,000     ⚠ AND wraparound risk is building. Six more weeks
+--                      of this and the database stops.
+
+-- ── STEP 4: FIX, IN ORDER ───────────────────────────────────────────────
+-- 1. Confirm the consumer is genuinely gone, then drop the slot:
+SELECT pg_drop_replication_slot('analytics_cdc');
+--    ⚠ Dropping a slot a live consumer needs forces it to full resync.
+--      Check active_pid and ask the owning team first.
+-- 2. Let vacuum catch up (it will be slow — 680M dead tuples):
+SET vacuum_cost_delay = 0;
+VACUUM (FREEZE, ANALYZE, VERBOSE) orders;
+-- 3. Reclaim the 320GB. VACUUM FULL is an outage at this size:
+--    pg_repack -t orders
+-- 4. Prevent recurrence:
+ALTER SYSTEM SET max_slot_wal_keep_size = '100GB';   -- invalidates a
+                                                     -- runaway slot
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';
+ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.01);
+
+-- ── STEP 5: THE MONITORING THAT WOULD HAVE CAUGHT IT IN WEEK ONE ────────
+--   inactive replication slots (immediately, any)
+--   oldest transaction age
+--   dead tuple ratio per table
+--   age(datfrozenxid)
+--   cache hit rate trend
+-- ✓ Six weeks of gradual decay is a monitoring failure. Every one of
+--   these numbers moved on day one, and the escalation path from
+--   "forgotten slot" to "database stops accepting writes" is entirely
+--   mechanical once you know it.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design MVCC-aware operational practice for a high-churn system.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYSTEM: 40k updates/sec across a few hot tables, plus long analytical
+-- queries and a CDC pipeline. Postgres. Requirement: no bloat spirals,
+-- no wraparound, analytics must not degrade OLTP.
+
+-- ── PROBLEM 1: HIGH UPDATE RATE MEANS HIGH DEAD-TUPLE RATE ──────────────
+-- 40k updates/sec = 3.4 BILLION dead tuples per day. Autovacuum must
+-- keep pace or the table is unrecoverable within days.
+ALTER TABLE hot_table SET (
+    autovacuum_vacuum_scale_factor = 0.005,   -- 0.5%, not 20%
+    autovacuum_vacuum_cost_limit   = 4000,    -- default 200 = far too
+                                              -- slow for this rate
+    autovacuum_vacuum_cost_delay   = 0,       -- do not throttle
+    fillfactor = 80);                         -- room for HOT updates
+ALTER SYSTEM SET autovacuum_max_workers = 8;
+-- ⚠ The DEFAULTS ARE SIZED FOR SMALL TABLES. On a table of this
+--   throughput they guarantee a bloat spiral, and this is the single
+--   most common cause of "Postgres can't handle our write volume".
+
+-- ── PROBLEM 2: MAXIMISE HOT UPDATES ─────────────────────────────────────
+SELECT relname, n_tup_upd, n_tup_hot_upd,
+       round(100.0*n_tup_hot_upd/NULLIF(n_tup_upd,0),1) AS hot_pct
+FROM pg_stat_user_tables WHERE n_tup_upd > 1000000;
+-- A HOT update reuses space within the page and touches NO index
+-- (lesson 2). Target above 90%. Two requirements:
+--   • do NOT index frequently-updated columns — one index on
+--     `updated_at` disqualifies EVERY update
+--   • fillfactor below 100 so the new version fits on the same page
+-- ✓ On a 40k/sec table this single ratio is the difference between
+--   sustainable and a daily incident.
+
+-- ── PROBLEM 3: ANALYTICS HOLD THE HORIZON ───────────────────────────────
+-- A 40-minute analytical query pins the snapshot for 40 minutes, during
+-- which 96 million dead tuples become unreclaimable.
+-- ✓ Move analytics to a REPLICA — but understand the trade:
+--     hot_standby_feedback = on   → replica queries never cancelled, but
+--                                   they pin the PRIMARY's horizon
+--                                   (the problem simply moves)
+--     hot_standby_feedback = off  → primary is protected, but long
+--                                   replica queries get cancelled with
+--                                   "conflict with recovery"
+--     max_standby_streaming_delay = 300s  → a bounded middle ground
+-- ✓ For genuinely long analytics, a separate warehouse fed by CDC is the
+--   honest answer. Trying to serve 40-minute queries from the OLTP
+--   snapshot chain always costs someone something.
+
+-- ── PROBLEM 4: THE CDC SLOT IS AN ARMED FAILURE ─────────────────────────
+ALTER SYSTEM SET max_slot_wal_keep_size = '200GB';
+-- ✓ A stalled consumer gets its slot INVALIDATED and must resync —
+--   painful, but survivable. Without this, one stalled consumer fills
+--   the disk AND blocks vacuum database-wide AND builds wraparound risk.
+-- Monitoring: inactive slots, slot xmin age, retained WAL per slot.
+-- Process: slot teardown belongs in the same runbook as slot creation.
+
+-- ── PROBLEM 5: WRAPAROUND AT THIS TRANSACTION RATE ──────────────────────
+-- 40k txn/sec consumes 4.2 billion xids in about 30 HOURS of wall clock.
+-- Freezing is not optional maintenance here; it is continuous.
+ALTER SYSTEM SET autovacuum_freeze_max_age = 100000000;   -- earlier
+ALTER SYSTEM SET vacuum_freeze_min_age = 10000000;        -- freeze sooner
+-- ⚠ At this rate the margin between "fine" and "shut down" is DAYS, not
+--   months. Alerting on age(datfrozenxid) is mandatory, not advisory.
+
+-- ── PROBLEM 6: BOUND THE THINGS THAT GO WRONG ───────────────────────────
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '60s';
+ALTER SYSTEM SET statement_timeout = '30s';           -- per-role override
+                                                      -- for reporting
+ALTER ROLE analytics SET statement_timeout = '30min';
+-- Guardrails beat good intentions, and at this churn rate a single
+-- forgotten transaction does damage within minutes rather than weeks.
+
+-- ── THE MONITORING SET ──────────────────────────────────────────────────
+--   n_dead_tup and dead_pct per hot table
+--   HOT update ratio per hot table          ← the leading indicator
+--   oldest transaction age; inactive slots; prepared xacts
+--   age(datfrozenxid)                       ← days of margin here
+--   autovacuum worker saturation (are all workers always busy?)
+--   table size vs live-tuple estimate       ← bloat trend
+
+-- ── THE ARCHITECTURAL POINT ─────────────────────────────────────────────
+-- Every item above traces to ONE design decision: Postgres stores old
+-- versions in the table. That buys cheap updates and free rollback, and
+-- it bills you in vacuum. An undo-log engine would present none of these
+-- problems and would instead show lengthening undo chains and slowing
+-- reads under the same workload. Operating a database well means knowing
+-- which bill you are paying.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>MVCC keeps multiple row versions tagged with creating and superseding transaction ids; a snapshot decides which one you see.</li>
+        <li>The visibility rule is simply: the creator committed before I started, and the remover had not — everything else follows from it.</li>
+        <li>Snapshot lifetime is the entire difference between Read Committed and Repeatable Read; the machinery is identical.</li>
+        <li>PostgreSQL stores old versions in the table (cheap updates, free rollback, needs vacuum); InnoDB uses an undo log (no bloat, expensive rollback, slowing reads).</li>
+        <li>Vacuum cannot remove anything newer than the oldest running transaction — and that bound is database-wide, not per table.</li>
+        <li>Four things hold the horizon back: long transactions, inactive replication slots, orphaned prepared transactions, and standby feedback — check all of them.</li>
+        <li><code>VACUUM</code> makes space reusable; only <code>VACUUM FULL</code> or <code>pg_repack</code> returns it to the operating system.</li>
+        <li>Transaction id wraparound is the extreme end of blocked vacuum, and it stops the database — but it develops over weeks and is fully predictable from <code>age(datfrozenxid)</code>.</li>
+        <li>Hint bits mean a pure <code>SELECT</code> can dirty every page it reads, which is why the first query after a bulk load is slow and writes heavily.</li>
+        <li>Snapshot isolation is not serialisable: write skew involves disjoint writes, so there is no write-write conflict to detect.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="wal-recovery.html">← WAL, Checkpoints &amp; Crash Recovery</a>
+      <a href="locking-latches.html">Locking, Latches &amp; Deadlocks →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
