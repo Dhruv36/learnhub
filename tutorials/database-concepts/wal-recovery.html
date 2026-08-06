@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WAL, Checkpoints &amp; Crash Recovery — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>WAL, Checkpoints &amp; Crash Recovery <span class="level-badge level-ultra">Durability &amp; Concurrency</span></h1>
+    <p><strong>What you'll master:</strong> the two rules — write-ahead and force-at-commit — that together
+       make durability possible, what an LSN is and why every page carries one, how ARIES recovers in three
+       passes and why it must be idempotent because the machine can fail again <em>during</em> recovery, why
+       full-page writes exist and how torn pages would otherwise corrupt data silently, what
+       <code>fsync</code> actually guarantees and the ways storage hardware has historically lied about it,
+       how group commit turns hundreds of fsyncs into one, and the four capabilities the same log gives you
+       for free — recovery, replication, point-in-time restore and change data capture. Prerequisites:
+       <a href="buffer-pool.html">Buffer Pool &amp; Page Cache</a> — the dirty-page discussion there is where
+       this lesson begins. The <a href="../sql/transactions.html">SQL transactions lesson</a> covers the
+       user-facing side of durability; this is the mechanism beneath it.</p>
+
+    <h2>Part 1 — The Problem, and the Two Rules That Solve It</h2>
+    <pre>-- THE PUZZLE from lesson 1, stated precisely:
+--   Modified pages live in the buffer pool. Writing them all to disk at
+--   COMMIT means random I/O across the whole file — far too slow. Not
+--   writing them means a crash loses committed work.
+--   How can COMMIT be both fast and durable?
+
+-- ── THE ANSWER: LOG THE CHANGE, NOT THE PAGE ────────────────────────────
+-- A change description is small and can be appended SEQUENTIALLY. So:
+--   1. modify the page in memory                    (fast)
+--   2. append a record describing the change to the log   (sequential)
+--   3. fsync the log                                 ← durability point
+--   4. COMMIT returns
+--   5. write the data pages later, in bulk, at a checkpoint
+--
+-- One sequential fsync of a few hundred bytes makes many scattered page
+-- changes durable. Random work becomes sequential work — the recurring
+-- theme of this entire subject.
+
+-- ── THE TWO RULES ───────────────────────────────────────────────────────
+-- RULE 1 — WRITE-AHEAD (the "WA" in WAL):
+--   A modified page may NOT be written to disk before the log record
+--   describing that modification is durable.
+--   WHY: otherwise a crash could leave a changed page on disk with no
+--   log record explaining it. Recovery would find a page in an unknown
+--   state and have no way to decide whether to keep or undo the change.
+--   → This constrains EVICTION, not just commit (buffer pool lesson).
+--
+-- RULE 2 — FORCE-AT-COMMIT:
+--   All log records for a transaction must be durable BEFORE the commit
+--   is acknowledged.
+--   WHY: otherwise you told the user "saved" and a crash loses it.
+--
+-- ⚠ These two rules are the entire theory. Everything below — LSNs,
+--   ARIES, checkpoints, full-page writes — is machinery to enforce them
+--   efficiently. If you remember nothing else, remember that rule 1 is
+--   about page WRITES and rule 2 is about COMMITS, and they are
+--   different constraints.
+
+-- ── WHAT A LOG RECORD CONTAINS ──────────────────────────────────────────
+--   LSN            this record's position in the log (monotonic)
+--   transaction id which transaction made the change
+--   prev_lsn       previous record from the SAME transaction  ← for UNDO
+--   page id        which page was modified
+--   REDO info      how to re-apply the change
+--   UNDO info      how to reverse it (or MVCC provides this instead)
+--
+-- The prev_lsn chain is important: it links each transaction's records
+-- into a backward list, so rolling one back means walking its own chain
+-- rather than scanning the whole log.</pre>
+
+    <h2>Part 2 — LSNs: The Numbering That Makes It All Work</h2>
+    <pre>-- A Log Sequence Number is a monotonically increasing position in the
+-- log. In Postgres it is literally a byte offset, printed as hex:
+SELECT pg_current_wal_lsn();              -- 3A/7F2C1B08
+SELECT pg_current_wal_insert_lsn();       -- inserted (may not be flushed)
+SELECT pg_current_wal_flush_lsn();        -- DURABLE up to here
+-- ⚠ The gap between insert_lsn and flush_lsn is exactly the data that
+--   would be lost in a crash right now.
+
+-- ── EVERY PAGE CARRIES ITS LAST LSN ─────────────────────────────────────
+-- pd_lsn in the page header (lesson 2) records the log position of the
+-- most recent change to that page. This single field does three jobs:
+--
+-- 1. ENFORCES THE WRITE-AHEAD RULE
+--    Before writing page P to disk: is the WAL flushed past P.pd_lsn?
+--    If not, flush the log first. The check is one comparison.
+--
+-- 2. MAKES RECOVERY IDEMPOTENT
+--    During redo: if page.pd_lsn >= record.lsn, this change is ALREADY
+--    applied — skip it. This is why recovery can be re-run safely after
+--    crashing partway through, which is essential because the machine
+--    can and does fail again during recovery.
+--
+-- 3. TRACKS REPLICATION PROGRESS
+--    A replica reports the LSN it has received, flushed and applied, so
+--    lag is measured as an LSN difference (scaling lesson).
+SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS lag_bytes
+FROM pg_stat_replication;
+
+-- ── LOG ORGANISATION ────────────────────────────────────────────────────
+-- The WAL is a sequence of fixed-size SEGMENT FILES (16MB by default) in
+-- pg_wal/. Old segments are RECYCLED — renamed and reused — rather than
+-- deleted, which avoids filesystem allocation work on a hot path.
+SELECT * FROM pg_ls_waldir() ORDER BY name DESC LIMIT 5;
+SELECT pg_size_pretty(sum(size)) FROM pg_ls_waldir();
+-- ⚠ pg_wal filling up is one of the few ways to hard-stop a Postgres
+--   instance. The usual causes are an inactive replication slot holding
+--   segments, a failing archive_command, or max_wal_size set far below
+--   what checkpoints need. All three are worth alerting on.
+
+-- ── WHAT GETS LOGGED, AND WHAT DOES NOT ─────────────────────────────────
+-- Logged: heap inserts/updates/deletes, index changes, page splits,
+--   commits and aborts, checkpoints, freezing, visibility-map changes.
+-- NOT logged: UNLOGGED tables, temporary tables, hint-bit updates.
+CREATE UNLOGGED TABLE staging (...);
+-- ✓ Much faster writes — no WAL at all.
+-- ✗ TRUNCATED on crash recovery, and NOT replicated. Correct for
+--   rebuildable scratch data; catastrophic if someone assumes otherwise.</pre>
+    <div class="note">🔢 <strong>The LSN is the most elegant idea in database durability.</strong> One
+      monotonic number, stamped into every page, simultaneously enforces the write-ahead rule, makes recovery
+      idempotent so it can be interrupted and restarted safely, and provides the measurement that
+      replication lag is expressed in. When you understand why <code>page.pd_lsn &gt;= record.lsn</code> means
+      "already applied", you understand why crash recovery is safe to run twice — and that property is what
+      makes the whole design trustworthy.</div>
+
+    <h2>Part 3 — ARIES: Recovery in Three Passes</h2>
+    <pre>-- ARIES (Algorithms for Recovery and Isolation Exploiting Semantics) is
+-- the design nearly every engine implements. On restart after a crash:
+
+-- ── PASS 1: ANALYSIS ────────────────────────────────────────────────────
+-- Start at the last checkpoint record. Scan FORWARD to the end of the
+-- log to reconstruct two tables:
+--   TRANSACTION TABLE  which transactions were in flight, and their
+--                      last LSN
+--   DIRTY PAGE TABLE   which pages were dirty, and the recLSN — the LSN
+--                      of the OLDEST change not yet on disk for that page
+-- Output: the set of LOSERS (transactions that never committed) and the
+-- earliest LSN redo must start from.
+
+-- ── PASS 2: REDO — AND IT REDOES EVERYTHING ─────────────────────────────
+-- Scan forward from the earliest recLSN, re-applying EVERY change —
+-- including changes made by transactions that never committed.
+--
+-- ⚠ THAT SOUNDS WRONG. Why redo work that must then be undone?
+--   Because it is REPEATING HISTORY. Reconstructing the exact state at
+--   the moment of the crash means undo can then proceed against a known
+--   state, using the ordinary undo machinery. Trying to be selective
+--   during redo would require knowing each transaction's fate before
+--   reaching the end of the log, which you do not.
+--   This "repeating history" principle is ARIES's central insight and
+--   the thing most descriptions gloss over.
+--
+-- For each record: if page.pd_lsn >= record.lsn → already applied, skip.
+-- That check is what makes redo idempotent.
+
+-- ── PASS 3: UNDO ────────────────────────────────────────────────────────
+-- Roll back the losers, walking each transaction's prev_lsn chain
+-- BACKWARD and reversing each change.
+-- Each undo action writes a COMPENSATION LOG RECORD (CLR) describing
+-- what it undid, with an undoNext pointer to the next record to undo.
+--
+-- ⚠ WHY CLRs EXIST — this is the subtle part. If the system crashes
+--   DURING undo, recovery restarts. Without CLRs it would undo the same
+--   changes again, and undoing an undo could corrupt data. CLRs are
+--   redo-only records: on restart they are replayed, and their
+--   undoNext pointer tells recovery exactly where undo had reached.
+--   Undo therefore never repeats work, no matter how many times the
+--   machine fails mid-recovery.
+
+-- ── POSTGRES DOES NOT NEED PASS 3 ───────────────────────────────────────
+-- Because of MVCC. An uncommitted transaction's changes are new row
+-- VERSIONS tagged with its xid. If that xid never committed, the
+-- versions are simply invisible to everyone — no rollback required.
+-- Vacuum reclaims them later as ordinary dead tuples.
+-- ✓ CONSEQUENCE: Postgres recovery is redo-only, which makes it simpler
+--   and means ROLLBACK is nearly free at runtime too.
+-- ✗ THE PRICE: those dead versions accumulate in the table and must be
+--   vacuumed — the bloat trade-off from lesson 2.
+-- InnoDB and Oracle keep old versions in an UNDO LOG instead, so they do
+-- perform undo, and they suffer long undo chains rather than table
+-- bloat. Same problem, opposite placement.
+
+-- ── OBSERVE RECOVERY ────────────────────────────────────────────────────
+-- log after an unclean shutdown:
+--   database system was not properly shut down; automatic recovery in progress
+--   redo starts at 3A/7F2C1B08
+--   redo done at 3B/12004420, elapsed time: 24.412 s
+--   checkpoint starting: end-of-recovery
+-- ⚠ Recovery time is proportional to WAL volume since the last
+--   checkpoint. That is precisely the trade-off checkpoint tuning
+--   controls, and it is why "just make checkpoints rare" has a limit.</pre>
+
+    <h2>Part 4 — Torn Pages and Full-Page Writes</h2>
+    <pre>-- A subtle correctness problem that most people never hear about until
+-- it bites.
+
+-- ── THE TORN PAGE ───────────────────────────────────────────────────────
+-- Postgres pages are 8KB. Storage devices write in sectors of 512B-4KB.
+-- So an 8KB page write is 2-16 device operations, and they are NOT
+-- atomic together. Lose power midway and the page on disk is half old,
+-- half new — internally inconsistent, and its checksum will not match.
+--
+--   ┌──────────────┐
+--   │ new │ new    │  ← sectors written
+--   ├─────┴────────┤
+--   │ OLD │ OLD    │  ← sectors not yet written
+--   └──────────────┘
+--
+-- ⚠ WHY REDO CANNOT FIX THIS: a redo record says "change bytes 100-140
+--   of this page". Applying that to a page that is internally garbage
+--   produces different garbage. Redo assumes the page is in a valid
+--   prior state, and a torn page is in no valid state at all.
+
+-- ── THE FIX: FULL-PAGE WRITES ───────────────────────────────────────────
+-- After each checkpoint, the FIRST modification to any page writes the
+-- ENTIRE page image into the WAL, not just the delta. Recovery then
+-- restores the whole page from the log before applying subsequent
+-- incremental records — so it never has to trust a possibly-torn page.
+SHOW full_page_writes;      -- on. LEAVE IT ON.
+
+-- ── THE COST, WHICH IS LARGE ────────────────────────────────────────────
+-- Modifying one byte can write 8KB to the log. On write-heavy systems
+-- full-page writes are frequently the LARGEST component of WAL volume.
+-- And it is concentrated: WAL traffic spikes immediately after every
+-- checkpoint, then tapers as pages get their first touch.
+--
+-- ✓ THE LEVER: fewer checkpoints means fewer "first touches" and so
+--   dramatically less full-page-write traffic. Going from a 5-minute to
+--   a 15-minute checkpoint interval commonly cuts total WAL volume by
+--   half or more — which reduces archiving load, replication bandwidth
+--   and disk writes simultaneously.
+ALTER SYSTEM SET checkpoint_timeout = '15min';
+ALTER SYSTEM SET max_wal_size = '16GB';
+-- ⚠ And the counterweight, again: longer intervals mean longer crash
+--   recovery. This one trade-off connects checkpoints, WAL volume,
+--   replication bandwidth and RTO — which is why it is the single most
+--   consequential tuning decision in this area.
+SELECT wal_records, wal_fpi, wal_bytes FROM pg_stat_wal;
+-- wal_fpi is the full-page-image count. If it dominates wal_records,
+-- lengthening the checkpoint interval is your biggest available win.
+
+-- ── WHEN YOU MAY TURN IT OFF ────────────────────────────────────────────
+-- Only if the storage layer guarantees atomic 8KB writes — some
+-- enterprise arrays and ZFS with matching recordsize do. Filesystems
+-- like ext4 do NOT.
+-- ⚠ Turning it off without that guarantee risks silent, unrecoverable
+--   corruption discovered weeks later. The performance gain is real; the
+--   downside is losing the database. Do not do this on a hunch.
+-- (InnoDB's equivalent is the DOUBLEWRITE BUFFER: write each page to a
+--  scratch area first, then to its home. Same problem, different
+--  solution, similar cost.)</pre>
+
+    <h2>Part 5 — What fsync Really Guarantees</h2>
+    <pre>-- Durability rests entirely on one system call. It is worth knowing
+-- exactly what it promises and how that promise has been broken.
+
+-- ── THE LAYERS A WRITE PASSES THROUGH ───────────────────────────────────
+--   application buffer
+--     ↓ write()
+--   OS PAGE CACHE            ← write() returns HERE. Not durable.
+--     ↓ fsync()
+--   device write cache       ← volatile DRAM on the drive itself!
+--     ↓ FLUSH / FUA
+--   stable media             ← durable
+--
+-- ⚠ write() returning success means NOTHING about durability. It means
+--   the kernel has the data. A power loss at that moment loses it.
+-- ⚠ fsync() must also cause the DEVICE to flush its own volatile cache.
+--   Consumer SSDs have historically ignored flush commands to win
+--   benchmarks — the drive reports success while data sits in DRAM that
+--   a power loss erases. Enterprise drives have power-loss protection
+--   (a capacitor) making the cache effectively non-volatile.
+
+-- ── THE fsync PROBLEM (2018) ────────────────────────────────────────────
+-- A genuinely alarming discovery: on Linux, if a writeback error occurs,
+-- the kernel could report it to the FIRST fsync that noticed and then
+-- CLEAR the error flag. A subsequent fsync would return SUCCESS despite
+-- the data never reaching disk. Postgres treated fsync failure as
+-- retryable, retried, got success, and concluded the data was safe.
+-- ✓ THE FIX: Postgres now PANICS on fsync failure, forcing crash
+--   recovery from the WAL rather than trusting a second attempt.
+--   "Crash deliberately rather than continue with possibly-lost data" is
+--   the right instinct, and it is worth internalising as a design
+--   principle.
+
+-- ── CONFIGURATION, AND WHAT EACH SETTING REALLY MEANS ───────────────────
+SHOW fsync;                  -- on. Turning it OFF risks UNRECOVERABLE
+                             -- CORRUPTION, not merely data loss. There
+                             -- is no legitimate production use.
+SHOW synchronous_commit;     -- on
+--   on          wait for local WAL fsync                 (default)
+--   off         return BEFORE fsync — loses up to ~600ms of COMMITTED
+--               transactions on a crash. NOT corruption: the database
+--               stays consistent, but acknowledged writes vanish.
+--   local       fsync locally, do not wait for replicas
+--   remote_write  wait for a replica to receive it
+--   remote_apply  wait for a replica to APPLY it (no read lag)
+SHOW wal_sync_method;        -- fdatasync on Linux
+-- Per-transaction, which is the useful granularity:
+BEGIN; SET LOCAL synchronous_commit = off;
+INSERT INTO analytics_events ...;         -- rebuildable → relax it
+COMMIT;
+-- ✓ Payments fsync; clickstream does not. Durability is a per-workload
+--   decision, not a global one.
+
+-- ── GROUP COMMIT: WHY THROUGHPUT IS NOT 1/fsync ─────────────────────────
+-- An fsync costs ~0.1-1ms even on NVMe, so one fsync per commit caps you
+-- at roughly 1,000-10,000 commits/sec. Group commit fixes this: while
+-- one fsync is in flight, arriving commits queue; when it completes, the
+-- NEXT fsync covers all of them at once.
+ALTER SYSTEM SET commit_delay = 100;        -- microseconds to wait
+ALTER SYSTEM SET commit_siblings = 5;       -- only if ≥5 active txns
+-- ✓ 500 concurrent commits can share ONE fsync. Throughput becomes
+--   largely independent of fsync latency under concurrency — which is
+--   why a busy database sustains far more commits per second than the
+--   naive arithmetic suggests.
+-- ⚠ It adds a little latency to individual commits to gain throughput.
+--   Beneficial under load, pointless at low concurrency.</pre>
+
+    <h2>Part 6 — One Log, Four Capabilities</h2>
+    <pre>-- Once you have a durable, ordered, complete record of every change, you
+-- get several major features almost for free. This is why the WAL is the
+-- single most valuable component to understand.
+
+-- ── 1. CRASH RECOVERY (the original purpose) ────────────────────────────
+-- Covered above: replay from the last checkpoint.
+
+-- ── 2. PHYSICAL REPLICATION ─────────────────────────────────────────────
+-- Ship WAL segments to another server and replay them. The replica is
+-- byte-identical because it applies exactly the same changes.
+-- Streaming (continuous) or archive-based (segment files).
+SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn
+FROM pg_stat_replication;
+-- The four LSNs are four distinct durability guarantees:
+--   sent    left the primary
+--   write   the replica wrote it (to the OS)
+--   flush   the replica fsynced it       ← survives replica crash
+--   replay  the replica APPLIED it       ← visible to replica queries
+-- synchronous_standby_names picks WHICH of these commit waits for, and
+-- that choice is exactly the RPO decision (SQL scaling lesson).
+
+-- ── 3. POINT-IN-TIME RECOVERY ───────────────────────────────────────────
+-- base backup + archived WAL = the database at ANY moment in between.
+archive_mode = on
+archive_command = 'test ! -f /arch/%f && cp %p /arch/%f'
+-- restore to just before the bad migration:
+restore_command = 'cp /arch/%f %p'
+recovery_target_time = '2026-08-05 14:22:00'
+-- ✓ THIS is what makes a replica not a backup. A replica replicates your
+--   DROP TABLE in milliseconds; PITR lets you rewind to the second
+--   before it. Every production database needs base backups plus
+--   continuous WAL archiving, and needs the RESTORE tested — an
+--   untested backup is a hypothesis.
+
+-- ── 4. LOGICAL REPLICATION AND CDC ──────────────────────────────────────
+-- Decode the physical WAL into logical row changes and stream them.
+CREATE PUBLICATION p FOR TABLE orders;
+SELECT * FROM pg_create_logical_replication_slot('s', 'pgoutput');
+-- Enables: cross-version upgrades with no downtime, selective table
+-- replication, and feeding Kafka/warehouses (Debezium) without polling
+-- or triggers.
+-- ⚠ THE OPERATIONAL HAZARD: a replication slot RETAINS WAL until the
+--   consumer acknowledges it. An abandoned slot fills pg_wal until the
+--   disk is full and the database stops. It ALSO holds back the vacuum
+--   horizon, causing database-wide bloat (lesson 2). Both failure modes
+--   from one forgotten slot:
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))
+       AS retained
+FROM pg_replication_slots WHERE NOT active;
+-- Alert on this. It is one of the most common causes of a Postgres
+-- outage that looks inexplicable from the application side.
+
+-- ── THE DESIGN LESSON WORTH TAKING AWAY ─────────────────────────────────
+-- None of replication, PITR or CDC was designed separately. They all
+-- fell out of having an ordered, durable record of every change. When a
+-- single mechanism yields four capabilities, that is a sign the
+-- abstraction was chosen correctly — and it is a pattern worth looking
+-- for in your own designs.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Assuming durability</strong>
+        <pre>"COMMIT returned, so it's safe."
+"We have a replica, so we have
+ backups."
+"fsync=off made it faster."
+"The WAL is just overhead."
+→ Data loss on failover, and a
+  DROP TABLE replicated in 4ms
+  with nothing to restore from.</pre></div>
+      <div><strong>✅ Knowing the guarantee</strong>
+        <pre>"COMMIT means fsynced LOCALLY;
+ async replicas may not have it."
+"Replica ≠ backup: base backup +
+ archived WAL + a TESTED restore."
+"fsync=off risks corruption, not
+ just loss — synchronous_commit=off
+ is the safe relaxation."</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Treating a replica as a backup</td><td>An accidental <code>DELETE</code> replicates in milliseconds</td><td>Base backups plus continuous WAL archiving, with a tested restore</td></tr>
+      <tr><td>Turning off <code>fsync</code></td><td>Risks unrecoverable corruption, not merely lost transactions</td><td>Relax <code>synchronous_commit</code> instead, per transaction</td></tr>
+      <tr><td>Disabling <code>full_page_writes</code> without atomic-write hardware</td><td>Torn pages that redo cannot repair; silent corruption</td><td>Leave it on; reduce its cost with longer checkpoint intervals</td></tr>
+      <tr><td>Very frequent checkpoints</td><td>Full-page writes dominate WAL; write storms; replication bandwidth</td><td>Longer <code>checkpoint_timeout</code>, larger <code>max_wal_size</code></td></tr>
+      <tr><td>Very rare checkpoints</td><td>Crash recovery takes many minutes</td><td>The interval is an explicit RTO decision, not a default to ignore</td></tr>
+      <tr><td>Abandoned replication slots</td><td><code>pg_wal</code> fills and the database halts; vacuum blocked database-wide</td><td>Monitor inactive slots and their retained WAL; drop stale ones</td></tr>
+      <tr><td>Ignoring a failing <code>archive_command</code></td><td>WAL accumulates until the disk is full</td><td>Alert on archiver failures and <code>pg_wal</code> size</td></tr>
+      <tr><td>Assuming <code>COMMIT</code> means replicas have it</td><td>Failover loses acknowledged transactions</td><td>Know your RPO; use synchronous replication with a quorum where required</td></tr>
+      <tr><td>Using <code>UNLOGGED</code> tables for data that matters</td><td>Silently truncated on crash recovery, and never replicated</td><td>Only for rebuildable scratch data</td></tr>
+      <tr><td>Never testing recovery</td><td>Discovering the backup was broken during an incident</td><td>Restore drills on a schedule; an untested backup is a hypothesis</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What is write-ahead logging and what problem does it solve?</summary>
+      <p>It resolves a conflict between commit speed and durability. Modified pages live in the buffer pool in
+         memory, and flushing all of them to their scattered locations on disk at every commit would be
+         random I/O — far too slow to do per transaction. But leaving them only in memory means a crash loses
+         committed work.</p>
+      <p>Write-ahead logging separates the record of a change from the change itself. The engine modifies the
+         page in memory, appends a compact description of the change to a sequential log file, and fsyncs
+         that one file. Once the log record is durable the transaction can commit, because the change can
+         always be reconstructed from it. The data pages themselves are written later in bulk at a
+         checkpoint. One sequential fsync therefore makes many scattered changes durable, converting random
+         work into sequential work.</p>
+      <p>The name comes from the ordering rule: a log record must reach stable storage before the data page
+         it describes. There is a second rule too — all of a transaction's log records must be durable before
+         its commit is acknowledged. The first constrains when pages may be written, including at eviction;
+         the second constrains when a commit may return. Those two rules are the whole theory, and
+         everything else is machinery to enforce them efficiently.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What is a checkpoint and why is its frequency a trade-off?</summary>
+      <p>A checkpoint flushes all dirty pages from the buffer pool to their real locations on disk and records
+         a position in the log before which nothing needs replaying. Without checkpoints the log would grow
+         forever and recovery would have to replay from the beginning of time.</p>
+      <p>Frequent checkpoints make crash recovery fast, because there is little log to replay, but they cost
+         in three ways. Each one issues a burst of write I/O that can saturate the disk and spike latency.
+         They also multiply full-page writes, since the first modification to any page after a checkpoint
+         writes the entire page into the log rather than just the change — so on write-heavy systems frequent
+         checkpoints can double or triple total WAL volume, which in turn increases archiving load and
+         replication bandwidth.</p>
+      <p>Infrequent checkpoints invert all of that: smoother steady-state performance and much less WAL, at
+         the cost of longer recovery after a crash. So the interval is really a recovery-time objective
+         decision dressed up as a tuning parameter, and it should be set with whoever owns that objective.
+         Separately, <code>checkpoint_completion_target</code> spreads the writes across the interval rather
+         than dumping them at once, which removes most of the latency spike without changing recovery time
+         at all — that one is close to a free win.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Explain ARIES recovery, and why redo re-applies uncommitted transactions.</summary>
+      <p>ARIES recovers in three passes. Analysis starts at the last checkpoint and scans forward to the end
+         of the log, rebuilding which transactions were in flight and which pages were dirty, producing the
+         set of losers — transactions that never committed — and the earliest log position redo must begin
+         from. Redo then scans forward re-applying changes. Undo finally rolls back the losers by walking
+         each transaction's backward chain of records.</p>
+      <p>The part that seems wrong is that redo re-applies everything, including changes from transactions
+         that never committed and will immediately be undone. The reason is a principle called repeating
+         history: the goal of redo is to reconstruct the exact state at the moment of the crash, so that undo
+         can then run against a known, consistent state using the ordinary undo machinery. Being selective
+         during redo would require knowing each transaction's outcome before reaching the end of the log,
+         which you do not, and it would create a state that matches neither the crash moment nor any valid
+         history.</p>
+      <p>Two mechanisms make this safe to interrupt. Every page stores the log position of its last change, so
+         redo skips any record whose position is already reflected in the page — making redo idempotent. And
+         each undo action writes a compensation log record noting what it undid, with a pointer to where undo
+         should continue. If the machine crashes during recovery, the compensation records are replayed and
+         undo resumes exactly where it stopped, never repeating work. That matters because crashing during
+         recovery is a real scenario, not a hypothetical.</p>
+      <p>PostgreSQL is a partial exception: because MVCC keeps uncommitted changes as row versions tagged with
+         a transaction id that never committed, those versions are simply invisible and need no rollback. Its
+         recovery is redo-only. The price is that those dead versions must be vacuumed later, which is the
+         familiar bloat trade-off — whereas InnoDB and Oracle keep old versions in an undo log and pay with
+         long undo chains instead.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What is a torn page and how do databases prevent it?</summary>
+      <p>A torn page happens because a database page is larger than the unit a storage device writes
+         atomically. An eight-kilobyte page maps to several device sectors, and those writes are not atomic
+         as a group. If power is lost midway, the page on disk contains some new sectors and some old ones —
+         internally inconsistent and matching no valid state.</p>
+      <p>The reason this is dangerous is that redo cannot repair it. A redo record says how to modify a page
+         from a known prior state, so applying it to a page that is partly old and partly new produces
+         different corruption rather than a correct result. The normal recovery mechanism assumes page
+         validity, and a torn page breaks that assumption.</p>
+      <p>PostgreSQL prevents it with full-page writes: after each checkpoint, the first modification to any
+         page writes that page's entire image into the log rather than just the delta. Recovery can then
+         restore the complete page from the log before applying later incremental records, so it never has to
+         trust a possibly-torn page on disk. InnoDB solves the same problem differently with a doublewrite
+         buffer, writing each page first to a scratch area and then to its home location, so a valid copy
+         always exists somewhere.</p>
+      <p>Both are expensive. Full-page writes mean a one-byte change can write eight kilobytes to the log, and
+         on write-heavy systems they often dominate WAL volume — concentrated right after each checkpoint,
+         since that is when first touches occur. The main lever is checkpoint frequency: lengthening the
+         interval reduces first touches and commonly halves total WAL. Turning the protection off is only
+         defensible when the storage layer genuinely guarantees atomic page writes, which some enterprise
+         arrays and correctly-configured ZFS do but ordinary filesystems do not. The downside of getting that
+         wrong is silent corruption discovered much later.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A commit returned successfully but the data was gone after failover. Explain, and describe how you would prevent it.</summary>
+      <p>Because durability as promised by commit is local. <code>COMMIT</code> returns once the log record is
+         fsynced on the primary, which guarantees survival of a crash of that machine. Replicas receive the
+         log afterwards, asynchronously, with lag that is usually milliseconds but grows under write bursts
+         or network trouble. If the primary dies after acknowledging the commit but before the replica
+         consumed that record, and you promote the replica, the transaction is not in the new timeline. The
+         database did not lie; it made a narrower promise than people assume.</p>
+      <p>There is a second route to the same outcome. With <code>synchronous_commit = off</code>, commit
+         returns before the local fsync at all, so a crash on the primary itself loses a window of
+         acknowledged transactions. That is data loss without corruption — the database remains internally
+         consistent — but it is still surprising if nobody chose it deliberately.</p>
+      <p>Prevention starts with deciding the recovery point objective explicitly rather than inheriting it.
+         Synchronous replication makes commit wait for a remote acknowledgement, and PostgreSQL lets you
+         choose which guarantee: <code>remote_write</code> means the replica received it,
+         <code>remote_apply</code> means it has applied it and replica reads will see it. That buys
+         correctness with write latency, and it introduces an availability coupling — which is why you
+         configure a quorum such as <code>ANY 1 (r1, r2)</code> rather than naming a single standby, since a
+         single named standby going down would block all writes.</p>
+      <p>In practice I would run asynchronous replication for most tables and accept a small RPO, while
+         routing the genuinely unrecoverable operations — payments, ledger entries — through a synchronous
+         path or an external durable record with idempotency keys. Alongside that, monitor replication lag in
+         bytes and seconds, alert on it, and rehearse failover so the actual data-loss window is a measured
+         number rather than a guess. And keep base backups with continuous WAL archiving regardless, because
+         replication protects against node loss while point-in-time recovery protects against the mistakes
+         replication faithfully copies.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Design the durability configuration for a system with mixed workloads.</summary>
+      <p>I would start by rejecting the premise that durability is one global setting, because different data
+         in the same database warrants genuinely different guarantees, and PostgreSQL lets you choose per
+         transaction.</p>
+      <p>For financial or ledger operations I would use <code>synchronous_commit = remote_apply</code> against
+         a quorum of standbys, so a commit is not acknowledged until at least one replica has applied it.
+         That gives an RPO of zero for those operations at the cost of a network round trip per commit, which
+         is acceptable because they are a small fraction of volume and the cost of losing one is
+         unbounded.</p>
+      <p>Ordinary application writes — orders, user changes — would use the default local
+         <code>synchronous_commit = on</code> with asynchronous replication. They survive a crash of the
+         primary, and the small failover data-loss window is a documented, accepted risk rather than an
+         accident.</p>
+      <p>For high-volume rebuildable data such as analytics events or clickstream, I would set
+         <code>synchronous_commit = off</code> at the transaction or role level. Those writes can be
+         regenerated or are statistically tolerant of losing a fraction of a second, and removing the fsync
+         from that path substantially raises throughput for the whole system, including the transactions that
+         do need durability. For genuinely disposable staging data, unlogged tables remove WAL entirely —
+         with the sharp caveat that they are truncated on crash recovery and never replicated, so that choice
+         needs to be visible in the schema and understood by everyone.</p>
+      <p>Underneath all of that, <code>fsync</code> and <code>full_page_writes</code> stay on unconditionally,
+         because both protect against corruption rather than merely loss, and corruption is not a risk worth
+         trading for throughput. I would enable group commit tuning so concurrent commits share fsyncs, set
+         a checkpoint interval chosen against a stated recovery-time objective, and configure continuous WAL
+         archiving with regularly tested restores.</p>
+      <p>The monitoring matters as much as the configuration: replication lag, inactive replication slots and
+         their retained WAL, archiver failures, and <code>pg_wal</code> size. An abandoned slot alone can both
+         fill the disk and block vacuum database-wide, and it is one of the most common causes of an outage
+         that looks inexplicable from the application side. Finally I would write down the resulting RPO and
+         RTO and have the business confirm them, because those numbers are a product decision that engineers
+         should surface rather than choose silently.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Watch the WAL grow and locate the durability point.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── THE THREE POSITIONS ─────────────────────────────────────────────────
+SELECT pg_current_wal_insert_lsn() AS inserted,
+       pg_current_wal_flush_lsn()  AS flushed,
+       pg_current_wal_lsn()        AS written;
+--  inserted    | flushed     | written
+--  3A/7F2C1B08 | 3A/7F2C1B08 | 3A/7F2C1B08
+-- ⚠ The gap between `inserted` and `flushed` is EXACTLY what a crash
+--   would lose right now. At rest it is zero.
+
+-- ── MEASURE WAL PER OPERATION ───────────────────────────────────────────
+SELECT pg_current_wal_lsn() AS before \gset
+CREATE TABLE t (id bigint PRIMARY KEY, v text);
+INSERT INTO t SELECT g, repeat('x',100) FROM generate_series(1,100000) g;
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'before'))
+       AS wal_generated;
+--  16 MB          → ~160 bytes of WAL per 100-byte row (header + index)
+
+-- ── AN UPDATE COSTS MORE THAN YOU EXPECT ────────────────────────────────
+CHECKPOINT;                                    -- force a clean start
+SELECT pg_current_wal_lsn() AS before \gset
+UPDATE t SET v = 'y' WHERE id &lt;= 10000;
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'before'));
+--  21 MB for 10,000 small updates = ~2.1KB each!
+-- WHY: this is the FIRST touch of those pages since the CHECKPOINT, so
+-- each one wrote a FULL 8KB PAGE IMAGE to the log.
+
+-- ── PROVE IT ────────────────────────────────────────────────────────────
+SELECT pg_current_wal_lsn() AS before \gset
+UPDATE t SET v = 'z' WHERE id &lt;= 10000;        -- SAME rows, no checkpoint
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'before'));
+--  1.2 MB → ~120 bytes each. 17× less.
+-- ✓ Identical statement, 17× the WAL, purely because of checkpoint
+--   timing. That is the full-page-write cost made visible.
+
+SELECT wal_records, wal_fpi, wal_bytes,
+       round(100.0*wal_fpi/NULLIF(wal_records,0),1) AS pct_full_pages
+FROM pg_stat_wal;
+-- If pct_full_pages is high, lengthening checkpoint_timeout is the
+-- single biggest available reduction in WAL volume.
+
+-- ── UNLOGGED: NO WAL AT ALL ─────────────────────────────────────────────
+CREATE UNLOGGED TABLE u (id bigint, v text);
+SELECT pg_current_wal_lsn() AS before \gset
+INSERT INTO u SELECT g, repeat('x',100) FROM generate_series(1,100000) g;
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'before'));
+--  1.5 MB (just incidental catalog activity) vs 16 MB
+-- ⚠ And on crash recovery this table is TRUNCATED, and it never
+--   replicates. Correct for rebuildable staging; a disaster if anyone
+--   assumes otherwise.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Crash the database and read the recovery log.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ⚠ On a test instance only.
+
+-- ── SET UP AN UNFINISHED TRANSACTION ────────────────────────────────────
+CREATE TABLE t (id int PRIMARY KEY, v text);
+INSERT INTO t VALUES (1,'committed');
+-- session 2, deliberately left open:
+BEGIN;
+INSERT INTO t VALUES (2,'uncommitted');
+-- (no COMMIT)
+
+-- ── CRASH IT ────────────────────────────────────────────────────────────
+pg_ctl -D $PGDATA -m immediate stop        -- no clean shutdown, no
+                                           -- checkpoint, no flush
+pg_ctl -D $PGDATA start
+
+-- ── THE RECOVERY LOG ────────────────────────────────────────────────────
+--  LOG: database system was interrupted; last known up at 14:02:11
+--  LOG: database system was not properly shut down;
+--       automatic recovery in progress
+--  LOG: redo starts at 3A/7F2C1B08          ← the last checkpoint
+--  LOG: invalid record length at 3A/7F31A2C0: wanted 24, got 0
+--                                            ← the end of valid WAL:
+--                                              exactly where the crash
+--                                              happened
+--  LOG: redo done at 3A/7F31A288, elapsed time: 0.412 s
+--  LOG: checkpoint starting: end-of-recovery
+--  LOG: database system is ready to accept connections
+
+-- ── VERIFY THE OUTCOME ──────────────────────────────────────────────────
+SELECT * FROM t;
+--  1 | committed        ← survived: its commit record was fsynced
+-- Row 2 is absent: the transaction never committed.
+
+-- ⚠ NOTE WHAT DID NOT HAPPEN: no rollback pass. In Postgres the
+--   uncommitted row was physically WRITTEN as a tuple tagged with an
+--   xid that never committed, so it is simply INVISIBLE. Vacuum
+--   reclaims it later as an ordinary dead tuple. That is why Postgres
+--   recovery is redo-only, and why ROLLBACK is nearly free at runtime.
+SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname='t';   -- 1
+
+-- ── MEASURE RECOVERY TIME AGAINST WAL VOLUME ────────────────────────────
+ALTER SYSTEM SET checkpoint_timeout = '30min';
+ALTER SYSTEM SET max_wal_size = '32GB';
+SELECT pg_reload_conf();
+-- generate several GB of writes, then crash again:
+--  LOG: redo done at 3B/A1002240, elapsed time: 94.221 s
+-- ✓ 0.4s → 94s. Recovery time is directly proportional to WAL replayed
+--   since the last checkpoint. THIS is the concrete cost of long
+--   checkpoint intervals, and it is what turns the tuning question into
+--   an RTO conversation.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure the cost of every durability setting.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- Single-row commits in a loop; 60 seconds each. NVMe, 16 cores.
+
+-- ── 1. DEFAULT: fsync per commit ────────────────────────────────────────
+SET synchronous_commit = on;
+-- pgbench -c 1 -T 60 -f insert.sql
+--   tps = 1,240        latency 0.81ms
+-- ⚠ ONE CLIENT is bounded by fsync latency (~0.8ms). This is the number
+--   people quote when they say "the database only does 1000 writes/sec",
+--   and it is misleading.
+
+-- ── 2. CONCURRENCY: group commit does the work ──────────────────────────
+-- pgbench -c 64 -T 60 -f insert.sql
+--   tps = 41,200       latency 1.55ms
+-- ✓ 33× the throughput with only 2× the latency. While one fsync is in
+--   flight, arriving commits queue and the NEXT fsync covers all of
+--   them. Throughput becomes largely independent of fsync latency under
+--   load — which is why the single-client number tells you almost
+--   nothing about capacity.
+
+-- ── 3. RELAXED DURABILITY ───────────────────────────────────────────────
+SET synchronous_commit = off;
+-- 1 client:  tps = 18,400    (15× faster — no fsync in the path)
+-- 64 clients: tps = 52,100   (only 1.26× — group commit had already
+--                             amortised most of the fsync cost)
+-- ✓ THE INSIGHT: relaxing durability helps enormously at LOW
+--   concurrency and only modestly at high concurrency. If you are
+--   considering it for throughput, check whether group commit has
+--   already solved your problem.
+-- ⚠ The risk: a crash loses up to ~600ms of COMMITTED transactions.
+--   Not corruption — the database stays consistent — but acknowledged
+--   writes vanish.
+
+-- ── 4. GROUP COMMIT TUNING ──────────────────────────────────────────────
+SET synchronous_commit = on;
+ALTER SYSTEM SET commit_delay = 100;      -- microseconds
+ALTER SYSTEM SET commit_siblings = 5;
+-- 64 clients: tps = 47,800   (+16% over default)
+-- Deliberately waits 100μs so more commits join each fsync. Helps under
+-- load, pointless at low concurrency (the siblings check disables it).
+
+-- ── 5. SYNCHRONOUS REPLICATION ──────────────────────────────────────────
+SET synchronous_commit = remote_apply;
+-- 64 clients: tps = 12,400   latency 5.2ms
+-- ✓ Zero RPO. Costs a network round trip per commit — 3-4× throughput.
+-- Configure a QUORUM, not one named standby:
+--   synchronous_standby_names = 'ANY 1 (r1, r2)'
+--   (naming a single standby means its failure BLOCKS ALL WRITES)
+
+-- ── 6. fsync = off ──────────────────────────────────────────────────────
+-- tps = 68,000, and it does not matter.
+-- ⚠ This risks UNRECOVERABLE CORRUPTION, not just data loss: pages can
+--   reach disk in an order the WAL cannot reconcile. There is no
+--   legitimate production use. If you want the speed, use
+--   synchronous_commit = off, which is the SAFE relaxation.
+
+-- ── THE DECISION TABLE ──────────────────────────────────────────────────
+--  workload            setting                      RPO
+--  payments/ledger     remote_apply + quorum        0
+--  normal app writes   on (default)                 async replica lag
+--  analytics events    off (per transaction)        ~600ms
+--  scratch/staging     UNLOGGED table               all of it on crash
+-- Durability is per-workload. Setting it globally means every workload
+-- pays the strictest cost or accepts the weakest guarantee.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Perform a point-in-time recovery.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SCENARIO: at 14:22 someone runs DELETE FROM orders; with no WHERE.
+-- The replica dutifully replicated it in 4ms. Recover to 14:21:59.
+
+-- ── PREREQUISITE (set up BEFORE you need it) ────────────────────────────
+ALTER SYSTEM SET wal_level = 'replica';
+ALTER SYSTEM SET archive_mode = 'on';
+ALTER SYSTEM SET archive_command =
+  'test ! -f /archive/%f && cp %p /archive/%f';
+-- restart, then take a base backup:
+pg_basebackup -D /backups/base -Ft -z -P --checkpoint=fast
+-- ⚠ Base backup + ALL WAL since = every moment in between. Without
+--   continuous archiving, PITR is impossible — this must exist in
+--   advance.
+
+-- ── VERIFY ARCHIVING IS ACTUALLY WORKING ────────────────────────────────
+SELECT archived_count, failed_count, last_failed_time, last_failed_wal
+FROM pg_stat_archiver;
+-- ⚠ A failing archive_command means WAL accumulates in pg_wal until the
+--   disk fills AND your PITR window is silently broken. Alert on
+--   failed_count and on pg_wal size — a broken backup you do not know
+--   about is worse than no backup.
+
+-- ── FIND THE EXACT MOMENT ───────────────────────────────────────────────
+-- From application logs, or by inspecting the WAL:
+pg_waldump /archive/0000000100003A0000007F | grep -i delete | head
+-- rmgr: Heap  len: 54  tx: 918442  lsn: 3A/7F2C1B08  desc: DELETE off 12
+-- You can target a time, an LSN, an xid, or a named restore point:
+SELECT pg_create_restore_point('before_migration');   -- ✓ do this BEFORE
+                                                      --   risky changes
+
+-- ── RESTORE ─────────────────────────────────────────────────────────────
+pg_ctl -D $PGDATA stop
+mv $PGDATA $PGDATA.broken            -- ⚠ KEEP IT. Do not delete
+                                     --   evidence during an incident.
+mkdir $PGDATA && tar -xf /backups/base/base.tar.gz -C $PGDATA
+
+cat > $PGDATA/postgresql.auto.conf &lt;&lt;'EOF'
+restore_command = 'cp /archive/%f %p'
+recovery_target_time = '2026-08-05 14:21:59+00'
+recovery_target_action = 'pause'      -- ✓ PAUSE, not promote
+EOF
+touch $PGDATA/recovery.signal
+pg_ctl -D $PGDATA start
+
+-- ── VERIFY BEFORE COMMITTING TO IT ──────────────────────────────────────
+--  LOG: starting point-in-time recovery to 2026-08-05 14:21:59+00
+--  LOG: redo done at 3A/7F2C1A90
+--  LOG: recovery stopping before commit of transaction 918442
+--  LOG: pause at recovery target
+SELECT count(*) FROM orders;         -- 4,182,003 ✓ the rows are back
+-- ✓ recovery_target_action = 'pause' lets you CHECK before making it
+--   permanent. If you overshot, adjust the target and restart the
+--   restore. Promoting immediately removes that option.
+SELECT pg_wal_replay_resume();       -- only once satisfied
+
+-- ── AFTERWARDS ──────────────────────────────────────────────────────────
+-- 1. A new TIMELINE starts. Archive it separately; do not overwrite the
+--    old one, and understand that replicas must be rebuilt or rewound
+--    (pg_rewind) to follow it.
+-- 2. Take a fresh base backup immediately.
+-- 3. The RTO here is dominated by restoring the base backup and
+--    replaying WAL — potentially hours on a large database. Measure it,
+--    do not assume it.
+
+-- ── THE POINT ───────────────────────────────────────────────────────────
+-- This is what makes a replica not a backup. Replication copies the
+-- mistake faithfully and instantly; PITR is the only thing that rewinds
+-- it. And the restore MUST be rehearsed — an untested backup is a
+-- hypothesis, and incidents are a poor time to test hypotheses.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Diagnose <code>pg_wal</code> growing without bound.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYMPTOMS: pg_wal is 840GB and rising. max_wal_size is 4GB. Disk 94%
+-- full. If it reaches 100%, the database STOPS — this is urgent.
+
+-- ── WAL IS RETAINED FOR EXACTLY FOUR REASONS. CHECK ALL FOUR. ───────────
+
+-- 1. A REPLICATION SLOT holding it (by far the most common)
+SELECT slot_name, slot_type, active, active_pid,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))
+       AS retained
+FROM pg_replication_slots ORDER BY 5 DESC;
+--  slot_name        | active | retained
+--  debezium_cdc     | f      | 812 GB     ← FOUND IT
+--  replica_2        | t      | 12 MB
+-- ⚠ An INACTIVE slot retains WAL FOREVER. A Debezium connector was
+--   decommissioned three weeks ago and nobody dropped its slot.
+--   It is also holding back the vacuum horizon, so the database has
+--   been bloating for three weeks as a second symptom.
+
+-- 2. A FAILING archive_command
+SELECT archived_count, failed_count, last_failed_time, last_failed_wal
+FROM pg_stat_archiver;
+-- Non-zero failed_count with a recent timestamp → WAL cannot be
+-- archived, so it cannot be recycled. (Common causes: the archive disk
+-- is full, credentials expired, the destination host is unreachable.)
+
+-- 3. wal_keep_size set too high
+SHOW wal_keep_size;
+
+-- 4. Checkpoints not completing
+SELECT checkpoints_timed, checkpoints_req FROM pg_stat_bgwriter;
+SELECT now() - pg_stat_get_bgwriter_stat_reset_time();
+
+-- ── IMMEDIATE ACTION (disk at 94% — minutes matter) ─────────────────────
+-- ⚠ NEVER delete files from pg_wal by hand. That destroys the ability to
+--   recover and can render the cluster unstartable. It is the single
+--   most damaging "obvious" fix in this situation.
+-- ✓ Drop the abandoned slot — this releases the WAL immediately:
+SELECT pg_drop_replication_slot('debezium_cdc');
+CHECKPOINT;         -- lets the recycling actually happen
+SELECT pg_size_pretty(sum(size)) FROM pg_ls_waldir();   -- 840GB → 3.2GB
+
+-- ⚠ BEFORE DROPPING, CONFIRM IT IS REALLY DEAD. Dropping a slot that a
+--   consumer still needs means that consumer can never resume — it will
+--   require a full resync. Check active_pid, ask the owning team, and
+--   check whether the downstream system is still running.
+
+-- ── THE SECOND SYMPTOM YOU WILL FIND ────────────────────────────────────
+SELECT relname, n_dead_tup FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC LIMIT 5;
+-- Enormous. The slot held back the vacuum horizon for three weeks, so
+-- dead tuples accumulated database-wide (lesson 2). After dropping the
+-- slot, vacuum can finally reclaim — but the FILES stay large:
+--   pg_repack -t the_worst_tables
+
+-- ── PREVENT THE RECURRENCE ──────────────────────────────────────────────
+ALTER SYSTEM SET max_slot_wal_keep_size = '100GB';
+-- ✓ PG13+. A slot exceeding this is INVALIDATED rather than being
+--   allowed to fill the disk. The consumer must resync — bad, but far
+--   better than an outage. This one setting prevents the entire class.
+-- Alerts worth having:
+--   • inactive replication slots (any, immediately)
+--   • retained WAL per slot > 10GB
+--   • pg_stat_archiver.failed_count > 0
+--   • pg_wal size > 2 × max_wal_size
+--   • free disk < 25%
+
+-- ── THE PROCESS FIX ─────────────────────────────────────────────────────
+-- Replication slots are created by tools and forgotten by humans. Slot
+-- creation should be part of a service's lifecycle, with teardown in the
+-- same runbook as setup. This failure is organisational as much as
+-- technical, and max_slot_wal_keep_size is the guardrail that makes the
+-- organisational failure survivable.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design a durability and recovery strategy from stated objectives.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- BUSINESS REQUIREMENTS (get these in writing FIRST):
+--   payments:     RPO 0,     RTO 5 min
+--   app data:     RPO 1 min, RTO 30 min
+--   analytics:    RPO 1 hour, RTO 4 hours
+--   Regulatory: 7-year retention, restorable to any day.
+--   Budget: real, but not unlimited.
+
+-- ── STEP 1: TRANSLATE RPO INTO CONFIGURATION ────────────────────────────
+-- RPO 0 means a commit cannot be acknowledged until it exists somewhere
+-- that survives losing the primary. That is synchronous replication —
+-- there is no other mechanism.
+ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (replica_a, replica_b)';
+-- ⚠ QUORUM, not a single name. 'FIRST 1 (replica_a)' means replica_a
+--   going down BLOCKS ALL WRITES — turning a redundancy feature into a
+--   single point of failure. This is a genuinely common mistake.
+-- Then apply it only where it is needed:
+--   payments:    SET LOCAL synchronous_commit = remote_apply;
+--   app data:    default (on) — local fsync, async replica
+--   analytics:   SET LOCAL synchronous_commit = off;
+-- ✓ Per-transaction durability means the 99% of volume that tolerates
+--   a small window does not pay the round trip that the 1% requires.
+
+-- ── STEP 2: TRANSLATE RTO INTO ARCHITECTURE ─────────────────────────────
+-- RTO 5 min RULES OUT restore-from-backup: a multi-terabyte restore plus
+-- WAL replay is hours. 5 minutes means FAILOVER to a warm standby.
+--   • Patroni (or RDS Multi-AZ) for automated promotion
+--   • health checks + a VIP or a connection-router update so clients
+--     find the new primary without a deploy
+--   • TEST IT MONTHLY. An untested failover is a hypothesis.
+-- RTO 30 min for app data is the same failover; RTO 4 hours for
+-- analytics permits a restore.
+
+-- ── STEP 3: CHECKPOINT TUNING IS AN RTO DECISION ────────────────────────
+-- Crash recovery replays WAL since the last checkpoint (exercise 2).
+ALTER SYSTEM SET checkpoint_timeout = '10min';
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+ALTER SYSTEM SET max_wal_size = '16GB';
+-- 10 minutes bounds single-node recovery to a few minutes while keeping
+-- full-page-write volume moderate. If recovery must be faster, shorten
+-- it and accept more WAL — but note that with failover as the primary
+-- RTO mechanism, crash recovery time matters less than people assume.
+
+-- ── STEP 4: THE 7-YEAR REQUIREMENT ──────────────────────────────────────
+-- Continuous WAL archiving cannot be the whole answer — 7 years of WAL
+-- is unaffordable and replaying it would take weeks.
+--   • pgBackRest or WAL-G to object storage
+--   • full backup weekly, incremental daily, WAL continuously
+--   • retain 30 days at full PITR granularity (any second)
+--   • beyond 30 days: monthly fulls only (any DAY, per the requirement)
+--   • lifecycle to cold storage after 90 days
+-- ⚠ Verify RESTORABILITY, not just backup success. pgBackRest's
+--   `check`, plus an automated weekly restore into a scratch instance
+--   with a row-count and checksum comparison. A backup that has never
+--   been restored is a hypothesis.
+
+-- ── STEP 5: NON-NEGOTIABLES ─────────────────────────────────────────────
+fsync = on                  -- corruption risk, not loss risk
+full_page_writes = on       -- torn pages; unless the storage guarantees
+                            -- atomic 8KB writes AND you have verified it
+data_checksums = on         -- ⚠ initdb-time only. Detects silent
+                            -- corruption from failing hardware. Cannot
+                            -- be added later without a rebuild, so it
+                            -- must be decided at cluster creation.
+
+-- ── STEP 6: MONITORING (the part that fails in practice) ────────────────
+--   replication lag in bytes AND seconds, per replica
+--   synchronous standby availability  ← writes block if quorum is lost
+--   pg_stat_archiver.failed_count
+--   inactive replication slots + retained WAL
+--   pg_wal size vs max_wal_size
+--   last successful backup age, last successful RESTORE TEST age
+--   checkpoint frequency (timed vs requested)
+
+-- ── STEP 7: WRITE DOWN WHAT YOU ACTUALLY DELIVERED ──────────────────────
+--   payments:  RPO 0 (sync quorum). RTO ~2 min (automated failover).
+--   app data:  RPO ~2s typical, up to 30s under peak lag. RTO ~2 min.
+--   analytics: RPO ~600ms local; RTO 4h via restore.
+--   PITR: any second within 30 days; any day within 7 years.
+-- ⚠ Note app data's RPO is stated as a RANGE, because async lag varies.
+--   Promising "1 minute" without measuring peak lag is how these
+--   commitments get quietly broken. Publish the measured numbers, get
+--   the business to confirm them, and re-measure after traffic growth —
+--   RPO and RTO are product decisions that engineers must surface, not
+--   choose silently.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Two rules are the whole theory: write-ahead constrains when pages may be written, force-at-commit constrains when a commit may return.</li>
+        <li>One sequential fsync of a small log record makes many scattered page changes durable — random work converted into sequential work.</li>
+        <li>The LSN stamped in every page enforces the write-ahead rule, makes redo idempotent, and measures replication lag — one number, three jobs.</li>
+        <li>ARIES redoes <em>everything</em> including uncommitted work, because repeating history gives undo a known state to work against.</li>
+        <li>Compensation log records make undo resumable, which matters because the machine can crash during recovery.</li>
+        <li>PostgreSQL needs no undo pass — MVCC makes uncommitted versions invisible — and pays with bloat instead of undo chains.</li>
+        <li>Torn pages cannot be repaired by redo, which is why full-page writes exist; they often dominate WAL volume and shrink with longer checkpoint intervals.</li>
+        <li><code>write()</code> returning is not durability, and <code>fsync</code> must also flush the device's own volatile cache — hardware has lied about this.</li>
+        <li>Group commit makes throughput largely independent of fsync latency under concurrency, so single-client benchmarks badly understate capacity.</li>
+        <li>The same log yields recovery, replication, point-in-time restore and CDC — and an abandoned replication slot can fill the disk and block vacuum simultaneously.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="buffer-pool.html">← Buffer Pool &amp; Page Cache</a>
+      <a href="mvcc.html">MVCC &amp; Snapshot Isolation →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
