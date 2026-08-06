@@ -10,7 +10,7 @@
 
 <header class="site-header">
   <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
-  <nav><a href="index.html">← SQL Track</a><a href="quiz.html">Quizzes</a></nav>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
 </header>
 
 <div class="tutorial-layout">
@@ -18,112 +18,880 @@
 
   <main class="content">
     <h1>Query Optimization <span class="level-badge level-ultra">Advanced</span></h1>
-    <p>Slow database queries are the #1 cause of slow applications. The optimization skill is a
-       repeatable workflow — find the slow queries, read their plans, apply the right fix — plus a
-       catalogue of the fixes that solve 95% of real cases. This lesson is that catalogue.</p>
+    <p><strong>What you'll master:</strong> a measurement-first workflow that finds the query actually
+       costing you time rather than the one that looks slowest, why <code>pg_stat_statements</code> ranked by
+       <em>total</em> time beats ranked by mean, how the planner's cost model works well enough to predict
+       when it will go wrong, the rewrites that unlock plans — sargability, decorrelation, pre-aggregation
+       before joining, <code>EXISTS</code> over <code>IN</code>, keyset pagination — the N+1 problem that
+       makes a database look innocent while an endpoint dies, when to stop optimising and cache or
+       materialise instead, how to make <code>COUNT(*)</code> not be the slowest thing on the page, tuning
+       <code>work_mem</code> and <code>random_page_cost</code> with evidence, and the guardrails that stop
+       one bad query from taking a fleet down. Prerequisites:
+       <a href="indexes.html">Indexes &amp; Query Plans</a> — this lesson assumes you can read
+       <code>EXPLAIN</code> output. Examples are PostgreSQL.</p>
 
-    <h2>The Workflow</h2>
-    <pre>1. FIND the slow queries — don't guess:
-   Postgres: pg_stat_statements (total/mean time per query shape), slow-query log
-   APM traces (which endpoint → which query)
-2. EXPLAIN ANALYZE the worst offender (indexes lesson: Seq Scans, estimate gaps, sorts)
-3. Apply the matching fix (below); re-measure. One change at a time.
-4. Guard: statement_timeout so a bad query can't hold the fleet hostage.</pre>
+    <h2>Part 1 — Measure First: Finding the Query That Matters</h2>
+    <pre>-- ── THE RULE THAT SAVES THE MOST TIME ───────────────────────────────────
+-- The slowest query is rarely the most expensive one. A 2-second report
+-- run twice a day costs 4 seconds. A 12ms query run 40,000 times a
+-- minute costs 8 minutes of database time per minute — it needs eight
+-- cores just to stand still. Optimise TOTAL time, not per-call time.
 
-    <h2>The Fix Catalogue</h2>
-    <table class="tbl">
-      <tr><th>Symptom in the plan / app</th><th>Fix</th></tr>
-      <tr><td>Seq Scan on a big table with a selective filter</td><td>Add the matching (composite) index; check for functions/casts defeating it</td></tr>
-      <tr><td>Many fast identical queries (app slow, DB "fine")</td><td>The N+1 problem — JOIN / IN-batch / eager fetch (joins lesson)</td></tr>
-      <tr><td>SELECT * fetching wide rows</td><td>Select needed columns; enables index-only scans</td></tr>
-      <tr><td>Big OFFSET pagination</td><td>Keyset pagination (aggregates lesson)</td></tr>
-      <tr><td>Sort node dominating time</td><td>Index matching the ORDER BY; smaller LIMIT windows</td></tr>
-      <tr><td>Estimate ≠ actual rows (plan chosen badly)</td><td>ANALYZE the table; adjust statistics targets</td></tr>
-      <tr><td>Repeated identical expensive query</td><td>Cache the result (app/Redis) — System Design caching lesson; or a materialized view</td></tr>
-      <tr><td>Huge IN (:ids) lists</td><td>JOIN a VALUES list / temp table; batch sizes</td></tr>
-      <tr><td>Slow writes on a heavily-indexed table</td><td>Drop unused indexes (pg_stat_user_indexes)</td></tr>
-      <tr><td>Wildly slow COUNT(*) on big tables</td><td>Approximate (pg_class.reltuples), counter cache, or accept the cost intentionally</td></tr>
-    </table>
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;   -- also needs
+-- shared_preload_libraries = 'pg_stat_statements' and a restart.
 
-    <h2>Rewrites That Unlock Plans</h2>
-    <pre>-- Sargable predicates (Search ARGument ABLE — can use an index):
-WHERE created_at >= '2026-01-01' AND created_at < '2026-02-01'  -- ✅
-WHERE DATE(created_at) = '2026-01-15'                            -- ❌ function on column
-WHERE score > 90                                                 -- ✅  (not score+10 > 100)
+SELECT substr(query, 1, 70) AS query,
+       calls,
+       round(total_exec_time::numeric, 1)          AS total_ms,
+       round(mean_exec_time::numeric, 2)           AS mean_ms,
+       round(100 * total_exec_time /
+             sum(total_exec_time) OVER (), 1)      AS pct,
+       rows / GREATEST(calls, 1)                   AS rows_per_call
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 15;
 
--- EXISTS instead of IN for big correlated sets; NOT EXISTS instead of NOT IN (NULL trap):
-SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+--  query                          | calls  | total_ms | mean_ms | pct
+--  SELECT * FROM orders WHERE ... | 412088 | 486221.0 |    1.18 | 41.2  ★
+--  SELECT ... JOIN users ...      |    204 | 198441.0 |  972.75 | 16.8
+--  UPDATE sessions SET last_seen  | 891002 |  91223.0 |    0.10 |  7.7  ★
+--
+-- ★ Neither of the two biggest costs is a "slow query". The top one
+--   averages 1.18ms — it would never appear in a slow-query log — and it
+--   is 41% of all database time. This table is why you measure.
 
--- Pre-aggregate BEFORE joining (avoid fan-out, shrink the join input):
-WITH order_totals AS (SELECT user_id, SUM(total) t FROM orders GROUP BY user_id)
-SELECT u.name, ot.t FROM users u JOIN order_totals ot ON ot.user_id = u.id;
+-- ── THE CACHE-HIT-RATE CHECK (30 seconds, often decisive) ───────────────
+SELECT sum(blks_hit)*100 / NULLIF(sum(blks_hit+blks_read),0) AS hit_pct
+FROM pg_stat_database WHERE datname = current_database();
+-- Below ~95% on an OLTP database means the working set does not fit in
+-- memory. No amount of query rewriting fixes that; more RAM or less data
+-- does. Check this BEFORE spending a day on a plan.
 
--- UNION ALL (no dedup) over UNION when duplicates are impossible/irrelevant.</pre>
+-- ── WHAT TO RECORD BEFORE CHANGING ANYTHING ─────────────────────────────
+SELECT pg_stat_statements_reset();       -- reset, then measure a window
+-- Capture: total_exec_time, calls, the plan, and the endpoint's p99.
+-- Without a baseline you cannot tell improvement from natural variation,
+-- and you will "fix" things that were never broken.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Optimising by intuition</strong>
+        <pre>"The dashboard feels slow —
+ it must be the big JOIN."
+→ two days rewriting a query
+  that is 3% of database time.
+→ endpoint unchanged.
+→ the real cost was 400k calls
+  of a 1ms query nobody looked
+  at.</pre></div>
+      <div><strong>✅ Optimising by measurement</strong>
+        <pre>pg_stat_statements ORDER BY
+  total_exec_time DESC
+→ top row is 41% of all DB time
+→ EXPLAIN it, fix it, re-measure
+→ 41% → 4%.
+One afternoon, and the number
+moved because you picked the
+right target.</pre></div>
+    </div>
 
-    <h2>Materialized Views — Precomputed Reads</h2>
-    <pre>CREATE MATERIALIZED VIEW daily_revenue AS
-SELECT date_trunc('day', created_at) d, SUM(total) revenue FROM orders GROUP BY 1;
-REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;   -- on a schedule / after loads
--- A stored query RESULT (unlike a view, which re-runs). Perfect for dashboards/aggregates
--- that tolerate staleness — the denormalization trade (schema lesson) with built-in refresh.</pre>
+    <h2>Part 2 — How the Planner Decides (and How It Goes Wrong)</h2>
+    <pre>-- The planner enumerates plans, assigns each a COST in abstract units,
+-- and picks the cheapest. The cost model is arithmetic over statistics:
+--
+--   seq_page_cost          1.0    read one page sequentially
+--   random_page_cost       4.0    read one page randomly  ← see below
+--   cpu_tuple_cost         0.01   process one row
+--   cpu_index_tuple_cost   0.005  process one index entry
+--   cpu_operator_cost      0.0025 evaluate one operator
+--
+-- Everything follows from those numbers times ROW ESTIMATES. So there
+-- are exactly two ways a plan goes wrong:
+--   1. the estimates are wrong  (statistics problem — most common)
+--   2. the constants are wrong  (hardware mismatch)
 
-    <h2>Connection & Server-Side Levers</h2>
-    <pre>-- Connection pooling (app-side or PgBouncer): opening connections is expensive; too many
---   connections thrashes the DB. Pool sized to the DB's capacity (Node/Java lessons).
--- statement_timeout / lock_timeout: bound worst-case damage.
--- work_mem: sorts/hashes spill to disk when it's too small (EXPLAIN shows "external sort").
--- Read replicas for read-heavy scaling; caching layers before the DB (System Design track).</pre>
+-- ── PROBLEM 1: WRONG ESTIMATES ──────────────────────────────────────────
+EXPLAIN ANALYZE SELECT ... ;
+--   rows=200 (estimated)  vs  rows=214882 (actual)   ← 1000× off
+-- The planner chose an optimal plan FOR 200 ROWS. It was not stupid, it
+-- was misinformed. Fixing the plan means fixing the information.
+ANALYZE orders;
+SELECT last_autoanalyze, n_mod_since_analyze
+FROM pg_stat_user_tables WHERE relname='orders';
+-- Classic trigger: a bulk load, after which autoanalyze has not run.
+-- Always ANALYZE at the end of a large import.
+
+-- ── CORRELATED COLUMNS: THE INDEPENDENCE ASSUMPTION ─────────────────────
+WHERE city='Paris' AND country='France'
+-- The planner multiplies selectivities as if independent, so it computes
+-- 0.001 × 0.01 = 0.00001 of the table. Every Paris row IS France, so the
+-- truth is 0.001 — a 100× underestimate, and a nested loop sized for 5
+-- rows that receives 50,000.
+CREATE STATISTICS city_country (dependencies, ndistinct)
+    ON city, country FROM addresses;
+ANALYZE addresses;
+-- This is THE fix for multi-column filters whose plans flip between fast
+-- and catastrophic, and it is rarely the first thing anyone tries.
+
+-- ── PROBLEM 2: WRONG CONSTANTS ──────────────────────────────────────────
+-- random_page_cost = 4.0 encodes a spinning disk: a random read costs 4×
+-- a sequential one. On SSD or NVMe the true ratio is closer to 1.1-1.5.
+-- Left at 4.0, the planner systematically OVER-charges index scans and
+-- picks sequential scans that are genuinely slower on your hardware.
+ALTER SYSTEM SET random_page_cost = 1.1;      -- SSD/NVMe
+ALTER SYSTEM SET effective_cache_size = '24GB';  -- ~75% of RAM; a HINT
+                                                 -- about available cache,
+                                                 -- allocates nothing
+-- These two settings fix more "the planner ignores my index" complaints
+-- than any query rewrite, and most installations never touch them.
+
+-- ── DIAGNOSTIC TOGGLES: NEVER A FIX ─────────────────────────────────────
+SET enable_seqscan = off;      -- costs seq scans absurdly high, does not
+                               -- disable them
+EXPLAIN ANALYZE ...;           -- is the alternative actually faster?
+RESET enable_seqscan;
+-- If the forced plan wins, that is EVIDENCE about estimates or costs —
+-- go fix those. Shipping the toggle hides the problem and breaks every
+-- other query in the session.</pre>
+
+    <h2>Part 3 — Rewrites That Unlock Plans</h2>
+    <pre>-- ── 1. SARGABILITY: KEEP THE COLUMN BARE ────────────────────────────────
+WHERE DATE(created_at) = '2026-01-15'              -- ✗ scan
+WHERE created_at &gt;= '2026-01-15'
+  AND created_at &lt;  '2026-01-16'                   -- ✓ index range
+-- Half-open also avoids the BETWEEN '...23:59:59' bug that silently
+-- drops the last second of the day.
+WHERE score + 10 &gt; 100        →   WHERE score &gt; 90
+WHERE lower(email) = :e       →   CREATE INDEX ON users (lower(email))
+
+-- ── 2. NOT IN WITH NULLS: THE SILENT WRONG ANSWER ───────────────────────
+SELECT * FROM users
+WHERE id NOT IN (SELECT user_id FROM orders);      -- ✗ ZERO ROWS if any
+                                                   --   user_id IS NULL
+-- `id NOT IN (1, 2, NULL)` is NOT TRUE for every id — it is UNKNOWN,
+-- because id might equal the NULL. This is a CORRECTNESS bug that looks
+-- like a performance bug, and it is the most dangerous item in this
+-- lesson.
+SELECT * FROM users u WHERE NOT EXISTS (           -- ✓ correct AND
+    SELECT 1 FROM orders o WHERE o.user_id = u.id);--   usually faster
+--   (an anti-join; see the JOINs lesson)
+
+-- ── 3. PRE-AGGREGATE BEFORE JOINING ─────────────────────────────────────
+-- ✗ Join first, aggregate after: the join multiplies rows, then you
+--   collapse them. And any second aggregate is now WRONG (fan-out).
+SELECT u.name, count(o.id), count(DISTINCT p.id)
+FROM users u JOIN orders o ON o.user_id=u.id
+             JOIN payments p ON p.user_id=u.id
+GROUP BY u.id;              -- count(o.id) is multiplied by payments!
+
+-- ✓ Aggregate each side to one row per user, THEN join:
+WITH o AS (SELECT user_id, count(*) n FROM orders   GROUP BY 1),
+     p AS (SELECT user_id, count(*) n FROM payments GROUP BY 1)
+SELECT u.name, o.n, p.n
+FROM users u LEFT JOIN o USING (user_id) LEFT JOIN p USING (user_id);
+-- Correct, and it shrinks the join inputs by orders of magnitude.
+
+-- ── 4. LATERAL FOR TOP-N-PER-GROUP ──────────────────────────────────────
+-- "3 most recent orders per user" via window function ranks EVERYTHING
+-- then discards 99%. LATERAL stops after 3 per user, using the index:
+SELECT u.id, o.*
+FROM users u
+CROSS JOIN LATERAL (
+    SELECT * FROM orders WHERE user_id = u.id
+    ORDER BY created_at DESC LIMIT 3) o;
+-- Wins decisively when the per-group limit is small and indexed.
+
+-- ── 5. KEYSET PAGINATION ────────────────────────────────────────────────
+SELECT * FROM orders ORDER BY id LIMIT 20 OFFSET 100000;   -- ✗ reads and
+                                                           -- discards
+                                                           -- 100,000 rows
+SELECT * FROM orders WHERE id &gt; :last_id ORDER BY id LIMIT 20;  -- ✓ O(1)
+-- OFFSET cost grows linearly with page number: page 1 is instant, page
+-- 5000 times out. Keyset is constant. The trade is no random page
+-- access — which almost no user actually needs.
+
+-- ── 6. UNION ALL WHEN DUPLICATES ARE IMPOSSIBLE ─────────────────────────
+SELECT ... UNION SELECT ...        -- sorts/hashes EVERYTHING to dedupe
+SELECT ... UNION ALL SELECT ...    -- ✓ concatenates; free
+
+-- ── 7. LET THE DATABASE FILTER, NOT THE APPLICATION ─────────────────────
+rows = db.query("SELECT * FROM orders")      -- ✗ 4M rows over the wire
+paid = [r for r in rows if r.status=='paid'] --   then discard 99%
+-- Every predicate you can push into SQL saves network, memory and time.
+-- The corollary: SELECT the columns you need. `SELECT *` on a wide table
+-- prevents index-only scans and drags TOAST data across the network.</pre>
+
+    <h2>Part 4 — N+1: When the Database Is Innocent</h2>
+    <pre>-- ── THE SHAPE ───────────────────────────────────────────────────────────
+users = db.query("SELECT * FROM users LIMIT 100")        -- 1 query
+for u in users:
+    u.orders = db.query(
+        "SELECT * FROM orders WHERE user_id = ?", u.id)  -- 100 queries
+-- Every query is 0.4ms and perfectly indexed. The database dashboard
+-- shows nothing wrong. The endpoint takes 900ms, because 101 round
+-- trips × ~8ms of network and driver overhead is the entire budget.
+--
+-- ⚠ THIS IS THE MOST COMMON PERFORMANCE BUG IN APPLICATIONS, and it is
+--   invisible in every database-side metric except query COUNT.
+
+-- ── DETECTION ───────────────────────────────────────────────────────────
+-- • APM/tracing: queries per request. A number that scales with the size
+--   of the result set is an N+1, always.
+-- • pg_stat_statements: a query shape with a huge `calls` and a tiny
+--   `mean_exec_time` — the ★ rows from Part 1.
+-- • In tests: assert a query-count budget per endpoint. This is the only
+--   method that catches it BEFORE production.
+
+-- ── FIX 1: ONE ROUND TRIP WITH ANY(...) ─────────────────────────────────
+SELECT * FROM orders WHERE user_id = ANY(:user_ids);
+-- Preferred over a huge IN (:a, :b, ...) list: one bound parameter, one
+-- prepared plan, no plan-cache explosion from thousands of distinct
+-- statement shapes.
+
+-- ── FIX 2: JOIN AND FLATTEN ─────────────────────────────────────────────
+SELECT u.*, o.* FROM users u LEFT JOIN orders o ON o.user_id = u.id
+WHERE u.id = ANY(:ids);
+-- One query, but user columns repeat per order row. Fine for narrow
+-- rows; wasteful for wide ones — and it is a fan-out, so any aggregate
+-- in the same query will be wrong.
+
+-- ── FIX 3: AGGREGATE INTO JSON (usually the best of both) ───────────────
+SELECT u.*,
+       COALESCE(json_agg(o.* ORDER BY o.created_at DESC)
+                FILTER (WHERE o.id IS NOT NULL), '[]') AS orders
+FROM users u LEFT JOIN orders o ON o.user_id = u.id
+WHERE u.id = ANY(:ids)
+GROUP BY u.id;
+-- One round trip, no repeated parent columns, nested shape ready for the
+-- API response. The FILTER is essential: without it a user with no
+-- orders gets [null] instead of [].
+
+-- ── ORM SPECIFICS ───────────────────────────────────────────────────────
+-- Django    .select_related() = JOIN (to-one)
+--           .prefetch_related() = second query + ANY() (to-many)
+-- Rails     .includes(:orders)
+-- SQLAlchemy selectinload() / joinedload()
+-- Hibernate @BatchSize, JOIN FETCH — and beware LazyInitializationException
+-- ⚠ Lazy loading is the DEFAULT in most ORMs, so N+1 is the default
+--   behaviour you must actively opt out of. It never appears in code
+--   review as a line that looks wrong.</pre>
+
+    <h2>Part 5 — Stop Optimising: Cache, Materialise, Precompute</h2>
+    <pre>-- Some queries are irreducibly expensive. Ninety days of orders
+-- aggregated by region cannot be made fast by an index — the work is the
+-- work. The question stops being "how do I speed this up" and becomes
+-- "does this need to run now, and does it need to be exact?"
+
+-- ── THE STALENESS LADDER (pick the cheapest rung that is acceptable) ────
+-- 1. NOT AT ALL      remove the query. Does the page need this number?
+-- 2. MATERIALISED    a stored result, refreshed on a schedule
+-- 3. INCREMENTAL     a summary table maintained on write
+-- 4. CACHED          Redis/app cache with a TTL
+-- 5. ASYNC           compute off the request path, store the answer
+
+-- ── MATERIALISED VIEWS ──────────────────────────────────────────────────
+CREATE MATERIALIZED VIEW daily_revenue AS
+SELECT date_trunc('day', created_at) AS day,
+       region, sum(total_cents) AS revenue, count(*) AS orders
+FROM orders GROUP BY 1, 2;
+CREATE UNIQUE INDEX ON daily_revenue (day, region);   -- ⚠ REQUIRED for
+                                                      -- CONCURRENTLY
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;
+-- Without CONCURRENTLY the refresh takes an ACCESS EXCLUSIVE lock and
+-- readers BLOCK for its duration — a dashboard outage on every refresh.
+-- With it, readers keep using the old data until the swap.
+-- ⚠ A plain materialised view recomputes EVERYTHING. At some size the
+--   refresh itself becomes the problem, which is when you move to (3).
+
+-- ── INCREMENTAL SUMMARY TABLES ──────────────────────────────────────────
+INSERT INTO daily_revenue (day, region, revenue, orders)
+VALUES (current_date, :region, :cents, 1)
+ON CONFLICT (day, region) DO UPDATE
+SET revenue = daily_revenue.revenue + EXCLUDED.revenue,
+    orders  = daily_revenue.orders  + 1;
+-- O(1) per write instead of O(n) per refresh, and always fresh. Costs a
+-- little write latency and demands a reconciliation job, because any
+-- maintained aggregate WILL drift eventually:
+SELECT day, region, revenue FROM daily_revenue d
+WHERE revenue &lt;&gt; (SELECT sum(total_cents) FROM orders o
+                  WHERE date_trunc('day',o.created_at)=d.day
+                    AND o.region=d.region);
+-- A denormalisation without a drift check is a bug with a delay on it.
+
+-- ── COUNT(*): THE PERENNIAL ONE ─────────────────────────────────────────
+SELECT count(*) FROM orders;              -- reads EVERY row. MVCC means
+                                          -- visibility is per-row, so
+                                          -- there is no stored total.
+-- ✓ Good enough for "About 4,182,000 results":
+SELECT reltuples::bigint FROM pg_class WHERE relname='orders';
+-- ✓ Exact for a filtered subset, if indexed:
+SELECT count(*) FROM orders WHERE status='pending';  -- index-only scan
+-- ✓ For pagination, answer the question the UI actually has:
+SELECT EXISTS (SELECT 1 FROM orders
+               WHERE ... OFFSET :page_size LIMIT 1);  -- "is there a next
+                                                      --  page?" — O(1)
+-- The senior move: nobody reads the digits past the third. "Exact,
+-- unbounded, real-time" is three requirements where usually one was
+-- meant.</pre>
+
+    <h2>Part 6 — Server Levers and Guardrails</h2>
+    <pre>-- ── work_mem: THE ONE THAT SILENTLY SPILLS ──────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT ... ORDER BY ...;
+--   Sort Method: external merge  Disk: 84320kB      ← spilled
+--   Sort Method: quicksort  Memory: 2140kB          ← in memory ✓
+--   Buckets: 1024  Batches: 8  Memory Usage: 4096kB ← hash spilled
+SET work_mem = '64MB';        -- session-scoped, for one heavy query
+-- ⚠ work_mem is PER SORT/HASH NODE PER CONNECTION, not per server. A
+--   complex query with five such nodes at 100 connections can commit
+--   500 × work_mem. Setting it globally to 1GB is how people OOM their
+--   database. Raise it for the specific session or role that needs it.
+ALTER ROLE reporting SET work_mem = '256MB';   -- ✓ targeted
+
+-- ── OTHER LEVERS WORTH KNOWING ──────────────────────────────────────────
+-- shared_buffers        ~25% of RAM; the DB's own page cache
+-- effective_cache_size  ~75% of RAM; a planner HINT, allocates nothing
+-- max_parallel_workers_per_gather   parallel scans for big aggregates
+-- default_statistics_target  100 → 1000 for skewed columns
+-- jit = off             JIT can add 100ms+ to short OLTP queries; it is
+--                       a win for long analytical ones only
+
+-- ── CONNECTIONS: MORE IS SLOWER ─────────────────────────────────────────
+-- Every connection is a process with its own memory. Past roughly
+-- (cores × 2) + effective_spindles, adding connections REDUCES
+-- throughput through context switching and lock contention.
+-- 500 app threads → PgBouncer in transaction mode → 40 real connections.
+-- ⚠ Transaction-mode pooling breaks session state: session advisory
+--   locks, temp tables, prepared statements, SET commands.
+
+-- ── GUARDRAILS: NON-NEGOTIABLE IN PRODUCTION ────────────────────────────
+ALTER DATABASE app SET statement_timeout = '30s';
+ALTER DATABASE app SET lock_timeout = '5s';
+ALTER DATABASE app SET idle_in_transaction_session_timeout = '60s';
+ALTER ROLE reporting SET statement_timeout = '10min';   -- per-role
+-- Without these, ONE pathological query holds a connection, blocks
+-- vacuum, and can queue every other query behind it. Timeouts convert an
+-- outage into a failed request.
+
+-- ── CATCHING SLOW QUERIES AUTOMATICALLY ─────────────────────────────────
+ALTER SYSTEM SET log_min_duration_statement = '1s';
+CREATE EXTENSION auto_explain;      -- logs the PLAN of slow queries
+ALTER SYSTEM SET auto_explain.log_min_duration = '3s';
+ALTER SYSTEM SET auto_explain.log_analyze = on;
+-- The plan you need is the one from the moment it was slow, with the
+-- real parameters. Reproducing it later usually gives a different plan
+-- and a confusing afternoon.</pre>
+    <div class="note">🎯 <strong>The optimisation loop, in order.</strong> <strong>1.</strong> Measure —
+      <code>pg_stat_statements</code> by total time, plus queries-per-request from your APM.
+      <strong>2.</strong> Pick the biggest number, not the ugliest query. <strong>3.</strong>
+      <code>EXPLAIN (ANALYZE, BUFFERS)</code> and find the node that actually costs — multiply by
+      <code>loops</code>. <strong>4.</strong> Change <em>one</em> thing. <strong>5.</strong> Re-measure
+      against the baseline. <strong>6.</strong> Add a guardrail so it cannot silently regress. Steps 1 and 5
+      are the ones people skip, and they are the ones that make the difference between tuning and
+      guessing.</div>
 
     <h2>Common Mistakes</h2>
     <table class="tbl">
       <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
-      <tr><td>Optimizing without measuring</td><td>Effort on the wrong query</td><td>pg_stat_statements first — always</td></tr>
-      <tr><td>Fixing the query when it's N+1</td><td>DB looks fine; endpoint slow</td><td>Count queries per request in APM/logs</td></tr>
-      <tr><td>Non-sargable predicates</td><td>Indexes exist but unused</td><td>Rewrite: bare column on one side of the operator</td></tr>
-      <tr><td>COUNT(*) on every page load</td><td>Constant heavy scans</td><td>Cache/estimate counts</td></tr>
-      <tr><td>Caching without invalidation strategy</td><td>Stale data bugs</td><td>TTLs + explicit invalidation (caching lesson)</td></tr>
-      <tr><td>One giant report query in the request path</td><td>Timeouts under load</td><td>Materialized view / async job (Node scaling lesson)</td></tr>
+      <tr><td>Optimising without measuring</td><td>Days spent on 3% of database time</td><td><code>pg_stat_statements</code> ordered by <code>total_exec_time</code></td></tr>
+      <tr><td>Ranking by mean instead of total</td><td>The 400k-call 1ms query never surfaces</td><td>Total time is what a core-second is spent on</td></tr>
+      <tr><td>Tuning SQL when it is N+1</td><td>Database healthy, endpoint slow</td><td>Count queries per request; batch or eager-load</td></tr>
+      <tr><td><code>NOT IN</code> against a nullable column</td><td>Zero rows returned, silently — a wrong answer</td><td><code>NOT EXISTS</code></td></tr>
+      <tr><td>Joining before aggregating</td><td>Inflated counts from fan-out; huge join inputs</td><td>Aggregate in CTEs, then join</td></tr>
+      <tr><td><code>OFFSET</code> pagination on deep pages</td><td>Page 1 instant, page 5000 times out</td><td>Keyset pagination</td></tr>
+      <tr><td><code>SELECT *</code> everywhere</td><td>No index-only scans; TOAST and network overhead</td><td>Select the columns you use</td></tr>
+      <tr><td>Global <code>work_mem</code> raised to fix one query</td><td>Out-of-memory under concurrency</td><td>Set it per session or per role</td></tr>
+      <tr><td><code>REFRESH MATERIALIZED VIEW</code> without <code>CONCURRENTLY</code></td><td>Dashboard blocks on every refresh</td><td>Add a unique index and use <code>CONCURRENTLY</code></td></tr>
+      <tr><td>No <code>statement_timeout</code></td><td>One query holds a connection and blocks vacuum for hours</td><td>Set timeouts at database and role level</td></tr>
+      <tr><td>Shipping <code>enable_seqscan = off</code></td><td>Every other query in that session gets a worse plan</td><td>Use it to diagnose; fix statistics or cost constants</td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1: An endpoint got slow this week. Walk your full diagnosis, DB included.</summary>
-      <p>Start at the endpoint: APM/trace shows time split (app vs DB) and the queries issued — first check
-         query COUNT per request (N+1 shows as many fast queries; fix with a join/batch). If it's one slow
-         query: pg_stat_statements to confirm its cost, then EXPLAIN ANALYZE — hunt Seq Scans (missing/
-         defeated index), estimate-vs-actual gaps (run ANALYZE), sort spills (work_mem/index). Check what
-         changed this week: data growth crossing a plan threshold, a dropped index, stale stats after a
-         bulk load. Fix one variable, re-measure, and add a regression guard (statement_timeout + the query
-         in a dashboard).</p></details>
-    <details class="solution"><summary>Q2: What makes a predicate sargable, and why does it matter?</summary>
-      <p>Sargable = the predicate can use an index seek: the bare column on one side of a comparison with a
-         constant/parameter range — email = :x, created_at >= :from, name LIKE 'a%'. Wrapping the column in
-         a function (LOWER(email)), arithmetic (score+10 > 100), casts, or a leading wildcard forces the
-         engine to evaluate the expression per row — full scan, index useless. Fixes: move computation to
-         the other side (score > 90), rewrite date functions as ranges, or create an expression index
-         matching the function. One line of predicate style is often the entire difference between 5ms and
-         5s.</p></details>
-    <details class="solution"><summary>Q3: When do you cache/materialize instead of optimizing the query?</summary>
-      <p>When the query is inherently expensive (large aggregates, multi-way joins) AND the result tolerates
-         staleness. Options by freshness need: app/Redis cache with TTL (seconds-minutes; cheapest),
-         materialized view refreshed on schedule (dashboard aggregates), counter-cache/denormalized columns
-         maintained on write (always-fresh reads, write cost), or moving the work off the request path
-         entirely (async job → stored result). The discipline: define acceptable staleness first, pick the
-         cheapest layer that meets it, and design invalidation explicitly — cache bugs come from skipping
-         that step. This is the System Design caching lesson applied to SQL.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> An endpoint is slow. Walk through your diagnosis.</summary>
+      <p>I start above the database, because the first question is whether the database is even involved. A
+         trace of the request shows the split between application time and database time, and it shows how
+         many queries ran. If there are dozens or hundreds of small queries, it is an N+1 and no individual
+         query needs tuning — the fix is to batch or eager-load. That case is common enough that I check it
+         before anything else.</p>
+      <p>If it is one slow query, I confirm its real cost in <code>pg_stat_statements</code> — sorting by
+         total time, because a query's importance is calls multiplied by mean, not mean alone — and then run
+         <code>EXPLAIN (ANALYZE, BUFFERS)</code>. In the plan I look for a sequential scan on a large table
+         with a selective filter, a large gap between estimated and actual rows, a sort or hash that spilled
+         to disk, and any node whose per-loop time multiplied by its loop count dominates the total.</p>
+      <p>Then I ask what changed, because "it got slow this week" is a strong hint: data crossing a threshold
+         where the planner flips strategy, a bulk load that left statistics stale, an index dropped by a
+         migration, or a new caller increasing the call rate. I fix one thing, re-measure against the
+         baseline, and add a guardrail — a statement timeout and the query on a dashboard — so a regression
+         is caught by monitoring rather than by a user.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What makes a predicate sargable and why does it matter?</summary>
+      <p>Sargable means the predicate can be satisfied by descending an index rather than by testing every
+         row. In practice it means the indexed column appears bare on one side of the comparison, with a
+         constant or parameter on the other: <code>email = :x</code>, <code>created_at &gt;= :from</code>, or
+         <code>name LIKE 'a%'</code>. The reason is simply that the index is sorted by the column's stored
+         value, so the engine can find a contiguous range of entries.</p>
+      <p>Wrapping the column in anything hides that stored value. <code>DATE(created_at) = '2026-01-15'</code>
+         forces the function to be evaluated per row, so the index is unusable even though it exists;
+         <code>score + 10 &gt; 100</code> has the same problem; and a cast on the column side does too, which
+         is especially nasty because it can be introduced by a driver binding the wrong parameter type
+         without any visible change to the SQL. Leading wildcards fail for a related reason — a sorted
+         structure can find things by prefix but not by suffix.</p>
+      <p>The fixes are to move the computation to the constant side, rewrite date functions as half-open
+         ranges, or build an expression index matching the function exactly. It is worth internalising
+         because it is often the entire difference between five milliseconds and five seconds, and the query
+         looks perfectly reasonable either way.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> The database CPU is fine and every query is fast, but the endpoint takes a second. What is happening?</summary>
+      <p>That combination is close to diagnostic of an N+1 query pattern. The endpoint loads a collection and
+         then, for each item, issues another query to load a relation. Each of those is genuinely fast and
+         well indexed, so nothing in the database's own metrics looks wrong — no slow query log entries, low
+         CPU, healthy cache hit rate. But a hundred round trips, each paying network latency and driver and
+         connection-pool overhead, consumes the entire request budget in coordination rather than work.</p>
+      <p>I confirm it by counting queries per request in tracing, or by looking for a query shape in
+         <code>pg_stat_statements</code> with an enormous call count and a sub-millisecond mean. The fix is to
+         collapse the round trips: fetch the children in one query with <code>WHERE parent_id =
+         ANY(:ids)</code> and stitch them in memory, or join and flatten, or aggregate the children into JSON
+         so a single query returns the nested shape the API needs. In an ORM these are
+         <code>prefetch_related</code>, <code>includes</code>, or <code>selectinload</code>.</p>
+      <p>The important part is preventing recurrence, because lazy loading is the default in most ORMs — N+1
+         is what you get unless you actively opt out, and it never looks wrong in code review. So I add a
+         query-count assertion to the tests for that endpoint. That turns an invisible, gradually worsening
+         problem into a failing build the moment someone reintroduces it.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> When do you stop optimising a query and cache or materialise it instead?</summary>
+      <p>When the work is irreducible and the result tolerates staleness. If a query aggregates ninety days of
+         orders, there is no index that avoids reading ninety days of orders — the cost is inherent to the
+         question. At that point continuing to tune is effort against a floor, and the productive question
+         becomes whether the answer needs to be computed at request time and whether it needs to be exact.</p>
+      <p>I work down a ladder from cheapest to most complex. First, can the query be removed — does the page
+         genuinely need that number, or is it there because someone added it once? Then a materialised view
+         refreshed on a schedule, which suits dashboards where minutes of staleness are irrelevant; it must
+         have a unique index so the refresh can run <code>CONCURRENTLY</code>, or readers block on every
+         refresh. Then an incrementally maintained summary table updated on write, which is O(1) per write
+         instead of O(n) per refresh and is always fresh, at the cost of write latency and a reconciliation
+         job. Then a cache with a TTL, and finally moving the computation off the request path entirely into
+         a job that stores its result.</p>
+      <p>The discipline is to decide the acceptable staleness first and then pick the cheapest rung that
+         meets it, rather than reaching for Redis reflexively. And every maintained aggregate needs a drift
+         check, because it will eventually disagree with its source, and silent divergence is worse than a
+         slow query.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A query intermittently takes 30 seconds instead of 30 milliseconds, with no code changes. Explain.</summary>
+      <p>Intermittent with identical SQL means the plan is changing, or the data behind one parameter is
+         unlike the data behind the others. The most common cause is parameter skew combined with plan
+         caching. PostgreSQL plans a prepared statement using the actual values for the first several
+         executions, then may switch to a generic plan chosen without knowing the value. If most parameter
+         values match a few hundred rows and one tenant matches ten million, whichever plan gets cached is
+         catastrophic for one population or the other, and which one you get depends on execution order. I
+         would confirm by comparing plans across executions and test <code>plan_cache_mode =
+         force_custom_plan</code>, which re-plans every time at a small planning cost and is often correct for
+         skewed multi-tenant workloads.</p>
+      <p>The second candidate is statistics. Autoanalyze runs after a proportion of the table changes, so
+         after a bulk load there is a window where estimates are badly wrong and plans flip. Correlated
+         predicates cause the same instability, since the planner multiplies selectivities assuming
+         independence and can be off by orders of magnitude; extended statistics fix that. If the timing
+         correlates with a nightly import, that is the answer.</p>
+      <p>Then resource-dependent effects that are invisible in the SQL. A sort or hash that fits in
+         <code>work_mem</code> at low concurrency spills to disk when several run at once, turning an
+         in-memory operation into external merges. Cache state matters similarly: the same plan against a
+         cold buffer pool is dramatically slower, which shows up as high <code>read</code> versus
+         <code>hit</code> counts. And lock waits can masquerade as slow execution — a query blocked behind a
+         migration or a long transaction reports elapsed time that has nothing to do with its plan.</p>
+      <p>To diagnose it properly I need the plan from the slow moment rather than a reproduction, so
+         <code>auto_explain</code> with <code>log_analyze</code> above a threshold is the tool that turns this
+         from guesswork into evidence. Reproducing an intermittent problem by hand usually produces the fast
+         plan and a wasted afternoon.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> You inherit a system where every endpoint is slow. Where do you start and how do you prioritise?</summary>
+      <p>I resist the instinct to start fixing queries, because with everything slow the cause is usually
+         systemic rather than a set of individual bad queries. First I establish where time goes overall:
+         <code>pg_stat_statements</code> ordered by total execution time tells me how database time is
+         distributed, and it is normally extremely concentrated — a handful of statements accounting for most
+         of it. Alongside that I check the database-wide cache hit rate, connection count against core count,
+         and whether autovacuum is keeping up. A hit rate in the eighties, or four hundred connections on
+         eight cores, or tables with tens of millions of dead tuples each explain "everything is slow" in a
+         way that no query rewrite will.</p>
+      <p>Those systemic checks are also the cheapest wins. Connection pooling in front of an over-connected
+         database, <code>random_page_cost</code> corrected for SSDs, <code>effective_cache_size</code> set
+         sensibly, and vacuum catching up on bloated tables are configuration changes that can move every
+         endpoint at once. I would do those before touching application code, because they are reversible and
+         they change the baseline everything else is measured against.</p>
+      <p>Then I prioritise by total database time weighted by user impact, not by how bad each query looks.
+         The top few statements typically cover the majority of load, and a checkout path matters more than
+         an admin report with the same cost. I also look for the pattern-level problems that produce many
+         individual symptoms — N+1 loading across an ORM, <code>OFFSET</code> pagination everywhere,
+         <code>SELECT *</code> as a house style — because one fix at the pattern level beats fifty at the
+         query level.</p>
+      <p>Throughout, I add guardrails before optimisations: statement, lock, and idle-in-transaction timeouts
+         so one pathological query cannot hold the fleet hostage, and <code>auto_explain</code> so the next
+         slow query arrives with its plan attached. Finally I make the measurement permanent — top queries by
+         total time on a dashboard, query-count budgets in endpoint tests — so the system does not silently
+         drift back. Inheriting a slow system usually means nobody owned the numbers, and the durable fix is
+         that someone now does.</p></details>
 
-    <div class="exercise"><strong>🏋️ Practice:</strong> enable pg_stat_statements and find your top query by total time; make a non-sargable date filter, watch the Seq Scan, rewrite as a range; reproduce N+1 in a script (log query count), fix with one JOIN; build a materialized view for a daily aggregate and REFRESH it; set statement_timeout and watch a runaway query get killed.</div>
+    <h2>🏋️ Exercises</h2>
 
-    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li>Workflow: find (pg_stat_statements/APM) → EXPLAIN ANALYZE → one fix → re-measure; timeouts as guardrails.</li>
-      <li>The big four fixes: missing/defeated indexes, N+1 batching, sargable rewrites, keyset pagination.</li>
-      <li>Pre-aggregate before joins; EXISTS/NOT EXISTS; UNION ALL when dedup isn't needed.</li>
-      <li>Cache or materialize expensive tolerant-of-staleness reads — with explicit invalidation.</li>
-      <li>Pool connections, bound timeouts, size work_mem; replicas/caches before heroic query tuning.</li>
-    </ul></div>
+    <div class="exercise"><strong>1 (easy):</strong> Find the query actually costing the most, and prove intuition wrong.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+SELECT pg_stat_statements_reset();     -- clean window
+-- ...let a representative workload run...
+
+SELECT substr(query,1,60) AS q, calls,
+       round(total_exec_time::numeric)   AS total_ms,
+       round(mean_exec_time::numeric, 2) AS mean_ms,
+       round(100*total_exec_time/sum(total_exec_time) OVER (),1) AS pct
+FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;
+
+--  q                              | calls  | total_ms | mean_ms | pct
+--  SELECT * FROM sessions WHERE.. | 892104 |   214105 |    0.24 | 38.1
+--  SELECT ... monthly report ...  |     18 |    97200 | 5400.00 | 17.3
+--  UPDATE users SET last_seen ... | 741002 |    88920 |    0.12 | 15.8
+
+-- ── THE LESSON IN THREE ROWS ────────────────────────────────────────────
+-- Everyone complains about the report: 5.4 SECONDS per run. It is 17% of
+-- database time.
+-- Nobody has ever noticed the session lookup: 0.24ms. It is 38%.
+-- Halving the session query saves 19% of ALL database time. Making the
+-- report instant saves 17% — and it is far harder.
+--
+-- Sorting by mean_exec_time would have shown the report first and hidden
+-- the real cost entirely. Sort by TOTAL.
+
+-- ── THE CHEAPEST FIX FOR THE TOP ROW IS OFTEN "STOP CALLING IT" ─────────
+-- 892k calls suggests a session lookup on EVERY request, including
+-- static assets. Caching it for 60 seconds, or moving sessions out of
+-- Postgres, removes 38% of load without optimising anything.
+
+-- ── ALSO WORTH 30 SECONDS ───────────────────────────────────────────────
+SELECT sum(blks_hit)*100/NULLIF(sum(blks_hit+blks_read),0) AS hit_pct
+FROM pg_stat_database WHERE datname=current_database();
+-- Under ~95% on OLTP → the working set does not fit in RAM. Fix that
+-- before tuning any single query.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Make four non-sargable predicates sargable and measure each.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE INDEX ON orders (created_at);
+CREATE INDEX ON users (email);
+CREATE INDEX ON products (price_cents);
+
+-- ── 1. FUNCTION ON A DATE ───────────────────────────────────────────────
+EXPLAIN ANALYZE SELECT * FROM orders
+WHERE date_trunc('day', created_at) = DATE '2026-08-05';
+-- Seq Scan ... Rows Removed by Filter: 4,182,003   Time: 890ms
+EXPLAIN ANALYZE SELECT * FROM orders
+WHERE created_at &gt;= DATE '2026-08-05'
+  AND created_at &lt;  DATE '2026-08-06';
+-- Index Scan ... Time: 1.4ms                        ✓ 635×
+-- Half-open also fixes the BETWEEN '...23:59:59' bug, which drops any
+-- row in the final second — a correctness win alongside the speed one.
+
+-- ── 2. CASE-INSENSITIVE MATCH ───────────────────────────────────────────
+WHERE lower(email) = 'asha@example.com'          -- Seq Scan  412ms
+CREATE INDEX ON users (lower(email));            -- → 0.3ms
+-- Or use citext / a case-insensitive collation and stop repeating the
+-- function at every call site.
+
+-- ── 3. ARITHMETIC ───────────────────────────────────────────────────────
+WHERE price_cents / 100 &gt; 50      -- Seq Scan
+WHERE price_cents &gt; 5000          -- ✓ Index. Free; just algebra.
+
+-- ── 4. THE INVISIBLE ONE: A CAST ────────────────────────────────────────
+WHERE order_ref = 12345           -- order_ref is varchar
+-- MySQL coerces the COLUMN to numeric → index unusable, no warning.
+WHERE order_ref = '12345'         -- ✓
+-- Drivers introduce this without the SQL changing. When a plan makes no
+-- sense, check the bound parameter TYPES.
+
+-- ── AND THE ONE THAT IS NOT A REWRITE ───────────────────────────────────
+WHERE email LIKE '%@gmail.com'
+-- No rewrite exists: a sorted tree cannot search by suffix. This needs a
+-- different INDEX TYPE:
+CREATE EXTENSION pg_trgm;
+CREATE INDEX ON users USING gin (email gin_trgm_ops);
+-- Knowing which problems are rewrites and which need a different
+-- structure is the actual skill here.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce an N+1, fix it three ways, and compare.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── REPRODUCE ───────────────────────────────────────────────────────────
+users = query("SELECT * FROM users LIMIT 100")           #   1 query
+for u in users:
+    u.orders = query("SELECT * FROM orders WHERE user_id=%s", u.id)
+                                                          # 100 queries
+-- Total: 101 queries, 0.4ms each = 40ms of DATABASE time...
+-- ...and 912ms of WALL time. The other 870ms is round trips.
+-- Every database metric says the system is healthy.
+
+-- ── FIX 1: BATCH WITH ANY() ─────────────────────────────────────────────
+users  = query("SELECT * FROM users LIMIT 100")
+orders = query("SELECT * FROM orders WHERE user_id = ANY(%s)",
+               [u.id for u in users])
+by_user = defaultdict(list)
+for o in orders: by_user[o.user_id].append(o)
+for u in users:  u.orders = by_user[u.id]
+-- 2 queries, ~18ms. ✓ Simple, keeps the object shape.
+-- ANY(array) over IN (list): ONE bound parameter, so one cached plan
+-- rather than a new statement shape for every distinct list length.
+
+-- ── FIX 2: JOIN AND FLATTEN ─────────────────────────────────────────────
+SELECT u.id AS uid, u.name, o.* FROM users u
+LEFT JOIN orders o ON o.user_id = u.id WHERE u.id = ANY(%s);
+-- 1 query, ~14ms. User columns repeat per order row — irrelevant for
+-- narrow rows, wasteful for wide ones. And it is a fan-out: any
+-- aggregate in this query would be multiplied.
+
+-- ── FIX 3: AGGREGATE TO JSON ────────────────────────────────────────────
+SELECT u.*,
+       COALESCE(json_agg(o.* ORDER BY o.created_at DESC)
+                FILTER (WHERE o.id IS NOT NULL), '[]') AS orders
+FROM users u LEFT JOIN orders o ON o.user_id=u.id
+WHERE u.id = ANY(%s)
+GROUP BY u.id;
+-- 1 query, ~16ms, nested shape ready for the API response.
+-- ⚠ The FILTER is required: without it a user with no orders gets
+--   [null], and that null reaches your JSON response.
+
+-- ── PREVENT THE REGRESSION (the part that matters) ──────────────────────
+def test_user_list_query_budget(django_assert_num_queries):
+    with django_assert_num_queries(2):
+        client.get('/api/users')
+-- N+1 comes back the moment someone adds a field to a serialiser, and it
+-- degrades gradually so nobody notices the day it happens. A query-count
+-- assertion turns it into a failing build. Fixing the instance without
+-- adding the test means fixing it again next quarter.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Optimise a dashboard query that joins before aggregating.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── ✗ THE ORIGINAL (8.4 seconds, and WRONG) ─────────────────────────────
+SELECT u.id, u.name,
+       count(o.id)          AS orders,
+       count(p.id)          AS payments,
+       sum(o.total_cents)   AS revenue
+FROM users u
+LEFT JOIN orders   o ON o.user_id = u.id
+LEFT JOIN payments p ON p.user_id = u.id
+WHERE u.created_at &gt; now() - interval '90 days'
+GROUP BY u.id, u.name;
+
+-- ── DEFECT 1: IT RETURNS WRONG NUMBERS ──────────────────────────────────
+-- A user with 3 orders and 2 payments produces 3 × 2 = 6 join rows.
+--   count(o.id)        → 6   (should be 3)
+--   sum(o.total_cents) → each order counted TWICE
+-- FAN-OUT. Two independent one-to-many joins multiply each other. The
+-- query has probably been reporting inflated revenue for months, and
+-- nobody checks a dashboard against a known-correct total.
+-- ⚠ count(DISTINCT o.id) patches the counts but NOT the sum, and it is
+--   expensive. It is a plaster over a modelling error.
+
+-- ── ✓ AGGREGATE FIRST, THEN JOIN ────────────────────────────────────────
+WITH recent AS (
+    SELECT id, name FROM users WHERE created_at &gt; now() - interval '90 days'
+), o AS (
+    SELECT user_id, count(*) AS orders, sum(total_cents) AS revenue
+    FROM orders WHERE user_id IN (SELECT id FROM recent) GROUP BY user_id
+), p AS (
+    SELECT user_id, count(*) AS payments
+    FROM payments WHERE user_id IN (SELECT id FROM recent) GROUP BY user_id
+)
+SELECT r.id, r.name,
+       COALESCE(o.orders,0)   AS orders,
+       COALESCE(p.payments,0) AS payments,
+       COALESCE(o.revenue,0)  AS revenue
+FROM recent r LEFT JOIN o USING (user_id) LEFT JOIN p USING (user_id);
+-- Each CTE is ONE ROW PER USER, so the joins cannot multiply.
+-- Correct numbers, and 8.4s → 240ms.
+
+-- ── WHY IT IS ALSO FASTER ───────────────────────────────────────────────
+-- The original built a huge intermediate result (orders × payments per
+-- user) and then collapsed it. Aggregating first means each join input
+-- is at most one row per user. Less intermediate data is usually the
+-- whole explanation for a large speedup.
+
+-- ── SUPPORTING INDEXES ──────────────────────────────────────────────────
+CREATE INDEX ON users (created_at);
+CREATE INDEX ON orders (user_id) INCLUDE (total_cents);   -- index-only
+CREATE INDEX ON payments (user_id);
+
+-- ── THEN ASK THE REAL QUESTION ──────────────────────────────────────────
+-- 240ms is still slow for a dashboard, and this data does not need to be
+-- to-the-second fresh:
+CREATE MATERIALIZED VIEW user_stats_90d AS SELECT ... ;
+CREATE UNIQUE INDEX ON user_stats_90d (id);
+REFRESH MATERIALIZED VIEW CONCURRENTLY user_stats_90d;   -- hourly
+-- → 2ms. The fastest query is the one that already ran.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A report is correct but takes four minutes. Get it under a second.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- "Revenue by region by month for the last 2 years, with year-on-year
+--  comparison." 40M orders. Runs on a dashboard page load. 4 minutes.
+
+-- ── STEP 1: MEASURE, DO NOT ASSUME ──────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT date_trunc('month', o.created_at) AS m, r.name,
+       sum(o.total_cents) AS revenue
+FROM orders o JOIN regions r ON r.id = o.region_id
+WHERE o.created_at &gt; now() - interval '2 years'
+GROUP BY 1, 2 ORDER BY 1, 2;
+-- HashAggregate (actual time=241002 rows=576)
+--   -&gt; Hash Join (actual rows=31,204,882)
+--        -&gt; Seq Scan on orders (actual rows=31,204,882)
+--             Filter: created_at &gt; ...
+--   Buffers: shared read=1,847,221      ← 14GB off disk
+--   Sort Method: external merge  Disk: 2,140,880kB   ← spilled
+-- It reads 31 MILLION rows to produce 576. That ratio is the whole
+-- problem, and no index changes it: the rows genuinely must be summed.
+
+-- ── STEP 2: CHEAP WINS FIRST ────────────────────────────────────────────
+SET work_mem = '256MB';           -- stop the external merge
+-- 4min → 2min 40s. Real, but nowhere near enough. Worth knowing that
+-- this class of fix has a ceiling.
+
+-- ── STEP 3: MAKE IT INDEX-ONLY (still O(n), but a smaller n) ────────────
+CREATE INDEX CONCURRENTLY ON orders (created_at)
+       INCLUDE (region_id, total_cents);
+-- The scan no longer touches the 400-byte heap rows, only a narrow
+-- index. 2min 40s → 38s. Still not a dashboard.
+
+-- ── STEP 4: STOP RE-COMPUTING HISTORY ───────────────────────────────────
+-- THE KEY INSIGHT: January 2025's revenue will never change. Recomputing
+-- 24 months of immutable history on every page load is the actual error.
+CREATE MATERIALIZED VIEW revenue_monthly AS
+SELECT date_trunc('month', o.created_at) AS month,
+       o.region_id, sum(o.total_cents) AS revenue, count(*) AS orders
+FROM orders o GROUP BY 1, 2;
+CREATE UNIQUE INDEX ON revenue_monthly (month, region_id);  -- required
+                                                            -- for
+                                                            -- CONCURRENTLY
+SELECT m.month, r.name, m.revenue,
+       lag(m.revenue, 12) OVER (PARTITION BY m.region_id
+                                ORDER BY m.month) AS same_month_last_year
+FROM revenue_monthly m JOIN regions r ON r.id = m.region_id
+WHERE m.month &gt; now() - interval '2 years' ORDER BY 1, 2;
+-- 38s → 4ms.  The YoY comparison is a window function over 576 rows
+-- instead of a self-join over millions (see the Window Functions lesson).
+
+-- ── STEP 5: MAKE THE REFRESH CHEAP TOO ──────────────────────────────────
+REFRESH MATERIALIZED VIEW CONCURRENTLY revenue_monthly;   -- still 38s
+-- Fine hourly. But as data grows the refresh becomes the new problem, so
+-- for the current month only, maintain incrementally:
+INSERT INTO revenue_monthly (month, region_id, revenue, orders)
+VALUES (date_trunc('month', now()), :region, :cents, 1)
+ON CONFLICT (month, region_id) DO UPDATE
+SET revenue = revenue_monthly.revenue + EXCLUDED.revenue,
+    orders  = revenue_monthly.orders  + 1;
+-- O(1) per order. Closed months are immutable and never recomputed.
+
+-- ── STEP 6: RECONCILE, BECAUSE IT WILL DRIFT ────────────────────────────
+SELECT m.month, m.region_id, m.revenue AS cached,
+       (SELECT sum(total_cents) FROM orders o
+        WHERE date_trunc('month',o.created_at)=m.month
+          AND o.region_id=m.region_id) AS actual
+FROM revenue_monthly m
+WHERE m.month &gt; now() - interval '3 months'
+  AND m.revenue &lt;&gt; (SELECT ...);
+-- Nightly, alerting on any row. A maintained aggregate without a drift
+-- check is a bug with a delay on it — and on a revenue dashboard, silent
+-- wrongness is far worse than slowness.
+
+-- ── THE SHAPE OF THE ANSWER ─────────────────────────────────────────────
+-- 4min → 2min40 (work_mem) → 38s (covering index) → 4ms (materialise).
+-- The first two are query optimisation and bought 6×. The last one is
+-- recognising the query should not run at request time at all, and
+-- bought 10,000×. Knowing when to stop tuning is the senior skill.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Make pagination and its total count fast on a 50M-row table.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- Search results, filters, sorting, "page 1 of 2,847", deep paging.
+-- Page 1: 40ms. Page 500: 4s. Page 5000: timeout.
+
+-- ── PART A: WHY OFFSET DIES ─────────────────────────────────────────────
+SELECT * FROM products WHERE category_id=7
+ORDER BY created_at DESC LIMIT 20 OFFSET 100000;
+-- The engine produces 100,020 rows in order and THROWS AWAY 100,000.
+-- Cost grows linearly with page number. Every deep page is a small DoS,
+-- and crawlers walk every page.
+
+-- ── ✓ KEYSET (SEEK) PAGINATION ──────────────────────────────────────────
+SELECT * FROM products
+WHERE category_id = 7
+  AND (created_at, id) &lt; (:last_created_at, :last_id)   -- row comparison
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+CREATE INDEX ON products (category_id, created_at DESC, id DESC);
+-- Constant time for every page: descend to the position, read 20, stop.
+-- Page 5000 costs exactly what page 1 costs.
+--
+-- ⚠ The TIEBREAKER is not optional. Ordering by created_at alone with
+--   duplicate timestamps causes rows to be skipped or repeated across
+--   pages. The row-comparison syntax handles the composite cursor
+--   correctly and maps directly onto the index order.
+-- ⚠ The cursor must encode EVERY sort column. Change the sort, change
+--   the cursor — so encode it opaquely (base64 of the tuple) rather than
+--   exposing raw ids, or you can never change the ordering.
+
+-- ── THE TRADE, STATED HONESTLY ──────────────────────────────────────────
+-- No jumping to an arbitrary page number. For infinite scroll and "next"
+-- links that is no loss at all; for a page-number UI it is a product
+-- decision. HYBRID: keyset for next/previous, and allow OFFSET only
+-- within the first N pages where it is still cheap.
+
+-- ── PART B: THE COUNT IS NOW THE SLOWEST THING ──────────────────────────
+SELECT count(*) FROM products WHERE category_id=7;   -- 2.1s, every page
+-- MVCC means visibility is per-row per-snapshot, so there is no stored
+-- count to read. It must examine every matching row.
+
+-- 1. DO YOU NEED IT? "Page 1 of 2,847" is decoration. Replace with
+--    "next/previous" and the count disappears — the cheapest possible
+--    optimisation.
+-- 2. IS THERE A NEXT PAGE? — O(1), and it is what the UI needs:
+SELECT EXISTS (SELECT 1 FROM products WHERE category_id=7
+               ORDER BY created_at DESC OFFSET 20 LIMIT 1);
+-- 3. FETCH ONE EXTRA ROW: request 21, show 20, and the 21st tells you a
+--    next page exists. Zero extra queries.
+-- 4. APPROXIMATE, THEN EXACT WHEN SMALL:
+SELECT count(*) FROM (SELECT 1 FROM products WHERE category_id=7
+                      LIMIT 1000) t;
+-- → "1000+ results" above the cap, exact below it. Users cannot tell,
+--    and it bounds the work absolutely.
+-- 5. PLANNER ESTIMATE, no scan at all:
+EXPLAIN (FORMAT JSON) SELECT * FROM products WHERE category_id=7;
+-- read "Plan Rows" → "About 41,000 results".
+-- 6. MAINTAINED COUNTER for a stable, high-traffic facet:
+CREATE TABLE category_counts (category_id int PRIMARY KEY, n bigint);
+-- updated by trigger or by the write path; needs a drift check.
+
+-- ── PART C: FILTER COMBINATIONS ─────────────────────────────────────────
+-- Users combine category, price, brand, rating arbitrarily. You cannot
+-- build a composite index per combination.
+CREATE INDEX ON products USING gin (
+    to_tsvector('english', name || ' ' || description));
+-- Or accept that search is a different workload and move it to a search
+-- engine. Trying to serve arbitrary faceted search from B-trees is the
+-- point where "optimise the query" stops being the right frame — the
+-- data structure is wrong for the access pattern.
+
+-- ── THE RESULT ──────────────────────────────────────────────────────────
+-- Page 5000: timeout → 12ms. Count: 2.1s → 0ms (removed) or 3ms
+-- (bounded). Two of the three fixes were changing what the page asks
+-- for, not how the database answers it.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Rank by <code>total_exec_time</code>, not mean: a 1ms query called 400,000 times outranks a 5-second report, and only one of them shows up in a slow-query log.</li>
+        <li>Bad plans come from bad estimates or bad cost constants — <code>ANALYZE</code>, extended statistics, and <code>random_page_cost</code> for SSDs fix more than rewrites do.</li>
+        <li>Keep the column bare on one side of the comparison; functions, arithmetic, and driver-introduced casts silently disable indexes.</li>
+        <li><code>NOT IN</code> against a nullable column returns zero rows — a correctness bug wearing a performance bug's clothes. Use <code>NOT EXISTS</code>.</li>
+        <li>Aggregate before joining: two one-to-many joins multiply each other, producing both wrong numbers and enormous intermediate results.</li>
+        <li>N+1 is invisible in every database metric except query count — detect it in tracing, fix with batching, and prevent it with a query-count assertion in tests.</li>
+        <li><code>OFFSET</code> pagination degrades linearly with page depth; keyset pagination is constant, and needs a tiebreaker column in both the cursor and the index.</li>
+        <li>Exact unbounded <code>COUNT(*)</code> is usually a product decision, not a database problem — bound it, estimate it, or remove it.</li>
+        <li>Decide acceptable staleness first, then take the cheapest rung: materialised view, incremental summary, cache, or async — and give every maintained aggregate a drift check.</li>
+        <li><code>work_mem</code> is per node per connection, so raise it per session or role; and set <code>statement_timeout</code>, <code>lock_timeout</code> and <code>auto_explain</code> before you need them.</li>
+      </ul>
+    </div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="isolation.html">← Isolation & Locking</a>
-      <a class="btn" href="scaling.html">Next: Scaling →</a>
+      <a href="isolation.html">← Isolation Levels &amp; Locking</a>
+      <a href="scaling.html">Scaling: Replication, Partitioning, Sharding →</a>
     </div>
   </main>
 </div>
