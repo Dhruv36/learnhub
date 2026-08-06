@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Physical Schema Design for the Engine — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Physical Schema Design for the Engine <span class="level-badge level-ultra">Design Perspective</span></h1>
+    <p><strong>What you'll master:</strong> how to make schema decisions from the engine's perspective rather
+       than the entity-relationship diagram's — choosing key types by their effect on B-tree insert locality
+       and index width, ordering columns so alignment padding does not silently cost gigabytes, deciding
+       row width against rows-per-page rather than aesthetics, using <code>fillfactor</code> and index
+       choice so updates stay HOT, picking a partition key from real query logs instead of table size, and
+       distinguishing the decisions that are effectively permanent from the ones you can change on a
+       Tuesday. This lesson deliberately synthesises the storage internals from Section 1 into design rules,
+       so the prerequisites are <a href="pages-heap-files.html">Pages, Heap Files &amp; Row Layout</a>,
+       <a href="btrees.html">B+Trees</a> and <a href="mvcc.html">MVCC</a>. The
+       <a href="../sql/schema-design.html">SQL schema-design lesson</a> covers logical modelling — keys,
+       normal forms, constraints; this one is about what the physical layer does with that model.</p>
+
+    <h2>Part 1 — The Reversibility Hierarchy</h2>
+    <pre>-- Before any specific advice: know which decisions you can revisit and
+-- which you cannot. Spend design effort in proportion.
+
+-- ── EASY (minutes, online, reversible) ──────────────────────────────────
+--   add/drop an index            CREATE INDEX CONCURRENTLY
+--   change fillfactor            + a repack
+--   add a nullable column        metadata only (PG11+)
+--   add a CHECK constraint       NOT VALID, then VALIDATE
+--   tune autovacuum per table    a setting
+
+-- ── MODERATE (a migration, but tractable) ───────────────────────────────
+--   split wide columns out       expand → backfill → contract
+--   denormalise a cached column  plus a trigger and a drift check
+--   convert to a partitioned     create new, dual-write, backfill, swap
+--     table
+
+-- ── EFFECTIVELY PERMANENT ───────────────────────────────────────────────
+--   PRIMARY KEY TYPE             every FK, every index, every API and
+--                                every downstream consumer references it
+--   the PARTITION KEY            changing it is a full rewrite of a
+--                                table that is large by definition
+--   TIMESTAMP vs TIMESTAMPTZ     you cannot recover the intended zone
+--   NUMERIC vs FLOAT for money   the rounding errors are already in the
+--                                data
+--   data_checksums               initdb-time only; needs a full rebuild
+--
+-- ⚠ THE RULE: get the permanent ones right at design time; treat the
+--   easy ones as tuning to be done later WITH MEASUREMENTS. Teams
+--   routinely invert this — agonising over index choices while picking
+--   a UUID primary key in thirty seconds.</pre>
+
+    <h2>Part 2 — Key Choice: The Decision With the Longest Shadow</h2>
+    <pre>-- From the B+tree lesson: sequential keys fill index pages to ~90%,
+-- random keys to ~50%, and random inserts scatter across the whole tree
+-- instead of appending to one cached page. That is the mechanism. Here
+-- is the design consequence.
+
+-- ── THE OPTIONS, RANKED BY PHYSICAL COST ────────────────────────────────
+id bigint GENERATED ALWAYS AS IDENTITY   -- 8 bytes, sequential  ★ default
+id uuid  DEFAULT gen_random_uuid()       -- 16 bytes, RANDOM     ✗
+id uuid  DEFAULT uuidv7()                -- 16 bytes, time-ordered ✓
+--   (PG18 built-in; emulate on older versions, or use ULID/Snowflake)
+
+--   100M rows, primary key index:
+--     bigint sequential   ~1.0 GB, inserts hit one hot page
+--     uuidv7              ~2.0 GB, inserts hit one hot page
+--     uuidv4              ~3.2 GB, inserts scatter across 100M pages
+-- ⚠ uuidv4 vs uuidv7 is the SAME 16-byte type. The 60% size difference
+--   comes purely from ARRIVAL ORDER changing split behaviour — which
+--   isolates the mechanism perfectly and is worth stating in a design
+--   review.
+
+-- ── AND IT IS WORSE IN INNODB ───────────────────────────────────────────
+-- InnoDB clusters the table by the primary key, and every secondary
+-- index stores the PK as its row pointer. So a wide random PK:
+--   • scatters the ACTUAL ROWS, not just an index
+--   • adds 16 bytes to EVERY entry of EVERY secondary index
+-- "Keep the primary key narrow" is much stronger advice on MySQL, and
+-- the reason is architectural, not stylistic.
+
+-- ── WHEN YOU GENUINELY NEED A UUID ──────────────────────────────────────
+-- ✓ ids generated by clients or by other services before insert
+-- ✓ merging data from several databases without collision
+-- ✓ not leaking row counts or enabling enumeration in public URLs
+-- ✗ NOT a reason: "it feels more modern", or "we might shard one day"
+--
+-- ✓ THE PATTERN THAT GETS BOTH: a narrow internal key plus an opaque
+--   external one.
+CREATE TABLE orders (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,  -- joins
+    public_id uuid   NOT NULL DEFAULT gen_random_uuid() UNIQUE, -- URLs
+    ...
+);
+-- Internal joins and foreign keys stay 8 bytes; external references stay
+-- non-enumerable. The extra unique index is the price, and it is smaller
+-- than the cost of a UUID appearing in every FK.
+
+-- ── COMPOSITE KEYS AND THE PARTITION CONSTRAINT ─────────────────────────
+-- On a partitioned table the partition key MUST be part of every unique
+-- constraint:
+PRIMARY KEY (created_at, id)     -- not (id) alone
+-- ⚠ That means you can no longer enforce global uniqueness of `id`
+--   alone. It is a real modelling loss and it surprises people at
+--   partitioning time — decide it up front, not during the migration.</pre>
+    <div class="note">🔑 <strong>The primary key is the most expensive thirty-second decision in schema
+      design.</strong> It propagates into every foreign key, every secondary index, every API response and
+      every downstream system, and by the time the cost is visible it is embedded everywhere. Default to a
+      sequential <code>bigint</code>; use UUIDv7 or ULID when identifiers must be client-generated or
+      globally unique; use a separate public identifier when the requirement is opacity rather than
+      distribution. Random UUIDv4 as a primary key buys nothing that v7 does not also provide.</div>
+
+    <h2>Part 3 — Row Width: The Number That Sets Scan Cost</h2>
+    <pre>-- From lesson 2: the engine reads PAGES. Rows-per-page therefore
+-- determines the I/O cost of every scan, and row width determines
+-- rows-per-page.
+
+-- ── THE ARITHMETIC ──────────────────────────────────────────────────────
+-- 8192-byte page, 24-byte header, 24-byte tuple header + 4-byte pointer:
+--    60-byte row  → ~136 rows/page  → 10M rows =  74k pages = 574 MB
+--   400-byte row  →  ~20 rows/page  → 10M rows = 500k pages = 3.9 GB
+--  2000-byte row  →   ~4 rows/page  → 10M rows = 2.5M pages =  19 GB
+-- A scan of the third costs 34× the I/O of the first FOR THE SAME ROWS.
+
+-- ── LEVER 1: COLUMN ORDER (free, permanent) ─────────────────────────────
+-- Alignment padding is real storage. Order widest to narrowest:
+--   8-byte  bigint, timestamptz, double precision
+--   4-byte  int, float4, date
+--   2-byte  smallint
+--   1-byte  bool, char
+--   varlena text, jsonb, numeric  ← always last
+-- ✗ (smallint, bigint, smallint, bigint, bool) = 40 bytes payload
+-- ✓ (bigint, bigint, smallint, smallint, bool) = 24 bytes
+-- 40% smaller, identical columns. On 500M rows that is 8 GB — of disk,
+-- of buffer pool, of every backup, and of replication bandwidth.
+-- ⚠ Reordering later requires a table rewrite, so it is a design-time
+--   decision. And do not disfigure a 20-column table to save 4 bytes;
+--   apply it where the row count justifies it.
+
+-- ── LEVER 2: TYPE CHOICE ────────────────────────────────────────────────
+-- text 'temperature_reading' (20 bytes) → smallint FK (2 bytes)
+--   600M rows: 12 GB → 1.2 GB, and typos become impossible.
+-- timestamptz (8) not timestamp (8, but no zone — permanently ambiguous)
+-- numeric(12,2) or integer cents for money — NEVER float
+-- ⚠ varchar(50) and text are byte-identical. The limit is a constraint,
+--   never an optimisation.
+
+-- ── LEVER 3: VERTICAL PARTITIONING ──────────────────────────────────────
+-- The dangerous band is 200 bytes to 2 KB: too small for TOAST to move
+-- out of line, big enough to wreck rows-per-page.
+CREATE TABLE documents (          -- hot: listed, filtered, counted
+    id bigint PRIMARY KEY, title text, status text, created_at timestamptz);
+CREATE TABLE document_content (   -- cold: fetched one at a time
+    document_id bigint PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    summary text, body text);
+-- ✓ The hot table's scans read a fraction of the I/O; the cold columns
+--   cost a join only when actually needed.
+-- ⚠ TOAST already does this automatically ABOVE ~2 KB — so check
+--   pg_total_relation_size before assuming a big jsonb column is the
+--   problem. Frequently it is not, and the 600-byte summary is.</pre>
+
+    <h2>Part 4 — Designing for the Write Path</h2>
+    <pre>-- Read-oriented design is well covered. The write path has its own set
+-- of physical consequences, and they are less widely understood.
+
+-- ── HOT UPDATES ARE THE CENTRAL WRITE-PATH CONCERN ──────────────────────
+-- From lesson 2: an update writes a new tuple and must add an entry to
+-- EVERY index — unless no indexed column changed AND the new version
+-- fits on the same page, in which case NO index is touched.
+SELECT relname, n_tup_upd, n_tup_hot_upd,
+       round(100.0*n_tup_hot_upd/NULLIF(n_tup_upd,0),1) AS hot_pct
+FROM pg_stat_user_tables WHERE n_tup_upd > 100000 ORDER BY 2 DESC;
+-- Target >90% on update-heavy tables. The two design levers:
+--
+-- ✓ 1. DO NOT INDEX VOLATILE COLUMNS. An index on updated_at,
+--      last_seen, or a status that changes per row disqualifies EVERY
+--      update from HOT. One such index can triple the write cost of the
+--      hottest table in the system, and it is usually added for an admin
+--      screen that could use a replica or accept a scan.
+-- ✓ 2. LEAVE ROOM ON THE PAGE:
+ALTER TABLE sessions SET (fillfactor = 80);   -- update-heavy
+ALTER TABLE events   SET (fillfactor = 100);  -- append-only: pack it
+-- ⚠ fillfactor applies to NEW pages only; existing data needs a repack.
+--   And note the two tables want OPPOSITE settings — the knob follows
+--   the workload, not a rule.
+
+-- ── INDEX COUNT IS A WRITE TAX ──────────────────────────────────────────
+-- Each index means another B-tree to descend, latch, possibly split, and
+-- WAL-log per insert. At 40k inserts/sec the index COUNT is the primary
+-- design constraint, not any individual index's shape.
+SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes WHERE relname='hot_table' ORDER BY idx_scan;
+-- ✓ On a high-write table, deleting one unused index is usually a bigger
+--   win than optimising any query.
+
+-- ── PARTIAL INDEXES ARE THE BEST WRITE-PATH TOOL ────────────────────────
+CREATE INDEX ON jobs (run_after) WHERE status = 'queued';
+-- If 0.1% of rows are queued: the index is ~1000× smaller, stays
+-- entirely cached, AND is only MAINTAINED when a row is actually in that
+-- state. A row inserted as queued and completed touches it twice; rows
+-- that skip the state never touch it at all.
+-- ✓ For queue-shaped tables this single pattern is transformative.
+
+-- ── APPEND-ONLY IS THE EASIEST SHAPE TO OPERATE ─────────────────────────
+-- No updates means no dead tuples, no vacuum pressure, no bloat, no HOT
+-- concern, and correlation stays near 1 so index range scans are cheap.
+-- ✓ Where the domain allows it — event logs, ledgers, audit trails,
+--   time series — an append-only model with derived state removes an
+--   entire category of operational problem. That is a design choice with
+--   large physical consequences, and it is worth reaching for
+--   deliberately rather than arriving at by accident.</pre>
+
+    <h2>Part 5 — Partitioning as a Physical Decision</h2>
+    <pre>-- Partitioning is not "the table got big". It is a decision driven by
+-- the QUERY PATTERN and the RETENTION POLICY, and getting the key wrong
+-- makes things worse than not partitioning at all.
+
+-- ── WHAT IT ACTUALLY BUYS ───────────────────────────────────────────────
+-- 1. RETENTION AS A METADATA OPERATION — usually the real reason:
+ALTER TABLE events DETACH PARTITION events_2025_08 CONCURRENTLY;
+DROP TABLE events_2025_08;      -- milliseconds
+--    versus DELETE FROM events WHERE created_at < ... — hours of I/O,
+--    hundreds of millions of dead tuples, and a vacuum crisis.
+-- 2. PRUNING — queries carrying the key touch one partition.
+-- 3. SMALLER PER-PARTITION INDEXES; the hot one stays cached.
+-- 4. CHEAPER MAINTENANCE — vacuum and reindex operate per partition.
+-- ✗ NOT write capacity. It is still one server, one WAL, one fsync
+--   stream. Confusing this with sharding is the most common conceptual
+--   error in this area.
+
+-- ── CHOOSING THE KEY: FROM QUERY LOGS, NOT INTUITION ────────────────────
+SELECT substr(query,1,80), calls FROM pg_stat_statements
+WHERE query ILIKE '%events%' ORDER BY calls DESC LIMIT 20;
+-- ✓ Partition by the column that appears in the DOMINANT query shapes
+--   AND governs retention. For time-series that is almost always the
+--   timestamp, and the two requirements happily coincide.
+-- ⚠ A query WITHOUT the partition key scans EVERY partition — slower
+--   than the unpartitioned table. If your dominant filter is tenant_id
+--   and you partition by time, you have made every query worse.
+-- Multi-level is possible (RANGE by month, then HASH by tenant) but the
+-- partition count multiplies, and planning time grows with it.
+
+-- ── SIZING ──────────────────────────────────────────────────────────────
+-- Hundreds of partitions: fine. Thousands: planning time and lock-table
+-- pressure become real (locking lesson — each partition takes a lock).
+-- ✓ Target partitions large enough to be countable, small enough to
+--   drop usefully. Monthly for multi-year retention; daily only for
+--   short retention or very high volume.
+
+-- ── THE OPERATIONAL REQUIREMENTS PEOPLE FORGET ──────────────────────────
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+-- ⚠ Without a default partition, a row matching no partition ERRORS.
+--   At midnight on the first of the month, inserts start failing.
+-- ✓ Automate creation three months ahead (pg_partman or a cron job), and
+--   ALERT when the default partition is non-empty — that is the signal
+--   the job has stopped.
+-- ⚠ Every unique constraint must include the partition key (Part 2).</pre>
+
+    <h2>Part 6 — Designing Backwards From the Access Pattern</h2>
+    <pre>-- The method: start from the queries, derive the physical design, and
+-- state the trade-offs you accepted.
+
+-- ── THE PROCEDURE ───────────────────────────────────────────────────────
+-- 1. LIST THE TOP QUERY SHAPES. From pg_stat_statements on an existing
+--    system, or from the product spec on a new one. Five to ten shapes
+--    cover almost everything.
+-- 2. FOR EACH: which columns are equality-filtered, which is the range,
+--    what is the ORDER BY, what is returned, how many rows result?
+-- 3. DERIVE THE INDEXES: equalities first, one range last, direction
+--    matched to the sort, INCLUDE for returned columns.
+-- 4. DERIVE THE PARTITION KEY: which column appears in most shapes AND
+--    governs retention?
+-- 5. DERIVE ROW LAYOUT: which columns are read on the hot path? Split
+--    the rest out if the width hurts rows-per-page.
+-- 6. CHECK THE WRITE PATH: what is the update rate, which columns
+--    change, does the index set preserve HOT updates?
+-- 7. WRITE DOWN WHAT YOU TRADED. A design without stated trade-offs is
+--    a design nobody can revisit intelligently.
+
+-- ── A WORKED SKELETON ───────────────────────────────────────────────────
+-- Queries: (a) "this tenant's recent orders, newest first, page 1"
+--          (b) "one order by public id"
+--          (c) "pending orders for the fulfilment worker"
+--          (d) retention: drop after 24 months
+CREATE TABLE orders (
+    created_at  timestamptz NOT NULL,          -- 8  ┐ widest first
+    tenant_id   bigint      NOT NULL,          -- 8  │
+    total_cents bigint      NOT NULL,          -- 8  │
+    id          bigint GENERATED ALWAYS AS IDENTITY,  -- 8 ┘
+    public_id   uuid        NOT NULL DEFAULT gen_random_uuid(),
+    status      smallint    NOT NULL,          -- 2  not text
+    PRIMARY KEY (created_at, id)               -- partition key included
+) PARTITION BY RANGE (created_at);
+ALTER TABLE orders SET (fillfactor = 90);      -- status updates in place
+
+CREATE INDEX ON orders (tenant_id, created_at DESC)
+       INCLUDE (total_cents, status);          -- (a): no sort, no heap
+CREATE UNIQUE INDEX ON orders (public_id);     -- (b)
+CREATE INDEX ON orders (created_at) WHERE status = 0;  -- (c) partial
+
+-- ── THE TRADE-OFFS I ACCEPTED, STATED ───────────────────────────────────
+-- • partitioned by created_at → retention is a DETACH, and query (a)
+--   prunes. COST: `id` is no longer globally unique on its own, and any
+--   query without created_at scans all partitions.
+-- • public_id as a separate UUID → opaque external references while
+--   joins stay 8 bytes. COST: one extra unique index, and it is a random
+--   key so that index has ~50% page density.
+-- • status as smallint with a lookup table → 2 bytes not 20, typos
+--   impossible. COST: a join or an application-side mapping to display.
+-- • NO index on updated_at → preserves HOT updates on the status
+--   transition. COST: admin queries by update time scan; they run on a
+--   replica.
+-- ✓ Every line names what was bought and what was paid. That is the
+--   deliverable, not the DDL.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Designing from the ER diagram</strong>
+        <pre>"Third normal form, UUID PKs,
+ index everything we filter on."
+"We'll partition when it gets
+ big."
+"varchar(50) to save space."
+→ 3 rows/page, 4% HOT updates,
+  a partition key no query uses,
+  and an index set that costs
+  more than it saves.</pre></div>
+      <div><strong>✅ Designing from the queries</strong>
+        <pre>"Five query shapes. Two indexes
+ serve four of them."
+"Partition by created_at: it's in
+ the dominant filter AND governs
+ retention."
+"No index on updated_at — it
+ would kill HOT on 40k
+ updates/sec."</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Physical consequence</th><th>Better</th></tr>
+      <tr><td>Random UUID primary keys</td><td>~50% index page density, no insert locality, scattered writes</td><td>Sequential <code>bigint</code>, or UUIDv7 when client generation is required</td></tr>
+      <tr><td>Ignoring column order on large tables</td><td>Alignment padding wastes gigabytes permanently</td><td>Widest to narrowest, varlena last</td></tr>
+      <tr><td>Wide hot tables</td><td>Few rows per page, so every scan pays multiplied I/O</td><td>Split cold columns out; watch the 200 B – 2 KB band TOAST will not help</td></tr>
+      <tr><td>Indexing volatile columns</td><td>Every update rewrites every index; HOT ratio collapses</td><td>Check <code>n_tup_hot_upd</code> before adding; serve admin queries elsewhere</td></tr>
+      <tr><td><code>fillfactor</code> 100 on update-heavy tables</td><td>New versions cannot fit on the page, so no HOT updates</td><td>70–90, then repack to apply</td></tr>
+      <tr><td>Partitioning by a column queries omit</td><td>Every query scans every partition — worse than unpartitioned</td><td>Choose the key from real query logs</td></tr>
+      <tr><td>Partitioning without a default partition or creation job</td><td>Inserts fail at midnight on the first of the month</td><td>Default partition, automation three months ahead, alerting</td></tr>
+      <tr><td>Confusing partitioning with sharding</td><td>Partitioned for write capacity; nothing improves</td><td>Partitioning is one server — manageability and pruning only</td></tr>
+      <tr><td><code>timestamp</code> instead of <code>timestamptz</code></td><td>The intended zone is unrecoverable later</td><td>Always <code>timestamptz</code>; it is the same 8 bytes</td></tr>
+      <tr><td>Float for money</td><td>Rounding errors compound and are already in the data</td><td>Integer minor units or <code>numeric</code></td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Why does column order matter in a large table?</summary>
+      <p>Because of alignment padding. Each data type must begin at an offset that is a multiple of its
+         alignment requirement — eight bytes for <code>bigint</code> and <code>timestamptz</code>, four for
+         <code>int</code>, two for <code>smallint</code> — so the engine inserts padding bytes to make that
+         true. Those padding bytes are stored on disk forever.</p>
+      <p>Interleaving narrow and wide columns maximises the padding. A table declared as smallint, bigint,
+         smallint, bigint, boolean pays six bytes of padding twice plus trailing padding, occupying forty
+         bytes for twenty-seven bytes of actual data. Reordering the same columns widest to narrowest brings
+         it to twenty-four bytes — a forty percent reduction with no change to the schema's meaning.</p>
+      <p>Whether it matters depends entirely on scale. On a configuration table with a hundred rows it is
+         irrelevant and reordering would only hurt readability. On a five-hundred-million-row events table,
+         sixteen bytes per row is eight gigabytes — of disk, of buffer pool, of every backup, and of
+         replication bandwidth. And since rows per page determines scan cost, the smaller rows also make
+         every sequential scan proportionally faster. It is a design-time decision because changing it later
+         requires a full table rewrite.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What is the practical difference between partitioning and sharding?</summary>
+      <p>Partitioning splits one table into multiple physical pieces within a single database server. It
+         remains one logical table, so queries are unchanged, and the benefits are partition pruning — the
+         planner skips pieces that cannot match — and data lifecycle management, because dropping old data
+         becomes detaching a partition rather than deleting millions of rows. Maintenance like vacuum also
+         becomes per-partition rather than operating on one enormous table.</p>
+      <p>Sharding splits data across independent database servers, each owning a slice selected by a shard
+         key. That is what actually adds write capacity, because each shard has its own primary and its own
+         write path. The cost is that queries must be routed, cross-shard joins and transactions stop working
+         normally, unique constraints no longer hold globally, and every schema migration runs N times.</p>
+      <p>The short version is that partitioning is manageability within one node and sharding is capacity
+         beyond one node. Reaching for partitioning because write throughput is the bottleneck is a common
+         and completely ineffective move — the server still has one WAL and one fsync stream.</p>
+      <p>The other thing worth saying is that the most common real motivation for partitioning is not query
+         speed at all, it is retention. On a table with a rolling retention window, turning a multi-hour
+         delete that generates hundreds of millions of dead tuples into a millisecond metadata operation is
+         usually worth more than any read improvement.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> How would you design a schema for a write-heavy table?</summary>
+      <p>I would start from the write path rather than the queries, because at high write rates the physical
+         consequences of each decision dominate.</p>
+      <p>First, the key must be sequential or time-ordered, so inserts append to one hot page that stays
+         cached rather than scattering across the whole B-tree. A random UUID here is the single most
+         damaging choice available, roughly doubling index size and turning every insert into a read of a
+         cold page followed by a write.</p>
+      <p>Second, I would minimise the index count, because each index is another tree to descend, latch,
+         potentially split and write-ahead log on every insert. At forty thousand inserts per second the
+         number of indexes matters more than any individual index's shape, and dropping one unused index is
+         usually a bigger win than optimising a query. Where an index is needed for a small subset — pending
+         jobs, undeleted rows — I would make it partial, which is dramatically smaller and, crucially, only
+         maintained when a write actually touches that subset.</p>
+      <p>Third, if the table is also update-heavy I would protect HOT updates: no index on volatile columns
+         like <code>updated_at</code>, and <code>fillfactor</code> below a hundred so the new row version
+         fits on the same page. Getting that wrong turns one dirtied page per update into one per index plus
+         the heap, and it is measurable directly as the ratio of <code>n_tup_hot_upd</code> to
+         <code>n_tup_upd</code>.</p>
+      <p>Fourth, narrow rows and correct column order, since at this volume the storage and the scan cost are
+         the same number. And if there is a retention policy, partition by time from the start, because
+         retrofitting partitioning onto a very large table is a substantial migration while doing it up front
+         is free.</p>
+      <p>Finally I would consider whether the model can be append-only with derived state, since that removes
+         dead tuples, vacuum pressure and the entire HOT question at once.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> A table is 400 bytes per row and scans are slow. What are the options?</summary>
+      <p>Four hundred bytes gives roughly twenty rows per page, so a ten-million-row table is about four
+         gigabytes and every full scan reads all of it. The question is whether the hot queries actually need
+         all those bytes.</p>
+      <p>The first thing I would check is which columns are read on the hot path. Very often a listing or
+         filtering query needs five narrow columns while the row carries a description, a serialised blob and
+         several rarely-read fields. Splitting the cold columns into a side table keyed by the same primary
+         key makes the hot table narrow — perhaps sixty bytes and a hundred and thirty rows per page — so the
+         same scan reads a fraction of the I/O, and the cold columns cost a join only when actually
+         displayed.</p>
+      <p>Before doing that I would check what TOAST has already done, using
+         <code>pg_total_relation_size</code> against <code>pg_relation_size</code>. Values above roughly two
+         kilobytes are already moved out of line automatically, so a large JSONB column may not be the
+         problem at all. The dangerous band is a few hundred bytes to two kilobytes — too small to be toasted,
+         big enough to destroy rows per page — and that is usually where the real weight is.</p>
+      <p>Alongside that, column ordering may recover meaningful space for free, and type choices often help
+         more than expected: a repeated status string as a two-byte lookup key rather than twenty bytes of
+         text, integers rather than numerics where precision allows.</p>
+      <p>Finally I would ask whether the scan should happen at all. A covering index with
+         <code>INCLUDE</code> can answer the query without touching the heap, which sidesteps row width
+         entirely, and if the query is analytical, pre-aggregation removes the scan rather than optimising
+         it.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Which schema decisions are expensive to reverse, and how does that change your approach?</summary>
+      <p>I sort decisions by reversibility and spend design effort inversely to how easily they can be
+         changed, because the failure mode I see most often is teams agonising over reversible choices while
+         making permanent ones casually.</p>
+      <p>The genuinely permanent ones are the primary key type, the partition key, and a few type decisions.
+         The primary key propagates into every foreign key, every secondary index, every API response and
+         every downstream consumer, so changing it later is not a migration but a coordinated project across
+         systems you may not control. The partition key is a full rewrite of a table that is large by
+         definition. Using <code>timestamp</code> rather than <code>timestamptz</code> loses the intended
+         time zone irrecoverably — the information is simply not in the data. Storing money in a float bakes
+         rounding errors into records that may be years old before anyone notices. Checksums can only be
+         enabled at cluster creation.</p>
+      <p>The reversible ones are indexes, <code>fillfactor</code>, autovacuum settings, adding nullable
+         columns, and adding constraints as <code>NOT VALID</code> then validating. All of those can be done
+         online, in minutes, and undone. In the middle sit things like splitting wide columns or converting
+         to a partitioned table — real migrations with an expand, backfill and contract pattern, but
+         tractable.</p>
+      <p>What this changes in practice is where I insist on rigour in a design review. I will spend real time
+         on the key type and the partition key, and I will ask for the query log evidence behind the
+         partition choice. For indexes I am content to say "start with these three, measure, and add what the
+         workload proves it needs", because that decision costs nothing to revisit and speculative indexes
+         carry a permanent write tax.</p>
+      <p>The corollary is that I document the permanent decisions with their reasoning, since the next person
+         needs to know what was traded rather than rediscovering it. A schema without stated trade-offs is
+         one nobody can revisit intelligently.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Walk through designing the physical schema for a high-volume events table.</summary>
+      <p>I would start from the access patterns and the retention policy, because those two determine almost
+         every physical decision that follows.</p>
+      <p>Suppose the pattern is high-rate ingest, reads of a single entity's recent events, hourly
+         aggregates, and ninety-day retention. Retention immediately says partition by time, because dropping
+         a partition is a metadata operation while deleting a day of events would generate hundreds of
+         millions of dead tuples and a vacuum crisis. Monthly or weekly partitions depending on volume, with
+         creation automated several months ahead, a default partition so inserts cannot fail at a boundary,
+         and an alert if that default becomes non-empty.</p>
+      <p>The key is a sequential <code>bigint</code>, with the partition key included in the primary key
+         because that is required — which means accepting that the identifier alone is no longer globally
+         unique. Row layout is ordered widest to narrowest with variable-length columns last, and I would
+         push repeated string values like an event type into a small lookup key, since at hundreds of
+         millions of rows twenty bytes per row is a double-digit gigabyte decision and it also makes typos
+         impossible.</p>
+      <p>For indexes I would be deliberately sparse, because at high ingest rates the index count is the
+         binding constraint. A composite on entity and timestamp descending serves the per-entity recent
+         query with no sort, and <code>INCLUDE</code> on the returned columns makes it index-only.
+         <code>fillfactor</code> stays at one hundred because the data is append-only, which is the opposite
+         of the advice for an update-heavy table and follows directly from the workload.</p>
+      <p>For the aggregate queries I would not try to serve them from the raw table. Reading hundreds of
+         millions of rows per dashboard load is not an indexing problem, so I would maintain rollups
+         incrementally on write or refresh them on a schedule, and accept the staleness explicitly.</p>
+      <p>Then I would write down what was traded: partitioning bought retention and pruning at the cost of
+         global uniqueness and of any query lacking the time key scanning everything; the sparse index set
+         bought ingest throughput at the cost of some ad-hoc queries being slow, which is acceptable because
+         they run on a replica. And I would state the ceiling honestly — this design serves a single node
+         well, and if write volume outgrows one primary the next step is a functional split rather than
+         sharding the core domain.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure the real cost of a bad key choice.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+CREATE TABLE k_bigint (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                       v text);
+CREATE TABLE k_uuid4  (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), v text);
+CREATE TABLE k_uuid7  (id uuid PRIMARY KEY, v text);
+
+INSERT INTO k_bigint (v) SELECT 'x' FROM generate_series(1,3000000);
+INSERT INTO k_uuid4  (v) SELECT 'x' FROM generate_series(1,3000000);
+-- time-ordered UUID (emulating v7):
+INSERT INTO k_uuid7 (id, v) SELECT
+  (lpad(to_hex((extract(epoch from clock_timestamp())*1000)::bigint),12,'0')
+   ||'7'|| substr(replace(gen_random_uuid()::text,'-',''),14,19))::uuid, 'x'
+FROM generate_series(1,3000000);
+VACUUM ANALYZE k_bigint, k_uuid4, k_uuid7;
+
+-- ── COMPARE ─────────────────────────────────────────────────────────────
+SELECT 'bigint seq' AS kind,
+       pg_size_pretty(pg_relation_size('k_bigint_pkey')) AS idx,
+       (SELECT round(avg_leaf_density::numeric,1)
+        FROM pgstatindex('k_bigint_pkey')) AS density
+UNION ALL SELECT 'uuid v4 random',
+       pg_size_pretty(pg_relation_size('k_uuid4_pkey')),
+       (SELECT round(avg_leaf_density::numeric,1) FROM pgstatindex('k_uuid4_pkey'))
+UNION ALL SELECT 'uuid v7 ordered',
+       pg_size_pretty(pg_relation_size('k_uuid7_pkey')),
+       (SELECT round(avg_leaf_density::numeric,1) FROM pgstatindex('k_uuid7_pkey'));
+
+--  kind            | idx    | density
+--  bigint seq      |  64 MB |    90.2
+--  uuid v4 random  | 193 MB |    54.1     ← 3× the index
+--  uuid v7 ordered | 118 MB |    89.7     ← density recovered
+
+-- ── READ IT CAREFULLY ───────────────────────────────────────────────────
+-- v4 vs v7: SAME 16-byte type, same row count. The only difference is
+-- ARRIVAL ORDER, and density goes 54% → 90%. That isolates the mechanism
+-- exactly — it is split behaviour, not the type.
+-- v7 vs bigint: still ~2× because 16 bytes > 8 bytes. Unavoidable if you
+-- need client-generated global ids.
+
+-- ── AND THE WRITE COST ──────────────────────────────────────────────────
+\timing on
+INSERT INTO k_bigint (v) SELECT 'x' FROM generate_series(1,500000);  -- 1.4 s
+INSERT INTO k_uuid4 (v)  SELECT 'x' FROM generate_series(1,500000);  -- 9.8 s
+-- 7× slower: each insert must READ a cold random page before writing it.
+-- With a dataset far larger than RAM the gap widens further.
+
+-- ── THE DESIGN CONCLUSION ───────────────────────────────────────────────
+-- Need client-generated global ids?  → UUIDv7 / ULID.
+-- Need opacity in URLs but not global generation?
+--   → bigint PK + a separate public_id uuid UNIQUE.
+-- Neither?  → bigint.
+-- UUIDv4 as a PRIMARY KEY costs 3× the index and 7× the insert time for
+-- nothing v7 does not also provide.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Redesign a table's physical layout and measure the saving.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── ✗ THE ORIGINAL (as an ORM would generate it) ────────────────────────
+CREATE TABLE readings_bad (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    is_valid    boolean,
+    device_id   uuid NOT NULL,
+    sensor_type varchar(50) NOT NULL,      -- 'temperature_ambient'
+    reading     double precision,
+    seq         integer,
+    recorded_at timestamp,                 -- ⚠ no time zone
+    unit        varchar(10)                -- 'celsius'
+);
+
+-- ── ✓ REDESIGNED FOR THE ENGINE ─────────────────────────────────────────
+CREATE TABLE sensor_types (id smallint PRIMARY KEY, name text NOT NULL,
+                           unit text NOT NULL);
+CREATE TABLE readings_good (
+    recorded_at timestamptz NOT NULL,      -- 8  ┐ widest first
+    device_id   bigint      NOT NULL,      -- 8  │
+    reading     double precision,          -- 8  │
+    id          bigint GENERATED ALWAYS AS IDENTITY,  -- 8 ┘
+    seq         integer,                   -- 4
+    sensor_type smallint    NOT NULL REFERENCES sensor_types,  -- 2
+    is_valid    boolean     NOT NULL,      -- 1
+    PRIMARY KEY (recorded_at, id)
+) PARTITION BY RANGE (recorded_at);
+ALTER TABLE readings_good SET (fillfactor = 100);   -- append-only
+
+-- ── MEASURE ─────────────────────────────────────────────────────────────
+INSERT INTO readings_bad SELECT gen_random_uuid(), true, gen_random_uuid(),
+       'temperature_ambient', random()*100, g, now(), 'celsius'
+FROM generate_series(1,2000000) g;
+-- (populate readings_good equivalently)
+SELECT pg_size_pretty(pg_total_relation_size('readings_bad')),
+       pg_size_pretty(pg_total_relation_size('readings_good'));
+--  248 MB | 104 MB        ← 58% smaller, identical information
+
+-- ── WHERE THE SAVINGS CAME FROM (per row) ───────────────────────────────
+--  uuid id → bigint                     -8 bytes
+--  uuid device_id → bigint              -8
+--  varchar(50) sensor_type → smallint  -18   (the biggest single win)
+--  varchar(10) unit → moved to lookup  -11
+--  column reordering (padding)         -14
+--                                      ─────
+--                                      -59 bytes/row
+--  At 600M rows/year that is ~35 GB — of disk, buffer pool, backups and
+--  replication bandwidth, every year.
+
+-- ── AND THE CORRECTNESS FIXES ───────────────────────────────────────────
+-- timestamp → timestamptz: the original is PERMANENTLY AMBIGUOUS. You
+--   cannot recover which zone was intended, so this is unfixable later.
+-- sensor_type FK: 'temperatur_ambient' becomes an error rather than a
+--   silently separate category.
+-- sequential PK: inserts append to one hot page instead of scattering.
+
+-- ── AND THE SCAN CONSEQUENCE ────────────────────────────────────────────
+SELECT relpages, round(reltuples/relpages) AS rows_per_page
+FROM pg_class WHERE relname IN ('readings_bad','readings_good');
+--  readings_bad  | 31,250 pages | 64 rows/page
+--  readings_good | 13,020 pages | 154 rows/page
+-- Every sequential scan reads 2.4× fewer pages. The storage saving and
+-- the speed-up are the same fact.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Choose a partition key from evidence.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SITUATION: `events` is 1.2 TB and growing. Someone proposes
+-- partitioning by tenant_id "because we're multi-tenant".
+
+-- ── STEP 1: WHAT DO THE QUERIES ACTUALLY FILTER ON? ─────────────────────
+SELECT substr(query,1,90) AS q, calls,
+       round(total_exec_time::numeric) AS total_ms
+FROM pg_stat_statements WHERE query ILIKE '%from events%'
+ORDER BY total_exec_time DESC LIMIT 10;
+--  q                                                    | calls   | total_ms
+--  SELECT * FROM events WHERE created_at > $1 AND ...   | 412,088 | 890,221
+--  SELECT count(*) FROM events WHERE created_at BETWEEN | 18,004  | 412,882
+--  SELECT * FROM events WHERE tenant_id = $1 AND
+--         created_at > $2                                | 204,118 | 188,004
+--  SELECT * FROM events WHERE id = $1                    | 88,201  |  12,004
+--
+-- created_at appears in the top three shapes (95% of total time).
+-- tenant_id appears in one, and always ALONGSIDE created_at.
+
+-- ── STEP 2: WHAT GOVERNS RETENTION? ─────────────────────────────────────
+-- "Delete events older than 90 days." → time.
+-- ✓ Both criteria point the same way, which is the common and happy case
+--   for event data.
+
+-- ── STEP 3: WHY tenant_id WOULD BE WRONG HERE ───────────────────────────
+-- • The top two query shapes DO NOT carry tenant_id → they would scan
+--   EVERY partition. Partitioning would make the dominant queries
+--   SLOWER than not partitioning.
+-- • Retention would still need a DELETE, since tenants are not dropped
+--   by age — losing the single biggest benefit.
+-- • Tenant counts grow constantly and are wildly uneven, so partitions
+--   would be unbalanced and multiply without bound.
+
+-- ── STEP 4: THE DESIGN ──────────────────────────────────────────────────
+CREATE TABLE events (
+    created_at timestamptz NOT NULL,
+    tenant_id  bigint NOT NULL,
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    payload jsonb,
+    PRIMARY KEY (created_at, id)          -- partition key REQUIRED in PK
+) PARTITION BY RANGE (created_at);
+-- monthly partitions, 90-day retention → ~4 live partitions
+CREATE INDEX ON events (tenant_id, created_at DESC);   -- serves shape 3
+                                                       -- WITHIN each
+                                                       -- partition
+
+-- ── STEP 5: VERIFY PRUNING BEFORE COMMITTING ────────────────────────────
+EXPLAIN SELECT * FROM events WHERE created_at > now() - interval '1 day';
+--  Append -> Seq Scan on events_2026_08        ← 1 partition ✓
+EXPLAIN SELECT * FROM events WHERE tenant_id = 42;
+--  Append -> ... all partitions                ← ⚠ no pruning
+-- The second is acceptable: it is 4 partitions over 90 days, not 60 over
+-- 5 years, and it is not a top query shape. Bounded retention limits the
+-- damage from unpruned queries — worth noting as part of the decision.
+
+-- ── STEP 6: THE OPERATIONAL REQUIREMENTS ────────────────────────────────
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+-- ⚠ Without this, inserts FAIL at midnight on the first of the month.
+-- Automate creation 3 months ahead (pg_partman), and alert if the
+-- default partition is ever non-empty — that means the job stopped.
+SELECT count(*) FROM events_default;    -- must stay 0
+
+-- ── IF tenant_id WERE THE DOMINANT FILTER ───────────────────────────────
+-- Then LIST or HASH by tenant_id would be right — or two-level: RANGE by
+-- month, subpartitioned by HASH(tenant_id). ⚠ But partition count
+-- multiplies (12 months × 8 hashes = 96), and planning time and
+-- lock-table pressure grow with it. Only worth it with evidence from the
+-- query log, which is the point of this whole exercise.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Design the index set for a table under heavy write load.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- TABLE: sessions. 30k updates/sec (last_seen refresh), 2k inserts/sec.
+-- Queries: (a) by session token, (b) active sessions for a user,
+--          (c) reap sessions idle > 30 min.
+
+-- ── THE NAIVE INDEX SET ─────────────────────────────────────────────────
+CREATE INDEX ON sessions (token);            -- (a)
+CREATE INDEX ON sessions (user_id);          -- (b)
+CREATE INDEX ON sessions (last_seen);        -- (c)  ⚠ ← the problem
+CREATE INDEX ON sessions (created_at);       -- "for reporting"
+CREATE INDEX ON sessions (is_active);        -- "might be useful"
+
+-- ── MEASURE THE DAMAGE ──────────────────────────────────────────────────
+SELECT n_tup_upd, n_tup_hot_upd,
+       round(100.0*n_tup_hot_upd/NULLIF(n_tup_upd,0),1) AS hot_pct
+FROM pg_stat_user_tables WHERE relname='sessions';
+--  n_tup_upd | n_tup_hot_upd | hot_pct
+--  84,102,441|             0 |     0.0        ← ZERO HOT updates
+-- Every last_seen refresh writes a new tuple AND inserts into all five
+-- indexes. Six structures written for one column change, 30,000 times a
+-- second.
+
+-- ── FIX 1: DROP THE INDEX ON THE VOLATILE COLUMN ────────────────────────
+DROP INDEX sessions_last_seen_idx;
+-- "But we need query (c)!" — do we need an INDEX for it?
+--   The reaper runs once a minute over a table of ~200k live rows. A
+--   sequential scan takes 40ms. An index that costs 30,000 writes/sec to
+--   save 40ms/minute is a catastrophically bad trade.
+-- ✓ If the table were much larger, a PARTIAL index on a STABLE column
+--   serves it without touching the update path:
+CREATE INDEX ON sessions (created_at) WHERE is_active;
+
+-- ── FIX 2: DROP THE SPECULATIVE INDEXES ─────────────────────────────────
+SELECT indexrelname, idx_scan FROM pg_stat_user_indexes
+WHERE relname='sessions' ORDER BY idx_scan;
+--  sessions_is_active_idx  |      0        ← never used, 3 values anyway
+--  sessions_created_at_idx |     41        ← 41 scans vs 84M writes
+DROP INDEX sessions_is_active_idx, sessions_created_at_idx;
+
+-- ── FIX 3: LEAVE ROOM ON THE PAGE ───────────────────────────────────────
+ALTER TABLE sessions SET (fillfactor = 75);
+VACUUM FULL sessions;        -- or pg_repack; fillfactor applies to NEW
+                             -- pages only
+
+-- ── RE-MEASURE ──────────────────────────────────────────────────────────
+SELECT n_tup_upd, n_tup_hot_upd,
+       round(100.0*n_tup_hot_upd/NULLIF(n_tup_upd,0),1) AS hot_pct
+FROM pg_stat_user_tables WHERE relname='sessions';
+--  hot_pct: 97.2 ✓
+-- Write throughput up ~3×, bloat growth down by roughly the same factor,
+-- and vacuum now has 2 structures to clean instead of 6.
+
+-- ── THE FINAL SET, AND WHY ──────────────────────────────────────────────
+CREATE UNIQUE INDEX ON sessions (token);   -- (a) unique, essential
+CREATE INDEX ON sessions (user_id);        -- (b) stable column
+-- (c) served by a scan, or a partial index on a stable column
+-- ✓ THE PRINCIPLE: on a write-heavy table, every index must justify its
+--   permanent cost against measured read benefit. "Might be useful" is
+--   not a justification — it is a 30,000-per-second tax.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Do a full physical redesign from an access-pattern audit.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYSTEM: order management. `orders` is 340 GB, 210M rows. Complaints:
+-- listing is slow, writes are slowing, disk growing faster than data.
+
+-- ── STEP 1: AUDIT THE ACCESS PATTERNS ───────────────────────────────────
+SELECT substr(query,1,70), calls, round(total_exec_time::numeric) AS ms
+FROM pg_stat_statements WHERE query ILIKE '%orders%'
+ORDER BY total_exec_time DESC LIMIT 8;
+--  1. tenant's orders, newest first, paginated   412k calls  41% of time
+--  2. one order by public uuid                   188k calls  12%
+--  3. pending orders for fulfilment               88k calls   9%
+--  4. monthly revenue aggregate                      2k calls  22%
+--  5. UPDATE orders SET status = ...              940k calls  11%
+
+-- ── STEP 2: AUDIT THE PHYSICAL STATE ────────────────────────────────────
+SELECT relpages, round(reltuples/relpages) AS rows_per_page
+FROM pg_class WHERE relname='orders';                     -- 6 rows/page
+SELECT n_dead_tup, n_tup_hot_upd, n_tup_upd
+FROM pg_stat_user_tables WHERE relname='orders';
+--  dead 88M / live 210M = 30%;  hot_pct = 3.1%
+SELECT pg_size_pretty(pg_indexes_size('orders'));         -- 290 GB (!)
+SELECT indexrelname, idx_scan FROM pg_stat_user_indexes
+WHERE relname='orders' ORDER BY idx_scan;                 -- 4 of 11 unused
+
+-- ── STEP 3: DIAGNOSE ────────────────────────────────────────────────────
+-- • 6 rows/page  → rows are ~1.3 KB. Listing queries read enormous I/O
+--   for a few displayed columns.
+-- • hot_pct 3%   → an index on a volatile column. Found: (updated_at).
+--   940k status updates/sec-equivalent are each rewriting 11 indexes.
+-- • indexes ≈ heap → 11 indexes, 4 never scanned, all bloated.
+-- • 30% dead     → vacuum cannot keep up with the non-HOT update rate.
+-- ✓ These are not four problems. The volatile-column index caused the
+--   HOT collapse, which caused the dead-tuple rate, which caused the
+--   bloat. One root cause.
+
+-- ── STEP 4: THE REDESIGN ────────────────────────────────────────────────
+-- (a) SPLIT THE WIDE COLD COLUMNS OUT
+CREATE TABLE order_details (
+    order_id bigint PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE,
+    shipping_address jsonb, billing_address jsonb,
+    notes text, raw_payload jsonb);
+-- hot `orders` drops to ~90 bytes → ~85 rows/page (14× fewer pages read
+-- per listing query)
+
+-- (b) FIX THE WRITE PATH
+DROP INDEX orders_updated_at_idx;      -- the HOT killer
+DROP INDEX <the 4 unused>;             -- pure write tax
+ALTER TABLE orders SET (fillfactor = 85);
+
+-- (c) ONE COMPOSITE FOR THE DOMINANT QUERY
+CREATE INDEX CONCURRENTLY ON orders (tenant_id, created_at DESC)
+       INCLUDE (total_cents, status);  -- query 1: no sort, index-only
+CREATE UNIQUE INDEX CONCURRENTLY ON orders (public_id);      -- query 2
+CREATE INDEX CONCURRENTLY ON orders (created_at)
+       WHERE status = 'pending';       -- query 3: partial, tiny
+
+-- (d) PARTITION BY MONTH — retention plus pruning
+--     (expand → dual-write → backfill → swap; see the SQL scaling lesson)
+
+-- (e) MATERIALISE QUERY 4
+CREATE MATERIALIZED VIEW revenue_monthly AS SELECT ...;
+--     22% of database time → ~0. Closed months never change.
+
+-- ── STEP 5: RESULTS ─────────────────────────────────────────────────────
+--  rows/page        6 → 85
+--  hot_pct         3% → 94%
+--  indexes      290GB → 41GB
+--  total        340GB → 96GB
+--  listing p99  840ms → 12ms
+--  write tps         → 3.2× higher
+-- ✓ No query was rewritten except the one that was materialised. Every
+--   other gain came from physical design.
+
+-- ── STEP 6: WHAT I WOULD WRITE DOWN ─────────────────────────────────────
+-- "orders is now narrow and partitioned by created_at. Cold columns live
+--  in order_details — join only when displaying one order. Do NOT index
+--  updated_at: it eliminates HOT updates and was the root cause of the
+--  2026 bloat incident. Admin queries by update time run on the replica."
+-- ✓ The comment preventing the regression is worth as much as the fix.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design a schema whose physical properties survive 100× growth.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- REQUIREMENT: an audit log. Today 5M rows/month. Expect 500M/month
+-- within three years. Must remain queryable and operable throughout.
+-- Queries: "all actions on entity X", "all actions by user Y last week",
+-- compliance export by date range. Retention: 7 years.
+
+-- ── DESIGN PRINCIPLE: WHICH COSTS SCALE, AND HOW ────────────────────────
+-- • index LOOKUPS scale logarithmically → fine at any size
+-- • SEQUENTIAL SCANS scale linearly     → must never be on the hot path
+-- • DELETES scale linearly and generate dead tuples → must be avoided
+--   entirely, not optimised
+-- • per-row STORAGE scales linearly     → row width is a 100× decision
+-- ✓ So: make every hot query index-served, and make retention a metadata
+--   operation. Those two properties are what survive the growth.
+
+-- ── THE SCHEMA ──────────────────────────────────────────────────────────
+CREATE TABLE audit_log (
+    occurred_at timestamptz NOT NULL,      -- 8  ┐ widest first
+    actor_id    bigint      NOT NULL,      -- 8  │
+    entity_id   bigint      NOT NULL,      -- 8  │
+    id          bigint GENERATED ALWAYS AS IDENTITY,  -- 8 ┘
+    entity_type smallint    NOT NULL,      -- 2  lookup, not text
+    action      smallint    NOT NULL,      -- 2  lookup, not text
+    detail      jsonb,                     -- varlena last; TOASTed
+    PRIMARY KEY (occurred_at, id)
+) PARTITION BY RANGE (occurred_at);
+ALTER TABLE audit_log SET (fillfactor = 100);   -- append-only: no updates
+REVOKE UPDATE, DELETE ON audit_log FROM app_user;  -- enforce immutability
+
+-- ── WHY EACH DECISION SURVIVES 100× ─────────────────────────────────────
+-- APPEND-ONLY: no updates means no dead tuples, no vacuum pressure, no
+--   bloat, no HOT concern, and correlation stays ~1 so index range scans
+--   remain near-sequential. This single property removes most of what
+--   would otherwise degrade with scale.
+-- PARTITION BY TIME: 7-year retention becomes DETACH + DROP. A DELETE of
+--   500M rows would be an outage; a partition drop is milliseconds. At
+--   100× growth this is the difference between operable and not.
+-- SMALLINT LOOKUPS: 'ORDER_STATUS_CHANGED' is 20 bytes. At 500M
+--   rows/month × 84 months that is 840 GB of repeated strings versus
+--   84 GB of smallints.
+-- SEQUENTIAL PK: inserts append to one hot page regardless of table
+--   size.
+-- JSONB LAST + TOASTed: the main heap stays narrow, so scans and the
+--   index-only paths are unaffected by detail size (lesson 2).
+
+-- ── INDEXES: ONE PER QUERY SHAPE, NO MORE ───────────────────────────────
+CREATE INDEX ON audit_log (entity_type, entity_id, occurred_at DESC);
+CREATE INDEX ON audit_log (actor_id, occurred_at DESC);
+-- ⚠ Both are per-partition, so each stays small and the recent
+--   partition's indexes remain cached. That is the property that keeps
+--   lookups fast at 100× — the index the hot queries use does not grow,
+--   because old data lives in other partitions.
+-- Compliance export uses the partition key directly — no index needed.
+
+-- ── PARTITION SIZING OVER TIME ──────────────────────────────────────────
+-- today  5M/month   → MONTHLY partitions (84 for 7 years)
+-- at 100× 500M/month → monthly partitions are 500M rows each: too big to
+--                      vacuum, reindex or restore conveniently
+-- ✓ THE PLAN: switch to WEEKLY or DAILY partitions for new data as
+--   volume grows. Partition granularity can change going forward without
+--   touching existing partitions — one of the few scaling decisions that
+--   is genuinely revisable, which is worth knowing.
+-- ⚠ But watch the count: 7 years of daily partitions is 2,555, and
+--   planning time and lock-table pressure grow with partition count
+--   (locking lesson). Tier it: daily for recent, then merge older
+--   partitions into monthly ones during archival.
+
+-- ── THE TIERING THAT MAKES 7 YEARS AFFORDABLE ───────────────────────────
+-- hot   (90 days)  → local NVMe, fully indexed
+-- warm  (2 years)  → cheaper storage via a tablespace, same schema
+ALTER TABLE audit_log_2024_03 SET TABLESPACE archive_hdd;
+ALTER TABLESPACE archive_hdd SET (random_page_cost = 4.0);
+-- cold  (7 years)  → DETACH, export to Parquet in object storage, DROP.
+--                    Compliance queries against cold data run in a query
+--                    engine over the object store, not in Postgres.
+-- ✓ Keeping 7 years of hot-queryable audit data in an OLTP database is
+--   usually the wrong requirement, and naming that early is more
+--   valuable than any indexing decision.
+
+-- ── WHAT I WOULD STATE AS THE CEILING ───────────────────────────────────
+-- This design serves a single node to roughly 500M rows/month of ingest.
+-- Beyond that, the constraint is WAL volume and backup time rather than
+-- query performance, and the next step is a separate database for audit
+-- (a functional split) rather than sharding — audit data is
+-- self-contained and joins to nothing, which makes it the easiest thing
+-- in any system to move out.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Sort decisions by reversibility: primary key type, partition key, and <code>timestamptz</code> versus <code>timestamp</code> are effectively permanent; indexes and <code>fillfactor</code> are tuning.</li>
+        <li>UUIDv4 versus UUIDv7 is the same 16-byte type with a 60% index-size difference, purely from arrival order — which isolates the mechanism perfectly.</li>
+        <li>A narrow internal <code>bigint</code> key plus a separate public UUID gets opacity without putting a random key in every foreign key and index.</li>
+        <li>Row width sets rows per page, which sets scan cost: a 400-byte row costs seven times the I/O of a 60-byte row for the same rows.</li>
+        <li>Column order costs real storage through alignment padding — order widest to narrowest, and it can only be changed with a rewrite.</li>
+        <li>The 200-byte to 2 KB band is where wide columns do the most damage: too small for TOAST, big enough to destroy rows per page.</li>
+        <li>Indexing a volatile column eliminates HOT updates and can triple write cost — measure <code>n_tup_hot_upd</code> before adding one.</li>
+        <li>Partial indexes are the strongest write-path tool: smaller, cache-resident, and only maintained when a write touches the subset.</li>
+        <li>Choose the partition key from query logs and the retention policy — a key the dominant queries omit makes the table slower than not partitioning.</li>
+        <li>Design backwards from the top query shapes, and write down what each decision bought and cost; a schema without stated trade-offs cannot be revisited intelligently.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="join-algorithms.html">← Join &amp; Aggregation Algorithms</a>
+      <a href="oltp-olap.html">OLTP vs OLAP &amp; Row vs Columnar →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
