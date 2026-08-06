@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Buffer Pool &amp; Page Cache — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Buffer Pool &amp; Page Cache <span class="level-badge level-adv">Storage Foundations</span></h1>
+    <p><strong>What you'll master:</strong> why the buffer pool is the single highest-leverage component in
+       database performance and how to reason about its hit rate honestly, the page table and pinning
+       machinery that makes concurrent access safe, why real engines use clock-sweep and LRU-K rather than
+       textbook LRU — and the sequential-flood problem that forced that choice, how dirty pages, the
+       write-ahead rule and background writers interact to keep checkpoints from becoming latency cliffs,
+       why PostgreSQL deliberately keeps a small buffer pool and relies on the OS page cache while
+       InnoDB does the opposite, and how to size and diagnose the thing in production. Prerequisites:
+       <a href="pages-heap-files.html">Pages, Heap Files &amp; Row Layout</a>. The next lesson,
+       <a href="wal-recovery.html">WAL, Checkpoints &amp; Crash Recovery</a>, picks up where the dirty-page
+       discussion here leaves off.</p>
+
+    <h2>Part 1 — Why This Is the Component That Matters Most</h2>
+    <pre>-- The buffer pool is an in-memory cache of pages. Every read and every
+-- write goes through it. Nothing else in the engine has that property.
+
+-- ── THE ARITHMETIC THAT MAKES IT DECISIVE ───────────────────────────────
+-- From lesson 1: RAM ~100ns, NVMe ~20,000ns. A cache hit is ~200× faster
+-- than a miss. So average access time is dominated ENTIRELY by the miss
+-- rate:
+--
+--   hit rate    average access time
+--    99.9%      100ns×0.999 + 20,000ns×0.001  =    120 ns
+--    99%        100ns×0.99  + 20,000ns×0.01   =    299 ns
+--    95%                                       =  1,095 ns
+--    90%                                       =  2,090 ns
+--    71%                                       =  5,900 ns
+--
+-- ⚠ READ THAT AGAIN. Dropping from 99% to 95% — which sounds like a
+--   minor change and looks fine on a dashboard — makes average access
+--   3.7× SLOWER. From 99% to 90% is 7×.
+--
+-- This is why "the database got slow" so often traces to the working set
+-- outgrowing memory, and why the fix is frequently RAM rather than
+-- query tuning. The relationship is not linear, so intuition
+-- systematically underestimates it.
+
+-- ── CHECK IT FIRST, ALWAYS ──────────────────────────────────────────────
+SELECT sum(blks_hit) * 100 / NULLIF(sum(blks_hit + blks_read), 0) AS hit_pct
+FROM pg_stat_database WHERE datname = current_database();
+-- OLTP target: >99%. Below 95% means the working set does not fit, and
+-- no amount of index tuning changes that.
+
+-- ⚠ BUT THIS NUMBER LIES IN TWO DIRECTIONS, and knowing how is the
+--   difference between a real diagnosis and a comforting one:
+--   1. In Postgres, a "miss" (blks_read) is a read from the OS, which
+--      may itself be served by the OS PAGE CACHE — fast. So the true
+--      disk-hit rate is better than reported.
+--   2. It is cumulative since the last stats reset, so it is dominated
+--      by history. A database that has been up for a year shows an
+--      excellent average while being terrible right now.
+SELECT pg_stat_reset();     -- then measure a real window
+-- Per-table is far more actionable than the global figure:
+SELECT relname, heap_blks_hit, heap_blks_read,
+       round(100.0*heap_blks_hit/NULLIF(heap_blks_hit+heap_blks_read,0),1) AS pct
+FROM pg_statio_user_tables
+WHERE heap_blks_read > 0 ORDER BY heap_blks_read DESC LIMIT 10;</pre>
+
+    <h2>Part 2 — The Page Table, Pinning, and Frames</h2>
+    <pre>-- The buffer pool is a fixed array of FRAMES, each holding one page,
+-- plus a hash table mapping page identity → frame.
+
+--   PAGE TABLE (hash)                 FRAME ARRAY
+--   (rel=16412, block=42) ──────────▶ ┌──────────────────────┐
+--   (rel=16412, block=87) ────┐       │ frame 0: page data   │
+--   (rel=16511, block=3)  ──┐ └─────▶ │ frame 1: page data   │
+--                           └───────▶ │ frame 2: page data   │
+--                                     │ ...                  │
+--                                     └──────────────────────┘
+--   PER-FRAME METADATA (this is where the interesting behaviour lives):
+--     dirty?      modified since it was read in
+--     pin count   how many backends are USING it right now
+--     usage count for the replacement policy
+--     content lock  the latch guarding the page's bytes
+
+-- ── PINNING: THE RULE THAT PREVENTS DISASTER ────────────────────────────
+-- Before touching a page a backend PINS it, incrementing the pin count.
+-- A pinned page CANNOT BE EVICTED. Without this, one backend could evict
+-- a page another was mid-way through reading, and the second would read
+-- garbage or a completely different page's bytes.
+--
+--   ReadBuffer(rel, blk)     → pin, return the frame
+--   ...use the page...
+--   ReleaseBuffer(buf)       → unpin
+--
+-- ⚠ A leaked pin is a real bug class: the page can never be evicted, so
+--   the pool effectively shrinks. In extreme cases every frame ends up
+--   pinned and the engine cannot read anything new.
+SELECT count(*) FROM pg_buffercache WHERE pinning_backends > 0;
+
+-- ── THE FULL PAGE-REQUEST ALGORITHM ─────────────────────────────────────
+GetPage(rel, blk):
+  1. look up (rel, blk) in the page table
+  2. HIT  → pin, bump usage count, return.                    ~100 ns
+  3. MISS → find a victim frame (Part 3)
+       a. if the victim is DIRTY:
+            ⚠ flush its WAL first (the write-ahead rule, lesson 6),
+              THEN write the page out                    ← a READ can
+                                                            cause TWO
+                                                            WRITES
+       b. remove the victim from the page table
+       c. read the requested page from disk               ~20,000 ns
+       d. insert into the page table, pin, return
+
+-- ⚠ STEP 3a IS THE ONE PEOPLE MISS. A read miss on a full pool of dirty
+--   pages must evict something dirty, which requires an fsync of the WAL
+--   and then a page write before the read can even begin. A "simple
+--   SELECT" can therefore block on write I/O — and that is exactly what
+--   a read-heavy query looks like during a checkpoint storm.
+
+-- ── INSPECT THE REAL POOL ───────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+SELECT c.relname,
+       count(*) AS buffers,
+       pg_size_pretty(count(*) * 8192::bigint) AS cached,
+       round(100.0 * count(*) FILTER (WHERE b.isdirty) / count(*), 1) AS dirty_pct,
+       round(avg(b.usagecount), 2) AS avg_usage
+FROM pg_buffercache b JOIN pg_class c ON b.relfilenode = pg_relation_filenode(c.oid)
+GROUP BY c.relname ORDER BY buffers DESC LIMIT 10;
+-- This tells you WHAT is actually occupying memory — frequently a
+-- surprise, and often a table nobody thought was hot.</pre>
+
+    <h2>Part 3 — Replacement: Why Not LRU</h2>
+    <pre>-- Which page do you evict when the pool is full? Textbooks say LRU.
+-- Real engines do not use it, for two concrete reasons.
+
+-- ── PROBLEM 1: LRU IS TOO EXPENSIVE ─────────────────────────────────────
+-- True LRU means moving an entry to the head of a linked list on EVERY
+-- access — including cache HITS, which are the common case. That list is
+-- shared, so every access needs a lock on it. At millions of accesses
+-- per second across dozens of cores, the LRU list becomes the
+-- bottleneck: you would spend more time maintaining the cache metadata
+-- than reading pages.
+
+-- ── PROBLEM 2: SEQUENTIAL FLOODING (the fatal one) ──────────────────────
+-- A single large sequential scan reads millions of pages, each used
+-- exactly ONCE. Under LRU, every one of them becomes "most recently
+-- used" and evicts genuinely hot pages.
+--
+--   before:  [hot][hot][hot][hot][hot]   99% hit rate
+--   one big analytical query...
+--   after:   [scan][scan][scan][scan]    hot pages GONE
+--   → every subsequent OLTP query is a miss until the cache refills
+--
+-- ⚠ This is why "someone ran a report and the whole site got slow" is a
+--   real phenomenon with a precise mechanism, not folklore.
+
+-- ── THE SOLUTION 1: CLOCK SWEEP (what Postgres uses) ────────────────────
+-- Approximate LRU with no list and no global lock. Frames sit in a
+-- circular array; a hand sweeps round.
+--   on access:  usage_count = min(usage_count + 1, 5)   -- a local write
+--   on evict:   sweep forward:
+--                 usage_count > 0 → decrement, move on   (second chance)
+--                 usage_count = 0 → EVICT this one
+--
+--     hand →  [3][1][0][5][2][0][4]
+--             evict when the hand lands on a 0
+--
+-- ✓ O(1) amortised, no shared list, no lock on the hit path.
+-- ✓ Frequently-used pages accumulate a high count and survive several
+--   sweeps; single-use pages fall to 0 quickly and are reclaimed.
+-- The cap of 5 matters: it bounds how long a formerly-hot page can
+-- resist eviction after it stops being used.
+
+-- ── THE SOLUTION 2: RING BUFFERS FOR SCANS ──────────────────────────────
+-- Postgres detects a large sequential scan (table > 1/4 of
+-- shared_buffers) and confines it to a small RING of buffers — 256KB —
+-- reusing them instead of touching the main pool.
+-- ✓ A 500GB scan evicts nothing. The flooding problem disappears.
+-- ✓ Same mechanism for VACUUM (256KB ring) and bulk COPY (16MB ring),
+--   which is why a vacuum of a huge table does not destroy your cache.
+
+-- ── THE SOLUTION 3: LRU-K / MIDPOINT INSERTION (InnoDB) ─────────────────
+-- InnoDB splits its LRU list into a YOUNG (5/8) and OLD (3/8) sublist.
+-- A newly read page enters at the head of the OLD sublist, not the
+-- young one. It is only promoted to young if it is accessed AGAIN after
+-- innodb_old_blocks_time (default 1s).
+-- ✓ Sequential-scan pages are touched once, never promoted, and are
+--   evicted from the old sublist without ever displacing hot data.
+-- ✓ Same goal as Postgres's ring buffer, reached differently: distinguish
+--   "referenced once" from "genuinely hot" rather than treating every
+--   access as equal. That distinction is the real content of LRU-K.
+
+-- ── AND WHAT NOT TO DO ──────────────────────────────────────────────────
+-- MRU, FIFO and random replacement all exist and all perform worse on
+-- database access patterns. The lesson is not that LRU is wrong in
+-- principle — it is that the ACCESS PATTERN (mixed point lookups and
+-- huge one-shot scans) breaks naive recency, and every real engine
+-- carries a specific mechanism to handle it.</pre>
+    <div class="note">🧹 <strong>Sequential flooding is the mechanism behind a very common incident.</strong>
+      An analytics query, an unbounded export, or a table scan from a missing index reads millions of
+      single-use pages. Under naive LRU those evict the entire working set and every OLTP query becomes a
+      miss until the cache refills — which can take minutes. Postgres defends with ring buffers, InnoDB with
+      midpoint insertion. When you see a hit-rate cliff correlated with a reporting job, this is what
+      happened, and moving that job to a replica is the durable fix.</div>
+
+    <h2>Part 4 — Dirty Pages, Checkpoints, and Write Storms</h2>
+    <pre>-- A page modified in memory is DIRTY: it differs from the on-disk copy.
+-- Writing it immediately would mean random I/O per change, so the engine
+-- defers — which is what makes writes fast, and what creates the
+-- problem this part is about.
+
+-- ── THE RULE THAT CONSTRAINS EVERYTHING ─────────────────────────────────
+-- WRITE-AHEAD: a dirty page may NOT be written to disk before the WAL
+-- record describing its change is durable. Otherwise a crash could leave
+-- a changed page with no log record explaining it, and recovery could
+-- not decide whether to keep or undo it.
+-- Each page carries pd_lsn — the log position of the last change to it —
+-- so eviction checks: is the WAL flushed past pd_lsn? If not, fsync the
+-- WAL first.
+-- ⚠ This is why evicting a dirty page is not just a write: it can force
+--   a log flush too.
+
+-- ── WHO WRITES DIRTY PAGES OUT ──────────────────────────────────────────
+-- 1. BACKGROUND WRITER — trickles out dirty pages continuously so
+--    backends usually find a clean victim.
+-- 2. CHECKPOINTER — periodically flushes ALL dirty pages and records a
+--    point before which the WAL is no longer needed for recovery.
+-- 3. A BACKEND ITSELF — when it needs a frame and every candidate is
+--    dirty. This is the bad case: a user query now waits on a write.
+SELECT buffers_clean,    -- written by the background writer  ✓
+       buffers_checkpoint, -- written at checkpoints          ✓
+       buffers_backend,  -- written by QUERIES                ✗ bad
+       maxwritten_clean  -- bgwriter hit its per-round cap
+FROM pg_stat_bgwriter;
+-- ⚠ A high buffers_backend relative to the others means backends are
+--   doing their own eviction writes — a direct, measurable cause of
+--   latency spikes. Raise bgwriter_lru_maxpages and lower
+--   bgwriter_delay.
+
+-- ── THE CHECKPOINT SPIKE ────────────────────────────────────────────────
+-- A checkpoint must flush every dirty page. If 8GB of the pool is dirty,
+-- that is 8GB of writes in a burst — saturating the disk, and every
+-- query that needs I/O queues behind it.
+--
+--   naive:      ▁▁▁▁▁████████▁▁▁▁▁████████    ← periodic cliffs
+--   spread:     ▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃    ← smooth
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+-- Spread the writes over 90% of the interval between checkpoints instead
+-- of dumping them at once. This is the single most effective knob
+-- against periodic latency spikes, and it is the default in PG14+.
+ALTER SYSTEM SET checkpoint_timeout = '15min';   -- default 5min
+ALTER SYSTEM SET max_wal_size = '8GB';
+-- ⚠ THE TRADE-OFF: less frequent checkpoints mean fewer, smaller write
+--   bursts and less full-page-write WAL traffic — but LONGER CRASH
+--   RECOVERY, because more log must be replayed. You are choosing
+--   between steady-state smoothness and recovery time.
+SELECT checkpoints_timed, checkpoints_req FROM pg_stat_bgwriter;
+-- checkpoints_req ≫ checkpoints_timed means checkpoints are being forced
+-- by WAL volume rather than by the timer — raise max_wal_size.
+
+-- ── FULL PAGE WRITES: THE HIDDEN WAL AMPLIFIER ──────────────────────────
+-- After each checkpoint, the FIRST modification to any page writes the
+-- ENTIRE 8KB page into the WAL, not just the change. This protects
+-- against torn pages — a partial page write during a crash, which
+-- recovery could not otherwise repair.
+-- ⚠ CONSEQUENCE: WAL volume spikes immediately after every checkpoint,
+--   and frequent checkpoints multiply it. Updating one byte can write
+--   8KB to the log. On write-heavy systems this is often the largest
+--   single source of WAL traffic, and lengthening the checkpoint
+--   interval is the main lever against it.</pre>
+
+    <h2>Part 5 — Two Philosophies: Postgres vs InnoDB</h2>
+    <pre>-- ── POSTGRES: A SMALL POOL, TRUSTING THE OS ────────────────────────────
+-- shared_buffers is conventionally ~25% of RAM. Postgres reads through
+-- the OS, so pages live in BOTH shared_buffers AND the OS page cache —
+-- double buffering.
+--
+--   [ 128GB RAM ]
+--   ├─ shared_buffers  32GB   ← Postgres's own pool
+--   ├─ OS page cache   ~80GB  ← the kernel's, also holding DB pages
+--   └─ work_mem, connections, etc.
+--
+-- ✓ WHY THIS IS DEFENSIBLE: the OS cache is not wasted — it is a large
+--   second tier. A shared_buffers miss usually hits the page cache
+--   (~1-2 μs), not the disk (~20 μs). The kernel also handles readahead
+--   and adapts memory between processes.
+-- ✗ The double copy wastes some memory, and Postgres cannot control
+--   eviction in the second tier.
+-- ⚠ Do NOT set shared_buffers to 80% of RAM "because more cache is
+--   better". It starves the page cache, doubles the memory used per
+--   cached page, and typically makes things worse. 25% is the default
+--   advice for good reasons; above ~40% needs evidence.
+
+-- ── INNODB: A LARGE POOL, BYPASSING THE OS ──────────────────────────────
+-- innodb_buffer_pool_size is conventionally 70-80% of RAM, with
+-- O_DIRECT so the OS cache is bypassed entirely.
+--   ✓ no double buffering; InnoDB controls its own eviction with LRU-K
+--   ✓ one copy per page, so the same RAM caches more data
+--   ✗ InnoDB must implement everything itself — readahead, flushing
+--     policy, and it cannot borrow memory the OS would otherwise free
+innodb_flush_method = O_DIRECT
+innodb_buffer_pool_instances = 8   -- shard the pool to cut mutex
+                                   -- contention on many-core machines
+
+-- ── WHICH IS BETTER? ────────────────────────────────────────────────────
+-- Neither, and that is the honest answer. They are coherent designs with
+-- different assumptions: Postgres treats the kernel as a competent
+-- partner, InnoDB treats it as overhead to be bypassed. What matters is
+-- knowing WHICH you are running, because the sizing advice is opposite
+-- and applying one system's rule to the other is a common and
+-- significant misconfiguration.
+
+-- ── HUGE PAGES: WORTH DOING, RARELY DONE ────────────────────────────────
+-- With 4KB OS pages, a 32GB buffer pool needs 8 million page-table
+-- entries per backend, and the TLB cannot hold them — so address
+-- translation itself starts missing.
+-- 2MB huge pages reduce that to ~16,000 entries: fewer TLB misses, and
+-- the page tables themselves shrink from gigabytes to megabytes.
+ALTER SYSTEM SET huge_pages = 'try';      -- + vm.nr_hugepages in sysctl
+-- Typically a few percent throughput, more on large pools with many
+-- connections. Cheap and safe with 'try', which falls back silently.</pre>
+
+    <h2>Part 6 — Sizing and Diagnosing</h2>
+    <pre>-- ── SIZING: MEASURE THE WORKING SET, DO NOT GUESS ───────────────────────
+-- The goal is not "cache the database" — it is "cache the WORKING SET":
+-- the pages actually touched in a representative window. That is usually
+-- a small fraction of the total.
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+SELECT pg_size_pretty(count(*) * 8192::bigint) AS pool_used,
+       pg_size_pretty(sum(CASE WHEN usagecount >= 3
+                          THEN 8192 ELSE 0 END)::bigint) AS hot
+FROM pg_buffercache WHERE relfilenode IS NOT NULL;
+-- If "hot" is far below the pool size, you have headroom. If the pool is
+-- full of high-usage pages AND the hit rate is poor, the working set
+-- exceeds memory — that is the buy-RAM signal.
+
+-- ── THE DIAGNOSTIC SEQUENCE ─────────────────────────────────────────────
+-- 1. GLOBAL HIT RATE — is this even a caching problem?
+SELECT sum(blks_hit)*100/NULLIF(sum(blks_hit+blks_read),0)
+FROM pg_stat_database WHERE datname=current_database();
+-- 2. WHICH TABLES MISS? — global numbers hide the culprit
+SELECT relname, heap_blks_read,
+       round(100.0*heap_blks_hit/NULLIF(heap_blks_hit+heap_blks_read,0),1) AS pct
+FROM pg_statio_user_tables ORDER BY heap_blks_read DESC LIMIT 10;
+-- 3. WHAT IS OCCUPYING THE POOL? — often not what you expect
+SELECT c.relname, count(*) AS buffers, round(avg(usagecount),1) AS usage
+FROM pg_buffercache b JOIN pg_class c
+  ON b.relfilenode = pg_relation_filenode(c.oid)
+GROUP BY 1 ORDER BY 2 DESC LIMIT 10;
+-- 4. ARE BACKENDS DOING THEIR OWN WRITES? — a latency cause
+SELECT buffers_backend, buffers_clean, buffers_checkpoint
+FROM pg_stat_bgwriter;
+-- 5. PER-QUERY EVIDENCE — the honest metric
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
+--   shared hit=4821 read=12        ← well cached
+--   shared hit=12 read=48210       ← cold; and note that BUFFERS is
+--                                     stable across runs while timing
+--                                     is not, which is why it is the
+--                                     better comparison
+
+-- ── THE TRAP: BLOAT MASQUERADING AS A MEMORY SHORTAGE ───────────────────
+SELECT relname, n_live_tup, n_dead_tup,
+       pg_size_pretty(pg_relation_size(relid)) AS size
+FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 5;
+-- ⚠ A table that is 76% dead tuples has a working set 4× larger than it
+--   needs to be. The symptom is a poor hit rate; the cause is vacuum,
+--   not RAM. Buying memory "fixes" it expensively and temporarily.
+--   ALWAYS check bloat before concluding you need more memory — this is
+--   the most common misdiagnosis in this whole area.
+
+-- ── PREWARMING AFTER A RESTART ──────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+SELECT pg_prewarm('orders');
+-- Postgres can also snapshot and restore pool contents automatically:
+ALTER SYSTEM SET pg_prewarm.autoprewarm = on;
+-- ✓ Matters more than people expect: a restarted database with a cold
+--   pool can take an hour to return to normal latency, and that window
+--   is often mistaken for a deployment problem.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Tuning by folklore</strong>
+        <pre>"Hit rate is 99.2%, cache is
+ fine."   (cumulative since 2024)
+"Set shared_buffers to 80% of
+ RAM — more cache is better."
+"Queries got slow, add RAM."
+→ Starved page cache, and the
+  real cause was 76% dead tuples.</pre></div>
+      <div><strong>✅ Measuring</strong>
+        <pre>Reset stats, measure a window.
+Per-table misses → one table.
+pg_buffercache → it holds 40% of
+ the pool at usagecount 1.
+n_dead_tup → 4× bloat.
+→ pg_repack, not a bigger box.</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Reading the cumulative hit rate as current</td><td>A year of history hides today's problem</td><td><code>pg_stat_reset()</code>, then measure a representative window</td></tr>
+      <tr><td>Setting <code>shared_buffers</code> to 70–80% in Postgres</td><td>Starves the OS page cache; double buffering wastes memory</td><td>~25% is the default advice; that number is InnoDB's, not Postgres's</td></tr>
+      <tr><td>Buying RAM before checking bloat</td><td>Expensive, temporary fix for a vacuum problem</td><td>Check <code>n_dead_tup</code> first — 4× bloat means a 4× working set</td></tr>
+      <tr><td>Ignoring <code>buffers_backend</code></td><td>Queries are doing their own eviction writes, adding latency</td><td>Tune the background writer: <code>bgwriter_lru_maxpages</code>, <code>bgwriter_delay</code></td></tr>
+      <tr><td>Short <code>checkpoint_timeout</code> with a low completion target</td><td>Periodic write storms and inflated full-page-write WAL traffic</td><td>Longer interval, <code>checkpoint_completion_target = 0.9</code></td></tr>
+      <tr><td>Running analytics on the OLTP primary</td><td>Sequential flooding evicts the working set</td><td>Route to a replica; ring buffers help but do not eliminate it</td></tr>
+      <tr><td>Comparing query timings on a warm versus cold cache</td><td>Meaningless benchmarks and false conclusions</td><td>Compare <code>BUFFERS</code> hit/read counts, which are stable</td></tr>
+      <tr><td>Restarting and expecting immediate normal latency</td><td>An hour of degraded performance blamed on the deploy</td><td><code>pg_prewarm</code> / autoprewarm</td></tr>
+      <tr><td>Assuming a cache miss means a disk read</td><td>Overstates the problem in Postgres</td><td>A <code>blks_read</code> may be served by the OS page cache</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What is the buffer pool and why does it matter so much?</summary>
+      <p>It is the database's in-memory cache of pages, and every read and write passes through it. When a
+         query needs a page the engine checks the pool first; a hit costs roughly a hundred nanoseconds while
+         a miss costs about twenty microseconds on NVMe, so a hit is two hundred times faster.</p>
+      <p>That ratio is why it dominates performance. Average access time is essentially determined by the miss
+         rate, and the relationship is not linear in the way people expect. At a 99% hit rate average access
+         is about three hundred nanoseconds; at 95% it is roughly eleven hundred. So a four-point drop that
+         looks minor on a dashboard makes the database nearly four times slower on average. This is why so
+         many gradual slowdowns trace back to a working set that has outgrown memory.</p>
+      <p>Writes go through it too. A modified page is marked dirty and written out later, in bulk, rather
+         than immediately — that deferral is what makes writes fast, and it creates the checkpoint and
+         background-writer machinery that manages when those writes actually happen.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What does it mean to pin a page?</summary>
+      <p>Pinning marks a page as in use so it cannot be evicted. Before a backend reads or modifies a page it
+         increments the frame's pin count, and it decrements it when finished. Any frame with a non-zero pin
+         count is off-limits to the replacement algorithm.</p>
+      <p>Without it, one backend could evict a page while another was halfway through reading it, and the
+         second would find either garbage or an entirely different page's bytes in the same frame. Since
+         several backends legitimately read the same page concurrently, the count is a counter rather than a
+         boolean.</p>
+      <p>It is worth distinguishing pinning from the content lock. The pin says "this frame must keep holding
+         this page"; the content lock, a latch, guards the bytes while they are being read or modified.
+         They protect different things, and a page can be pinned by many readers while none holds an
+         exclusive content lock. A leaked pin is a genuine bug class — the page becomes permanently
+         unevictable, effectively shrinking the pool.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why don't databases use plain LRU for buffer replacement?</summary>
+      <p>Two reasons, and the second is the more serious. The first is cost: true LRU requires moving an entry
+         to the head of a shared list on every access, including hits, which are the overwhelming majority.
+         That list needs a lock, so at millions of accesses per second across many cores it becomes the
+         bottleneck — you would spend more time maintaining cache metadata than serving pages.</p>
+      <p>The second is sequential flooding. A large scan reads millions of pages that are each used exactly
+         once, and under LRU every one of them becomes most-recently-used and evicts genuinely hot data. One
+         analytics query can therefore wipe the working set and leave every subsequent OLTP query missing
+         until the cache refills. That is the precise mechanism behind "someone ran a report and the site got
+         slow".</p>
+      <p>PostgreSQL solves both with clock sweep plus ring buffers. Clock sweep approximates LRU using a
+         per-frame usage counter and a rotating hand, giving pages a second chance without any shared list or
+         lock on the hit path. Ring buffers confine large sequential scans, vacuum and bulk copy to a small
+         set of reusable frames, so a five-hundred-gigabyte scan evicts nothing.</p>
+      <p>InnoDB reaches the same goal differently, with midpoint insertion: a newly read page enters the old
+         portion of the LRU list and is only promoted to the young portion if it is accessed again after a
+         short delay. Scan pages are touched once, never promoted, and are discarded without displacing hot
+         data. Both designs are really about distinguishing "referenced once" from "genuinely hot", which is
+         the insight naive recency lacks.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> How can a read query end up waiting on writes?</summary>
+      <p>Through eviction. If the pool is full, reading a new page requires evicting an existing one, and if
+         the victim is dirty it must be written out first. Worse, the write-ahead rule says a dirty page
+         cannot reach disk before the log record describing its change is durable, so evicting it may also
+         force a WAL flush. A single read miss can therefore trigger a log fsync and a page write before the
+         read even starts.</p>
+      <p>Normally you do not notice, because the background writer trickles dirty pages out continuously so
+         backends usually find a clean victim. The problem appears when it cannot keep up — under a write
+         burst, or when it is tuned too conservatively. Then backends do their own eviction writes, which is
+         visible directly as a rising <code>buffers_backend</code> in <code>pg_stat_bgwriter</code>, and it
+         shows up as latency on queries that are logically pure reads.</p>
+      <p>Checkpoints compound it. A checkpoint must flush every dirty page, so if several gigabytes are dirty
+         it issues that much I/O in a burst and saturates the device; everything needing disk queues behind
+         it. The remedies are spreading checkpoint writes with
+         <code>checkpoint_completion_target</code> near 0.9, lengthening
+         <code>checkpoint_timeout</code> and raising <code>max_wal_size</code> so checkpoints are timed
+         rather than forced, and making the background writer more aggressive so backends rarely evict
+         anything themselves.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Why does PostgreSQL recommend 25% of RAM while MySQL recommends 75%?</summary>
+      <p>Because they made opposite decisions about the operating system. PostgreSQL performs ordinary
+         buffered I/O, so every page it reads passes through the kernel's page cache and ends up cached in
+         two places — once in <code>shared_buffers</code> and once in the OS. Given that, a small pool is
+         deliberate: the page cache acts as a large second tier, a shared_buffers miss is usually served from
+         memory at a microsecond or two rather than from disk, and the kernel handles readahead and can
+         rebalance memory across the whole machine. Setting <code>shared_buffers</code> very high starves that
+         second tier while doubling the memory spent per cached page, which commonly makes things worse.</p>
+      <p>InnoDB instead opens files with <code>O_DIRECT</code>, bypassing the page cache entirely. There is no
+         second tier and no double copy, so every byte of RAM given to the buffer pool caches distinct data,
+         and seventy to eighty percent is appropriate. The cost is that InnoDB must implement everything the
+         kernel would have done — its own readahead, its own flushing policy — and cannot opportunistically
+         use memory the OS would otherwise free.</p>
+      <p>Neither is superior; they are coherent designs with different assumptions about whether the kernel
+         is a competent partner or overhead to be bypassed. What matters operationally is knowing which you
+         are running, because applying one system's sizing rule to the other is a significant and fairly
+         common misconfiguration — and the Postgres direction of that error is the more damaging one, since
+         it degrades performance while appearing generous.</p>
+      <p>I would add that on large pools, huge pages are worth enabling in either system. A thirty-two
+         gigabyte pool addressed in four-kilobyte pages needs millions of page-table entries per backend,
+         which the TLB cannot hold, so address translation itself starts missing. Two-megabyte pages cut that
+         by a factor of five hundred, and <code>huge_pages = try</code> makes it safe to attempt.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Cache hit rate fell from 99.5% to 88% over three months. Walk through your diagnosis.</summary>
+      <p>Gradual decline means something has been growing, so the question is what — and the important
+         discipline is not to assume it is data volume, because the most common cause is not.</p>
+      <p>I would start by checking bloat, because it is both the most frequent explanation and the one that
+         looks exactly like a memory shortage. A table that is seventy percent dead tuples has a working set
+         several times larger than its live data warrants, so the pool holds mostly garbage. I would compare
+         <code>n_dead_tup</code> to <code>n_live_tup</code> and check when autovacuum last succeeded, then
+         look for what is blocking it: a long-running transaction, an inactive replication slot, or an
+         orphaned prepared transaction, any of which freezes the cleanup horizon database-wide. If that is
+         the cause, the fix is <code>pg_repack</code> and removing the blocker, not hardware.</p>
+      <p>If bloat is not the story, I would separate genuine growth from a workload change. Per-table
+         statistics in <code>pg_statio_user_tables</code> show whether misses are spread across everything —
+         suggesting the dataset simply outgrew memory — or concentrated in one relation, which points at a
+         specific query or feature. Then <code>pg_buffercache</code> tells me what actually occupies the pool,
+         grouped by relation with average usage counts. A table holding a large share of the pool at usage
+         count one is being streamed through rather than cached, which is the signature of sequential
+         flooding from a new report, an unbounded export, or a query that lost its index.</p>
+      <p>I would also check whether an index was dropped or invalidated, since a query switching from an
+         index scan to a sequential scan changes its page demand by orders of magnitude and would produce
+         exactly this curve. <code>pg_stat_user_indexes</code> and a check for invalid indexes cover that
+         quickly.</p>
+      <p>Only after ruling those out would I conclude that the working set has genuinely outgrown memory, and
+         even then I would quantify it — how much of the pool is hot, and how much more would be needed —
+         rather than guessing at a number. Alongside whatever fix applies, I would add trending on hit rate,
+         dead tuple ratio and oldest transaction age, because a three-month decline that nobody noticed is
+         primarily a monitoring gap.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Observe the hit-rate cliff directly.
+      <details class="solution"><summary>Solution</summary>
+      <pre>SHOW shared_buffers;                      -- say 128MB for this test
+CREATE TABLE small AS SELECT g AS id, repeat('x',100) AS v
+FROM generate_series(1,200000) g;         -- ~28 MB — fits easily
+CREATE TABLE big AS SELECT g AS id, repeat('x',100) AS v
+FROM generate_series(1,5000000) g;        -- ~700 MB — far exceeds it
+VACUUM ANALYZE small, big;
+
+-- ── WARM, THEN MEASURE ──────────────────────────────────────────────────
+SELECT count(*) FROM small;               -- twice, to warm it
+SELECT pg_stat_reset();
+SELECT count(*) FROM small;
+
+SELECT heap_blks_hit, heap_blks_read,
+       round(100.0*heap_blks_hit/(heap_blks_hit+heap_blks_read),1) AS pct
+FROM pg_statio_user_tables WHERE relname='small';
+--  3572 | 0 | 100.0        ← entirely cached
+
+SELECT pg_stat_reset();
+SELECT count(*) FROM big;
+SELECT heap_blks_hit, heap_blks_read,
+       round(100.0*heap_blks_hit/(heap_blks_hit+heap_blks_read),1) AS pct
+FROM pg_statio_user_tables WHERE relname='big';
+--  1204 | 88418 | 1.3      ← almost entirely misses
+
+-- ── THE TIMING DIFFERENCE ───────────────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM small;  -- 12 ms
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM big;    -- 890 ms
+-- ~25× more data, ~74× the time — the extra factor is the miss rate.
+
+-- ── NOW THE INTERESTING PART: RING BUFFERS ──────────────────────────────
+SELECT count(*) FROM small;               -- warm it again
+SELECT count(*) FROM big;                 -- scan the huge table
+SELECT c.relname, count(*) AS buffers
+FROM pg_buffercache b JOIN pg_class c
+  ON b.relfilenode = pg_relation_filenode(c.oid)
+WHERE c.relname IN ('small','big') GROUP BY 1;
+--  small | 3572     ← STILL CACHED ✓
+--  big   |   32     ← only the 256KB ring
+-- ✓ Postgres detected a scan of a table larger than 1/4 of
+--   shared_buffers and confined it to a ring, so it evicted nothing.
+--   Without that, `small` would have been flushed out entirely — the
+--   sequential flooding problem, prevented.
+
+-- ── PROVE THE PROTECTION HAS LIMITS ─────────────────────────────────────
+SELECT count(*) FROM big WHERE id IN
+  (SELECT (random()*5000000)::int FROM generate_series(1,50000));
+-- A RANDOM access pattern is not a sequential scan, so no ring buffer
+-- applies — and this one WILL evict hot pages. The defence is
+-- pattern-specific, not universal.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Inspect what is actually in the buffer pool.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+
+-- ── WHAT OCCUPIES MEMORY, AND HOW HOT IS IT? ────────────────────────────
+SELECT c.relname,
+       count(*) AS buffers,
+       pg_size_pretty(count(*) * 8192::bigint) AS cached,
+       pg_size_pretty(pg_relation_size(c.oid))  AS total_size,
+       round(100.0*count(*)*8192/NULLIF(pg_relation_size(c.oid),0),1) AS pct_cached,
+       round(avg(b.usagecount), 2) AS avg_usage,
+       count(*) FILTER (WHERE b.isdirty) AS dirty
+FROM pg_buffercache b
+JOIN pg_class c ON b.relfilenode = pg_relation_filenode(c.oid)
+WHERE b.relfilenode IS NOT NULL
+GROUP BY c.relname, c.oid
+ORDER BY buffers DESC LIMIT 15;
+
+--  relname   | buffers | cached | total_size | pct_cached | avg_usage | dirty
+--  orders    |  184220 | 1439MB |    12 GB   |       11.7 |      4.21 |  8412
+--  audit_log |   98110 |  766MB |    41 GB   |        1.8 |      1.02 |    12
+--  users     |   12040 |   94MB |    94 MB   |      100.0 |      4.88 |   204
+
+-- ── READ IT ─────────────────────────────────────────────────────────────
+-- users:     100% cached, avg_usage 4.88 → genuinely hot, perfectly
+--            served. Nothing to do.
+-- orders:    only 11.7% cached but avg_usage 4.21 → the cached part is
+--            hot and being reused. More RAM would measurably help here.
+-- audit_log: 766MB of the pool at avg_usage 1.02 → pages read ONCE and
+--            never reused. This table is STREAMING THROUGH the cache,
+--            occupying memory that orders could use.
+--            ⚠ This is the actionable finding, and it is invisible in
+--              the global hit rate.
+
+-- ── THE USAGE-COUNT DISTRIBUTION ────────────────────────────────────────
+SELECT usagecount, count(*),
+       pg_size_pretty(count(*)*8192::bigint) AS size
+FROM pg_buffercache WHERE relfilenode IS NOT NULL
+GROUP BY 1 ORDER BY 1;
+--  0 |  41220 | 322 MB      ← next to be evicted
+--  1 | 128410 | 1003 MB     ← touched once
+--  5 | 210044 | 1641 MB     ← hot, survives sweeps
+-- A large mass at usagecount 1 means a lot of the pool is single-use
+-- traffic. If the hit rate is also poor, that is where the memory is
+-- going.
+
+-- ── AND HOW MUCH IS FREE ────────────────────────────────────────────────
+SELECT count(*) FILTER (WHERE relfilenode IS NULL) AS unused,
+       count(*) AS total FROM pg_buffercache;
+-- Unused frames after a long uptime means shared_buffers is larger than
+-- the workload needs — that memory would serve better as OS page cache.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce a checkpoint write storm and smooth it.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── CONFIGURE THE BAD CASE ──────────────────────────────────────────────
+ALTER SYSTEM SET checkpoint_timeout = '30s';
+ALTER SYSTEM SET checkpoint_completion_target = 0.1;   -- dump it all
+ALTER SYSTEM SET max_wal_size = '512MB';
+SELECT pg_reload_conf();
+
+CREATE TABLE t (id bigint PRIMARY KEY, v text);
+INSERT INTO t SELECT g, repeat('x',200) FROM generate_series(1,3000000) g;
+
+-- ── GENERATE WRITE LOAD AND WATCH LATENCY ───────────────────────────────
+-- pgbench -c 8 -T 180 -f update.sql        (UPDATE t SET v=... WHERE id=?)
+-- latency samples:
+--   3ms 3ms 4ms 3ms | 890ms 1240ms 1100ms | 3ms 4ms 3ms | 950ms ...
+--                     ↑ checkpoint          ↑ recovers    ↑ next one
+-- Sawtooth latency on a steady workload — the signature of checkpoint
+-- storms.
+
+SELECT checkpoints_timed, checkpoints_req,
+       checkpoint_write_time, checkpoint_sync_time,
+       buffers_checkpoint, buffers_clean, buffers_backend
+FROM pg_stat_bgwriter;
+--  checkpoints_timed | checkpoints_req | buffers_backend
+--                  4 |              38 | 412088
+-- ⚠ TWO red flags:
+--   checkpoints_req ≫ checkpoints_timed → checkpoints forced by WAL
+--     volume, not the timer. max_wal_size is too small.
+--   buffers_backend huge → QUERIES are evicting dirty pages themselves,
+--     which is latency paid directly by users.
+
+-- ── FIX ─────────────────────────────────────────────────────────────────
+ALTER SYSTEM SET checkpoint_timeout = '15min';
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+ALTER SYSTEM SET max_wal_size = '8GB';
+ALTER SYSTEM SET bgwriter_delay = '50ms';        -- default 200ms
+ALTER SYSTEM SET bgwriter_lru_maxpages = 1000;   -- default 100
+SELECT pg_reload_conf();
+
+-- ── RE-MEASURE ──────────────────────────────────────────────────────────
+--   4ms 3ms 5ms 4ms 6ms 4ms 3ms 5ms 4ms 7ms 4ms   ← p99 340ms → 11ms
+SELECT checkpoints_timed, checkpoints_req, buffers_backend, buffers_clean
+FROM pg_stat_bgwriter;
+--  12 | 0 | 8204 | 398110
+-- ✓ checkpoints are now timed, not forced
+-- ✓ the background writer does the work (buffers_clean), not backends
+
+-- ── WHAT EACH KNOB DID, AND THE TRADE ───────────────────────────────────
+-- completion_target 0.9  spread the write burst over 90% of the
+--                        interval instead of dumping it — the single
+--                        biggest win
+-- max_wal_size 8GB       stopped WAL-volume-forced checkpoints
+-- timeout 15min          fewer checkpoints AND much less full-page-write
+--                        WAL traffic (the first touch of a page after
+--                        each checkpoint logs the whole 8KB page)
+-- bgwriter tuning        backends stop doing their own eviction writes
+--
+-- ⚠ THE COST: crash recovery now replays up to 15 minutes of WAL instead
+--   of 30 seconds. You are trading recovery time for steady-state
+--   smoothness, and that is a deliberate choice to make with whoever
+--   owns the RTO — not a free win.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Distinguish a memory shortage from bloat.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYMPTOM: hit rate 82%, "we need more RAM". Verify before buying.
+
+-- ── STEP 1: IS THE DATA REALLY THAT BIG? ────────────────────────────────
+SELECT relname,
+       pg_size_pretty(pg_relation_size(relid)) AS physical,
+       n_live_tup, n_dead_tup,
+       round(100.0*n_dead_tup/NULLIF(n_live_tup+n_dead_tup,0),1) AS dead_pct
+FROM pg_stat_user_tables ORDER BY pg_relation_size(relid) DESC LIMIT 5;
+--  relname | physical | n_live_tup | n_dead_tup | dead_pct
+--  orders  |  412 GB  | 210000000  | 680000000  |     76.4
+-- ⚠ 76% dead. The LIVE data is roughly 95GB; the table is 412GB.
+--   The working set is inflated 4× by garbage, and buying RAM would be
+--   paying to cache dead tuples.
+
+-- ── STEP 2: WHY IS VACUUM NOT RECLAIMING? ───────────────────────────────
+SELECT relname, last_autovacuum, autovacuum_count
+FROM pg_stat_user_tables WHERE relname='orders';
+--  last_autovacuum: 2026-05-12         ← three months ago
+-- Exactly three things can freeze the cleanup horizon:
+SELECT pid, now()-xact_start AS age, state FROM pg_stat_activity
+WHERE xact_start IS NOT NULL ORDER BY xact_start LIMIT 3;
+SELECT slot_name, active, restart_lsn FROM pg_replication_slots
+WHERE NOT active;
+SELECT gid, prepared FROM pg_prepared_xacts;
+
+-- ── STEP 3: CONFIRM WITH THE POOL CONTENTS ──────────────────────────────
+SELECT c.relname, count(*) AS buffers, round(avg(usagecount),2) AS usage
+FROM pg_buffercache b JOIN pg_class c
+  ON b.relfilenode = pg_relation_filenode(c.oid)
+GROUP BY 1 ORDER BY 2 DESC LIMIT 5;
+--  orders | 218440 | 1.31
+-- avg_usage 1.31 means most cached `orders` pages are read once and not
+-- reused — consistent with scanning mostly-dead pages to find live rows.
+
+-- ── THE VERDICT ─────────────────────────────────────────────────────────
+-- This is NOT a memory problem. 95GB of live data would fit comfortably
+-- in the existing 128GB. Adding RAM would raise the hit rate temporarily
+-- while the bloat keeps growing, and the problem returns — more
+-- expensively.
+
+-- ── FIX ─────────────────────────────────────────────────────────────────
+SELECT pg_terminate_backend(:blocking_pid);       -- or drop the dead slot
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';
+VACUUM (VERBOSE, ANALYZE) orders;                 -- stops the growth
+-- reclaim the 320GB (VACUUM FULL = outage at this size):
+--   pg_repack -t orders
+ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.01);
+
+-- ── AFTER ───────────────────────────────────────────────────────────────
+-- 412GB → 97GB, hit rate 82% → 99.4%, no hardware purchased.
+
+-- ── THE DECISION RULE WORTH REMEMBERING ─────────────────────────────────
+-- Before concluding "we need more RAM", establish that the LIVE working
+-- set genuinely exceeds memory. If dead_pct is high, you have a vacuum
+-- problem wearing a memory problem's clothing — and this is the single
+-- most common misdiagnosis in database operations.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Size the buffer pool for a real workload with evidence.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- MACHINE: 256GB RAM, Postgres. Database 2.4TB. Current
+-- shared_buffers=64GB, hit rate 94%. Question: what should it be?
+
+-- ── STEP 1: THE WORKING SET IS NOT THE DATABASE ─────────────────────────
+-- 2.4TB will never fit. The question is how much is ACTIVELY touched.
+SELECT pg_stat_reset();
+-- ...let a full business cycle run (a day, ideally a week)...
+SELECT pg_size_pretty(sum(heap_blks_read + heap_blks_hit) * 8192::bigint)
+       AS logical_reads,
+       pg_size_pretty(sum(pg_relation_size(relid))) AS total_size
+FROM pg_statio_user_tables;
+-- Better: what is DISTINCT and hot right now?
+SELECT pg_size_pretty(count(*) FILTER (WHERE usagecount >= 3)
+                      * 8192::bigint) AS hot,
+       pg_size_pretty(count(*) FILTER (WHERE usagecount &lt;= 1)
+                      * 8192::bigint) AS cold_or_single_use,
+       pg_size_pretty(count(*) FILTER (WHERE relfilenode IS NULL)
+                      * 8192::bigint) AS unused
+FROM pg_buffercache;
+--  hot    | cold_or_single_use | unused
+--  51 GB  | 12 GB              | 1.2 GB
+-- The pool is essentially full and 51GB of it is genuinely hot → there
+-- is demand for more.
+
+-- ── STEP 2: WHICH TABLES ARE STARVED? ───────────────────────────────────
+SELECT relname,
+       pg_size_pretty(pg_relation_size(relid)) AS size,
+       heap_blks_read,
+       round(100.0*heap_blks_hit/NULLIF(heap_blks_hit+heap_blks_read,0),1) AS pct
+FROM pg_statio_user_tables
+WHERE heap_blks_read > 100000 ORDER BY heap_blks_read DESC LIMIT 8;
+--  orders     | 340 GB | 88M | 91.2      ← big, hot, partially cached
+--  events     | 1.4 TB | 41M | 62.0      ← huge, streamed
+--  users      |  22 GB | 0.2M| 99.8      ← fully cached ✓
+-- `events` at 62% and 1.4TB will NEVER be cacheable. Chasing it with RAM
+-- is futile — it needs partitioning or a different access pattern.
+-- `orders` at 91% is the realistic target.
+
+-- ── STEP 3: RULE OUT BLOAT FIRST (always) ───────────────────────────────
+SELECT relname, round(100.0*n_dead_tup/NULLIF(n_live_tup+n_dead_tup,0),1)
+FROM pg_stat_user_tables ORDER BY 2 DESC NULLS LAST LIMIT 5;
+-- If orders is 40% dead, repacking it recovers 136GB of working set for
+-- free — worth far more than any buffer-pool change.
+
+-- ── STEP 4: THE POSTGRES-SPECIFIC REASONING ─────────────────────────────
+-- ⚠ Do NOT set shared_buffers to 200GB. Postgres reads THROUGH the OS
+--   page cache, so pages would be cached twice, halving effective
+--   memory, and the kernel would lose the ability to manage the rest.
+--   The 75% rule is InnoDB's (it uses O_DIRECT); applying it here is a
+--   common and damaging error.
+--
+--   256GB budget:
+--     shared_buffers      64-80GB   (25-30%)
+--     OS page cache      ~150GB     ← the second tier, NOT waste
+--     work_mem × conns    ~20GB     ← size this deliberately
+--     maintenance, OS      ~10GB
+--
+-- A shared_buffers miss served by the page cache costs ~1-2μs, not the
+-- 20μs of a disk read. So the effective hierarchy is already three
+-- levels deep, and the 94% figure understates real performance.
+
+-- ── STEP 5: THE RECOMMENDATION ──────────────────────────────────────────
+-- 1. Repack bloated tables FIRST — free working-set reduction.
+-- 2. Raise shared_buffers 64GB → 80GB and measure. Modest, reversible.
+-- 3. Partition `events` by time so only recent partitions are hot;
+--    this does more than any memory change, because it makes the
+--    working set structurally smaller.
+-- 4. Move analytics off the primary — 41M reads on `events` are likely
+--    reporting, and they are evicting `orders` pages.
+-- 5. ONLY THEN consider more RAM, with a measured number rather than a
+--    round one.
+
+-- ── AND MEASURE THE CHANGE HONESTLY ─────────────────────────────────────
+-- Compare EXPLAIN (ANALYZE, BUFFERS) hit/read counts on the top queries
+-- before and after — stable across runs, unlike wall-clock timing. A
+-- global hit-rate percentage moving from 94% to 96% is easy to
+-- misattribute to normal variation; buffer counts are not.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Diagnose latency spikes that correlate with nothing obvious.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYMPTOMS: p50 2ms steady. p99 spikes to 800ms every ~4 minutes.
+-- CPU flat. No slow queries in the log. Query rate constant.
+
+-- ── STEP 1: PERIODIC = SOMETHING SCHEDULED ──────────────────────────────
+-- A regular period with a flat workload means an internal process, not
+-- user traffic. Candidates: checkpoints, autovacuum, WAL archiving, or
+-- an external cron.
+SELECT checkpoints_timed, checkpoints_req,
+       checkpoint_write_time/1000 AS write_s,
+       checkpoint_sync_time/1000  AS sync_s,
+       buffers_checkpoint, buffers_backend
+FROM pg_stat_bgwriter;
+--  checkpoints_timed | checkpoints_req | write_s | sync_s
+--                 18 |             112 |   142.0 | 891.0
+-- ⚠ TWO findings:
+--   1. checkpoints_req (112) ≫ timed (18) → checkpoints are being FORCED
+--      by WAL volume. max_wal_size is too small, so they fire every
+--      ~4 minutes regardless of checkpoint_timeout.
+--   2. sync_time (891s) ≫ write_time (142s) → the time is in fsync, not
+--      in writing. The OS accumulated dirty pages and the checkpoint's
+--      fsync forces them all out at once.
+
+-- ── STEP 2: CONFIRM THE CORRELATION ─────────────────────────────────────
+ALTER SYSTEM SET log_checkpoints = on;   -- should ALWAYS be on
+SELECT pg_reload_conf();
+-- log:
+--   checkpoint starting: wal
+--   checkpoint complete: wrote 412088 buffers (24.6%);
+--     write=8.412 s, sync=41.203 s, total=49.882 s
+-- Timestamps line up exactly with the p99 spikes. Confirmed.
+
+-- ── STEP 3: WHY IS SYNC SO SLOW? ────────────────────────────────────────
+-- Postgres writes dirty pages to the OS during the spread phase, but the
+-- KERNEL buffers them and only writes to the device at fsync. If the OS
+-- is allowed to accumulate gigabytes of dirty data, the fsync at
+-- checkpoint end is one enormous synchronous flush that blocks
+-- everything needing I/O.
+cat /proc/sys/vm/dirty_background_ratio     # 10  → up to 25GB on 256GB
+cat /proc/sys/vm/dirty_ratio                # 20
+-- ⚠ These kernel defaults are sized for desktops, and on a large-memory
+--   database server they let tens of gigabytes accumulate before the
+--   kernel starts writing. This is a classic and frequently-missed
+--   contributor.
+
+-- ── STEP 4: THE FIXES, IN ORDER ─────────────────────────────────────────
+-- 1. Stop WAL-forced checkpoints:
+ALTER SYSTEM SET max_wal_size = '16GB';
+ALTER SYSTEM SET checkpoint_timeout = '15min';
+-- 2. Spread the writes:
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+-- 3. Make the kernel flush continuously instead of in one burst:
+sysctl -w vm.dirty_background_bytes=268435456   # 256MB
+sysctl -w vm.dirty_bytes=1073741824             # 1GB
+-- 4. Let the background writer do more, so backends do not evict:
+ALTER SYSTEM SET bgwriter_delay = '50ms';
+ALTER SYSTEM SET bgwriter_lru_maxpages = 1000;
+
+-- ── STEP 5: THE SECOND-ORDER WIN ────────────────────────────────────────
+-- Checkpoints every 4 minutes also inflate WAL enormously: the first
+-- modification to any page after a checkpoint writes the FULL 8KB page
+-- to the log (protection against torn pages). Going from 4 minutes to
+-- 15 cuts full-page writes roughly 4×, which reduces WAL volume,
+-- archiving load and replication bandwidth all at once.
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0'));
+-- Measure before and after; a 50-70% reduction is typical.
+
+-- ── RESULT AND THE GENERAL LESSON ───────────────────────────────────────
+-- p99 800ms → 14ms. WAL volume down 61%. No query was ever the problem.
+--
+-- ⚠ THE LESSON: periodic latency spikes with flat CPU and no slow
+--   queries are almost never a query problem. They are the engine's
+--   background machinery — checkpoints, vacuum, WAL — becoming visible.
+--   log_checkpoints and pg_stat_bgwriter answer this in five minutes,
+--   and both should be enabled before you need them.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Average access time is dominated by the miss rate, and non-linearly — 99% to 95% is nearly 4× slower on average, which is why hit rate is the first thing to check.</li>
+        <li>The cumulative hit rate lies; reset statistics and measure a window, and prefer per-table figures which actually identify the culprit.</li>
+        <li>Pinning prevents a page from being evicted while in use; a leaked pin permanently shrinks the pool.</li>
+        <li>A read miss can force a WAL flush and a page write before the read begins, which is how "pure read" queries end up waiting on writes.</li>
+        <li>Real engines avoid plain LRU because it needs a locked shared list and because a single large scan would evict the entire working set.</li>
+        <li>Clock sweep plus ring buffers (Postgres) and midpoint insertion (InnoDB) both exist to distinguish "referenced once" from "genuinely hot".</li>
+        <li><code>buffers_backend</code> rising means queries are doing their own eviction writes — tune the background writer.</li>
+        <li>Spread checkpoints with <code>checkpoint_completion_target</code> and lengthen the interval; the trade is longer crash recovery, and it also cuts full-page-write WAL traffic substantially.</li>
+        <li>Postgres wants ~25% of RAM because it reads through the OS page cache; InnoDB wants ~75% because it bypasses it. Applying the wrong rule is a significant misconfiguration.</li>
+        <li>Check bloat before buying RAM — a table that is 76% dead tuples has a 4× inflated working set, and that is the most common misdiagnosis in this area.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="lsm-trees.html">← LSM-Trees &amp; Write-Optimised Storage</a>
+      <a href="wal-recovery.html">WAL, Checkpoints &amp; Crash Recovery →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
