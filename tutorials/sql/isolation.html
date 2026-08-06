@@ -3,127 +3,900 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Isolation Levels & Locking — SQL — LearnHub</title>
+<title>Isolation Levels &amp; Locking — SQL — LearnHub</title>
 <link rel="stylesheet" href="../../css/style.css">
 </head>
 <body>
 
 <header class="site-header">
   <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
-  <nav><a href="index.html">← SQL Track</a><a href="quiz.html">Quizzes</a></nav>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
 </header>
 
 <div class="tutorial-layout">
   <aside class="sidebar" id="sidebar"></aside>
 
   <main class="content">
-    <h1>Isolation Levels & Locking <span class="level-badge level-ultra">Advanced</span></h1>
-    <p>The I in ACID has settings. Isolation levels trade correctness against concurrency: stricter levels
-       prevent more anomalies but allow less parallelism. Understanding the anomalies, the levels that
-       prevent them, and pessimistic-vs-optimistic locking is core senior material — it's how you reason
-       about "what happens when two requests touch the same row".</p>
+    <h1>Isolation Levels &amp; Locking <span class="level-badge level-ultra">Advanced</span></h1>
+    <p><strong>What you'll master:</strong> the five anomalies as concrete two-session interleavings rather
+       than dictionary definitions, why the SQL standard's level definitions are historical artefacts that
+       describe locking implementations nobody uses anymore, how MVCC makes readers and writers stop
+       blocking each other and what it costs in dead tuples and vacuum pressure, why Read Committed's
+       per-statement snapshot produces the surprising <em>read-committed update anomaly</em>, write skew as
+       the anomaly snapshot isolation cannot see, how Postgres SSI actually detects serialisation conflicts,
+       the full lock hierarchy from row locks to the <code>ACCESS EXCLUSIVE</code> lock that turns a
+       migration into an outage, and how to write a retry loop that is correct rather than dangerous.
+       Prerequisites: <a href="transactions.html">Constraints &amp; Transactions</a>. Examples are
+       PostgreSQL, with MySQL/InnoDB differences called out — and they are significant here.</p>
 
-    <h2>The Anomalies (what can go wrong)</h2>
+    <h2>Part 1 — The Anomalies, as Interleavings</h2>
+    <pre>-- Definitions are forgettable. The interleaving that produces each one is
+-- not. Read these as two sessions, numbered in execution order.
+
+-- ── DIRTY READ ──────────────────────────────────────────────────────────
+-- S1 (1) BEGIN; UPDATE accounts SET balance=0 WHERE id=1;
+-- S2 (2) SELECT balance FROM accounts WHERE id=1;   → 0   ← uncommitted!
+-- S1 (3) ROLLBACK;
+-- S2 acted on a value that NEVER EXISTED. No mainstream engine allows
+-- this by default; Postgres cannot produce it at all.
+
+-- ── NON-REPEATABLE READ (a row changes under you) ───────────────────────
+-- S1 (1) BEGIN; SELECT balance FROM accounts WHERE id=1;   → 100
+-- S2 (2) UPDATE accounts SET balance=50 WHERE id=1; COMMIT;
+-- S1 (3) SELECT balance FROM accounts WHERE id=1;   → 50   ← changed
+-- One transaction, two reads, two answers. Any report computing several
+-- aggregates in sequence can produce internally inconsistent output.
+
+-- ── PHANTOM READ (the SET of rows changes) ──────────────────────────────
+-- S1 (1) BEGIN; SELECT count(*) FROM orders WHERE total &gt; 100;  → 12
+-- S2 (2) INSERT INTO orders (total) VALUES (500); COMMIT;
+-- S1 (3) SELECT count(*) FROM orders WHERE total &gt; 100;  → 13  ← phantom
+-- Distinct from non-repeatable read: no row S1 saw was modified. New
+-- rows appeared that match its predicate.
+
+-- ── LOST UPDATE ─────────────────────────────────────────────────────────
+-- S1 (1) SELECT stock FROM products WHERE id=1;   → 10
+-- S2 (2) SELECT stock FROM products WHERE id=1;   → 10
+-- S1 (3) UPDATE products SET stock=9 WHERE id=1;
+-- S2 (4) UPDATE products SET stock=9 WHERE id=1;
+-- Two sales, one decrement. Covered in depth in the transactions lesson;
+-- here the point is that ISOLATION LEVEL alone does not fix it at Read
+-- Committed — both transactions commit successfully.
+
+-- ── WRITE SKEW (the subtle one, and the reason SERIALIZABLE exists) ─────
+-- Invariant: at least one doctor must remain on call.
+-- S1 (1) BEGIN; SELECT count(*) FROM doctors WHERE on_call;  → 2  ok
+-- S2 (2) BEGIN; SELECT count(*) FROM doctors WHERE on_call;  → 2  ok
+-- S1 (3) UPDATE doctors SET on_call=false WHERE id=1;
+-- S2 (4) UPDATE doctors SET on_call=false WHERE id=2;
+-- S1 (5) COMMIT;   S2 (6) COMMIT;
+-- → ZERO doctors on call. Each transaction was individually correct.
+-- ⚠ Note what is special: they wrote DIFFERENT ROWS. There is no
+--   write-write conflict for the engine to detect, so no snapshot-based
+--   level catches it. Only SERIALIZABLE does.</pre>
     <table class="tbl">
-      <tr><th>Anomaly</th><th>What happens</th></tr>
-      <tr><td><strong>Dirty read</strong></td><td>Read another transaction's UNCOMMITTED change (which may roll back)</td></tr>
-      <tr><td><strong>Non-repeatable read</strong></td><td>Re-read the same ROW in one transaction → different value (someone committed between)</td></tr>
-      <tr><td><strong>Phantom read</strong></td><td>Re-run the same QUERY → new rows appear (someone inserted matching rows)</td></tr>
-      <tr><td><strong>Lost update</strong></td><td>Two read-modify-write transactions overwrite each other's change</td></tr>
-      <tr><td><strong>Write skew</strong></td><td>Two txns each check a condition then write, jointly violating an invariant (e.g., both on-call doctors go off duty)</td></tr>
+      <tr><th>Anomaly</th><th>Shape</th><th>Real consequence</th></tr>
+      <tr><td>Dirty read</td><td>Read uncommitted data</td><td>Acting on a value that was rolled back</td></tr>
+      <tr><td>Non-repeatable read</td><td>Same row, different value on re-read</td><td>A report whose sections disagree with each other</td></tr>
+      <tr><td>Phantom read</td><td>Same predicate, new rows appear</td><td>Counts and sums that shift mid-transaction</td></tr>
+      <tr><td>Lost update</td><td>Two read-modify-writes overwrite</td><td>Oversold stock, vanished withdrawals</td></tr>
+      <tr><td>Write skew</td><td>Read overlapping data, write disjoint rows</td><td>A multi-row invariant broken with no conflict to detect</td></tr>
     </table>
 
-    <h2>The Isolation Levels</h2>
+    <h2>Part 2 — The Levels, and Why the Standard Misleads</h2>
     <table class="tbl">
-      <tr><th>Level</th><th>Prevents</th><th>Notes</th></tr>
-      <tr><td>READ UNCOMMITTED</td><td>Nothing extra</td><td>Dirty reads possible (Postgres treats it as Read Committed)</td></tr>
-      <tr><td><strong>READ COMMITTED</strong></td><td>Dirty reads</td><td><strong>Postgres default.</strong> Each statement sees the latest committed data — values can change between statements</td></tr>
-      <tr><td><strong>REPEATABLE READ</strong></td><td>+ non-repeatable reads (in PG also phantoms)</td><td><strong>MySQL/InnoDB default.</strong> The transaction sees a consistent snapshot from its start</td></tr>
-      <tr><td>SERIALIZABLE</td><td>All anomalies (incl. write skew)</td><td>As if transactions ran one-by-one; may abort with serialization errors — <strong>you must retry</strong></td></tr>
+      <tr><th>Level</th><th>Dirty</th><th>Non-repeatable</th><th>Phantom</th><th>Lost update</th><th>Write skew</th></tr>
+      <tr><td>Read Uncommitted</td><td>allowed*</td><td>allowed</td><td>allowed</td><td>allowed</td><td>allowed</td></tr>
+      <tr><td><strong>Read Committed</strong> (PG default)</td><td>prevented</td><td>allowed</td><td>allowed</td><td>allowed</td><td>allowed</td></tr>
+      <tr><td><strong>Repeatable Read</strong> (MySQL default)</td><td>prevented</td><td>prevented</td><td>prevented in PG†</td><td>prevented in PG‡</td><td>allowed</td></tr>
+      <tr><td>Serializable</td><td>prevented</td><td>prevented</td><td>prevented</td><td>prevented</td><td>prevented</td></tr>
     </table>
-    <pre>BEGIN ISOLATION LEVEL REPEATABLE READ;  ...  COMMIT;
--- MVCC (multi-version concurrency control): Postgres/MySQL keep multiple row VERSIONS, so
--- READERS DON'T BLOCK WRITERS and vice versa — each transaction reads an appropriate snapshot.
--- That's why plain reads are cheap even under writes; conflicts arise on WRITE-write.</pre>
+    <pre>-- * Postgres has no Read Uncommitted: asking for it silently gives you
+--   Read Committed. MVCC makes dirty reads structurally impossible.
+-- † The standard permits phantoms at Repeatable Read because it was
+--   written to describe two-phase LOCKING implementations. Postgres uses
+--   snapshots, so its Repeatable Read (true snapshot isolation) has no
+--   phantoms. MySQL/InnoDB also blocks most of them, via gap locks.
+-- ‡ Postgres Repeatable Read ABORTS the second writer with a
+--   serialisation failure rather than losing the update. MySQL
+--   Repeatable Read does NOT — it can lose updates. This is the single
+--   biggest practical divergence between the two engines.
 
-    <h2>Solving the Lost Update (the practical core)</h2>
-    <pre>-- Two ways to make read-then-write safe:
+-- ⚠ THE KEY MISCONCEPTION: the level names describe ANOMALIES PREVENTED,
+--   not a mechanism, and the standard's table reflects 1992 lock-based
+--   systems. Two databases at "Repeatable Read" can behave differently
+--   and both be conformant. Never reason from the name alone — test the
+--   interleaving on YOUR engine.
 
--- 1. PESSIMISTIC: lock the row while you work
-BEGIN;
-SELECT * FROM accounts WHERE id = 1 FOR UPDATE;   -- row locked; others' FOR UPDATE waits
--- compute in app...
-UPDATE accounts SET balance = :new WHERE id = 1;
-COMMIT;                                            -- lock released
--- Guaranteed, but holds locks (reduces concurrency); risk of deadlocks.
+BEGIN ISOLATION LEVEL REPEATABLE READ;         -- per transaction
+SET default_transaction_isolation = 'repeatable read';   -- per session
+SHOW transaction_isolation;                    -- what am I actually in?</pre>
 
--- 2. OPTIMISTIC: version check, retry on conflict (no locks held)
-UPDATE accounts SET balance = :new, version = version + 1
-WHERE id = 1 AND version = :version_i_read;
--- 0 rows affected → someone changed it → re-read and retry.
--- Better under low contention; the standard pattern in web apps and ORMs (@Version).</pre>
-    <div class="note">⚖️ <strong>The decision:</strong> hot rows + high contention or must-not-retry flows →
-      pessimistic (FOR UPDATE). Typical web traffic with rare conflicts → optimistic versioning (cheaper,
-      no lock waits). And remember the simplest fix from the transactions lesson: when the change is
-      expressible in one statement (<code>SET balance = balance - x</code>), a single atomic UPDATE needs
-      neither.</p></div>
+    <h2>Part 3 — MVCC: Why Readers Never Block Writers</h2>
+    <pre>-- Multi-Version Concurrency Control. An UPDATE does not overwrite a row.
+-- It writes a NEW VERSION and marks the old one as dead beyond a certain
+-- transaction id. Every row physically carries:
+--   xmin — the transaction that created this version
+--   xmax — the transaction that deleted/superseded it (0 if live)
 
-    <h2>Deadlocks</h2>
-    <pre>-- Txn A locks row 1, wants row 2; Txn B locks row 2, wants row 1 → DEADLOCK.
--- The DB detects it and KILLS one transaction (deadlock victim) — your app must retry.
--- Prevention: acquire locks in a CONSISTENT ORDER (e.g., always lower id first),
--- keep transactions short, and lock only what you need (FOR UPDATE with a precise WHERE).</pre>
+SELECT xmin, xmax, id, balance FROM accounts WHERE id = 1;
+--  xmin | xmax | id | balance
+--   842 |    0 |  1 |     100     ← created by txn 842, still live
+
+-- A transaction takes a SNAPSHOT: the set of transaction ids it should
+-- consider committed. A row version is visible if xmin is in that set
+-- and xmax is not. Two transactions therefore see DIFFERENT VERSIONS of
+-- the same row simultaneously, with no coordination and no waiting.
+--
+-- ✓ CONSEQUENCE 1: readers never block writers, writers never block
+--   readers. A long analytical query does not stop the write path — the
+--   single most important practical property of MVCC.
+-- ✓ CONSEQUENCE 2: conflicts only ever arise WRITE-vs-WRITE.
+
+-- ── WHERE THE SNAPSHOT IS TAKEN: THE WHOLE DIFFERENCE ───────────────────
+-- READ COMMITTED    a NEW snapshot at the start of EVERY STATEMENT
+-- REPEATABLE READ   ONE snapshot at the first statement, held to the end
+-- That single sentence explains every behavioural difference below.
+
+-- ── THE COST: DEAD TUPLES ───────────────────────────────────────────────
+-- Old versions stay in the table until no snapshot can still need them.
+-- VACUUM reclaims them. But vacuum cannot remove any version newer than
+-- the OLDEST RUNNING TRANSACTION — so one forgotten `idle in
+-- transaction` session prevents cleanup DATABASE-WIDE.
+SELECT pid, now()-xact_start AS age, state FROM pg_stat_activity
+WHERE state &lt;&gt; 'idle' ORDER BY xact_start LIMIT 5;
+SELECT relname, n_live_tup, n_dead_tup FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC LIMIT 5;
+-- Bloat is the MVCC tax. It is normally invisible and occasionally an
+-- incident — see the transactions lesson.
+
+-- ── AN UPDATE IS A DELETE + INSERT ──────────────────────────────────────
+-- Which means it must update EVERY INDEX on the table, even for columns
+-- that did not change. (HOT updates avoid this when no indexed column
+-- changes AND the new version fits on the same page — another reason to
+-- keep index counts low and fillfactor sane on hot tables.)</pre>
+
+    <h2>Part 4 — Read Committed's Surprise, and Repeatable Read's Trade</h2>
+    <pre>-- ── THE READ-COMMITTED UPDATE ANOMALY ───────────────────────────────────
+-- Read Committed takes a new snapshot per STATEMENT. But what happens
+-- when a statement blocks mid-flight on a row another transaction is
+-- updating?
+
+-- S1 (1) BEGIN; UPDATE products SET stock = stock - 1 WHERE id = 1;
+--                                                     -- stock 10 → 9
+-- S2 (2) BEGIN; UPDATE products SET stock = stock - 1 WHERE id = 1;
+--        ↑ BLOCKS on S1's row lock
+-- S1 (3) COMMIT;
+-- S2 unblocks. It does NOT re-run from its original snapshot and it does
+-- NOT fail. It RE-READS the row's latest committed version and
+-- re-evaluates: 9 - 1 = 8. ✓ Correct.
+
+-- ⚠ BUT THE PREDICATE IS RE-CHECKED TOO, AND THAT CAN SURPRISE:
+-- S1 (1) BEGIN; UPDATE products SET price = 200 WHERE id = 1;  -- was 100
+-- S2 (2) BEGIN; UPDATE products SET stock = 0 WHERE id = 1 AND price = 100;
+--        ↑ blocks
+-- S1 (3) COMMIT;
+-- S2 unblocks, re-reads the row: price is now 200, so the WHERE no
+-- longer matches. 0 ROWS AFFECTED. The statement "succeeded" and did
+-- nothing — silently, unless you check the count.
+--
+-- This is why "check rows affected" is not pedantry. At Read Committed
+-- it is the only signal that your predicate lost a race.
+
+-- ── AND THE ONE THAT BREAKS REPORTS ─────────────────────────────────────
+BEGIN;  -- READ COMMITTED
+SELECT sum(balance) FROM accounts WHERE type='asset';       -- 1,000,000
+--   ... a transfer commits between the two statements ...
+SELECT sum(balance) FROM accounts WHERE type='liability';   --   900,000
+COMMIT;
+-- The two figures come from DIFFERENT points in time. Your balance sheet
+-- does not balance, and there is no bug in either query.
+-- ✓ FIX: a single snapshot for the whole report:
+BEGIN ISOLATION LEVEL REPEATABLE READ;  ...  COMMIT;
+-- This is the most common LEGITIMATE reason to raise the level: reports,
+-- exports, and consistent multi-query backups.
+
+-- ── REPEATABLE READ'S TRADE: SERIALISATION FAILURES ─────────────────────
+-- S1 BEGIN ISOLATION LEVEL REPEATABLE READ;
+--    SELECT stock FROM products WHERE id=1;         → 10
+-- S2 UPDATE products SET stock=9 WHERE id=1; COMMIT;
+-- S1 UPDATE products SET stock=9 WHERE id=1;
+-- ERROR: could not serialize access due to concurrent update  (40001)
+--
+-- Postgres refuses to let S1 write over a version it cannot see. The
+-- update is NOT lost — but the transaction dies and the APPLICATION MUST
+-- RETRY. Choosing Repeatable Read without a retry loop converts silent
+-- corruption into visible 500s. That is an improvement, but only if you
+-- handle it.
+--
+-- ⚠ MySQL/InnoDB behaves differently here: at Repeatable Read an UPDATE
+--   reads the LATEST committed row, not the snapshot, so it silently
+--   applies and the lost update is possible. Same level name, opposite
+--   safety property.</pre>
+
+    <h2>Part 5 — Serializable, and What It Costs</h2>
+    <pre>-- Postgres implements SERIALIZABLE as SSI (Serializable Snapshot
+-- Isolation). It does NOT lock reads. It runs at snapshot isolation
+-- speed, tracks the read/write DEPENDENCIES between transactions, and
+-- aborts one when it detects a pattern that could not occur in any
+-- serial order.
+
+-- ── THE DOCTOR PROBLEM, SOLVED ──────────────────────────────────────────
+-- S1 BEGIN ISOLATION LEVEL SERIALIZABLE;
+--    SELECT count(*) FROM doctors WHERE on_call;   → 2
+-- S2 BEGIN ISOLATION LEVEL SERIALIZABLE;
+--    SELECT count(*) FROM doctors WHERE on_call;   → 2
+-- S1 UPDATE doctors SET on_call=false WHERE id=1;  COMMIT;   ✓
+-- S2 UPDATE doctors SET on_call=false WHERE id=2;  COMMIT;
+-- ERROR: could not serialize access due to read/write dependencies
+--        among transactions
+-- HINT: The transaction might succeed if retried.
+--
+-- The engine noticed S2 read data S1 wrote AND wrote data S1 read — a
+-- dependency cycle. No serial order produces this outcome, so it aborts
+-- one. On retry, S2 sees one doctor on call and its check correctly
+-- fails at the application level.
+
+-- ── WHAT MAKES SSI REMARKABLE ───────────────────────────────────────────
+-- It gives true serialisability with NO read locks. Readers still do not
+-- block. You pay in: predicate-tracking memory (SIReadLock entries),
+-- and FALSE POSITIVES — some aborts are transactions that would in fact
+-- have been fine. That is the price of tracking dependencies cheaply.
+
+-- ── THE NON-NEGOTIABLE REQUIREMENT: A RETRY LOOP ────────────────────────
+-- SERIALIZABLE without retry is strictly worse than not using it.
+for attempt in range(1, 6):
+    try:
+        with db.transaction(isolation='serializable'):
+            do_the_work()            # ⚠ MUST be safe to run twice
+        break
+    except SerializationFailure:     # SQLSTATE 40001
+        if attempt == 5: raise
+        sleep(random.uniform(0, 0.05 * 2**attempt))   # expo + JITTER
+
+-- FOUR THINGS PEOPLE GET WRONG HERE:
+--   1. Retrying on the wrong errors. Retry ONLY 40001 (serialisation)
+--      and 40P01 (deadlock). Retrying a constraint violation or a
+--      timeout re-runs work that already partly happened.
+--   2. No jitter → the retries collide again in lockstep.
+--   3. Side effects inside the block. An email or an API call is sent
+--      once per ATTEMPT. Move them to an outbox (transactions lesson).
+--   4. Unbounded retries under real contention, turning a slow endpoint
+--      into a self-inflicted load test.
+
+-- ── WHEN SERIALIZABLE IS THE RIGHT ANSWER ───────────────────────────────
+-- ✓ multi-row invariants too complex to express as a constraint
+-- ✓ correctness matters more than throughput; contention is low
+-- ✓ you want to stop reasoning about anomalies case by case
+-- ✗ hot rows with heavy contention — abort rates make it unusable
+-- ✗ long transactions (more time to conflict, bigger loss on abort)
+-- ⚠ It must be set on EVERY participating transaction. One Read
+--   Committed writer can violate the invariant the others are
+--   protecting.</pre>
+    <div class="note">🎯 <strong>The escalation order that actually applies in practice.</strong> Reach for
+      the cheapest tool that closes the specific hole: <strong>1.</strong> a single atomic
+      <code>UPDATE</code> when the new value derives from the old; <strong>2.</strong> a database constraint
+      — <code>UNIQUE</code>, <code>CHECK</code>, or <code>EXCLUDE</code> — when the invariant fits one row or
+      a conflict rule, because it needs no coordination at all; <strong>3.</strong> explicit
+      <code>SELECT ... FOR UPDATE</code> on the rows your decision reads; <strong>4.</strong>
+      <code>SERIALIZABLE</code> with retries when the invariant genuinely spans rows you cannot enumerate.
+      Most teams jump from 1 to 4 and skip the two options that solve the majority of real cases with no
+      abort rate.</div>
+
+    <h2>Part 6 — Locks, Deadlocks, and Migrations</h2>
+    <pre>-- ── ROW-LEVEL LOCKS ─────────────────────────────────────────────────────
+SELECT ... FOR UPDATE;          -- exclusive: blocks other FOR UPDATE,
+                                -- FOR SHARE, and any UPDATE/DELETE
+SELECT ... FOR NO KEY UPDATE;   -- weaker; what a normal UPDATE takes
+SELECT ... FOR SHARE;           -- others may read-lock, none may write
+SELECT ... FOR KEY SHARE;       -- what an FK check takes
+
+SELECT ... FOR UPDATE NOWAIT;       -- fail instantly if locked
+SELECT ... FOR UPDATE SKIP LOCKED;  -- ignore locked rows entirely
+-- SKIP LOCKED is how you build a work queue in SQL. N workers each grab
+-- disjoint rows with zero contention:
+UPDATE jobs SET status='running'
+WHERE id IN (SELECT id FROM jobs WHERE status='queued'
+             ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 10)
+RETURNING *;
+
+-- ⚠ FOREIGN KEYS TAKE LOCKS TOO. Inserting a child row takes a KEY SHARE
+--   lock on the parent. A hot parent row (a "default" tenant, a shared
+--   category) can serialise inserts across the whole child table for
+--   reasons that appear nowhere in the query.
+
+-- ── DEADLOCKS ───────────────────────────────────────────────────────────
+-- S1 locks row 1, wants row 2.  S2 locks row 2, wants row 1.
+-- ERROR: deadlock detected
+-- DETAIL: Process 1234 waits for ShareLock on transaction 890...
+-- The engine detects the cycle (after deadlock_timeout, default 1s),
+-- kills the cheaper victim, and the survivor proceeds.
+--
+-- ✓ PREVENTION 1 — CONSISTENT LOCK ORDER. Almost every deadlock is two
+--   code paths acquiring the same rows in different orders:
+SELECT * FROM accounts WHERE id IN (:a, :b) ORDER BY id FOR UPDATE;
+--   Sorting the ids makes the cycle impossible. This one line fixes the
+--   majority of real deadlocks.
+-- ✓ PREVENTION 2 — shorter transactions: less overlap, less opportunity.
+-- ✓ PREVENTION 3 — touch rows in a fixed order inside batch jobs
+--   (ORDER BY the key in the UPDATE ... FROM subquery).
+-- ✓ AND ALWAYS: retry on 40P01. Deadlocks are a normal operating
+--   condition, not a bug to be eliminated entirely.
+SET deadlock_timeout = '1s';    -- how long to wait before checking
+
+-- ── TABLE-LEVEL LOCKS: WHERE MIGRATIONS GO WRONG ────────────────────────
+-- ACCESS SHARE        SELECT
+-- ROW EXCLUSIVE       INSERT/UPDATE/DELETE
+-- SHARE               CREATE INDEX (blocks writes)
+-- ACCESS EXCLUSIVE    ALTER TABLE, DROP, TRUNCATE, VACUUM FULL
+--                     — conflicts with EVERYTHING, including SELECT
+
+-- ⚠ THE LOCK QUEUE IS THE REAL DANGER, AND IT IS NOT OBVIOUS:
+--   1. a long SELECT is running (holds ACCESS SHARE)
+--   2. your ALTER TABLE requests ACCESS EXCLUSIVE and QUEUES
+--   3. every subsequent query — including trivial SELECTs — queues
+--      BEHIND YOUR ALTER, because lock requests are ordered
+--   → the site is down, and the "cause" is a metadata change that
+--     takes 2ms once it starts.
+-- ✓ ALWAYS:
+SET lock_timeout = '3s';
+ALTER TABLE orders ADD COLUMN note text;   -- fails fast instead of
+                                           -- taking the site with it
+-- Then retry in a loop; on a busy table it may take several attempts.
+
+-- ── CHEAP VS EXPENSIVE DDL (Postgres 11+) ───────────────────────────────
+-- ✓ instant (metadata only): ADD COLUMN with or without a constant
+--   DEFAULT, DROP COLUMN, RENAME, ADD a NOT VALID constraint
+-- ✗ rewrites the whole table: changing a column type, ADD COLUMN with a
+--   VOLATILE default, SET NOT NULL on a big table (it must scan)
+-- ✓ THE SAFE PATTERN for adding a constraint to a live table:
+ALTER TABLE orders ADD CONSTRAINT ck CHECK (total &gt;= 0) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT ck;   -- scans, but takes only a
+                                             -- SHARE UPDATE EXCLUSIVE
+                                             -- lock: writes continue
+
+-- ── DIAGNOSING A LOCK PILE-UP, LIVE ─────────────────────────────────────
+SELECT pid, wait_event_type, wait_event, state,
+       pg_blocking_pids(pid) AS blocked_by,
+       now()-xact_start AS txn_age, left(query,60)
+FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) &gt; 0;
+-- pg_blocking_pids gives the chain directly. Follow it to the ROOT
+-- blocker — the one blocking others while blocked by nobody — and deal
+-- with that session, not the fifty victims downstream.
+
+-- ── ADVISORY LOCKS: MUTEXES FOR THINGS NOT IN A TABLE ───────────────────
+SELECT pg_try_advisory_xact_lock(hashtext('nightly-report'));
+-- Returns false if another session holds it. The `_xact_` variant
+-- releases automatically at COMMIT/ROLLBACK — always prefer it, because
+-- the session-scoped version leaks on crash and does not survive a
+-- transaction-mode connection pooler.</pre>
 
     <h2>Common Mistakes</h2>
     <table class="tbl">
       <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
-      <tr><td>Read-then-write without locking/versioning</td><td>Lost updates under load</td><td>Atomic UPDATE, FOR UPDATE, or version column</td></tr>
-      <tr><td>Assuming the default level prevents everything</td><td>Anomalies at Read Committed surprise you</td><td>Know your DB's default; raise per-transaction when needed</td></tr>
-      <tr><td>SERIALIZABLE without retry logic</td><td>Random 40001 serialization errors bubble to users</td><td>Retry loop on serialization failures</td></tr>
-      <tr><td>Long transactions holding locks</td><td>Blocked writers, deadlocks, replication lag</td><td>Short transactions; no external I/O inside</td></tr>
-      <tr><td>Inconsistent lock ordering</td><td>Deadlocks</td><td>Global lock order; keep lock sets small</td></tr>
-      <tr><td>Ignoring write skew</td><td>Invariants violated despite "no conflicts"</td><td>SERIALIZABLE, or explicit locking of the checked rows</td></tr>
+      <tr><td>Assuming the default level prevents anomalies</td><td>Lost updates and skew in production, none in testing</td><td>Read Committed prevents only dirty reads; add the specific protection</td></tr>
+      <tr><td>Reasoning from level names across engines</td><td>Code correct on Postgres, loses updates on MySQL</td><td>Same name ≠ same guarantees; test the interleaving on your engine</td></tr>
+      <tr><td><code>SERIALIZABLE</code> with no retry loop</td><td>Random 40001 errors surfacing as 500s</td><td>Retry on 40001/40P01 with backoff and jitter</td></tr>
+      <tr><td>Side effects inside a retried transaction</td><td>Duplicate emails and charges, one per attempt</td><td>Outbox table; keep the retried block pure</td></tr>
+      <tr><td>Retrying every error</td><td>Re-running work that already partly applied</td><td>Retry only serialisation and deadlock SQLSTATEs</td></tr>
+      <tr><td>Inconsistent lock acquisition order</td><td>Recurring deadlocks under load</td><td><code>ORDER BY id ... FOR UPDATE</code> — sort before locking</td></tr>
+      <tr><td>Migrations without <code>lock_timeout</code></td><td>One long query + one <code>ALTER</code> = total outage via the lock queue</td><td>Set <code>lock_timeout</code>, retry the DDL</td></tr>
+      <tr><td>Ignoring affected rows at Read Committed</td><td>Predicate lost a race; statement silently did nothing</td><td>Treat <code>0 rows</code> as a business outcome</td></tr>
+      <tr><td>Long-running transaction left open</td><td>Vacuum blocked database-wide; bloat; degraded plans</td><td><code>idle_in_transaction_session_timeout</code>; keep transactions short</td></tr>
+      <tr><td>Raising the isolation level to fix a lost update</td><td>Abort storms on hot rows</td><td>An atomic <code>UPDATE</code> or a constraint usually solves it with no aborts</td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1: Explain the isolation levels and what each additionally prevents.</summary>
-      <p>Read Uncommitted allows dirty reads (seeing uncommitted data). Read Committed (Postgres default)
-         prevents dirty reads — each statement sees only committed data, but two reads in one transaction
-         can differ (non-repeatable). Repeatable Read (MySQL default) gives the transaction a consistent
-         snapshot — re-reads return the same data (Postgres's implementation also prevents phantoms).
-         Serializable makes concurrent transactions equivalent to some serial order, additionally
-         preventing write skew — at the cost of serialization aborts that applications must retry. Stricter
-         = fewer anomalies, less concurrency; choose per-transaction based on the invariants at stake.</p></details>
-    <details class="solution"><summary>Q2: Optimistic vs pessimistic locking — mechanics and when each wins.</summary>
-      <p>Pessimistic: SELECT ... FOR UPDATE locks the rows up front; others wait until you commit —
-         guarantees exclusive access, right for hot rows/high contention or when a retry is unacceptable,
-         but holds locks (throughput cost, deadlock risk). Optimistic: read freely, then write with a
-         version guard (WHERE version = :read_version, incrementing it); zero rows affected means a
-         concurrent change — re-read and retry. No locks held, so it scales better when conflicts are rare
-         (typical web traffic); it's what ORM @Version implements. Rule of thumb: contention high →
-         pessimistic; contention low → optimistic; expressible in one atomic UPDATE → neither.</p></details>
-    <details class="solution"><summary>Q3: What is write skew, and why does only SERIALIZABLE stop it?</summary>
-      <p>Two transactions each read overlapping data, verify a constraint, and write DIFFERENT rows — each
-         write is individually fine, but together they violate the invariant. Classic: two on-call doctors
-         each check "at least one other doctor is on call" and both go off duty. Snapshot-based levels
-         (Repeatable Read) don't detect it because neither transaction wrote a row the other read-modified
-         — no write-write conflict. SERIALIZABLE tracks read/write dependencies (SSI in Postgres) and
-         aborts one transaction to preserve a serial order. Alternative: explicitly lock the rows your
-         check depends on (FOR UPDATE) to force the conflict.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> Name the isolation levels and what each additionally prevents.</summary>
+      <p>Read Uncommitted permits dirty reads — seeing data another transaction has not committed and may
+         roll back. Read Committed prevents that: every statement sees only committed data. It is
+         PostgreSQL's default, and the important caveat is that each <em>statement</em> gets a fresh view, so
+         two reads within one transaction can legitimately differ. Repeatable Read gives the whole
+         transaction a single consistent snapshot, so re-reading a row returns the same value; it is
+         MySQL's default. Serializable additionally guarantees the result is equivalent to running the
+         transactions one at a time in some order, which is the only level that prevents write skew.</p>
+      <p>The nuance worth adding is that the standard's table describes lock-based implementations from 1992.
+         PostgreSQL's Repeatable Read is true snapshot isolation and has no phantom reads even though the
+         standard permits them there, and it aborts conflicting writers rather than losing updates — whereas
+         MySQL at the same named level can lose an update. So the level name tells you the intent, not the
+         behaviour; the engine's documentation tells you the behaviour.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What is MVCC and why does it matter?</summary>
+      <p>Multi-Version Concurrency Control means an update does not overwrite a row in place. It writes a new
+         version and marks the old one as superseded, with each version tagged by the transaction that
+         created it and the one that removed it. Each transaction takes a snapshot describing which
+         transactions it should consider committed, and uses that to decide which version of each row it can
+         see.</p>
+      <p>The payoff is that readers never block writers and writers never block readers. A long analytical
+         query reads a consistent older snapshot while writes continue at full speed, with no coordination
+         between them, which is why the same database can serve reporting and transactional traffic at all.
+         It also means conflicts only ever arise between two writers.</p>
+      <p>The cost is that old versions accumulate as dead tuples until vacuum reclaims them, and vacuum
+         cannot remove anything newer than the oldest running transaction. So a single long-lived or
+         forgotten transaction causes bloat across the entire database, not just the tables it touched.
+         MVCC's convenience and its main operational hazard come from the same mechanism.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What is write skew, and why does snapshot isolation miss it?</summary>
+      <p>Write skew is when two transactions each read an overlapping set of rows, each check a condition
+         that involves those rows, and then each write <em>different</em> rows. Individually both are
+         correct; together they break an invariant that spans the rows. The standard example is an on-call
+         rota where two doctors each check "at least one other doctor is on call", both see the other, and
+         both go off duty, leaving nobody.</p>
+      <p>Snapshot isolation misses it because its conflict detection is write-versus-write. Neither
+         transaction modified a row the other one modified, so from the engine's point of view there is
+         nothing to conflict on. Each transaction's snapshot was internally consistent; the problem lives in
+         the relationship between what one read and what the other wrote, which snapshot isolation does not
+         track. This is exactly the gap Serializable Snapshot Isolation closes: it records read/write
+         dependencies between transactions, spots the cycle that no serial ordering could produce, and
+         aborts one participant.</p>
+      <p>The alternative fixes without raising the level are to materialise the conflict deliberately — take
+         <code>FOR UPDATE</code> locks on the rows the decision depends on, so the second transaction blocks
+         and then re-reads — or to express the invariant as something the database can enforce directly, such
+         as a constraint or a counter row that both transactions must update. That last option converts the
+         invisible read/write dependency into an ordinary write-write conflict, which every level can
+         detect.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Optimistic versus pessimistic locking — mechanics and how you choose.</summary>
+      <p>Pessimistic locking takes the lock before doing the work: <code>SELECT ... FOR UPDATE</code> marks
+         the rows exclusively, other writers block until you commit, and you are guaranteed nobody changed
+         them in between. It is simple to reason about and there is no retry path, but it holds locks for
+         the whole transaction, which serialises writers on those rows and creates deadlock potential if
+         different code paths acquire rows in different orders.</p>
+      <p>Optimistic concurrency takes no lock. You read the row along with a version number, do the work, and
+         write with <code>WHERE version = :version_i_read</code>, incrementing it. If zero rows are affected,
+         somebody else committed first and you re-read and retry, or report a conflict to the user. Nothing
+         is held between the read and the write, which is essential when there is human think time in
+         between — you cannot keep a database lock open while someone edits a form.</p>
+      <p>I choose by contention and by the shape of the gap. High contention on a hot row favours pessimistic,
+         because optimistic degenerates into a retry storm where most attempts are wasted. Low contention,
+         which is most web traffic, favours optimistic, because the common case costs nothing. Long or
+         unbounded think time forces optimistic regardless. And before either, I check whether the change is
+         expressible as a single atomic statement such as <code>SET stock = stock - 1 WHERE stock &gt;= 1</code>,
+         because that needs neither approach and is the right answer more often than people expect.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A nightly job deadlocks intermittently. How do you diagnose and fix it?</summary>
+      <p>I start with the log, because Postgres records both sides of a deadlock in detail. The
+         <code>DETAIL</code> lines name the two processes, the locks each was waiting for and holding, and
+         the statements involved. That usually identifies the two code paths immediately, and with
+         <code>log_lock_waits</code> on I also get the near-misses that did not quite deadlock but indicate
+         the same contention.</p>
+      <p>The overwhelmingly common cause is inconsistent lock ordering: two paths touching the same set of
+         rows in different sequences. A batch job updating rows in the order a query happened to return them
+         will interleave differently with a second job or with live traffic on each run, which is exactly why
+         it is intermittent. The fix is to impose a total order — sort by primary key before locking, and in
+         batch updates make the driving subquery <code>ORDER BY</code> the key. That single change eliminates
+         most real deadlocks because a cycle requires two parties to disagree about order.</p>
+      <p>Then I look for secondary contributors: transactions holding locks longer than necessary, which
+         widens the window; foreign-key locks on a hot parent row, which are invisible in the query text but
+         very real; and batch sizes large enough that two runs are almost guaranteed to overlap. Reducing the
+         batch size and committing more often shrinks the exposure, at the cost of losing all-or-nothing
+         semantics across the whole job, which is usually an acceptable trade for a nightly process that is
+         restartable.</p>
+      <p>Finally I make the job resilient rather than assuming I have eliminated the problem. Deadlocks are a
+         normal operating condition in any concurrent system, so the job retries on SQLSTATE 40P01 with
+         backoff and jitter, and it is written to be idempotent so a retry cannot double-apply. If a deadlock
+         still requires manual intervention after all that, the design is wrong, not the database.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A migration adding a column took the site down for eight minutes, though the ALTER itself was instant. Explain.</summary>
+      <p>The <code>ALTER TABLE</code> needed an <code>ACCESS EXCLUSIVE</code> lock, which conflicts with every
+         other lock mode including the <code>ACCESS SHARE</code> that a plain <code>SELECT</code> takes. A
+         long-running query — a report, an analytics scan, or an idle transaction that had touched the table
+         — was already holding <code>ACCESS SHARE</code>, so the <code>ALTER</code> could not acquire its
+         lock and went into the wait queue.</p>
+      <p>The part that turns a wait into an outage is that the lock queue is ordered. Once the
+         <code>ALTER</code> is queued, every subsequent request for a conflicting lock queues <em>behind
+         it</em>, including ordinary <code>SELECT</code>s that would otherwise have run happily alongside the
+         existing reader. So the whole table becomes unavailable for the duration of the original slow query,
+         not for the duration of the schema change. On PostgreSQL 11 and later, adding a nullable column or
+         one with a constant default is a metadata-only change taking a couple of milliseconds — which is
+         exactly why the timing looks inexplicable if you only measure the statement.</p>
+      <p>The fix is <code>SET lock_timeout</code> to a few seconds before the DDL, so the migration fails fast
+         instead of forming a queue, wrapped in a retry loop that tries again until it wins a quiet moment.
+         I would also check for long-running transactions before migrating, and set
+         <code>idle_in_transaction_session_timeout</code> so a forgotten session cannot hold the table
+         hostage. For genuinely expensive operations the technique is to avoid the exclusive lock rather than
+         hold it better: <code>CREATE INDEX CONCURRENTLY</code>, adding constraints as <code>NOT VALID</code>
+         and validating in a second step under a weaker lock, and expand-backfill-contract for type changes
+         instead of rewriting a table in place.</p></details>
 
-    <div class="exercise"><strong>🏋️ Practice (two psql sessions):</strong> demonstrate a non-repeatable read at Read Committed, then prevent it with Repeatable Read; produce a lost update with read-then-write, then fix with FOR UPDATE and again with a version column; create a deadlock with two sessions locking in opposite order and read the error; run SERIALIZABLE transactions that conflict and implement a retry.</div>
+    <h2>🏋️ Exercises</h2>
 
-    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li>Know the anomalies (dirty, non-repeatable, phantom, lost update, write skew) and which level stops each.</li>
-      <li>Defaults differ: Postgres = Read Committed, MySQL = Repeatable Read; set per-transaction when invariants demand.</li>
-      <li>MVCC = readers don't block writers (snapshots); conflicts are about writes.</li>
-      <li>Lost updates: atomic UPDATE > optimistic versioning (low contention) > FOR UPDATE (high contention).</li>
-      <li>SERIALIZABLE needs retry logic; deadlocks need consistent lock ordering and short transactions.</li>
-    </ul></div>
+    <div class="exercise"><strong>1 (easy):</strong> Demonstrate a non-repeatable read, then prevent it.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE accounts (id int PRIMARY KEY, balance int);
+INSERT INTO accounts VALUES (1, 100);
+
+-- ── AT READ COMMITTED (the default) ─────────────────────────────────────
+-- Session 1                          | Session 2
+-- BEGIN;                             |
+-- SELECT balance ... id=1;  → 100    |
+--                                    | UPDATE accounts SET balance=50
+--                                    |   WHERE id=1;
+--                                    | COMMIT;
+-- SELECT balance ... id=1;  →  50 ✗  |
+-- COMMIT;
+-- Same transaction, same query, two answers.
+
+-- ── AT REPEATABLE READ ──────────────────────────────────────────────────
+-- Session 1                          | Session 2
+-- BEGIN ISOLATION LEVEL              |
+--   REPEATABLE READ;                 |
+-- SELECT balance ... id=1;  → 100    |
+--                                    | UPDATE ... balance=50; COMMIT;
+-- SELECT balance ... id=1;  → 100 ✓  |
+-- COMMIT;
+-- SELECT balance ... id=1;  →  50    ← after commit, the new snapshot
+
+-- ── WHY ─────────────────────────────────────────────────────────────────
+-- Read Committed takes a NEW snapshot per STATEMENT.
+-- Repeatable Read takes ONE snapshot at the first statement and holds it.
+-- That is the entire difference, and it explains every other behaviour.
+
+-- ⚠ Note S1 was never blocked. Under MVCC it read an older VERSION of
+--   the row while S2 wrote a new one. Readers do not block writers.
+
+-- ── THE PRACTICAL CASE ──────────────────────────────────────────────────
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT sum(balance) FROM accounts WHERE type='asset';
+SELECT sum(balance) FROM accounts WHERE type='liability';
+COMMIT;
+-- Both figures now come from the SAME instant, so the balance sheet
+-- balances. Multi-query reports and consistent exports are the most
+-- common legitimate reason to raise the level.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Cause a deadlock deliberately, read the error, then make it impossible.
+      <details class="solution"><summary>Solution</summary>
+      <pre>INSERT INTO accounts VALUES (1, 100), (2, 100);
+
+-- ── CAUSE IT ────────────────────────────────────────────────────────────
+-- Session 1                          | Session 2
+-- BEGIN;                             | BEGIN;
+-- UPDATE accounts SET balance=       |
+--   balance-10 WHERE id=1;           |
+--                                    | UPDATE accounts SET balance=
+--                                    |   balance-10 WHERE id=2;
+-- UPDATE ... WHERE id=2;  ← blocks   |
+--                                    | UPDATE ... WHERE id=1;  ← blocks
+--                                    |
+-- ERROR:  deadlock detected
+-- DETAIL: Process 2841 waits for ShareLock on transaction 1002;
+--         blocked by process 2903.
+--         Process 2903 waits for ShareLock on transaction 1001;
+--         blocked by process 2841.
+-- HINT:   See server log for query details.
+
+-- One transaction is killed (the victim), the other completes. Each held
+-- what the other wanted: a cycle, which no amount of waiting resolves.
+
+-- ── MAKE IT IMPOSSIBLE: SORT BEFORE LOCKING ─────────────────────────────
+BEGIN;
+SELECT id FROM accounts WHERE id IN (:a, :b) ORDER BY id FOR UPDATE;
+--   ↑ BOTH sessions now take id=1 first, then id=2. The second waits at
+--     the first lock instead of acquiring one and demanding another.
+--     A cycle requires disagreement about order; there is none.
+UPDATE accounts SET balance = balance - 10 WHERE id = :a;
+UPDATE accounts SET balance = balance + 10 WHERE id = :b;
+COMMIT;
+
+-- ── RETRY ANYWAY ────────────────────────────────────────────────────────
+-- Consistent ordering removes the deadlocks you control. FK locks, index
+-- page locks and other code paths can still produce them, so any writer
+-- retries on 40P01. Deadlocks are an operating condition, not a bug you
+-- eliminate to zero.
+
+-- ── DIAGNOSING ONE YOU DID NOT CREATE ───────────────────────────────────
+SET log_lock_waits = on;      -- logs waits over deadlock_timeout,
+                              -- catching near-misses BEFORE they become
+                              -- deadlocks — a genuine early warning
+SELECT pid, pg_blocking_pids(pid), left(query,60)
+FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) &gt; 0;</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Produce write skew, then fix it three ways and compare.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE doctors (id int PRIMARY KEY, name text, on_call boolean);
+INSERT INTO doctors VALUES (1,'Asha',true), (2,'Ben',true);
+-- INVARIANT: at least one doctor on call, always.
+
+-- ── PRODUCE IT (Read Committed OR Repeatable Read — both fail) ──────────
+-- Session 1                          | Session 2
+-- BEGIN;                             | BEGIN;
+-- SELECT count(*) FROM doctors       | SELECT count(*) FROM doctors
+--   WHERE on_call;  → 2 (ok)         |   WHERE on_call;  → 2 (ok)
+-- UPDATE doctors SET on_call=false   |
+--   WHERE id=1;                      |
+--                                    | UPDATE doctors SET on_call=false
+--                                    |   WHERE id=2;
+-- COMMIT;                            | COMMIT;
+SELECT count(*) FROM doctors WHERE on_call;   -- 0  ✗ INVARIANT BROKEN
+-- No error, no conflict, no blocking. They wrote DIFFERENT ROWS, so
+-- there is nothing for snapshot isolation to detect.
+
+-- ── FIX 1: SERIALIZABLE ─────────────────────────────────────────────────
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM doctors WHERE on_call;
+UPDATE doctors SET on_call=false WHERE id=:me;
+COMMIT;
+-- ERROR: could not serialize access due to read/write dependencies
+-- SSI saw that each transaction read what the other wrote. One aborts.
+-- ✓ No schema change, no explicit locks, catches skew you did not
+--   anticipate.
+-- ✗ Needs a retry loop everywhere, and EVERY participant must use it —
+--   one Read Committed writer defeats the whole scheme.
+
+-- ── FIX 2: LOCK WHAT YOU READ ───────────────────────────────────────────
+BEGIN;
+SELECT count(*) FROM doctors WHERE on_call FOR UPDATE;
+--   ↑ FOR UPDATE on the rows the DECISION depends on. S2 now blocks at
+--     the SELECT, and re-reads count=1 after S1 commits, so its check
+--     correctly fails.
+UPDATE doctors SET on_call=false WHERE id=:me;
+COMMIT;
+-- ✓ Works at any isolation level; no retries.
+-- ✗ You must remember to lock the read rows at every call site, and it
+--   serialises all on-call changes.
+-- ⚠ FOR UPDATE cannot lock rows that do not exist yet — it does not stop
+--   a concurrent INSERT of a new matching row (a phantom).
+
+-- ── FIX 3: MAKE IT A WRITE-WRITE CONFLICT ───────────────────────────────
+CREATE TABLE shift_state (shift_id int PRIMARY KEY, on_call_count int
+    NOT NULL CHECK (on_call_count &gt;= 1));
+BEGIN;
+UPDATE shift_state SET on_call_count = on_call_count - 1 WHERE shift_id=:s;
+--   ↑ Both transactions now write the SAME ROW. The second one blocks,
+--     re-reads, and the CHECK rejects the decrement below 1.
+UPDATE doctors SET on_call=false WHERE id=:me;
+COMMIT;
+-- ✓ The invariant is enforced by the DATABASE and cannot be bypassed by
+--   any writer, at any isolation level, ever.
+-- ✗ A schema change, and that counter row is a serialisation point.
+
+-- ── CHOOSING ────────────────────────────────────────────────────────────
+-- Known, nameable invariant on a hot path → FIX 3. Best guarantee.
+-- Complex or unknown invariants, low contention → FIX 1.
+-- Targeted fix in existing code, no schema change → FIX 2.
+-- The deeper point: write skew disappears when you turn an invisible
+-- read/write dependency into an explicit write-write conflict. All three
+-- fixes are that same idea by different means.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Write a correct retry wrapper for serialisation failures.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── ✗ THE NAIVE VERSION, AND FIVE DEFECTS ──────────────────────────────
+while True:
+    try:
+        run_transaction()
+        break
+    except Exception:          -- 1. catches EVERYTHING
+        pass                   -- 2. no backoff  3. no jitter
+                               -- 4. infinite    5. no side-effect safety
+
+-- ── ✓ CORRECT ───────────────────────────────────────────────────────────
+RETRYABLE = {'40001',    # serialization_failure
+             '40P01'}    # deadlock_detected
+
+def with_retry(fn, attempts=5, base=0.02, cap=1.0):
+    for n in range(attempts):
+        try:
+            with db.transaction(isolation='serializable'):
+                return fn()                    # ⚠ MUST be side-effect free
+        except DatabaseError as e:
+            if e.sqlstate not in RETRYABLE or n == attempts - 1:
+                raise
+            metrics.increment('txn.retry', tags={'sqlstate': e.sqlstate})
+            sleep(min(cap, base * 2**n) * random.uniform(0.5, 1.5))
+    # exhausted → propagate; the caller decides (503, queue, alert)
+
+-- ── WHY EACH PIECE ──────────────────────────────────────────────────────
+-- ONLY 40001/40P01. These two are the errors the database is TELLING you
+--   to retry — nothing was applied. A unique violation, a timeout or a
+--   connection error means something else, and retrying may re-run work
+--   that already partly happened. A blanket `except` turns a bug into
+--   duplicated side effects.
+-- EXPONENTIAL BACKOFF. Immediate retry hits the same contention window.
+-- JITTER. Without it, N conflicting transactions retry in lockstep and
+--   collide again — the classic thundering herd. Jitter is not optional.
+-- BOUNDED ATTEMPTS. Unbounded retries under real contention are a
+--   self-inflicted load test that never resolves.
+-- METRICS. A rising retry rate is the leading indicator of a hot row.
+--   Silent retries hide a scalability problem until it is an outage.
+
+-- ── THE PART EVERYONE GETS WRONG: SIDE EFFECTS ──────────────────────────
+def transfer():                          # ✗ email sent PER ATTEMPT
+    db.execute("UPDATE accounts ...")
+    email.send("Transfer complete")      # not rolled back by the DB
+
+def transfer():                          # ✓ outbox: atomic with the data
+    db.execute("UPDATE accounts ...")
+    db.execute("INSERT INTO outbox (topic, payload) VALUES (...)")
+-- A separate worker sends from the outbox. If the transaction aborts,
+-- the outbox row vanishes with it. The rule: NOTHING outside the
+-- database may happen inside a retried block.
+
+-- ── AND: IS SERIALIZABLE EVEN NEEDED? ───────────────────────────────────
+-- Before adding this machinery, check whether an atomic UPDATE or a
+-- CHECK constraint closes the hole with zero aborts and zero retry code.
+-- A retry loop is the right answer to a real multi-row invariant, and
+-- the wrong answer to a lost update.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build a job queue in SQL that is correct with many concurrent workers.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE jobs (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payload      jsonb       NOT NULL,
+    status       text        NOT NULL DEFAULT 'queued'
+                 CHECK (status IN ('queued','running','done','failed')),
+    run_after    timestamptz NOT NULL DEFAULT now(),
+    attempts     int         NOT NULL DEFAULT 0,
+    locked_at    timestamptz,
+    last_error   text
+);
+-- PARTIAL index: only pending work. Tiny, cache-resident, and only
+-- maintained when a row is actually claimable.
+CREATE INDEX jobs_ready ON jobs (run_after, id)
+    WHERE status = 'queued';
+
+-- ── ✗ WHAT FAILS ────────────────────────────────────────────────────────
+-- (a) SELECT ... WHERE status='queued' LIMIT 1;  then UPDATE
+--     Check-then-act: every worker grabs the SAME job.
+-- (b) SELECT ... FOR UPDATE LIMIT 1;
+--     Correct, but all workers queue on the SAME row. Throughput does
+--     not improve with more workers — it gets worse.
+
+-- ── ✓ THE CLAIM: SKIP LOCKED ────────────────────────────────────────────
+UPDATE jobs SET status='running', locked_at=now(), attempts=attempts+1
+WHERE id IN (
+    SELECT id FROM jobs
+    WHERE status='queued' AND run_after &lt;= now()
+    ORDER BY run_after, id
+    FOR UPDATE SKIP LOCKED           -- ← the whole design
+    LIMIT 10)
+RETURNING *;
+-- SKIP LOCKED means "ignore rows another transaction has locked" rather
+-- than waiting. Ten workers claim ten DISJOINT batches simultaneously
+-- with no blocking and no coordination. Throughput scales with workers.
+-- ORDER BY inside the subquery also gives a consistent lock order, so
+-- the workers cannot deadlock against each other.
+
+-- ── CRASHED WORKERS: THE PART PEOPLE FORGET ─────────────────────────────
+-- A worker that dies mid-job leaves the row 'running' forever. The row
+-- lock died with its connection; the STATUS did not.
+UPDATE jobs SET status='queued', locked_at=NULL
+WHERE status='running' AND locked_at &lt; now() - interval '10 minutes';
+-- ⚠ The timeout must exceed the longest legitimate runtime, or you will
+--   duplicate work that is still in progress. Better: have workers
+--   heartbeat locked_at, so the reaper distinguishes "slow" from "dead".
+
+-- ── AT-LEAST-ONCE IS THE HONEST GUARANTEE ───────────────────────────────
+-- A worker can finish the work and crash before marking it done. The
+-- reaper then re-queues it. Exactly-once delivery does not exist across
+-- a process boundary, so HANDLERS MUST BE IDEMPOTENT — a unique key on
+-- the effect, or a natural upsert. Any queue promising exactly-once is
+-- doing at-least-once plus deduplication, and you still own the dedupe.
+
+-- ── FAILURE HANDLING ────────────────────────────────────────────────────
+UPDATE jobs SET status = CASE WHEN attempts &gt;= 5 THEN 'failed'
+                              ELSE 'queued' END,
+               run_after = now() + (interval '1 minute' * 2^attempts),
+               last_error = :err
+WHERE id = :id;
+-- Exponential backoff in the data, and a terminal 'failed' state so a
+-- poison message cannot retry forever. Alert on the failed count.
+
+-- ── LISTEN/NOTIFY INSTEAD OF POLLING ────────────────────────────────────
+-- Polling every second wastes queries and adds latency:
+LISTEN jobs_channel;                                    -- worker
+SELECT pg_notify('jobs_channel', '');                   -- on insert
+-- ⚠ NOTIFY is fire-and-forget and does NOT survive a disconnect, so keep
+--   a slow poll (every 30s) as the safety net. Use it to reduce latency,
+--   never as the only delivery mechanism.
+
+-- ── WHEN TO STOP DOING THIS ─────────────────────────────────────────────
+-- SKIP LOCKED queues are excellent to roughly thousands of jobs/second
+-- and give you transactional enqueue for free — the job and the data
+-- that caused it commit together, which no external broker can offer.
+-- Beyond that, queue tables generate heavy churn: every claim and
+-- completion is an UPDATE, so dead tuples and index bloat dominate, and
+-- autovacuum becomes the bottleneck. That is the point to move to a
+-- purpose-built broker — and to know WHY, not just that people say so.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Diagnose a live incident: writes stalled, connections climbing, one <code>ALTER TABLE</code> in flight.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYMPTOMS: p99 from 40ms to 30s, connections at the pool cap, error
+-- rate climbing. A migration was deployed four minutes ago.
+
+-- ── STEP 1: WHO IS BLOCKING WHOM ────────────────────────────────────────
+SELECT pid, state, wait_event_type, wait_event,
+       pg_blocking_pids(pid) AS blocked_by,
+       now()-xact_start AS txn_age, left(query,70) AS q
+FROM pg_stat_activity
+WHERE backend_type='client backend'
+ORDER BY xact_start;
+--  pid  | state  | wait_event | blocked_by | txn_age  | q
+--  9001 | active | (none)     | {}         | 00:11:42 | SELECT ... report
+--  9002 | active | relation   | {9001}     | 00:04:10 | ALTER TABLE orders
+--  9003 | active | relation   | {9002}     | 00:04:09 | SELECT * FROM ord
+--  9004 | active | relation   | {9002}     | 00:04:08 | INSERT INTO order
+--  ...  (300 more, all blocked_by 9002)
+
+-- ── STEP 2: READ THE CHAIN, FIND THE ROOT ───────────────────────────────
+-- 9001 blocks nobody's attention but holds ACCESS SHARE (a slow report).
+-- 9002 (the ALTER) wants ACCESS EXCLUSIVE → conflicts → QUEUES.
+-- Everything after 9002 queues BEHIND IT, because lock requests are
+-- ORDERED. Ordinary SELECTs that would happily coexist with 9001 are now
+-- stuck behind a migration that has not started.
+--
+-- ⚠ THE COUNTER-INTUITIVE BIT: the ALTER is not slow. Adding a nullable
+--   column is metadata-only and takes ~2ms. The outage is entirely the
+--   LOCK QUEUE it created while waiting on an unrelated 11-minute query.
+--   The root cause is 9001 + 9002 together; neither alone is a problem.
+
+-- ── STEP 3: STOP IT NOW ─────────────────────────────────────────────────
+SELECT pg_cancel_backend(9002);     -- cancel the ALTER first: it is the
+                                    -- queue head. The 300 blocked
+                                    -- queries drain immediately.
+-- Prefer pg_cancel_backend (cancels the query) over
+-- pg_terminate_backend (kills the connection). Cancel the MIGRATION, not
+-- the report — killing 9001 leaves the ALTER to acquire its lock and the
+-- queue re-forms behind the next long query.
+
+-- ── STEP 4: RE-RUN IT SAFELY ────────────────────────────────────────────
+SET lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN note text;
+-- Now the worst case is that the migration fails in 2 seconds, having
+-- blocked nothing. Retry in a loop until it catches a quiet moment:
+DO $$
+BEGIN
+  FOR i IN 1..50 LOOP
+    BEGIN
+      SET lock_timeout = '2s';
+      ALTER TABLE orders ADD COLUMN note text;
+      RETURN;
+    EXCEPTION WHEN lock_not_available THEN
+      PERFORM pg_sleep(5);
+    END;
+  END LOOP;
+  RAISE EXCEPTION 'could not acquire lock after 50 attempts';
+END $$;
+
+-- ── STEP 5: PREVENT THE CLASS ───────────────────────────────────────────
+-- 1. lock_timeout in EVERY migration, enforced by the migration tool
+--    rather than by whoever wrote the file.
+-- 2. statement_timeout + idle_in_transaction_session_timeout globally,
+--    so an 11-minute query cannot exist on the OLTP primary at all.
+-- 3. Route reporting to a replica. This report had no business
+--    competing with the write path.
+-- 4. Pre-flight check: refuse to migrate while any transaction older
+--    than 60s is running:
+SELECT pid, now()-xact_start FROM pg_stat_activity
+WHERE now()-xact_start &gt; interval '60 seconds' AND state &lt;&gt; 'idle';
+-- 5. Know which DDL is cheap: ADD COLUMN (nullable or constant default),
+--    DROP COLUMN and RENAME are metadata-only. Type changes, volatile
+--    defaults and SET NOT NULL rewrite or scan the table — those need
+--    expand/backfill/contract, never a single ALTER.
+
+-- ── THE WRITE-UP ────────────────────────────────────────────────────────
+-- "The ALTER was instant" and "the ALTER caused an 8-minute outage" are
+-- both true. Lock ACQUISITION, not lock HOLDING, is what took the site
+-- down — and that distinction is the whole lesson.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Learn the anomalies as two-session interleavings, not definitions — the interleaving tells you which fix applies.</li>
+        <li>Isolation level names describe intent, not behaviour: Postgres Repeatable Read prevents phantoms and lost updates, MySQL's does not.</li>
+        <li>MVCC means readers never block writers because each transaction reads the row version its snapshot permits; the cost is dead tuples and vacuum pressure.</li>
+        <li>The whole Read Committed / Repeatable Read difference is where the snapshot is taken — per statement versus per transaction.</li>
+        <li>At Read Committed a blocked <code>UPDATE</code> re-reads and re-evaluates its predicate, so a race shows up only as zero affected rows.</li>
+        <li>Write skew is invisible to snapshot isolation because the transactions write different rows — there is no write-write conflict to detect.</li>
+        <li>Postgres SSI gives true serialisability without read locks, paying in false-positive aborts — so <code>SERIALIZABLE</code> without a retry loop is worse than not using it.</li>
+        <li>Retry only on 40001 and 40P01, with backoff and jitter, and keep every side effect out of the retried block via an outbox.</li>
+        <li>Sort rows before locking them; a consistent lock order makes the deadlock cycle structurally impossible.</li>
+        <li>Lock <em>acquisition</em> takes sites down, not lock holding: an <code>ACCESS EXCLUSIVE</code> request queues every later query behind it, so always set <code>lock_timeout</code> before DDL.</li>
+      </ul>
+    </div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="indexes.html">← Indexes</a>
-      <a class="btn" href="optimization.html">Next: Query Optimization →</a>
+      <a href="indexes.html">← Indexes &amp; Query Plans</a>
+      <a href="optimization.html">Query Optimization →</a>
     </div>
   </main>
 </div>
