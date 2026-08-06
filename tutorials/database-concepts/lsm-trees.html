@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSM-Trees &amp; Write-Optimised Storage — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>LSM-Trees &amp; Write-Optimised Storage <span class="level-badge level-adv">Storage Foundations</span></h1>
+    <p><strong>What you'll master:</strong> the one idea behind every write-optimised engine — never modify
+       anything, only append — and the machinery required to make reads work afterwards, how a memtable, an
+       immutable SSTable and a commit log combine into a durable write path, why bloom filters turn an
+       otherwise unacceptable read amplification into a non-issue and how to size them, the two compaction
+       strategies and the genuinely different systems they produce, why deletes create tombstones and how
+       that produces the notorious "my range scan got slower after I deleted everything" failure, the
+       three-way amplification trade-off made concrete with arithmetic, and how to decide between a B+tree
+       and an LSM for a real workload. Prerequisites:
+       <a href="btrees.html">B+Trees In Depth</a> — this lesson is largely a contrast with it. Engines
+       referenced: RocksDB, Cassandra, ScyllaDB, LevelDB, and the storage layer beneath many
+       time-series systems.</p>
+
+    <h2>Part 1 — The Idea: Stop Updating Things</h2>
+    <pre>-- A B+tree writes IN PLACE. To change one row: find its page, read it,
+-- modify it, write the whole page back. That is a random read followed
+-- by a random write, per change, forever.
+--
+-- The LSM insight is to refuse to do that. Never modify a stored byte.
+-- Buffer writes in memory, and when the buffer fills, write it out as a
+-- brand-new SORTED FILE. Sequentially. Never touched again.
+
+--   WRITE PATH
+--     ┌──────────────┐
+--     │  commit log  │  append + fsync → durability
+--     └──────────────┘
+--     ┌──────────────┐
+--     │   MEMTABLE   │  sorted in-memory structure (skiplist/red-black)
+--     │  (mutable)   │  writes land here. ~64MB typical.
+--     └──────┬───────┘
+--            │ full → freeze, flush SEQUENTIALLY
+--            ▼
+--     ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+--     │  SSTable 1   │  │  SSTable 2   │  │  SSTable 3   │  IMMUTABLE
+--     │  sorted, RO  │  │  sorted, RO  │  │  sorted, RO  │  sorted files
+--     └──────────────┘  └──────────────┘  └──────────────┘
+--            └──────── compaction merges them ────────┘
+
+-- ── WHY THIS IS FAST ────────────────────────────────────────────────────
+-- A write costs: one sequential log append + one in-memory insert.
+-- No page read. No random I/O. No page split. No index maintenance.
+-- Flushing is a large sequential write of an already-sorted buffer,
+-- which is the single fastest thing a storage device does.
+--
+-- Recall the numbers from lesson 1: NVMe sequential ~3,000 MB/s versus
+-- random 4KB at ~400 MB/s. An LSM converts the second into the first.
+-- That conversion IS the whole design.
+
+-- ── WHAT IT COSTS, STATED IMMEDIATELY ───────────────────────────────────
+-- A key can now live in the memtable OR in ANY of the SSTables, and the
+-- newest copy wins. So a read may have to check several places, and the
+-- files must be merged in the background forever. Every remaining part
+-- of this lesson is machinery to manage those two costs.
+
+-- ── AN SSTABLE (Sorted String Table) ────────────────────────────────────
+--   ┌────────────────────────────────────────────┐
+--   │ DATA BLOCKS   sorted key→value, compressed │  ~4-64KB each
+--   ├────────────────────────────────────────────┤
+--   │ INDEX BLOCK   first key of each data block │  → binary search
+--   ├────────────────────────────────────────────┤
+--   │ BLOOM FILTER  "is this key possibly here?" │  ← Part 3
+--   ├────────────────────────────────────────────┤
+--   │ FOOTER        offsets, checksums, metadata │
+--   └────────────────────────────────────────────┘
+-- Because the file is immutable, the index and bloom filter are built
+-- once at write time and are exactly right forever. Nothing to maintain,
+-- nothing to rebalance, and compression works far better than on mutable
+-- pages — often 5-10× versus 2-3× for a B+tree.</pre>
+
+    <h2>Part 2 — The Write and Read Paths in Full</h2>
+    <pre>-- ── WRITE ───────────────────────────────────────────────────────────────
+PUT(key, value):
+  1. append (key, value, seq_no) to the COMMIT LOG, fsync   ← durability
+  2. insert into the MEMTABLE (sorted, in memory)
+  3. return success                                          ← ~microseconds
+  -- when the memtable exceeds its threshold:
+  4. mark it immutable, start a fresh one (writes never block)
+  5. flush the frozen memtable to a new SSTable, sequentially
+  6. discard the corresponding commit-log segment
+
+-- ⚠ NOTE WHAT DID NOT HAPPEN: no read, no seek, no page split, no index
+--   update. The write path never touches existing data. This is why
+--   ingest rates of hundreds of thousands per second per node are
+--   ordinary for these engines.
+
+-- ── THE COMMIT LOG IS NOT OPTIONAL ──────────────────────────────────────
+-- The memtable is volatile. Without the log, a crash loses every
+-- acknowledged write since the last flush. It is the same write-ahead
+-- principle as a B+tree engine's WAL (lesson 6): one sequential fsync
+-- makes an in-memory change durable.
+-- Some systems allow relaxing it — Cassandra's `commitlog_sync: periodic`
+-- fsyncs every 10s by default, trading a 10-second data-loss window for
+-- throughput. Know which mode you are running before you promise
+-- durability to anyone.
+
+-- ── READ ────────────────────────────────────────────────────────────────
+GET(key):
+  1. check the MEMTABLE                    → found? return (newest wins)
+  2. check immutable memtables not yet flushed
+  3. for each SSTable, NEWEST FIRST:
+       a. ask its BLOOM FILTER             → "definitely not here"? SKIP
+       b. binary-search the index block    → locate the data block
+       c. read and decompress the block    → found? return
+  4. not found anywhere → the key does not exist
+
+-- ⚠ ORDER MATTERS ABSOLUTELY. The newest copy wins, so the search must
+--   go newest to oldest and stop at the first hit. An older SSTable
+--   still physically contains the superseded value; it is simply never
+--   reached.
+
+-- ── READ AMPLIFICATION, AND WHY IT IS SURVIVABLE ────────────────────────
+-- Naively, a read with 10 SSTables costs 10 file probes. That would be
+-- unacceptable. Two things rescue it:
+--   1. BLOOM FILTERS eliminate ~99% of the probes for keys that are not
+--      present in a given file (Part 3).
+--   2. COMPACTION keeps the file count small (Part 4).
+-- Without both, an LSM would be unusably slow to read. They are not
+-- optimisations; they are load-bearing.
+
+-- ── RANGE SCANS ARE THE HARDER CASE ─────────────────────────────────────
+SCAN(start, end):
+  -- open an iterator on the memtable AND on EVERY SSTable whose key
+  -- range overlaps, then merge them in sorted order, dropping
+  -- superseded versions as you go.
+-- ⚠ Bloom filters DO NOT HELP HERE. A bloom filter answers "is this
+--   exact key present"; it says nothing about a range. So range scans
+--   pay the full file-count cost, which is why compaction strategy
+--   matters far more for scan-heavy workloads than for point lookups.</pre>
+
+    <h2>Part 3 — Bloom Filters: The Component That Makes It Work</h2>
+    <pre>-- A probabilistic set membership test. It answers one question:
+--   "is this key DEFINITELY NOT in this file?"
+-- • "definitely not"  → guaranteed correct. Skip the file entirely.
+-- • "possibly yes"    → might be a FALSE POSITIVE; you must check.
+-- There are no false negatives, which is what makes it safe to use.
+
+-- ── HOW IT WORKS ────────────────────────────────────────────────────────
+-- A bit array of m bits and k independent hash functions.
+--   INSERT key: set the bits at h1(key), h2(key), ... hk(key)
+--   QUERY key:  if ANY of those bits is 0 → definitely absent
+--               if ALL are 1 → probably present (or a collision)
+--
+--   bits:  0 1 0 0 1 1 0 0 1 0 0 1 0 0
+--                ↑     ↑       ↑
+--          h1("alice") h2  h3   → all 1 → "possibly present"
+--
+--   query "bob": h1→ index 3 (0)  → DEFINITELY ABSENT. Stop.
+
+-- ── SIZING IT: THE ARITHMETIC WORTH KNOWING ─────────────────────────────
+--   bits per key   false positive rate   memory for 1 BILLION keys
+--        4               ~14%                  500 MB
+--        8                ~2%                    1 GB      ← common
+--       10                ~1%                  1.25 GB     ← RocksDB
+--       16               ~0.05%                  2 GB
+--       20               ~0.01%                2.5 GB
+-- Diminishing returns are steep: 8→16 bits doubles memory to remove 2%
+-- of probes. 10 bits per key is the near-universal default because it is
+-- where the curve flattens.
+
+-- ── WHAT IT BUYS, CONCRETELY ────────────────────────────────────────────
+-- 10 SSTables, key present in exactly one, 1% false positive rate:
+--   without filters: 10 file probes, ~9 of them wasted
+--   with filters:    1 real probe + (9 × 0.01) ≈ 0.09 wasted
+-- → ~10× fewer I/Os on point lookups. This single component is the
+--   difference between "LSM reads are fine" and "LSM reads are hopeless".
+
+-- ── WHERE THEY DO NOT HELP (know these) ─────────────────────────────────
+-- ✗ RANGE SCANS — a filter tests one exact key, not an interval.
+-- ✗ Workloads dominated by reads of keys that DO exist. The filter's job
+--   is eliminating files that lack the key; if the key is in most files
+--   (heavily-updated keys), it eliminates nothing.
+-- ✓ They shine on the common real pattern: "does this user exist?"
+--   answered mostly with "no", where nearly every probe is skipped.
+
+-- ── TUNING ──────────────────────────────────────────────────────────────
+-- RocksDB: bloom_filter_bits_per_key, and RIBBON FILTERS (newer) give
+--   the same false-positive rate for ~30% less memory at slightly higher
+--   CPU — usually worth it when memory is the constraint.
+-- ⚠ Filters must be IN MEMORY to be useful. If they are evicted from
+--   cache, each probe becomes a disk read to avoid a disk read, which is
+--   worse than not having them. Budget memory for filters explicitly —
+--   this is a real production failure mode on large datasets.</pre>
+    <div class="note">🎯 <strong>Bloom filters are not an optimisation here, they are structural.</strong> The
+      entire LSM design accepts read amplification in exchange for sequential writes. Bloom filters are what
+      make that trade survivable, converting ten file probes into roughly one. When someone reports that an
+      LSM-backed store "got slow", two of the first three things to check are whether the filters still fit
+      in memory and whether compaction has fallen behind.</div>
+
+    <h2>Part 4 — Compaction: The Background Cost You Must Budget For</h2>
+    <pre>-- Without compaction, SSTables accumulate forever: reads check more
+-- files, obsolete versions never disappear, and disk fills with garbage.
+-- Compaction merges SSTables, discarding superseded values and
+-- tombstones. It is essential, continuous, and it is where LSM
+-- operational difficulty lives.
+
+-- ── STRATEGY 1: SIZE-TIERED (STCS) ──────────────────────────────────────
+-- Merge SSTables of SIMILAR SIZE into one larger file.
+--   [4MB][4MB][4MB][4MB] → [16MB]
+--   [16MB][16MB][16MB][16MB] → [64MB] ...
+-- ✓ LOW WRITE AMPLIFICATION — each byte is rewritten only when its tier
+--   fills. Best raw write throughput.
+-- ✗ HIGH SPACE AMPLIFICATION — up to 2× transiently, because merging
+--   four 16MB files needs 64MB free before the originals are dropped.
+-- ✗ HIGH READ AMPLIFICATION — a key may live in one file per tier, and
+--   the ranges OVERLAP, so many files must be checked.
+-- → Cassandra's default. Right for write-heavy, insert-mostly data.
+
+-- ── STRATEGY 2: LEVELLED (LCS) ──────────────────────────────────────────
+-- Levels of increasing size (L0, L1=10×, L2=100×...). Within L1 and
+-- below, SSTables have NON-OVERLAPPING key ranges.
+--   L0: [a-z][a-z][a-z]        ← overlapping, freshly flushed
+--   L1: [a-f][g-m][n-s][t-z]   ← disjoint: at most ONE file per key
+--   L2: [a-c][d-f][g-i]...     ← disjoint
+-- ✓ LOW READ AMPLIFICATION — at most one file per level below L0.
+-- ✓ LOW SPACE AMPLIFICATION — ~10% overhead; obsolete data is merged
+--   away promptly.
+-- ✗ HIGH WRITE AMPLIFICATION — merging a file into the next level
+--   rewrites the overlapping files there. A byte can be rewritten ~10×
+--   per level, so 10-30× total is normal.
+-- → RocksDB's default. Right for read-heavy or space-constrained.
+
+-- ── THE COMPARISON THAT ACTUALLY DECIDES IT ─────────────────────────────
+--                     size-tiered     levelled
+--   write amp            ~4×           ~10-30×
+--   read amp (point)     ~n files      ~1 per level
+--   space amp            up to 2×        ~1.1×
+--   best for          write-heavy     read-heavy, space-tight
+--
+-- ⚠ On an SSD, write amplification is not just a throughput cost — it
+--   consumes the device's finite write endurance. A 30× write
+--   amplification on a heavy workload can meaningfully shorten drive
+--   life, and that is a real budget line in large deployments.
+
+-- ── OTHER STRATEGIES WORTH KNOWING ──────────────────────────────────────
+-- TIME-WINDOW (TWCS)  — group SSTables by time window and never compact
+--   across windows. Purpose-built for time-series with TTL: an entire
+--   expired window is DELETED as whole files, with no merge work at all.
+--   ✓ If your data is time-series with expiry, this is almost always the
+--     right answer and it is dramatically cheaper than the alternatives.
+-- UNIVERSAL (RocksDB) — a size-tiered variant tuned to bound space.
+-- FIFO — drop the oldest SSTable outright. Only for pure caches.
+
+-- ── OPERATIONAL REALITY ─────────────────────────────────────────────────
+-- Compaction competes with foreground traffic for I/O and CPU. That
+-- produces the characteristic LSM latency profile: excellent p50, and a
+-- p99 that spikes when a large compaction runs.
+--   • rate-limit it (RocksDB rate_limiter, Cassandra
+--     compaction_throughput_mb_per_sec) so it cannot starve queries
+--   • MONITOR PENDING COMPACTIONS. A backlog is the single most
+--     important LSM health metric: files accumulate, reads slow, disk
+--     fills, and it compounds — the system does not recover on its own
+--   • provision headroom. Space amplification means "disk 85% full" can
+--     be an emergency, because compaction needs room to work.</pre>
+
+    <h2>Part 5 — Deletes, Tombstones, and the Classic Failure</h2>
+    <pre>-- In an immutable-file world, how do you delete? You cannot erase from a
+-- file that is never modified. So you WRITE A DELETION MARKER — a
+-- tombstone — which is itself just another append.
+
+DELETE key 'user:42'  →  append ('user:42', TOMBSTONE, seq_no)
+
+-- A read that finds the tombstone first (newest wins) returns "not
+-- found", even though older SSTables still physically hold the value.
+-- The data is genuinely removed only when compaction merges those files
+-- and drops both the value and, eventually, the tombstone.
+
+-- ── WHY TOMBSTONES CANNOT BE DROPPED IMMEDIATELY ────────────────────────
+-- If a tombstone were discarded during compaction while an older
+-- SSTable elsewhere still contained the value, the deleted row would
+-- REAPPEAR — a "zombie". In a distributed store this is worse: a node
+-- that was offline during the delete could resurrect the row via repair.
+-- Hence Cassandra's gc_grace_seconds (default 10 days): tombstones must
+-- outlive the window in which any replica could still be carrying the
+-- old value.
+-- ⚠ Setting gc_grace_seconds to 0 to "clean up faster" is a classic way
+--   to resurrect deleted data. Understand the mechanism before touching
+--   it.
+
+-- ── THE FAILURE MODE EVERYONE MEETS EVENTUALLY ──────────────────────────
+-- A queue-shaped table: insert rows, process them, delete them.
+SELECT * FROM queue WHERE partition = 'x' LIMIT 10;
+-- Fast at first, then progressively slower, eventually timing out —
+-- despite the table being nearly EMPTY.
+--
+-- WHY: the range scan must walk every key in the range, and each
+-- tombstone is a key. Ten million deleted rows means ten million
+-- tombstones to read, decode and discard before returning ten live rows.
+-- Bloom filters do not help — this is a scan, not a point lookup.
+-- Cassandra will warn (tombstone_warn_threshold) and then refuse
+-- (tombstone_failure_threshold, default 100,000) rather than melt.
+--
+-- ✓ THE REAL FIX IS MODELLING, NOT TUNING:
+--   • do not build queues on an LSM store. The access pattern —
+--     write-then-immediately-delete over a narrow range — is precisely
+--     its worst case.
+--   • use TTLs instead of explicit deletes where possible; with TWCS an
+--     entire expired window is dropped as whole files with no tombstone
+--     scan at all
+--   • partition by time so consumed data falls into partitions you stop
+--     reading, rather than accumulating in a hot range
+--   • if you must delete, delete whole partitions rather than rows
+
+-- ── UPDATES ARE THE SAME MECHANISM ──────────────────────────────────────
+-- An update is just a new version appended with a higher sequence
+-- number; the old one lingers until compaction. So a heavily-updated key
+-- accumulates versions across many SSTables — and for THAT key, bloom
+-- filters stop helping, because it really is present in most of them.
+-- ⚠ A "hot key" updated thousands of times per second is an LSM
+--   anti-pattern for exactly this reason.</pre>
+
+    <h2>Part 6 — Choosing: B+Tree or LSM</h2>
+    <pre>-- ── THE THREE AMPLIFICATIONS, WITH NUMBERS ──────────────────────────────
+-- Workload: 100M keys, 1KB values, 50k writes/sec.
+--
+--                        B+TREE            LSM (levelled)
+--   write amp        ~8× (a page per       ~15× (compaction
+--                     row change)           rewrites)
+--   read amp (point)  ~3-4 pages           ~1-2 files (with filters)
+--   space amp        ~1.3× (fragmentation  ~1.1×
+--                     + MVCC bloat)
+--   compression       2-3× (mutable pages) 5-10× (immutable files)
+--   NET ON DISK      ~130 GB               ~15-20 GB
+--
+-- ⚠ THE SURPRISE: levelled LSM often has HIGHER write amplification than
+--   a B+tree, which contradicts "LSM is write-optimised". The
+--   distinction is that LSM writes are SEQUENTIAL. Writing 15× the bytes
+--   sequentially still beats writing 8× randomly, because sequential
+--   throughput is roughly an order of magnitude higher. It is a bet on
+--   the shape of the I/O, not its volume — and that nuance is exactly
+--   what a good interview answer contains.
+
+-- ── DECIDE BY ACCESS PATTERN ────────────────────────────────────────────
+-- ✓ LSM WHEN:
+--   • writes dominate, especially appends (events, metrics, logs)
+--   • the working set exceeds memory and compression matters
+--   • keys are naturally time-ordered
+--   • p50 latency matters more than p99
+-- ✓ B+TREE WHEN:
+--   • mixed read/write with real transactional semantics
+--   • range scans and ORDER BY are central
+--   • predictable latency is required (no compaction spikes)
+--   • you need multi-statement ACID transactions, foreign keys, joins
+--   • the data fits comfortably in memory — the LSM advantage largely
+--     evaporates when there is no disk pressure to avoid
+
+-- ── THE POINT PEOPLE MISS ───────────────────────────────────────────────
+-- This is a STORAGE ENGINE choice, not a database choice. MySQL runs
+-- InnoDB (B+tree) or MyRocks (LSM). MongoDB runs WiredTiger, which
+-- supports both. RocksDB is a library embedded inside dozens of systems.
+-- So the useful question is never "SQL or NoSQL" — it is "which storage
+-- structure suits this access pattern, and does the system I want
+-- support it?"
+
+-- ── AND THE HYBRIDS ─────────────────────────────────────────────────────
+-- • WiredTiger  B+tree with LSM-like write buffering
+-- • Bw-tree     lock-free, log-structured B+tree (Microsoft)
+-- • Fractal/Bε-tree  buffers messages inside internal nodes, landing
+--                    between the two on every axis (TokuDB)
+-- The dichotomy is a teaching device. Real engines borrow freely, and
+-- the amplification triangle is the framework that still describes them
+-- all.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Choosing by reputation</strong>
+        <pre>"Cassandra is web scale."
+"LSM is faster."
+"We need NoSQL for writes."
+"Postgres can't handle this
+ volume."
+→ A queue built on Cassandra,
+  timing out on tombstones at
+  month three.</pre></div>
+      <div><strong>✅ Choosing by access pattern</strong>
+        <pre>"Append-only, time-keyed, TTL
+ retention, no cross-row
+ transactions → LSM with TWCS."
+"Mixed read/write with joins and
+ ACID → B+tree; partition it."
+→ The failure modes are known
+  and budgeted for in advance.</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Building a queue on an LSM store</td><td>Tombstone accumulation makes range scans time out on a near-empty table</td><td>Use TTLs and time-windowed partitions, or a purpose-built queue</td></tr>
+      <tr><td>Assuming LSM always has lower write amplification</td><td>Levelled compaction can write more bytes than a B+tree</td><td>The win is <em>sequential</em> I/O, not fewer bytes</td></tr>
+      <tr><td>Not monitoring compaction backlog</td><td>Files accumulate, reads slow, disk fills — and it compounds</td><td>Pending-compaction count is the key LSM health metric</td></tr>
+      <tr><td>Running the disk near full</td><td>Compaction needs free space to merge; the system can wedge</td><td>Provision headroom sized to your space amplification</td></tr>
+      <tr><td>Letting bloom filters get evicted from memory</td><td>Each probe becomes a disk read to avoid a disk read</td><td>Budget filter memory explicitly, or use ribbon filters</td></tr>
+      <tr><td>Expecting bloom filters to speed up range scans</td><td>They test one exact key; scans pay the full file cost</td><td>For scan-heavy work, tune compaction, not filters</td></tr>
+      <tr><td>Setting <code>gc_grace_seconds</code> to 0</td><td>Deleted rows resurrect after a repair</td><td>Tombstones must outlive the replica-divergence window</td></tr>
+      <tr><td>Hot keys updated thousands of times per second</td><td>Versions spread across files; bloom filters stop helping</td><td>Aggregate in the application, or pick a different structure</td></tr>
+      <tr><td>Benchmarking with data that fits in RAM</td><td>Everything looks fast; the design difference is invisible</td><td>Test beyond memory, where the trade-off actually bites</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What is an LSM-tree and why is it fast at writes?</summary>
+      <p>A log-structured merge tree is a storage structure built on the rule that nothing already written is
+         ever modified. Writes go into a sorted in-memory structure called the memtable, backed by an
+         append-only commit log for durability. When the memtable fills, it is frozen and flushed to disk as
+         a new immutable sorted file, an SSTable, and a fresh memtable takes over so writes never block.
+         Background compaction later merges those files together.</p>
+      <p>It is fast at writes because the write path never reads anything. There is no page to fetch and
+         modify, no split, no index to maintain — just a sequential log append and an in-memory insert. The
+         flush is one large sequential write of already-sorted data, which is the fastest operation a storage
+         device performs. Comparing against the numbers from earlier in this track, NVMe sequential
+         throughput is roughly an order of magnitude better than random, and the LSM converts one into the
+         other.</p>
+      <p>The cost is on the read side. A key may live in the memtable or in any SSTable, with the newest copy
+         winning, so a read potentially checks several files. Bloom filters and compaction exist to keep that
+         manageable, and they are not optional extras — without them the design would not be usable.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What is a bloom filter and why does an LSM need one?</summary>
+      <p>A bloom filter is a compact probabilistic structure answering one question about a set: is this key
+         definitely absent? It is a bit array with several hash functions; inserting a key sets the bits at
+         its hash positions, and querying checks them. If any bit is zero the key is definitely not present.
+         If all are set it is probably present, but it might be a false positive from colliding keys. There
+         are never false negatives, which is what makes it safe to rely on.</p>
+      <p>An LSM needs it because reads would otherwise check every SSTable. With ten files and the key in
+         one, nine probes are wasted work — and each is potentially a disk read. Attaching a bloom filter to
+         each file lets the engine skip almost all of those. At the common setting of ten bits per key the
+         false positive rate is about one percent, so ten probes become roughly one real probe plus a tenth
+         of a wasted one.</p>
+      <p>Two limitations matter in practice. Filters do not help range scans, because they test an exact key
+         rather than an interval, so scan-heavy workloads depend on compaction rather than filters. And they
+         must stay resident in memory — if they get evicted, every probe becomes a disk read performed to
+         avoid a disk read, which is worse than having none. On large datasets, budgeting filter memory is a
+         real capacity-planning item.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Compare size-tiered and levelled compaction.</summary>
+      <p>Size-tiered compaction merges SSTables of roughly equal size into a larger one, so four small files
+         become one medium file, four medium files become one large file, and so on. Because a byte is only
+         rewritten when its tier fills, write amplification is low, which gives the best raw ingest
+         throughput. The downsides are that files at different tiers have overlapping key ranges, so a read
+         may need to check one file per tier, and that merging four large files transiently requires space
+         for both the inputs and the output — space amplification can approach double.</p>
+      <p>Levelled compaction organises files into levels of increasing size, and within every level below the
+         first, the files have non-overlapping key ranges. That means a point lookup checks at most one file
+         per level, so read amplification is low and predictable, and obsolete data is merged away promptly
+         so space overhead is around ten percent. The price is write amplification: pushing a file down a
+         level requires rewriting the overlapping files there, and repeated across levels a byte may be
+         rewritten ten to thirty times.</p>
+      <p>So the choice follows the workload. Size-tiered for write-heavy, insert-mostly data where ingest
+         rate dominates — Cassandra's default. Levelled for read-heavy or space-constrained systems —
+         RocksDB's default. I would add that on SSDs write amplification also consumes finite write
+         endurance, so a thirty-times factor on a heavy workload is a hardware lifetime question, not only a
+         throughput one.</p>
+      <p>And there is a third option that often wins outright when it applies: time-window compaction, which
+         groups files by time bucket and never merges across buckets. For time-series data with TTL
+         expiry, an entire expired window is deleted as whole files with no merging at all, which is
+         dramatically cheaper than either general strategy.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why do deletes cause problems in LSM systems?</summary>
+      <p>Because files are immutable, so nothing can be erased. A delete is implemented by appending a
+         tombstone — a marker saying this key is deleted as of a given sequence number. Reads that encounter
+         the tombstone first return not-found, while older files still physically contain the value. The data
+         is only genuinely removed when compaction merges those files and drops the value along with,
+         eventually, the tombstone.</p>
+      <p>Tombstones cannot be discarded eagerly. If one were dropped while an older file elsewhere still held
+         the value, the deleted row would reappear. In a distributed store the risk is greater, because a
+         node that was offline during the delete could resurrect the row through repair. That is why
+         Cassandra keeps tombstones for <code>gc_grace_seconds</code>, ten days by default, and why lowering
+         that value to reclaim space faster is a well-known way to bring deleted data back.</p>
+      <p>The failure people actually hit is a queue-shaped workload: insert rows, process them, delete them.
+         Range scans over that key range must walk every key including every tombstone, so a table holding
+         ten live rows and ten million tombstones reads ten million entries to return ten. Bloom filters
+         cannot help because this is a scan rather than a point lookup, and Cassandra will warn and then
+         refuse the query rather than fall over.</p>
+      <p>The fix is modelling rather than tuning. Do not build queues on an LSM store, since
+         write-then-immediately-delete over a narrow range is precisely its worst case. Prefer TTLs, which
+         combine with time-window compaction to drop whole expired files without any tombstone scanning, and
+         partition by time so consumed data falls out of the ranges you still read.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Is it true that LSM-trees have lower write amplification than B-trees?</summary>
+      <p>Not necessarily, and the honest answer is more interesting than the slogan. A B+tree writing one row
+         dirties a whole page, so with an eight-kilobyte page and a small row the amplification is often
+         around eight times. A levelled LSM writes the record once on flush and then rewrites it during each
+         compaction as it descends the levels, which commonly totals ten to thirty times. So by bytes
+         written, levelled LSM frequently loses.</p>
+      <p>The reason it is still called write-optimised is that the two write very differently. The B+tree
+         performs random writes scattered across the file, requiring a read of each page first if it is not
+         cached. The LSM performs large sequential writes of already-sorted data and never reads anything on
+         the write path. Since sequential throughput is roughly an order of magnitude better than random on
+         NVMe and far more than that on spinning disks, writing fifteen times the bytes sequentially still
+         beats writing eight times randomly. It is a bet on the shape of the I/O rather than its volume.</p>
+      <p>Two consequences follow. First, if you choose size-tiered compaction the amplification really is low,
+         around four times, but you pay in read and space amplification instead — you are moving along the
+         RUM triangle, not escaping it. Second, on SSDs the byte count matters independently of speed,
+         because write endurance is finite; a thirty-times amplification on a heavy workload is a
+         drive-lifetime consideration that the throughput argument does not address.</p>
+      <p>The framing I would leave an interviewer with is that no structure minimises read cost, write cost
+         and space simultaneously. Each engine picks a corner, and being able to say which corner and why is
+         more useful than any blanket claim about which is faster.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> An LSM-backed service has degraded over weeks: p99 up tenfold, disk filling. Diagnose it.</summary>
+      <p>Gradual degradation with rising disk usage points at compaction failing to keep pace, and I would
+         confirm that first because almost everything else is downstream of it. The pending compaction count
+         and the number of SSTables per level are the decisive metrics: a backlog means files accumulate, so
+         each read consults more of them and each range scan merges more iterators, while obsolete data is
+         never reclaimed so disk grows. It also compounds, because a larger backlog makes compaction more
+         expensive, and the system does not recover on its own.</p>
+      <p>Then I would ask why it fell behind. Usually the write rate has grown past what the configured
+         compaction throughput can absorb, or the rate limiter is set too conservatively, or compaction
+         threads are starved of I/O by foreground traffic. Sometimes it is the opposite: compaction is
+         running aggressively and competing with queries, which shows as p99 spikes correlated with
+         compaction activity rather than a monotonic decline. The shape of the latency graph distinguishes
+         those two.</p>
+      <p>Next I would check bloom filter residency, because it produces exactly this symptom set. As the
+         dataset grows, filters may no longer fit in the block cache, so probes that used to be answered from
+         memory become disk reads — and the extra reads worsen I/O contention, which worsens the compaction
+         backlog. Cache hit rates and filter memory usage answer this quickly, and ribbon filters or a larger
+         cache are the direct remedies.</p>
+      <p>I would also look for a workload-shape problem rather than a tuning problem: tombstone accumulation
+         from a delete-heavy access pattern, which slows range scans specifically while point lookups stay
+         fine, or a small number of very hot keys whose many versions spread across files and defeat the
+         filters. Those need modelling changes, not configuration.</p>
+      <p>For immediate mitigation, raise compaction throughput and add disk, since low free space can prevent
+         compaction from running at all and wedge the system entirely. The durable fixes depend on the cause:
+         switch strategy if the workload was misclassified — time-window compaction if this is really
+         time-series with TTL — resize the block cache and filters, or change the data model if deletes are
+         the driver. And the lasting deliverable is alerting on pending compactions, SSTable counts, filter
+         hit rate and free space, because every one of these is visible weeks before it becomes an
+         incident.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Implement a miniature LSM and observe the read path.
+      <details class="solution"><summary>Solution</summary>
+      <pre>import bisect
+
+class MiniLSM:
+    def __init__(self, memtable_limit=4):
+        self.memtable = {}          # real ones use a sorted structure
+        self.sstables = []          # newest FIRST
+        self.limit = memtable_limit
+        self.wal = []               # the commit log
+
+    def put(self, key, value):
+        self.wal.append((key, value))          # 1. durability first
+        self.memtable[key] = value             # 2. in-memory insert
+        if len(self.memtable) >= self.limit:
+            self.flush()
+
+    def delete(self, key):
+        self.put(key, TOMBSTONE)               # a delete IS a write
+
+    def flush(self):
+        # sorted + immutable = an SSTable
+        self.sstables.insert(0, sorted(self.memtable.items()))
+        self.memtable = {}
+        self.wal = []
+
+    def get(self, key):
+        if key in self.memtable:               # newest wins
+            v = self.memtable[key]
+            return None if v is TOMBSTONE else v
+        for i, sst in enumerate(self.sstables):        # newest → oldest
+            keys = [k for k, _ in sst]
+            j = bisect.bisect_left(keys, key)
+            if j &lt; len(keys) and keys[j] == key:
+                v = sst[j][1]
+                print("  found in SSTable %d" % i)
+                return None if v is TOMBSTONE else v
+        return None
+
+TOMBSTONE = object()
+
+# ── OBSERVE THE BEHAVIOUR ───────────────────────────────────────────────
+db = MiniLSM()
+for i in range(12):
+    db.put("key%02d" % i, "v%d" % i)
+print(len(db.sstables))          # 3 SSTables, 0 in memtable
+
+db.put("key00", "UPDATED")       # does NOT modify SSTable 2
+print(db.get("key00"))           # UPDATED — found in the memtable first
+# ⚠ 'v0' still physically exists in the oldest SSTable. It is simply
+#   never reached, because the search stops at the newest copy.
+
+db.delete("key05")
+print(db.get("key05"))           # None — the tombstone shadows it
+# The value is STILL on disk. Only compaction removes it.
+
+# ── THE COST THIS EXPOSES ───────────────────────────────────────────────
+db.get("nonexistent")            # probes EVERY SSTable, finds nothing
+# With 50 SSTables that is 50 wasted probes — which is exactly the
+# problem bloom filters solve (exercise 2).
+
+# ── AND THE COMPACTION THAT FIXES IT ────────────────────────────────────
+def compact(self):
+    merged = {}
+    for sst in reversed(self.sstables):        # OLDEST first, so newer
+        merged.update(dict(sst))               # values overwrite older
+    merged = {k: v for k, v in merged.items() if v is not TOMBSTONE}
+    self.sstables = [sorted(merged.items())]
+# ⚠ Note the iteration order: oldest to newest, so the newest value
+#   wins. Getting that backwards resurrects deleted and stale data —
+#   which is precisely the class of bug tombstone grace periods guard
+#   against in real systems.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Build a bloom filter and measure its false positive rate.
+      <details class="solution"><summary>Solution</summary>
+      <pre>import hashlib, math
+
+class BloomFilter:
+    def __init__(self, n_keys, bits_per_key=10):
+        self.m = n_keys * bits_per_key
+        # optimal k = (m/n) * ln2
+        self.k = max(1, round(bits_per_key * math.log(2)))
+        self.bits = bytearray((self.m + 7) // 8)
+
+    def _positions(self, key):
+        h = hashlib.sha256(key.encode()).digest()
+        h1 = int.from_bytes(h[:8], 'big')
+        h2 = int.from_bytes(h[8:16], 'big')
+        # double hashing: k hashes from 2 (Kirsch-Mitzenmacher)
+        return [(h1 + i * h2) % self.m for i in range(self.k)]
+
+    def add(self, key):
+        for p in self._positions(key):
+            self.bits[p // 8] |= (1 &lt;&lt; (p % 8))
+
+    def __contains__(self, key):
+        return all(self.bits[p // 8] &amp; (1 &lt;&lt; (p % 8))
+                   for p in self._positions(key))
+
+# ── MEASURE ─────────────────────────────────────────────────────────────
+for bpk in (4, 8, 10, 16, 20):
+    bf = BloomFilter(100000, bpk)
+    for i in range(100000):
+        bf.add("key%d" % i)
+    fp = sum(1 for i in range(100000, 200000) if "key%d" % i in bf)
+    print("%2d bits/key  k=%d  FP=%.2f%%  size=%dKB"
+          % (bpk, bf.k, fp/1000, bf.m//8//1024))
+
+#   4 bits/key  k=3  FP=14.62%  size=48KB
+#   8 bits/key  k=6  FP= 2.14%  size=97KB
+#  10 bits/key  k=7  FP= 0.82%  size=122KB     ← the usual default
+#  16 bits/key  k=11 FP= 0.05%  size=195KB
+#  20 bits/key  k=14 FP= 0.01%  size=244KB
+
+# ── READ THE CURVE ──────────────────────────────────────────────────────
+# 4→8 bits: halves memory cost, cuts FP from 15% to 2%. Huge win.
+# 10→20:    doubles memory to remove 0.8% of probes. Rarely worth it.
+# 10 bits/key is the industry default because that is where the curve
+# flattens — and there are NEVER false negatives at any setting, which
+# is what makes "definitely absent" safe to act on.
+
+# ── WHAT IT SAVES IN CONTEXT ────────────────────────────────────────────
+# 10 SSTables, key in one, FP=1%:
+#   without: 10 probes
+#   with:    1 + (9 × 0.01) = 1.09 probes    → ~9× fewer I/Os
+# At 1 BILLION keys, 10 bits/key costs 1.25GB of RAM. That must be
+# BUDGETED — if the filters get evicted, every probe becomes a disk read
+# performed in order to avoid a disk read.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Compute write amplification for both compaction strategies.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SETUP: 1KB values, 100 GB of live data, 50,000 writes/sec.
+--        Memtable 64MB, level multiplier 10.
+
+-- ── LEVELLED (RocksDB default) ──────────────────────────────────────────
+-- L0:  64 MB   (freshly flushed, overlapping)
+-- L1: 640 MB
+-- L2:   6.4 GB
+-- L3:    64 GB
+-- L4:   640 GB   ← 100GB of data lives around here
+--
+-- A record is written once per level it descends through. Merging a file
+-- into level N+1 rewrites the OVERLAPPING files there, and with a 10×
+-- multiplier each byte moving down is merged against ~10 bytes.
+--
+--   flush to L0                    1×
+--   L0 → L1                      ~10×
+--   L1 → L2                      ~10×
+--   L2 → L3                      ~10×
+--   L3 → L4                      ~10×
+--   ─────────────────────────────────
+--   TOTAL                     ~15-40× (levels are not all full)
+--
+-- Actual bytes written to disk:
+--   50,000/s × 1KB = 50 MB/s of LOGICAL writes
+--   × 20 write amp = 1,000 MB/s of PHYSICAL writes
+-- ⚠ That is ~1 GB/s sustained. Many NVMe drives can do it; check yours,
+--   and check the endurance rating — 1 GB/s continuous is ~31 PB/year.
+
+-- ── SIZE-TIERED (Cassandra default) ─────────────────────────────────────
+-- Merge 4 similar-sized files into 1, repeatedly:
+--   64MB ×4 → 256MB ×4 → 1GB ×4 → 4GB ×4 → 16GB ×4 → 64GB
+-- A byte is rewritten once per TIER, and there are ~5 tiers:
+--   TOTAL                        ~5×
+--   50 MB/s × 5 = 250 MB/s physical      ← 4× less than levelled
+
+-- ── BUT MEASURE THE OTHER TWO AXES ──────────────────────────────────────
+--                        levelled      size-tiered
+--   write amp              ~20×            ~5×
+--   read amp (point)    1 file/level    1 file/TIER, ranges OVERLAP
+--                       ≈ 4-5 files     ≈ 10-15 files
+--   space amp             ~1.1×          up to 2×  ← 100GB needs 200GB
+--   disk needed for
+--   100GB of data         110 GB          200 GB
+--
+-- ⚠ THE SPACE POINT IS OPERATIONALLY SHARP: size-tiered merging four
+--   16GB files needs 64GB free BEFORE it can drop the originals. On a
+--   disk at 85% capacity, compaction cannot run — and a wedged
+--   compaction is how LSM clusters actually fail.
+
+-- ── DECIDE ──────────────────────────────────────────────────────────────
+-- write-bound, disk cheap, reads mostly recent  → SIZE-TIERED
+-- read-heavy or space-constrained               → LEVELLED
+-- time-series with TTL                          → TIME-WINDOW, which
+--   sidesteps this entire calculation: expired windows are deleted as
+--   whole files with ZERO merge work. If the data fits that shape, it is
+--   not a compromise between the two — it is better than both.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Reproduce and fix the tombstone scan problem.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── THE ANTI-PATTERN: A QUEUE ON CASSANDRA ─────────────────────────────
+CREATE TABLE job_queue (
+    shard int, job_id timeuuid, payload text,
+    PRIMARY KEY (shard, job_id));
+
+-- Producer:  INSERT INTO job_queue (shard, job_id, payload)
+--            VALUES (0, now(), ?);
+-- Consumer:  SELECT * FROM job_queue WHERE shard=0 LIMIT 10;
+--            DELETE FROM job_queue WHERE shard=0 AND job_id=?;
+
+-- ── WHAT HAPPENS OVER TIME ──────────────────────────────────────────────
+-- day 1:    SELECT returns in 2ms
+-- week 1:   40ms
+-- week 3:   900ms
+-- week 4:   ReadTimeoutException — on a table with ~10 LIVE ROWS
+--
+-- Server log:
+--   Read 10 live rows and 214,882 tombstone cells (see
+--   tombstone_warn_threshold)
+--
+-- WHY: partition shard=0 accumulates one tombstone per consumed job.
+-- The range scan must read EVERY cell in the partition in order, decode
+-- each tombstone, and discard it — before it can return 10 live rows.
+-- ⚠ Bloom filters are irrelevant: this is a SCAN, not a point lookup.
+-- ⚠ Compaction cannot save you either: tombstones must survive
+--   gc_grace_seconds (10 days) or deleted jobs could resurrect after a
+--   repair.
+
+-- ── ✗ FIXES THAT DO NOT WORK ────────────────────────────────────────────
+ALTER TABLE job_queue WITH gc_grace_seconds = 0;
+--   Buys short-term relief and risks ZOMBIE ROWS: a replica that was
+--   down during the delete resurrects the job on repair, and it gets
+--   processed twice.
+-- Raising tombstone_failure_threshold: silences the guardrail while the
+--   underlying scan keeps getting slower. Strictly worse.
+
+-- ── ✓ FIX 1: TTL INSTEAD OF DELETE ──────────────────────────────────────
+INSERT INTO job_queue (shard, job_id, payload)
+VALUES (0, now(), ?) USING TTL 86400;
+-- Expiry is recorded at write time rather than as a separate tombstone
+-- write, and with TWCS whole expired SSTables are dropped as FILES:
+ALTER TABLE job_queue WITH compaction = {
+  'class': 'TimeWindowCompactionStrategy',
+  'compaction_window_unit': 'HOURS',
+  'compaction_window_size': 1 };
+-- ✓ Expired data disappears with no merge work and no tombstone scan.
+
+-- ── ✓ FIX 2: TIME-BUCKETED PARTITIONS ───────────────────────────────────
+CREATE TABLE job_queue (
+    bucket text,          -- '2026-08-05-14'  (hour)
+    job_id timeuuid, payload text,
+    PRIMARY KEY (bucket, job_id));
+-- Consumers read the current and previous bucket only. Old buckets fill
+-- with tombstones but are NEVER READ AGAIN, so they cost nothing until
+-- TTL removes them entirely.
+-- ✓ This is the general principle: make consumed data fall OUT of the
+--   ranges you scan, instead of accumulating inside them.
+
+-- ── ✓ FIX 3: DO NOT USE THIS DATABASE FOR THIS ──────────────────────────
+-- write-then-immediately-delete over a narrow key range is the exact
+-- worst case for an LSM. A queue wants: efficient deletes, ordered
+-- consumption, and at-least-once delivery.
+--   • Kafka  — a log, so consumption is an OFFSET, not a delete
+--   • SQS / RabbitMQ — purpose-built
+--   • Postgres SELECT ... FOR UPDATE SKIP LOCKED (SQL isolation lesson)
+-- ✓ THE SENIOR POINT: this is a data-modelling failure, not a tuning
+--   failure. No configuration makes an LSM good at queues, and
+--   recognising which access patterns fight the storage engine is the
+--   skill this whole track is for.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Choose and configure storage for a metrics platform.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- REQUIREMENT: 2M metric points/sec ingest. Queries: "one series, last
+-- 6h" (frequent) and "aggregate across series, last 30d" (dashboards).
+-- 13-month retention. Cost matters.
+
+-- ── STEP 1: CLASSIFY THE WORKLOAD ───────────────────────────────────────
+-- • append-only — points are never updated
+-- • time-ordered keys — natural sequential locality
+-- • TTL-based retention — data expires by age, wholesale
+-- • reads are RANGES over (series, time), never random point lookups
+-- • enormous volume: 2M/s × 86400 × 395 days ≈ 68 TRILLION points
+-- Every one of those points at an LSM. A B+tree would be crushed by the
+-- write rate and would offer nothing in return, since there are no
+-- updates, no transactions, and no joins.
+
+-- ── STEP 2: COMPACTION — THE DECISION THAT DOMINATES ────────────────────
+-- TIME-WINDOW COMPACTION, and it is not close.
+--   • data within a window is written once and never merged again →
+--     write amplification approaches 1×, versus ~20× for levelled
+--   • 13-month retention = DELETE WHOLE FILES. No tombstones, no merge
+--     work, no read impact. Compare with a DELETE-based approach, which
+--     would generate trillions of tombstones.
+--   • queries are time-ranged, so they touch few windows
+-- Window size: 1 day. (68T points / 395 windows ≈ 172 billion per
+-- window — large but bounded; hourly windows would create 9,480 windows
+-- and too many open files.)
+
+-- ── STEP 3: THE KEY DESIGN ──────────────────────────────────────────────
+-- partition key:   (metric_name, tag_hash, day_bucket)
+-- clustering key:  timestamp
+-- ✓ one series' points for a day are CONTIGUOUS → the 6h query is a
+--   single sequential read within one partition
+-- ✓ day_bucket in the partition key bounds partition size and aligns
+--   with the compaction window
+-- ✗ WITHOUT day_bucket, a year of points for one series becomes one
+--   gigantic partition — the classic Cassandra modelling error, and it
+--   degrades everything from repair to compaction to reads.
+
+-- ── STEP 4: BLOOM FILTERS — TURN THEM DOWN ──────────────────────────────
+bloom_filter_fp_chance = 0.1        -- deliberately LOOSE (default 0.01)
+-- Reads here are RANGE SCANS, and bloom filters do not help range scans
+-- at all. At this scale, filters at 10 bits/key would cost:
+--   68T keys × 10 bits ≈ 85 TB of RAM. Absurd.
+-- ✓ Spending memory on filters that cannot help the actual query pattern
+--   is a real and common misconfiguration. Put that RAM in the block
+--   cache instead, where it serves the range reads.
+
+-- ── STEP 5: COMPRESSION ─────────────────────────────────────────────────
+-- Immutable files compress well, and metrics compress exceptionally:
+-- • DELTA-OF-DELTA on timestamps (regular intervals → near zero)
+-- • XOR on float values (consecutive readings share most bits)
+-- The Gorilla paper reports ~12× on real metrics. At 68T points × ~16
+-- bytes raw ≈ 1.1 PB → ~90 TB compressed. That difference is the
+-- infrastructure budget.
+
+-- ── STEP 6: THE DASHBOARD QUERY NEEDS SOMETHING ELSE ────────────────────
+-- "Aggregate across 100,000 series over 30 days" would read billions of
+-- points per dashboard load. No storage tuning makes that acceptable.
+-- ✓ PRE-AGGREGATE ON INGEST (downsampling / rollups):
+--     raw      → 7 days
+--     1-minute → 90 days
+--     1-hour   → 13 months
+--   The dashboard reads the 1-hour rollup: 30 days × 24 = 720 points
+--   per series instead of 2.6 million. Four orders of magnitude.
+-- ⚠ This is the same lesson as the SQL optimisation track: past a point,
+--   the answer is not a faster query, it is not running the query.
+
+-- ── STEP 7: WHAT I WOULD ACTUALLY DEPLOY ────────────────────────────────
+-- Do not build this. Prometheus + Thanos/Mimir, VictoriaMetrics,
+-- InfluxDB or TimescaleDB already implement every decision above —
+-- time-window storage, delta-of-delta plus XOR compression, and
+-- automatic rollups. The value of the analysis is knowing WHY they are
+-- built that way, so you can configure them correctly and recognise when
+-- your workload does not fit their assumptions.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Debug a production LSM that degraded over six weeks.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYMPTOMS: RocksDB-backed service.
+--   p50 stable at 1.2ms; p99 8ms → 340ms
+--   disk 60% → 91% (data volume grew only 15%)
+--   CPU steady, disk I/O saturated
+--   restarts help for ~2 hours
+
+-- ── STEP 1: COMPACTION BACKLOG — CHECK THIS FIRST, ALWAYS ───────────────
+rocksdb.compaction-pending          -- 47        (healthy: 0-2)
+rocksdb.num-files-at-level0         -- 38        (trigger: 4)
+rocksdb.estimate-pending-compaction-bytes  -- 412 GB
+-- ✓ CONFIRMED. Compaction is far behind and the gap is growing.
+-- L0 files have OVERLAPPING ranges, so every read must check all 38 of
+-- them. That is the p99 explosion, and it explains why disk grew far
+-- faster than data: obsolete versions are never being reclaimed.
+
+-- ── STEP 2: WHY DID IT FALL BEHIND? ─────────────────────────────────────
+-- (a) write rate outgrew compaction capacity
+rocksdb.bytes-written               -- 180 MB/s, up from 90 six weeks ago
+-- (b) the rate limiter is throttling compaction itself
+options.rate_limiter               -- 100 MB/s ← at 20× write amp, 180
+                                   --   MB/s of logical writes NEEDS
+                                   --   ~3.6 GB/s of compaction I/O.
+                                   --   The limiter guarantees a backlog.
+-- (c) too few compaction threads
+max_background_compactions          -- 2 (on a 32-core machine)
+
+-- ⚠ THE COMPOUNDING TRAP: a backlog makes reads slower, which consumes
+--   more I/O, which leaves less for compaction, which grows the backlog.
+--   The system does NOT recover on its own — which is exactly why
+--   restarts help briefly and then it returns.
+
+-- ── STEP 3: RULE IN/OUT THE OTHER CANDIDATES ────────────────────────────
+rocksdb.bloom-filter-useful         -- ratio dropped from 0.98 → 0.71
+rocksdb.block-cache-usage           -- at capacity
+-- The dataset grew, so filters no longer all fit in the block cache.
+-- Evicted filters mean probes hit disk — MORE I/O, feeding the same
+-- loop. A genuine second contributor, not the root cause.
+--
+-- Also worth eliminating:
+rocksdb.num-deletes-active-mem-table   -- tombstone load
+rocksdb.estimate-num-keys              -- vs actual: version accumulation
+
+-- ── STEP 4: IMMEDIATE MITIGATION (config, no deploy) ────────────────────
+SetOptions({"max_background_compactions": "8"});
+rate_limiter->SetBytesPerSecond(800 &lt;&lt; 20);      -- 100MB/s → 800MB/s
+SetOptions({"level0_slowdown_writes_trigger": "20"});
+-- ⚠ ADD DISK FIRST IF POSSIBLE. Below ~10% free, compaction cannot
+--   allocate output files and the system WEDGES completely — an
+--   unrecoverable state that is much worse than being slow.
+-- Expect ingest to slow while the backlog drains. That is correct:
+--   back-pressure on writes is the mechanism that lets it catch up.
+
+-- ── STEP 5: THE REAL FIXES ──────────────────────────────────────────────
+-- 1. SIZE COMPACTION FOR THE WRITE RATE, not for last year's rate.
+--    Rule of thumb: compaction I/O budget ≈ logical write rate × write
+--    amplification. At 180 MB/s and 20× that is 3.6 GB/s — which may
+--    mean this node is simply undersized and needs to be split.
+-- 2. RESERVE FILTER MEMORY EXPLICITLY:
+cache_index_and_filter_blocks_with_high_priority = true;
+pin_l0_filter_and_index_blocks_in_cache = true;
+--    or switch to RIBBON filters: same FP rate, ~30% less memory.
+-- 3. RECONSIDER THE STRATEGY. If this is append-heavy with expiry,
+--    universal or time-window compaction would cut write amplification
+--    several-fold and remove the problem rather than tuning around it.
+-- 4. CAPACITY: 15% data growth caused a 50% disk increase. Space
+--    amplification means free space is not linear in data size, and
+--    must be provisioned as a multiple.
+
+-- ── STEP 6: THE MONITORING THAT SHOULD HAVE CAUGHT IT ───────────────────
+-- alert: compaction-pending > 10 sustained 15 min
+-- alert: num-files-at-level0 > 2× trigger
+-- alert: estimate-pending-compaction-bytes > 50 GB
+-- alert: bloom-filter-useful ratio &lt; 0.9
+-- alert: free disk &lt; 25%       ← not 10%; compaction needs the headroom
+-- Every one of these was visible in week one. Six weeks of gradual decay
+-- is a monitoring failure more than a tuning failure — and the general
+-- lesson is that LSM engines degrade slowly and then wedge suddenly, so
+-- the leading indicators are the ones worth alerting on.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>The whole LSM idea is refusing to modify stored data: buffer in a memtable, flush immutable sorted files, merge later — turning random writes into sequential ones.</li>
+        <li>The write path never reads, splits, or maintains an index, which is why ingest rates are so high; the cost is that a key may live in many files.</li>
+        <li>Bloom filters are structural rather than optional — they cut roughly ten file probes to one — but they must stay in memory and never help range scans.</li>
+        <li>Size-tiered compaction minimises write amplification at the cost of read and space; levelled minimises read and space at the cost of write.</li>
+        <li>Time-window compaction beats both for time-series with TTL, because expired data is dropped as whole files with no merge work.</li>
+        <li>Deletes are tombstones, which must outlive the replica-divergence window — lowering the grace period resurrects deleted rows.</li>
+        <li>Tombstone accumulation makes range scans slow on a near-empty table, which is why queues on LSM stores fail; the fix is modelling, not tuning.</li>
+        <li>Levelled LSM often writes <em>more</em> bytes than a B+tree — the win is sequential I/O, and on SSDs the byte count still costs write endurance.</li>
+        <li>Compaction backlog is the key health metric and it compounds: slower reads consume the I/O compaction needs, and the system does not self-recover.</li>
+        <li>This is a storage-engine choice, not a database choice — MySQL, MongoDB and others offer both, so the real question is which structure fits the access pattern.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="btrees.html">← B+Trees In Depth</a>
+      <a href="buffer-pool.html">Buffer Pool &amp; Page Cache →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

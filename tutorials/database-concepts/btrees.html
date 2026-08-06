@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>B+Trees In Depth — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>B+Trees In Depth <span class="level-badge level-adv">Storage Foundations</span></h1>
+    <p><strong>What you'll master:</strong> why a B+tree rather than a binary tree or a hash table — the
+       answer is entirely about page counts, not comparisons — how splits and merges keep the tree balanced
+       and what that costs during inserts, why sequential keys give you 100% space efficiency while random
+       keys give you 50% and how that single fact decides your primary-key type, the concurrency protocols
+       that let thousands of sessions walk one tree safely and why latch coupling was replaced by the
+       Blink-tree trick, what index bloat physically is and why <code>REINDEX</code> is sometimes the only
+       cure, deduplication and prefix truncation, and how to read the internal state of a real index to
+       decide whether it needs rebuilding. Prerequisites:
+       <a href="pages-heap-files.html">Pages, Heap Files &amp; Row Layout</a>. The
+       <a href="../sql/indexes.html">SQL track's indexes lesson</a> covers how to <em>use</em> indexes; this
+       one is about how they are built.</p>
+
+    <h2>Part 1 — Why This Shape</h2>
+    <pre>-- A B+tree looks over-complicated until you ask the right question. The
+-- question is NOT "how many comparisons?" — it is "how many PAGES must I
+-- fetch?", because a page fetch costs ~20 μs and a comparison costs ~1 ns.
+
+-- ── THE COMPETITION, FOR 100 MILLION ROWS ───────────────────────────────
+-- BINARY SEARCH TREE      depth = log2(100,000,000) ≈ 27
+--   Each node is small, so each level is a DIFFERENT page.
+--   27 page fetches × 20 μs = 540 μs. And no range queries.
+--
+-- HASH TABLE              O(1) — one fetch. Excellent!
+--   ✗ but NO range scans, NO ORDER BY, NO prefix matching, and it
+--     degrades badly when it must live on disk and grow.
+--
+-- B+TREE with ~400 keys per page   depth = log400(100,000,000) ≈ 3.1
+--   4 page fetches, and the top 2 levels are permanently cached.
+--   → ~1 real disk read. Plus sorted leaves, so ranges are free.
+
+-- ── THE INSIGHT: MAXIMISE FANOUT, MINIMISE DEPTH ────────────────────────
+-- A binary tree makes ONE decision per page fetch — it wastes 8KB to
+-- learn one bit. A B+tree page holds hundreds of keys and makes ONE
+-- decision among hundreds. Same I/O, vastly more progress.
+--
+--   fanout 2   (binary)  → depth 27
+--   fanout 100           → depth 4
+--   fanout 400           → depth 3.1
+--   fanout 1000          → depth 2.7
+-- Depth falls logarithmically as fanout rises, which is why page size
+-- and KEY WIDTH matter: a narrow key means more keys per page, higher
+-- fanout, and a shallower tree.
+
+-- ── B-TREE vs B+TREE (the "+" is the important part) ────────────────────
+-- B-tree:   data stored in EVERY node, internal and leaf
+-- B+tree:   data ONLY in leaves; internal nodes hold keys as SIGNPOSTS
+--           and leaves are linked in a doubly-linked list
+--
+-- Why B+ wins for databases:
+--   1. Internal nodes hold no payload → more keys per page → higher
+--      fanout → shallower tree.
+--   2. The linked leaves make a range scan a straight walk: descend
+--      once, then follow sibling pointers. No re-traversal per row.
+-- ⚠ Essentially every relational database uses a B+tree and calls it a
+--   "B-tree". The distinction matters when reading papers, not docs.
+
+-- ── THE STRUCTURE ───────────────────────────────────────────────────────
+--                  ┌─────────────┐
+--        ROOT      │  50  |  90  │        signposts only
+--                  └──┬────┬───┬─┘
+--            ┌────────┘    │   └────────┐
+--       ┌────┴────┐   ┌────┴────┐  ┌────┴────┐
+--  INT  │ 20 | 35 │   │ 65 | 78 │  │ 95 |120 │
+--       └─┬──┬───┬┘   └─┬──┬───┬┘  └─┬──┬───┬┘
+--         │  │   │      │  │   │     │  │   │
+--  LEAF  [..][..][..]  [..][..][..] [..][..][..]
+--         ↕   ↕   ↕     ↕   ↕   ↕    ↕   ↕   ↕     ← doubly linked
+--
+-- INVARIANTS that must hold after every operation:
+--   • all leaves are at the SAME depth (that is what "balanced" means)
+--   • every node except the root is at least HALF FULL
+--   • keys within a node are sorted
+--   • a range scan is: descend to the start, then walk the leaf chain</pre>
+
+    <h2>Part 2 — Insertion, Splits, and the Cost of Random Keys</h2>
+    <pre>-- Inserting into a full leaf requires a SPLIT, and splits are where all
+-- the interesting behaviour comes from.
+
+-- ── THE ALGORITHM ───────────────────────────────────────────────────────
+-- 1. descend to the correct leaf
+-- 2. room? insert in sorted position. Done — the common case.
+-- 3. full? SPLIT: allocate a new page, move half the keys across, and
+--    PUSH THE SEPARATOR KEY UP into the parent
+-- 4. parent full too? split it as well — recursively
+-- 5. root splits? a NEW ROOT is created and the tree grows one level
+--    deeper. This is the ONLY way a B+tree gets taller, which is why it
+--    stays perfectly balanced without any rebalancing pass.
+
+-- ── SEQUENTIAL INSERTS: THE HAPPY PATH ──────────────────────────────────
+INSERT ... id = 1, 2, 3, 4, ...          -- bigint IDENTITY
+-- Every insert goes to the RIGHTMOST leaf.
+--   ✓ one hot page, always in cache — near-zero read I/O
+--   ✓ Postgres detects this and does a RIGHTMOST SPLIT: instead of
+--     splitting 50/50, it leaves the old page FULL and starts a new one.
+--     Space efficiency approaches 100%.
+--   ✓ the tree grows tidily, leaves stay physically ordered
+
+-- ── RANDOM INSERTS: THE EXPENSIVE PATH ──────────────────────────────────
+INSERT ... id = gen_random_uuid()        -- UUIDv4
+-- Every insert lands in a DIFFERENT leaf, chosen uniformly at random.
+--   ✗ the target page is usually NOT cached → a read before every write
+--   ✗ splits are 50/50, so pages settle at ~50-70% full: the index is
+--     roughly TWICE the size it needs to be
+--   ✗ every insert dirties a different page → far more WAL and far more
+--     write I/O at checkpoint
+--   ✗ working set = the whole index rather than one page
+
+-- ── THE ARITHMETIC ──────────────────────────────────────────────────────
+-- 100M rows, 8-byte key:
+--   sequential  ~1.0 GB index, inserts touch 1 hot page
+--   random      ~2.1 GB index, inserts touch ~100M distinct pages
+-- Same data. Twice the storage, and orders of magnitude more I/O.
+--
+-- ✓ THIS is the mechanism behind "don't use UUIDv4 as a primary key".
+--   Not superstition — 50% space efficiency and no write locality.
+-- ✓ UUIDv7 / ULID / Snowflake are time-ordered, so they recover
+--   sequential behaviour while staying globally unique.
+
+-- ── DELETION, AND WHY POSTGRES MOSTLY DOES NOT MERGE ────────────────────
+-- Textbook B+trees merge underfull nodes with a sibling. Postgres
+-- deliberately does NOT do this in the general case: merging requires
+-- locking multiple pages and their parent, which hurts concurrency, and
+-- deleted space is usually reused by subsequent inserts anyway.
+-- ✓ CONSEQUENCE: an index that had 100M rows deleted does not shrink.
+--   The pages are marked reusable (for the same key range), but the FILE
+--   stays large. That is index bloat — Part 5.</pre>
+    <div class="note">🔑 <strong>The single most consequential fact in this lesson.</strong> Sequential keys
+      fill index pages to ~100%; random keys fill them to ~50–70%, because a split in the middle of the tree
+      divides a page evenly while a split at the right edge does not. That one behavioural difference is why
+      a UUIDv4 primary key roughly doubles index size, destroys write locality, and inflates the working set
+      — and why UUIDv7 fixes it without giving up global uniqueness.</div>
+
+    <h2>Part 3 — What Is Actually Stored in a Node</h2>
+    <pre>-- ── A LEAF ENTRY ────────────────────────────────────────────────────────
+--   [ index key ][ TID: (block, slot) ]
+-- The TID is the physical row address (previous lesson). In Postgres a
+-- leaf entry for a bigint key is roughly:
+--   8 (key) + 6 (TID) + 4 (line pointer) + alignment ≈ 20 bytes
+--   8192-byte page ≈ 400 entries → fanout ~400.
+
+-- ── KEY WIDTH DECIDES FANOUT DECIDES DEPTH ──────────────────────────────
+--   bigint      8 bytes  → ~400 entries/page → depth 3 at 100M rows
+--   uuid       16 bytes  → ~270             → depth 3-4
+--   text(60)   ~64 bytes → ~110             → depth 4
+--   text(200) ~204 bytes → ~38              → depth 5
+-- A wide key means a deeper tree AND a bigger index AND fewer index
+-- pages cached. Indexing a long text column is expensive in a way that
+-- is invisible in the schema.
+-- ✓ Index a hash or a prefix when the full value is not needed:
+CREATE INDEX ON docs (left(title, 32));
+CREATE INDEX ON docs (md5(url));           -- for pure equality lookups
+
+-- ── SUFFIX TRUNCATION (Postgres 12+) ────────────────────────────────────
+-- Internal nodes only need enough of a key to route correctly. If the
+-- boundary between two leaves is 'Smith,John' vs 'Smith,Karen', the
+-- parent can store just 'Smith,K' — the rest is redundant for routing.
+-- ✓ Shorter separators → more per page → higher fanout → shallower tree,
+--   for free. This is why upgrading Postgres often shrinks indexes.
+
+-- ── DEDUPLICATION (Postgres 13+) ────────────────────────────────────────
+-- A non-unique index on a low-cardinality column stored one entry per
+-- row: 'active' repeated ten million times, each with its own TID.
+-- Now: ONE key with a POSTING LIST of TIDs.
+--   before:  [active|TID1][active|TID2][active|TID3]...
+--   after:   [active|{TID1,TID2,TID3,...}]
+-- Indexes on status-like columns shrink dramatically — often 5-10×.
+SELECT version();   -- deduplication applies to btree indexes automatically
+-- ⚠ It also makes MVCC bloat cheaper: many versions of one row share a
+--   posting list rather than each occupying a full entry.
+
+-- ── INSPECT A REAL INDEX ────────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT * FROM bt_metap('users_pkey');
+--  magic | version | root | level | fastroot | fastlevel
+--  340322|       4 |  412 |     2 |      412 |         2
+-- level 2 → three levels total (0-indexed): root, one internal, leaves.
+
+SELECT type, live_items, dead_items, avg_item_size, page_size, free_size
+FROM bt_page_stats('users_pkey', 412);
+--  type | live_items | dead_items | avg_item_size | free_size
+--   r   |        287 |          0 |            16 |      3480
+-- type: r=root, i=internal, l=leaf, d=deleted
+-- free_size high on leaves across the index = bloat.</pre>
+
+    <h2>Part 4 — Concurrency: Thousands of Sessions, One Tree</h2>
+    <pre>-- A B+tree is a shared mutable data structure. Hundreds of backends
+-- descend it while others split pages underneath them. Getting this
+-- right without destroying throughput is genuinely hard.
+
+-- ── LATCHES ARE NOT LOCKS ───────────────────────────────────────────────
+-- LOCK   protects LOGICAL data (a row, a table). Held for the duration
+--        of a TRANSACTION. Visible in pg_locks. Deadlock-detected.
+-- LATCH  protects PHYSICAL structure (a page in memory) while it is read
+--        or modified. Held for MICROSECONDS. No deadlock detection —
+--        correctness comes from strict ordering discipline.
+-- ⚠ Conflating them is the most common confusion in this area. A latch
+--   is a mutex over a buffer frame; a lock is a transactional promise.
+
+-- ── THE NAIVE APPROACH: LATCH COUPLING (crabbing) ───────────────────────
+-- descend: latch child, THEN release parent — like a crab moving hand
+-- over hand, never letting go of both.
+--   read:  shared latch on child, release parent immediately
+--   write: hold the parent until you know the child will not split
+--          (if the child has room, an insert cannot propagate upward, so
+--           the parent is "safe" and can be released early)
+-- ✗ THE PROBLEM: a split propagating to the root requires latching the
+--   root exclusively. The root is on EVERY descent path, so the entire
+--   index serialises behind one split. On a write-heavy index this is a
+--   crippling bottleneck.
+
+-- ── THE FIX: Blink-TREES (what Postgres actually implements) ────────────
+-- Add ONE thing: every page gets a RIGHT-LINK to its sibling, plus a
+-- "high key" — the largest key this page may contain.
+--
+--   [ page A: keys 10-50, high=50 ] ──right→ [ page B: keys 51-90 ]
+--
+-- Now a split is a TWO-STEP operation that is safe to observe halfway:
+--   1. create the new right sibling, set A's right-link to it
+--      ← at this instant the tree is fully searchable, even though the
+--        parent does not know about B yet
+--   2. insert B's separator into the parent
+--
+-- A reader that descends to A looking for key 70 finds 70 > A's high
+-- key, so it FOLLOWS THE RIGHT-LINK to B. It self-corrects.
+--
+-- ✓ THE PAYOFF: readers never need to latch the parent. Descents take
+--   only one latch at a time and never block on splits. The root stops
+--   being a serialisation point, and read concurrency becomes
+--   essentially unlimited.
+-- ✓ This is why a Postgres index can serve enormous read concurrency
+--   while being modified — and it comes from one extra pointer.
+
+-- ── WHERE CONTENTION STILL APPEARS ──────────────────────────────────────
+-- Monotonically increasing keys mean EVERY insert targets the SAME
+-- rightmost leaf, so every inserter contends for one page's exclusive
+-- latch.
+SELECT wait_event_type, wait_event, count(*)
+FROM pg_stat_activity WHERE wait_event_type = 'LWLock'
+GROUP BY 1,2 ORDER BY 3 DESC;
+-- ⚠ THE IRONY: sequential keys are optimal for space and locality, and
+--   they are the worst case for insert CONTENTION at very high write
+--   rates. Most systems never reach that point; the ones that do use
+--   hash partitioning or per-worker key ranges to spread the hot spot.
+--   Know that the trade-off exists before someone "fixes" it with UUIDs.</pre>
+
+    <h2>Part 5 — Index Bloat and Maintenance</h2>
+    <pre>-- ── HOW AN INDEX BLOATS ─────────────────────────────────────────────────
+-- 1. MVCC: every UPDATE of an indexed column inserts a NEW index entry;
+--    the old one is dead but still occupies space (previous lesson).
+-- 2. Deletes leave entries that vacuum must find and remove.
+-- 3. Postgres does not merge underfull pages, so a page holding one
+--    surviving entry stays a full page.
+-- 4. Random-key splits leave pages ~50-70% full permanently.
+--
+-- The result: an index can be several times larger than its content
+-- warrants, and every lookup reads more pages to find the same rows.
+
+-- ── MEASURE IT ──────────────────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+SELECT * FROM pgstatindex('orders_pkey');
+--  version | tree_level | index_size | leaf_pages | avg_leaf_density |
+--        4 |          2 | 2147483648 |     240128 |            41.2  |
+--  leaf_fragmentation
+--               68.4
+-- avg_leaf_density  ~90% healthy for sequential, ~70% typical, &lt;50% bloated
+-- leaf_fragmentation  high = leaf pages are not in physical order, so
+--                     range scans do random I/O despite the index
+
+-- Cheap estimate across all indexes (no full scan):
+SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)) AS size,
+       idx_scan
+FROM pg_stat_user_indexes ORDER BY pg_relation_size(indexrelid) DESC LIMIT 10;
+
+-- ── FIXING IT ───────────────────────────────────────────────────────────
+REINDEX INDEX CONCURRENTLY orders_pkey;
+-- Builds a fresh index and swaps it. CONCURRENTLY (PG12+) avoids the
+-- write lock the plain form takes.
+-- ⚠ Needs disk space for BOTH copies during the rebuild.
+-- ⚠ On failure it can leave an INVALID index behind:
+SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+DROP INDEX CONCURRENTLY orders_pkey_ccnew;
+
+-- ── WHY VACUUM IS NOT ENOUGH ────────────────────────────────────────────
+-- VACUUM removes dead entries and marks pages reusable. It does NOT
+-- rebalance, does NOT merge half-empty pages, and does NOT restore
+-- physical ordering. An index bloated by random inserts or a mass delete
+-- needs a REBUILD, not a vacuum. This surprises people who assume
+-- autovacuum keeps everything tidy.
+
+-- ── PREVENTION BEATS REINDEXING ─────────────────────────────────────────
+-- • sequential or time-ordered keys (UUIDv7, not UUIDv4)
+-- • do not index volatile columns — every update adds an entry (HOT,
+--   previous lesson)
+-- • fillfactor: default 90 for indexes. LOWER it (70-80) for indexes on
+--   frequently-updated columns so new entries fit without splitting:
+ALTER INDEX orders_status_idx SET (fillfactor = 80);
+REINDEX INDEX CONCURRENTLY orders_status_idx;   -- to apply
+-- • partial indexes: fewer entries means less to bloat
+-- • drop unused indexes — zero benefit, full bloat and write cost</pre>
+
+    <h2>Part 6 — Variants and When B+Trees Are Wrong</h2>
+    <pre>-- ── CLUSTERED vs SECONDARY (the InnoDB/Postgres divide) ─────────────────
+-- CLUSTERED (InnoDB primary key): the leaf CONTAINS the row. One descent
+--   gets you the data. Range scans on the key are physically sequential.
+--   Secondary indexes store the PK, so they need a second descent.
+-- SECONDARY/heap (Postgres): the leaf holds a TID pointing into the
+--   heap. All indexes are symmetric; none is privileged.
+-- → In InnoDB, PK width inflates every secondary index and PK order
+--   dictates physical layout. In Postgres neither is true, but updates
+--   must maintain every index.
+
+-- ── COVERING INDEXES ────────────────────────────────────────────────────
+CREATE INDEX ON orders (user_id, created_at) INCLUDE (total_cents);
+-- INCLUDE columns live ONLY in leaves — payload, not part of the sort
+-- key. The tree stays narrow (fast descent) while the query is answered
+-- without touching the heap at all.
+-- ⚠ Putting them in the key instead would widen every internal page and
+--   lower fanout for no lookup benefit.
+
+-- ── WHEN A B+TREE IS THE WRONG STRUCTURE ────────────────────────────────
+-- ✗ WRITE-DOMINATED workloads → LSM-tree (next lesson): sequential
+--   appends instead of random in-place page updates.
+-- ✗ CONTAINMENT queries ("does this JSONB contain X", "which documents
+--   contain this word") → GIN. A B+tree indexes whole values, not the
+--   many items inside one.
+-- ✗ GEOMETRIC / OVERLAP queries ("what intersects this box", "which
+--   bookings overlap") → GiST, which supports operators a total order
+--   cannot express.
+-- ✗ HUGE, PHYSICALLY-ORDERED, APPEND-ONLY tables where you only need
+--   coarse filtering → BRIN. A 50GB table's BRIN index is a few MB
+--   because it stores min/max per block range instead of per row.
+-- ✗ PURE equality on a huge key with no range needs → hash index, though
+--   in practice B+tree is nearly always competitive and far more
+--   flexible.
+
+-- ── THE JUDGEMENT ───────────────────────────────────────────────────────
+-- B+tree is the default for a reason: it serves equality, ranges,
+-- prefixes, sorting and uniqueness with one structure and predictable
+-- cost. Reach for something else only when you can name which of those
+-- five you are giving up and what you gain.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ "Indexes are magic"</strong>
+        <pre>"Add an index, it'll be fast."
+"UUIDs are cleaner as PKs."
+"REINDEX is just maintenance
+ theatre."
+"Wide text keys are fine, the
+ index handles it."
+→ Doubled index size, halved
+  fanout, and no idea why writes
+  degraded.</pre></div>
+      <div><strong>✅ Reasoning about the tree</strong>
+        <pre>"UUIDv4 → 50% page fill and no
+ write locality; use UUIDv7."
+"Key width sets fanout sets
+ depth — index a hash instead."
+"avg_leaf_density is 41%, so
+ this one genuinely needs a
+ REINDEX, not a VACUUM."</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Random UUID primary keys</td><td>~50% page fill, no write locality, index roughly doubles</td><td>UUIDv7/ULID, or <code>bigint</code> with a separate public id</td></tr>
+      <tr><td>Indexing wide text columns</td><td>Low fanout, deeper tree, large index, less of it cached</td><td>Index a prefix, a hash, or use a purpose-built index type</td></tr>
+      <tr><td>Expecting <code>VACUUM</code> to fix index bloat</td><td>Pages stay half-empty; scans keep reading extra pages</td><td><code>REINDEX CONCURRENTLY</code> — vacuum does not rebalance or merge</td></tr>
+      <tr><td>Plain <code>REINDEX</code> in production</td><td>Blocks writes for the whole rebuild</td><td><code>REINDEX INDEX CONCURRENTLY</code>, then check for invalid leftovers</td></tr>
+      <tr><td>Confusing latches with locks</td><td>Looking for microsecond page contention in <code>pg_locks</code></td><td>Latches guard physical pages; locks guard logical data</td></tr>
+      <tr><td>Index <code>fillfactor</code> left at 90 on volatile columns</td><td>Constant page splits under update load</td><td>Lower to 70–80 and reindex to apply</td></tr>
+      <tr><td>Putting returned columns in the index key</td><td>Wider internal pages, lower fanout, deeper tree</td><td>Use <code>INCLUDE</code> — payload belongs in leaves only</td></tr>
+      <tr><td>Assuming a B+tree suits every access pattern</td><td>Poor results on containment, overlap, or write-heavy workloads</td><td>GIN, GiST, BRIN or LSM — name what you are trading</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Why do databases use B+trees instead of binary search trees?</summary>
+      <p>Because the cost that matters is page fetches, not comparisons. A page fetch from storage takes about
+         twenty microseconds while a comparison takes a nanosecond, so the goal is to make each fetch produce
+         as much progress as possible. A binary tree node holds one key, so fetching an eight-kilobyte page
+         buys you a single yes-or-no decision. Over a hundred million rows that is roughly twenty-seven
+         levels, and since each node lives on a different page, twenty-seven fetches.</p>
+      <p>A B+tree packs hundreds of keys into each page — around four hundred for an eight-byte key — so one
+         fetch narrows the search among four hundred possibilities rather than two. That gives a depth of
+         about three for the same hundred million rows, and because the top levels are small and constantly
+         accessed they stay cached, so a lookup is typically one real disk read.</p>
+      <p>The plus in B+tree matters too. Data lives only in the leaves, so internal nodes carry no payload
+         and can hold even more keys, raising fanout further. And the leaves are linked together, so a range
+         scan descends once and then walks the chain rather than re-traversing the tree for each row. That
+         combination — shallow depth for point lookups, linked sorted leaves for ranges — is why one
+         structure serves equality, ranges, prefixes and ordering.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What happens when you insert into a full page?</summary>
+      <p>The engine splits it. It allocates a new page, moves roughly half the entries into it, inserts the
+         new entry into whichever half it belongs, and then pushes a separator key up into the parent so the
+         parent knows how to route between the two pages.</p>
+      <p>If the parent is also full, it splits too, and that can cascade upward. When the root itself splits,
+         a new root is created above it and the tree becomes one level deeper. That is the only way a B+tree
+         grows in height, and it is why all leaves remain at exactly the same depth without any separate
+         rebalancing pass — the structure stays balanced by construction.</p>
+      <p>The behaviour worth knowing is that splits are not always even. When keys arrive in ascending order,
+         PostgreSQL detects that inserts are hitting the rightmost page and performs a rightmost split
+         instead: it leaves the existing page full and starts a fresh one, rather than halving it. That is
+         why sequential keys fill pages to nearly a hundred percent while random keys leave them around fifty
+         to seventy percent full — the same mechanism, a different arrival pattern, and roughly double the
+         index size.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Explain precisely why UUIDv4 primary keys hurt, and what you would use instead.</summary>
+      <p>Two distinct costs, both traceable to the tree's structure. The first is write locality. A random
+         UUID belongs at a random position in the index, so consecutive inserts target unrelated leaf pages.
+         Each one probably is not cached, so the engine reads a page before it can write, and each insert
+         dirties a different page, which multiplies write I/O at checkpoint time and inflates WAL. The
+         effective working set becomes the whole index rather than one hot page. Sequential keys, by
+         contrast, hit the same rightmost page over and over, and it stays in memory.</p>
+      <p>The second is space. Splits in the middle of a tree divide a page roughly evenly, so pages settle at
+         about half to seventy percent full and stay there. Sequential inserts trigger the rightmost-split
+         optimisation instead, leaving pages essentially full. So a randomly-keyed index is close to twice
+         the size of a sequentially-keyed one holding the same rows, which means fewer index pages fit in
+         cache and every lookup reads more.</p>
+      <p>In MySQL the damage is worse because InnoDB clusters the table by the primary key — the random key
+         scatters the actual rows, not just an index — and every secondary index stores the primary key, so
+         sixteen bytes gets copied into all of them.</p>
+      <p>The fix is a time-ordered identifier: UUIDv7, ULID or a Snowflake id. These keep global uniqueness
+         and client-side generation while restoring the sequential insert pattern. Alternatively, keep a
+         compact <code>bigint</code> as the internal primary key and expose a separate opaque public
+         identifier, so internal joins stay narrow and external references stay non-enumerable. What I would
+         push back on is choosing UUIDv4 for aesthetics — the costs here are structural, not stylistic.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What is index bloat, and why doesn't <code>VACUUM</code> fix it?</summary>
+      <p>Index bloat is an index occupying substantially more pages than its live entries require. It builds
+         up from several directions: under MVCC, updating an indexed column inserts a new index entry while
+         the old one lingers until vacuum removes it; deletes leave entries behind similarly; random-key
+         inserts leave pages permanently half full after even splits; and PostgreSQL deliberately does not
+         merge underfull pages, so a page whose entries were nearly all deleted remains a mostly empty
+         page.</p>
+      <p><code>VACUUM</code> does part of the job — it finds and removes dead index entries and marks space
+         reusable — but it does not restructure the tree. It will not merge two half-empty sibling pages into
+         one, it will not rebalance, and it will not restore the physical ordering of leaves. So after a mass
+         delete you can have an index whose pages are ten percent occupied, with vacuum reporting success,
+         and every scan still reading ten times the pages it needs.</p>
+      <p>The cure is a rebuild: <code>REINDEX INDEX CONCURRENTLY</code> constructs a fresh, densely packed
+         index and swaps it in without blocking writes. It needs room for both copies during the build, and
+         if it fails it can leave an invalid index behind, so the runbook should check
+         <code>pg_index.indisvalid</code> afterwards.</p>
+      <p>I would diagnose with <code>pgstatindex</code>, looking at <code>avg_leaf_density</code> — healthy is
+         around eighty or ninety percent, and below fifty is genuinely bloated — and
+         <code>leaf_fragmentation</code>, which tells me whether range scans have degraded into random I/O.
+         Prevention is better than periodic reindexing though: time-ordered keys, not indexing volatile
+         columns, lower fillfactor where updates are frequent, and dropping indexes nobody uses.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> How does a B+tree stay correct while hundreds of sessions read and modify it concurrently?</summary>
+      <p>The mechanism is latches rather than locks, and the distinction is important. A lock protects logical
+         data and is held for the duration of a transaction, with deadlock detection. A latch is a short-term
+         mutex over a page in the buffer pool, held for microseconds while the page is read or modified, with
+         no deadlock detection — correctness comes from a strict ordering discipline instead.</p>
+      <p>The classical approach is latch coupling, or crabbing: descending the tree, you latch the child
+         before releasing the parent, so you never hold neither. For writes you must retain the parent until
+         you know the child cannot split, because a split needs to insert a separator into the parent. The
+         problem is that a split propagating toward the root requires an exclusive latch on the root, and the
+         root is on every descent path, so the whole index serialises behind one split. On a write-heavy
+         index that is fatal for throughput.</p>
+      <p>PostgreSQL uses the B-link tree solution, which adds a right-link from each page to its sibling plus
+         a high key recording the largest value the page may hold. This makes a split observable safely
+         halfway through: first the new right sibling is created and linked, at which point the tree is
+         already fully searchable even though the parent knows nothing about it; then the separator is
+         inserted into the parent. A reader that arrives at a page and finds its target above the high key
+         simply follows the right-link and self-corrects.</p>
+      <p>The consequence is that readers never need to latch a parent — a descent holds one latch at a time
+         and never blocks on a concurrent split. The root stops being a serialisation point, and read
+         concurrency becomes effectively unlimited. One extra pointer per page buys all of that, which is
+         why it is one of the more elegant results in the field.</p>
+      <p>Contention does not vanish entirely. Monotonically increasing keys direct every insert at the same
+         rightmost leaf, so at very high write rates inserters queue for that page's exclusive latch. That is
+         the ironic counterpart to the earlier point: sequential keys are optimal for space and locality and
+         are the worst case for insert contention. Systems that genuinely hit it spread the hot spot with
+         hash partitioning or per-worker key ranges — but it is worth knowing the trade-off exists before
+         someone "solves" it by switching to random UUIDs and making everything worse.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> When would you not use a B+tree, and what would you use instead?</summary>
+      <p>A B+tree is built on one assumption: that the data has a total order and that order is what queries
+         exploit. It handles equality, ranges, prefixes, sorting and uniqueness with predictable cost, which
+         is why it is the default. I would move away from it when the workload violates that assumption or
+         when the write pattern makes in-place updates too expensive.</p>
+      <p>For write-dominated workloads — high-rate ingest of events, metrics or logs — an LSM-tree is the
+         better structure. A B+tree updates pages in place, which means random writes; an LSM buffers in
+         memory and flushes immutable sorted files, converting everything into sequential I/O, and it
+         compresses far better because the files never mutate. The costs are read amplification, mitigated
+         with bloom filters, and continuous background compaction that produces latency spikes.</p>
+      <p>For containment queries the total order is simply the wrong tool. Asking which documents contain a
+         word, or which JSONB values contain a key, is not a range over whole values, so a B+tree cannot
+         help; GIN indexes the items inside each value instead. Geometric and overlap queries — what
+         intersects this bounding box, which bookings overlap this interval — need GiST, because those
+         operators cannot be expressed as a one-dimensional ordering. For very large, physically ordered,
+         append-only tables where coarse filtering suffices, BRIN stores a summary per block range and can
+         index fifty gigabytes in a few megabytes.</p>
+      <p>Hash indexes are the interesting near-miss: theoretically better for pure equality, but a B+tree is
+         usually competitive in practice and far more flexible, so the specialisation rarely pays.</p>
+      <p>The discipline I would apply is to name what I am giving up. Choosing GIN means losing cheap range
+         scans and accepting slower writes; choosing BRIN means accepting that it only works while physical
+         order matches the column and that it returns candidate blocks rather than exact matches; choosing an
+         LSM means accepting compaction as a permanent background cost. If I cannot articulate the trade, the
+         B+tree is the right answer.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure a real index's depth and fanout.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE TABLE t (id bigint PRIMARY KEY, payload text);
+INSERT INTO t SELECT g, 'x' FROM generate_series(1, 10000000) g;
+VACUUM ANALYZE t;
+
+-- ── DEPTH ───────────────────────────────────────────────────────────────
+SELECT * FROM bt_metap('t_pkey');
+--  magic  | version | root | level | fastroot | fastlevel
+--  340322 |       4 | 3241 |     2 |     3241 |         2
+-- level=2 → THREE levels: leaves(0), internal(1), root(2).
+-- 10 MILLION rows, 3 levels. A lookup is 3 page fetches, and the root
+-- and internal level are always cached → ~1 real read.
+
+-- ── FANOUT ──────────────────────────────────────────────────────────────
+SELECT type, live_items, avg_item_size, free_size
+FROM bt_page_stats('t_pkey', 3241);          -- the root
+--  type | live_items | avg_item_size | free_size
+--   r   |         48 |            16 |      7200
+SELECT type, live_items, avg_item_size, free_size
+FROM bt_page_stats('t_pkey', 1);             -- a leaf
+--  type | live_items | avg_item_size | free_size
+--   l   |        367 |            16 |       284
+-- Fanout ≈ 367 per leaf. 367^3 ≈ 49 million — comfortably more than
+-- 10M, which is exactly why 3 levels suffice.
+
+-- ── PREDICT THE NEXT LEVEL ──────────────────────────────────────────────
+-- A 4th level appears at roughly 367^4 ≈ 18 BILLION rows.
+-- ✓ Growing from 10M to 1B rows adds ZERO levels. Index lookup cost is
+--   effectively constant across any realistic table size — the property
+--   that makes indexes so valuable.
+
+-- ── NOW WIDEN THE KEY AND WATCH FANOUT COLLAPSE ─────────────────────────
+CREATE TABLE t2 (id text PRIMARY KEY);
+INSERT INTO t2 SELECT repeat('k',60) || g FROM generate_series(1,10000000) g;
+SELECT level FROM bt_metap('t2_pkey');                       -- 3 (4 levels)
+SELECT live_items FROM bt_page_stats('t2_pkey', 1);          -- ~110
+SELECT pg_size_pretty(pg_relation_size('t_pkey')),
+       pg_size_pretty(pg_relation_size('t2_pkey'));
+--  214 MB | 1024 MB       ← 5× the index for the same row count
+-- Key width → fanout → depth AND size. Indexing a wide text column is
+-- expensive in a way nothing in the schema hints at.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove the sequential-versus-random page fill difference.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+-- ── SEQUENTIAL KEYS ─────────────────────────────────────────────────────
+CREATE TABLE seq_t (id bigint PRIMARY KEY);
+INSERT INTO seq_t SELECT generate_series(1, 5000000);
+
+-- ── RANDOM KEYS ─────────────────────────────────────────────────────────
+CREATE TABLE rnd_t (id uuid PRIMARY KEY);
+INSERT INTO rnd_t SELECT gen_random_uuid() FROM generate_series(1,5000000);
+
+-- ── TIME-ORDERED UUIDs (the fix) ────────────────────────────────────────
+CREATE TABLE v7_t (id uuid PRIMARY KEY);
+INSERT INTO v7_t SELECT
+  (lpad(to_hex((extract(epoch from clock_timestamp())*1000)::bigint),12,'0')
+   || '7' || substr(replace(gen_random_uuid()::text,'-',''), 14, 19))::uuid
+FROM generate_series(1, 5000000);
+-- (PG18 has uuidv7() built in; this emulates it: a millisecond timestamp
+--  prefix followed by randomness.)
+
+VACUUM ANALYZE seq_t, rnd_t, v7_t;
+
+-- ── COMPARE ─────────────────────────────────────────────────────────────
+SELECT 'sequential bigint' AS kind,
+       pg_size_pretty(pg_relation_size('seq_t_pkey')) AS size,
+       (SELECT round(avg_leaf_density::numeric,1)
+        FROM pgstatindex('seq_t_pkey')) AS density
+UNION ALL SELECT 'random uuidv4',
+       pg_size_pretty(pg_relation_size('rnd_t_pkey')),
+       (SELECT round(avg_leaf_density::numeric,1) FROM pgstatindex('rnd_t_pkey'))
+UNION ALL SELECT 'ordered uuidv7',
+       pg_size_pretty(pg_relation_size('v7_t_pkey')),
+       (SELECT round(avg_leaf_density::numeric,1) FROM pgstatindex('v7_t_pkey'));
+
+--  kind              | size   | density
+--  sequential bigint | 107 MB |    90.1     ← rightmost-split optimisation
+--  random uuidv4     | 322 MB |    54.7     ← 3× the size!
+--  ordered uuidv7    | 198 MB |    89.4     ← density recovered
+
+-- ── READ THE NUMBERS ────────────────────────────────────────────────────
+-- v4 vs v7: SAME 16-byte key, same row count. The only difference is
+-- ARRIVAL ORDER, and it changes density from 55% to 89%. That isolates
+-- the mechanism perfectly — it is the split behaviour, not the type.
+-- v7 vs bigint: still ~2× larger, purely because 16 bytes > 8 bytes.
+
+-- ── AND THE WRITE COST ──────────────────────────────────────────────────
+\timing on
+INSERT INTO seq_t SELECT generate_series(5000001, 6000000);   -- 2.1 s
+INSERT INTO rnd_t SELECT gen_random_uuid()
+FROM generate_series(1,1000000);                              -- 14.8 s
+-- 7× slower, because each insert must READ a cold random page before
+-- writing it. With a dataset far larger than RAM the gap widens further.
+
+-- ── CONCLUSION ──────────────────────────────────────────────────────────
+-- Need client-generated global ids? UUIDv7. Do not need them? bigint.
+-- UUIDv4 as a primary key costs 3× the index and 7× the insert time for
+-- no benefit that v7 does not also provide.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Create bloat deliberately, then measure and fix it.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE orders (id bigint PRIMARY KEY, status text, total int);
+INSERT INTO orders SELECT g, 'pending', g FROM generate_series(1,5000000) g;
+CREATE INDEX idx_status ON orders (status);
+VACUUM ANALYZE orders;
+SELECT pg_size_pretty(pg_relation_size('idx_status'));    -- 33 MB
+SELECT round(avg_leaf_density::numeric,1) FROM pgstatindex('idx_status');  -- 89.7
+
+-- ── BLOAT IT: UPDATE THE INDEXED COLUMN ─────────────────────────────────
+UPDATE orders SET status = 'shipped';       -- every row, indexed column
+VACUUM ANALYZE orders;
+SELECT pg_size_pretty(pg_relation_size('idx_status'));    -- 66 MB  (2×)
+SELECT round(avg_leaf_density::numeric,1) FROM pgstatindex('idx_status');  -- 45.2
+
+-- WHY: updating an INDEXED column means no HOT update, so each row got a
+-- new index entry. Vacuum removed the dead ones and marked the space
+-- reusable — but it did NOT merge the now half-empty pages, so the file
+-- stayed twice as large with half the density.
+
+-- ── MAKE IT WORSE: A MASS DELETE ────────────────────────────────────────
+DELETE FROM orders WHERE id % 10 &lt;&gt; 0;      -- keep 10%
+VACUUM ANALYZE orders;
+SELECT leaf_pages, round(avg_leaf_density::numeric,1)
+FROM pgstatindex('idx_status');
+--  leaf_pages | avg_leaf_density
+--        8412 |              6.3      ← 500k entries in 8412 pages
+-- Postgres does not merge underfull pages, so a page holding a handful
+-- of survivors remains a whole page. Every scan reads all 8412.
+
+-- ── PROVE IT COSTS READS ────────────────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders WHERE status='shipped';
+--  Buffers: shared hit=8420        Time: 41 ms
+
+-- ── FIX: REBUILD, NOT VACUUM ────────────────────────────────────────────
+VACUUM FULL orders;         -- would work, but ACCESS EXCLUSIVE = outage
+REINDEX INDEX CONCURRENTLY idx_status;      -- ✓ online
+SELECT leaf_pages, round(avg_leaf_density::numeric,1)
+FROM pgstatindex('idx_status');
+--  leaf_pages | avg_leaf_density
+--         548 |             88.9      ← 15× fewer pages
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM orders WHERE status='shipped';
+--  Buffers: shared hit=556         Time: 4 ms      ← 10× faster
+
+-- ── AFTERMATH CHECK (do not skip) ───────────────────────────────────────
+SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+-- A failed CONCURRENTLY rebuild leaves an invalid *_ccnew index that
+-- costs writes and serves nothing. Drop it and retry.
+
+-- ── AND PREVENT THE RECURRENCE ──────────────────────────────────────────
+ALTER INDEX idx_status SET (fillfactor = 75);
+REINDEX INDEX CONCURRENTLY idx_status;
+-- Leaves room for new entries so updates split pages less often. The
+-- deeper fix is not indexing a column that every row updates — ask what
+-- the index is for, since `status` with three values is rarely
+-- selective enough to earn its keep (see the SQL indexes lesson).</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Trace a split by watching the tree grow.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE grow (id int PRIMARY KEY);
+
+-- ── LEVEL 0: A SINGLE PAGE IS THE WHOLE TREE ────────────────────────────
+INSERT INTO grow SELECT generate_series(1, 100);
+SELECT root, level FROM bt_metap('grow_pkey');       -- root=1, level=0
+SELECT type, live_items FROM bt_page_stats('grow_pkey', 1);
+--  type | live_items
+--   l   |        100        ← the root IS a leaf. No internal nodes.
+
+-- ── THE FIRST SPLIT: THE TREE GAINS A LEVEL ─────────────────────────────
+INSERT INTO grow SELECT generate_series(101, 1000);
+SELECT root, level FROM bt_metap('grow_pkey');       -- root=3, level=1
+SELECT type, live_items FROM bt_page_stats('grow_pkey', 3);
+--  type | live_items
+--   r   |          3        ← now a root with 3 children
+-- The original page filled, split, and a NEW ROOT was created above it.
+-- That is the ONLY way a B+tree grows taller — and it is why every leaf
+-- stays at exactly the same depth automatically.
+
+-- ── WALK THE LEAF CHAIN ─────────────────────────────────────────────────
+SELECT blkno, type, live_items, btpo_prev, btpo_next
+FROM bt_multi_page_stats('grow_pkey', 1, 4);
+--  blkno | type | live_items | btpo_prev | btpo_next
+--      1 |  l   |        367 |         0 |         2
+--      2 |  l   |        367 |         1 |         4
+--      4 |  l   |        266 |         2 |         0
+-- The prev/next pointers ARE the linked list that makes range scans a
+-- straight walk. btpo_next=0 marks the rightmost leaf.
+
+-- ── SEQUENTIAL SPLITS ARE UNEVEN, ON PURPOSE ────────────────────────────
+-- Leaves 1 and 2 hold 367 each (full); leaf 4 holds 266 (still filling).
+-- With sequential keys Postgres uses the RIGHTMOST SPLIT: leave the old
+-- page full, start a new one. Hence ~90% density.
+
+-- ── COMPARE WITH RANDOM ARRIVAL ─────────────────────────────────────────
+CREATE TABLE grow_r (id int PRIMARY KEY);
+INSERT INTO grow_r SELECT (random()*1000000)::int
+FROM generate_series(1,1000) ON CONFLICT DO NOTHING;
+SELECT blkno, live_items FROM bt_multi_page_stats('grow_r_pkey', 1, 4);
+-- live_items hovering near 180-200 (about HALF of 367): random inserts
+-- land mid-tree, so splits are even and pages settle half full.
+-- ✓ Same code path, different arrival order, 2× the space. This is the
+--   whole UUIDv4 story visible in four rows of output.
+
+-- ── DEPTH VS SIZE ───────────────────────────────────────────────────────
+INSERT INTO grow SELECT generate_series(1001, 10000000);
+SELECT level FROM bt_metap('grow_pkey');             -- 2
+-- 100 rows → 10 million rows added exactly TWO levels. Logarithmic
+-- growth is why index performance is so stable as tables grow.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Design the index strategy for a write-heavy multi-tenant table.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- 50k inserts/sec, 5k updates/sec. Queries:
+--   A) tenant's recent items:  WHERE tenant_id=? ORDER BY created_at DESC
+--   B) by external ref:        WHERE external_ref=?
+--   C) pending work:           WHERE status='pending' ORDER BY created_at
+--   D) full-text on title
+-- Constraint: writes must not degrade.
+
+-- ── FIRST: EVERY INDEX IS A TAX ON 55k WRITES/SEC ───────────────────────
+-- Each index means another tree to descend, latch, possibly split, and
+-- WAL-log per write. At this rate the index COUNT is the primary design
+-- constraint, not any individual index's shape.
+
+CREATE TABLE items (
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    tenant_id    bigint      NOT NULL,
+    id           bigint GENERATED ALWAYS AS IDENTITY,
+    external_ref text,
+    title        text        NOT NULL,
+    status       text        NOT NULL DEFAULT 'pending',
+    PRIMARY KEY (created_at, id)
+) PARTITION BY RANGE (created_at);
+ALTER TABLE items SET (fillfactor = 90);
+
+-- ── QUERY A: the composite that also serves the sort ────────────────────
+CREATE INDEX ON items (tenant_id, created_at DESC);
+-- Equality first, then the range/sort column → descends straight to the
+-- tenant's slice, already ordered, so LIMIT stops early with no sort.
+-- Sequential-ish within each tenant → good page density.
+
+-- ── QUERY B: unique, but only where present ─────────────────────────────
+CREATE UNIQUE INDEX ON items (external_ref) WHERE external_ref IS NOT NULL;
+-- ⚠ external_ref is externally-generated and therefore RANDOM → ~50%
+--   page density and a cold page read per insert. Unavoidable if the
+--   lookup is required, but the PARTIAL clause means only rows that
+--   actually have one are indexed. If 60% are NULL, the index is 60%
+--   smaller and 60% of inserts skip it entirely.
+
+-- ── QUERY C: the highest-leverage index here ────────────────────────────
+CREATE INDEX ON items (created_at) WHERE status = 'pending';
+-- If pending is 0.1% of rows, this index is ~1000× smaller than a full
+-- one, stays entirely cached, and — crucially — is only MAINTAINED when
+-- a row is pending. A row inserted as pending and completed adds and
+-- removes ONE entry; rows that skip that state never touch it.
+-- ✗ A plain index on (status) would be useless anyway: three values,
+--   no selectivity, and it would tax every single write.
+
+-- ── QUERY D: NOT a B+tree problem ───────────────────────────────────────
+CREATE INDEX ON items USING gin (to_tsvector('english', title));
+-- ⚠ GIN writes are expensive. At 50k inserts/sec this may be the single
+--   costliest index on the table. Options, in order of preference:
+--   1. Set gin_pending_list_limit / fastupdate so insertions batch into
+--      a pending list and merge in bulk — far cheaper per insert.
+--   2. Move search to a dedicated engine and stop paying it on the OLTP
+--      write path at all.
+--   3. Index only recent partitions, if search over old data is rare.
+
+-- ── WHAT I REFUSED TO ADD ───────────────────────────────────────────────
+-- • an index on updated_at → would kill HOT updates for all 5k
+--   updates/sec (previous lesson). If an admin screen needs it, run it
+--   on a replica or accept a scan.
+-- • an index on tenant_id alone → redundant: it is the leftmost prefix
+--   of the composite above.
+-- • an index on status alone → no selectivity; the partial index serves
+--   the only query that matters.
+
+-- ── PARTITIONING IS PART OF THE INDEX STRATEGY ──────────────────────────
+-- Monthly partitions mean per-partition indexes: the hot month's trees
+-- are small and fully cached, while older ones are cold and untouched.
+-- Without partitioning, ONE tree spanning 600M rows/year must be kept
+-- hot in its entirety. Retention also becomes DETACH instead of a
+-- delete storm that would bloat every index at once.
+
+-- ── VERIFY THE DESIGN, DO NOT ASSUME IT ─────────────────────────────────
+SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes WHERE relname LIKE 'items%' ORDER BY idx_scan;
+-- Anything with idx_scan near zero after a full business cycle is pure
+-- write tax. At 55k writes/sec, deleting one unused index is a bigger
+-- win than optimising any query.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Diagnose an index that "should be fast" but is not.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYMPTOM: WHERE tenant_id=? AND created_at > ? uses the right index,
+-- returns 200 rows, and takes 900ms. Identical query on another tenant:
+-- 3ms.
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM events WHERE tenant_id=88 AND created_at > now()-'1 day'::interval;
+-- Index Scan using idx_events_tenant_created  (actual time=0.9..894 rows=200)
+--   Index Cond: (tenant_id=88 AND created_at > ...)
+--   Buffers: shared hit=41 read=8912           ← 8912 pages for 200 rows!
+-- The index is being used correctly. 200 rows should cost ~10 pages.
+
+-- ── HYPOTHESIS 1: INDEX BLOAT ───────────────────────────────────────────
+SELECT leaf_pages, round(avg_leaf_density::numeric,1) AS density,
+       round(leaf_fragmentation::numeric,1) AS frag
+FROM pgstatindex('idx_events_tenant_created');
+--  leaf_pages | density | frag
+--      184220 |    22.4 | 71.8
+-- density 22% → the index is ~4× larger than needed. But that inflates
+-- the INDEX read, and we are reading 8912 pages for 200 rows. Bloat is
+-- real but is not the whole story.
+
+-- ── HYPOTHESIS 2: HEAP FETCHES, NOT INDEX PAGES ─────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM events
+WHERE tenant_id=88 AND created_at > now()-'1 day'::interval;
+-- Index Only Scan  Buffers: shared hit=38 read=204   Time: 12 ms
+-- ✓ DECISIVE. Without touching the heap: 12ms. With: 894ms.
+-- So the index lookup is fine; fetching the 200 ROWS is the cost.
+
+-- ── WHY WOULD 200 HEAP FETCHES COST 8700 PAGES? ─────────────────────────
+SELECT correlation FROM pg_stats
+WHERE tablename='events' AND attname='created_at';       -- 0.03
+SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname='events';
+--  210000000 | 680000000        ← 76% dead
+-- TWO compounding effects:
+--   1. Correlation 0.03: rows that are adjacent in the index are
+--      scattered across the whole heap, so 200 rows = 200 RANDOM page
+--      reads, each cold.
+--   2. Table bloat: the heap is 4× its necessary size, so the working
+--      set does not fit in cache and every one of those reads is
+--      physical.
+-- Tenant 88's rows were written over months and updated repeatedly;
+-- another tenant's arrived in one recent batch and are still physically
+-- clustered — which is exactly why the same query is 3ms for them.
+
+-- ── HYPOTHESIS 3: rule it out explicitly ────────────────────────────────
+SELECT * FROM pg_index WHERE indexrelid='idx_events_tenant_created'::regclass
+  AND NOT indisvalid;                                    -- empty ✓ valid
+-- (A failed CREATE INDEX CONCURRENTLY leaves an invalid index that the
+--  planner ignores — always worth eliminating.)
+
+-- ── THE FIXES, IN ORDER OF LEVERAGE ─────────────────────────────────────
+-- 1. FIX THE BLOAT — it is the root cause of the cold cache.
+--    Find the vacuum blocker first, or it returns immediately:
+SELECT pid, now()-xact_start FROM pg_stat_activity
+WHERE state='idle in transaction' ORDER BY xact_start LIMIT 1;
+SELECT slot_name, active FROM pg_replication_slots WHERE NOT active;
+--    then: pg_repack -t events   (online; VACUUM FULL would be an outage)
+-- 2. MAKE THE QUERY INDEX-ONLY so heap correlation stops mattering:
+CREATE INDEX CONCURRENTLY ON events (tenant_id, created_at DESC)
+       INCLUDE (event_type, value);
+--    Now the 200 rows come from ~10 index pages. This is the fix that
+--    works REGARDLESS of heap layout — the most robust of the three.
+-- 3. PARTITION BY TIME so recent data is physically clustered by
+--    construction and correlation stays high permanently. Fixes the
+--    class of problem rather than this instance.
+-- ✗ CLUSTER events USING idx... would work once, takes an exclusive
+--   lock, and drifts again with the next writes. Not a maintenance
+--   routine.
+
+-- ── THE GENERAL LESSON ──────────────────────────────────────────────────
+-- "The index is being used" is not the end of the diagnosis. An index
+-- scan has two halves — walking the tree and fetching the rows — and
+-- they fail for different reasons. Comparing an Index Only Scan against
+-- the full query separates them in one measurement, and that single
+-- comparison is the most useful diagnostic move in this whole area.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>B+trees win because they minimise <em>page fetches</em>, not comparisons — hundreds of keys per page means depth 3–4 at any realistic table size.</li>
+        <li>Data lives only in leaves, which raises fanout, and the leaves are linked, which makes range scans a straight walk.</li>
+        <li>Key width determines fanout determines depth and size: indexing a wide text column can multiply an index fivefold.</li>
+        <li>Sequential inserts trigger rightmost splits and ~90% page density; random inserts split evenly and settle near 50%, roughly doubling the index.</li>
+        <li>That split behaviour — not the type itself — is why UUIDv4 primary keys hurt, and why UUIDv7 fixes it.</li>
+        <li>Latches guard physical pages for microseconds; locks guard logical data for a transaction. They are different mechanisms with different failure modes.</li>
+        <li>B-link trees add a right-link and high key per page, so readers self-correct across concurrent splits and never latch a parent — removing the root as a serialisation point.</li>
+        <li>PostgreSQL does not merge underfull pages, so <code>VACUUM</code> cannot cure index bloat; only <code>REINDEX CONCURRENTLY</code> restores density.</li>
+        <li><code>INCLUDE</code> columns are leaf payload — they enable index-only scans without widening internal pages and lowering fanout.</li>
+        <li>An index scan has two halves, tree walk and heap fetch; comparing against an index-only scan separates them and is the fastest way to diagnose a slow "working" index.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="pages-heap-files.html">← Pages, Heap Files &amp; Row Layout</a>
+      <a href="lsm-trees.html">LSM-Trees &amp; Write-Optimised Storage →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
