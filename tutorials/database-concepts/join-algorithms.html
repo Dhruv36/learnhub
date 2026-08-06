@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Join &amp; Aggregation Algorithms — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Join &amp; Aggregation Algorithms <span class="level-badge level-ultra">Query Processing</span></h1>
+    <p><strong>What you'll master:</strong> the three join algorithms as actual algorithms with cost
+       formulas, so you can predict which one the planner will choose and why, why a nested loop is
+       excellent at small scale and catastrophic at large scale — and why that asymmetry makes it the
+       signature of an estimate error, how hash joins partition and spill to disk when <code>work_mem</code>
+       runs out and what the <code>Batches</code> number in <code>EXPLAIN</code> is telling you, why merge
+       joins are the only algorithm that needs no memory proportional to input, how the same three-way
+       choice reappears for aggregation and set operations, and how parallel query changes the arithmetic.
+       Prerequisites: <a href="cost-models.html">Cost Models &amp; Statistics</a>. The
+       <a href="../sql/joins.html">SQL joins lesson</a> covers join semantics — inner versus outer, fan-out,
+       anti-joins; this lesson is about how the engine physically executes them.</p>
+
+    <h2>Part 1 — Nested Loop Join</h2>
+    <pre>-- The simplest algorithm, and the one whose behaviour you must
+-- internalise because its failure mode is the most common bad plan.
+
+for each row R in OUTER:
+    for each matching row S in INNER:
+        emit (R, S)
+
+-- ── THE THREE VARIANTS ──────────────────────────────────────────────────
+-- NAIVE: scan the whole inner relation per outer row.
+--   cost = outer_rows × inner_pages.  Catastrophic, essentially never
+--   chosen unless the inner side is tiny.
+-- BLOCK: read a chunk of outer rows, then scan the inner once per chunk.
+--   cost = (outer_pages / chunk) × inner_pages. Better, still bad.
+-- INDEXED: use an index on the inner join column.
+--   cost = outer_rows × index_lookup_cost   ← THE one that matters
+-- ⚠ When you see "Nested Loop" in a Postgres plan, it is almost always
+--   the indexed variant, with an Index Scan as the inner node.
+
+-- ── THE COST, AND THE ASYMMETRY THAT MATTERS ────────────────────────────
+--   cost ≈ outer_startup + outer_rows × (inner_startup + inner_per_row)
+--
+-- An index lookup is ~4-8 cost units. So:
+--     10 outer rows →      80 units   ← excellent
+--  1,000 outer rows →   8,000 units   ← fine
+-- 100,000 outer rows → 800,000 units  ← a hash join would be far cheaper
+--
+-- ✓ COST IS LINEAR IN OUTER ROWS. That single property explains
+--   everything about when it wins and how it fails.
+
+-- ── WHY IT IS THE SIGNATURE OF AN ESTIMATE ERROR ────────────────────────
+-- Because cost = outer_rows × something, underestimating the outer side
+-- by 1000× underestimates the plan's cost by exactly 1000×. The plan
+-- therefore LOOKS cheapest precisely when the estimate is most wrong.
+-- ⚠ An unexpected nested loop over a large input is the most reliable
+--   indicator of a statistics problem there is — more reliable than any
+--   other tell in a plan. Do not "fix" the join; fix the estimate
+--   (previous lesson).
+
+-- ── WHERE IT GENUINELY WINS ─────────────────────────────────────────────
+-- ✓ few outer rows and an index on the inner join key
+-- ✓ LIMIT queries: it STREAMS — the first result row is available
+--   immediately, with no build phase and no sort. A hash join must build
+--   its entire table before emitting anything.
+-- ✓ correlated subqueries and LATERAL, where the inner query genuinely
+--   depends on each outer row
+-- ✓ the ONLY algorithm that supports non-equi joins:
+SELECT * FROM a JOIN b ON a.value BETWEEN b.lo AND b.hi;
+--   Hash and merge joins require equality. Range and inequality joins
+--   have no alternative, which is why they are so often slow.
+
+-- ── READING IT ──────────────────────────────────────────────────────────
+EXPLAIN ANALYZE SELECT * FROM orders o JOIN users u ON u.id=o.user_id
+WHERE o.id = 42;
+--  Nested Loop  (actual time=0.05..0.06 rows=1 loops=1)
+--    -> Index Scan on orders  (actual rows=1 loops=1)
+--    -> Index Scan on users   (actual time=0.02..0.02 rows=1 loops=1)
+-- ⚠ ALWAYS multiply the inner node's time by `loops`. A node showing
+--   0.02ms with loops=200,000 is 4 seconds, and that is where the query
+--   went.</pre>
+
+    <h2>Part 2 — Hash Join</h2>
+    <pre>-- The workhorse for large equi-joins.
+
+-- PHASE 1 (BUILD): read the smaller relation, hash each row on the join
+--                  key, insert into an in-memory hash table.
+-- PHASE 2 (PROBE):  scan the larger relation, hash each row's key, look
+--                  it up, emit matches.
+
+-- ── THE COST ────────────────────────────────────────────────────────────
+--   cost ≈ build_pages + probe_pages + CPU for hashing both sides
+-- ✓ LINEAR in the size of both inputs — O(M+N), not O(M×N). That is the
+--   entire reason it beats a nested loop at scale.
+-- ✗ The build side must fit in work_mem, or it spills (below).
+-- ✗ It is BLOCKING: nothing is emitted until the build completes, so
+--   startup cost is high and LIMIT gains nothing.
+-- ✗ EQUALITY ONLY. A hash cannot answer "greater than".
+
+-- ── WHICH SIDE IS THE BUILD SIDE? ───────────────────────────────────────
+EXPLAIN SELECT * FROM orders o JOIN users u ON u.id = o.user_id;
+--  Hash Join
+--    -> Seq Scan on orders        ← PROBE side (larger)
+--    -> Hash
+--         -> Seq Scan on users    ← BUILD side (smaller)
+-- The planner puts the SMALLER estimated relation in the hash. If that
+-- estimate is wrong it builds a hash over the huge side — a
+-- disproportionately expensive mistake, and another reason estimates
+-- matter more than algorithm choice.
+
+-- ── SPILLING: WHAT `Batches` MEANS ──────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
+--  Hash  (actual rows=4,000,000)
+--    Buckets: 65536  Batches: 16  Memory Usage: 262144kB
+--                    ↑↑↑↑↑↑↑↑↑↑
+-- Batches > 1 means the hash table did NOT fit in work_mem. The engine
+-- partitions BOTH sides by hash value into 16 files on disk, then joins
+-- one partition pair at a time.
+-- ⚠ THE COST: both inputs are written to disk and read back. A spilled
+--   hash join can be several times slower, and it is invisible unless
+--   you read this line.
+-- ✓ THE FIX: raise work_mem for that query or role — never globally,
+--   because it is allocated PER NODE PER CONNECTION (buffer pool lesson).
+SET LOCAL work_mem = '256MB';
+
+-- ── HASH COLLISIONS AND SKEW ────────────────────────────────────────────
+-- The hash table degrades if many rows share a key. If 40% of orders
+-- have user_id = 0 (a placeholder), that bucket holds 40% of the rows
+-- and probing it is a linear scan.
+-- ⚠ This is why "join on a column with a dominant value" performs far
+--   worse than the row counts suggest, and it does not show up in the
+--   cost estimate at all.
+
+-- ── HASH JOIN CANNOT DO EVERYTHING ──────────────────────────────────────
+-- ✗ non-equi joins           → nested loop only
+-- ✗ output in sorted order   → a merge join preserves order; a hash
+--                              join destroys it, so ORDER BY afterwards
+--                              needs a separate sort node</pre>
+    <div class="note">⚖️ <strong>The three algorithms are not ranked — they are suited to different
+      inputs.</strong> Nested loop is linear in the outer row count, so it wins with few outer rows and an
+      indexed inner side, and it is the only option for non-equi joins. Hash join is linear in both inputs,
+      so it wins on large unsorted equi-joins, provided the build side fits in memory. Merge join needs
+      sorted inputs but uses bounded memory and preserves order. The planner's job is picking among them
+      using row estimates — which is why a wrong estimate produces a wrong algorithm, and why the fix is
+      almost always statistics rather than the join itself.</div>
+
+    <h2>Part 3 — Merge Join</h2>
+    <pre>-- Both inputs sorted on the join key; walk them in lockstep like merging
+-- two sorted lists.
+
+pointer A → first row of left;  pointer B → first row of right
+while both have rows:
+    if A.key < B.key:  advance A
+    elif A.key > B.key: advance B
+    else:              emit all matching pairs, advance both
+
+-- ── THE COST ────────────────────────────────────────────────────────────
+--   cost ≈ sort_left + sort_right + scan_both
+-- If the inputs are ALREADY sorted — from an index scan, or as the
+-- output of an earlier merge join — the sorts vanish and this becomes
+-- the cheapest option available.
+-- ✓ MEMORY IS BOUNDED. Unlike a hash join it does not hold either input
+--   in memory; it streams. That makes it the reliable choice for joins
+--   far larger than RAM.
+-- ✓ OUTPUT IS SORTED, which can eliminate a later ORDER BY, GROUP BY
+--   sort, or feed the next merge join for free.
+-- ✗ Sorting unsorted inputs is O(n log n) and may itself spill to disk.
+-- ✗ Equality only (though it also handles range predicates on the
+--   sort key in some cases).
+
+-- ── WHEN THE PLANNER PICKS IT ───────────────────────────────────────────
+EXPLAIN SELECT * FROM orders o JOIN users u ON u.id = o.user_id
+ORDER BY u.id;
+--  Merge Join
+--    -> Index Scan using orders_user_id_idx on orders   ← already sorted
+--    -> Index Scan using users_pkey on users            ← already sorted
+-- ✓ Both sides arrive sorted from index scans, so there is no sort cost
+--   AND the ORDER BY is satisfied for free. Three benefits from one
+--   choice — this is what "interesting orders" (planner lesson) means in
+--   practice.
+
+-- ── THE DUPLICATE-KEY SUBTLETY ──────────────────────────────────────────
+-- When both sides have repeated keys, the algorithm must re-scan the
+-- right side's matching group for each left row in the group — a
+-- "mark and restore". With heavy duplication on both sides this
+-- degenerates toward the quadratic behaviour of a nested loop.
+-- ⚠ Merge join is at its best on unique or near-unique keys, which is
+--   the usual case for primary-key joins and part of why it pairs so
+--   well with index scans.
+
+-- ── THE DECISION TABLE ──────────────────────────────────────────────────
+--                    NESTED LOOP      HASH            MERGE
+--  complexity        O(M × N)         O(M + N)        O(M log M + N log N)
+--                    (M lookups)                      (or O(M+N) if sorted)
+--  memory            minimal          build side      bounded
+--  needs sorted?     no               no              YES
+--  output sorted?    outer order      no              YES
+--  non-equi joins?   YES              no              no
+--  streams (LIMIT)?  YES              no (blocks)     partially
+--  best when         few outer rows,  large unsorted  inputs already
+--                    indexed inner    equi-join       sorted, or huge</pre>
+
+    <h2>Part 4 — Aggregation: The Same Choice Again</h2>
+    <pre>-- GROUP BY faces a structurally identical decision, and the same three
+-- shapes reappear.
+
+-- ── HASH AGGREGATE ──────────────────────────────────────────────────────
+EXPLAIN SELECT user_id, count(*) FROM orders GROUP BY user_id;
+--  HashAggregate  (cost=... rows=50000)
+--    Group Key: user_id
+--    -> Seq Scan on orders
+-- Build a hash table keyed by the group key, accumulate as you scan.
+-- ✓ ONE PASS, no sort. Usually fastest.
+-- ✗ Needs all GROUPS in work_mem — not all rows, just one entry per
+--   distinct group. That distinction matters: a billion rows in a
+--   hundred groups is fine.
+-- ⚠ Before PG13, HashAggregate could NOT spill; if the planner
+--   underestimated the group count it would exceed work_mem and consume
+--   unbounded memory, occasionally killing the backend. PG13+ spills to
+--   disk instead, which turned a crash into a slowdown.
+
+-- ── GROUP AGGREGATE (sort-based) ────────────────────────────────────────
+--  GroupAggregate
+--    Group Key: user_id
+--    -> Sort  Sort Key: user_id
+--         -> Seq Scan on orders
+-- Sort by the group key, then collapse adjacent equal rows.
+-- ✓ Bounded memory — the sort can spill gracefully.
+-- ✓ Output is sorted, satisfying an ORDER BY for free.
+-- ✓ Chosen when groups are numerous (hash would not fit) or the input is
+--   already sorted from an index.
+
+-- ── PARTIAL / FINALIZE (parallel aggregation) ───────────────────────────
+--  Finalize GroupAggregate
+--    -> Gather Merge  Workers Planned: 4
+--         -> Partial GroupAggregate
+--              -> Parallel Seq Scan on orders
+-- Each worker aggregates its own slice, then the leader combines the
+-- partial results. This works because count/sum/min/max are ASSOCIATIVE.
+-- ⚠ It is why some aggregates parallelise and others do not:
+--   count, sum, min, max, avg → decomposable ✓
+--   percentile_cont, median   → need the whole set ✗
+--   count(DISTINCT x)         → notoriously hard to parallelise or
+--                               estimate; consider approximation
+--                               (HyperLogLog via the postgresql-hll
+--                               extension) when exactness is not
+--                               required
+
+-- ── DISTINCT AND SET OPERATIONS USE THE SAME MACHINERY ──────────────────
+SELECT DISTINCT user_id FROM orders;      -- HashAggregate or Unique+Sort
+SELECT ... UNION SELECT ...;              -- dedup: hash or sort
+SELECT ... UNION ALL SELECT ...;          -- ✓ no dedup: pure append,
+                                          --   essentially free
+SELECT ... INTERSECT / EXCEPT ...;        -- hash or merge based
+-- ⚠ UNION versus UNION ALL is the single most common needless cost in
+--   this area: writing UNION when duplicates are impossible forces a
+--   full sort or hash of the combined result for nothing.</pre>
+
+    <h2>Part 5 — Memory, Spilling, and work_mem</h2>
+    <pre>-- Three plan nodes need memory proportional to their input: Sort, Hash
+-- (build), and HashAggregate. All three degrade the same way when
+-- work_mem is exhausted, and all three announce it in EXPLAIN.
+
+-- ── READING THE SPILL INDICATORS ────────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
+--  Sort Method: quicksort  Memory: 2140kB          ✓ in memory
+--  Sort Method: external merge  Disk: 84320kB      ✗ SPILLED
+--  Buckets: 65536  Batches: 1  Memory Usage: 4096kB   ✓ in memory
+--  Buckets: 65536  Batches: 16 Memory Usage: 262144kB ✗ SPILLED
+--  HashAggregate ... Disk Usage: 122880kB             ✗ SPILLED (PG13+)
+-- ⚠ These lines are easy to skim past and they frequently explain the
+--   entire difference between a fast and a slow run of the same query.
+
+-- ── THE ARITHMETIC THAT MAKES work_mem DANGEROUS ────────────────────────
+-- work_mem is PER NODE, PER CONNECTION — not per query and not per
+-- server.
+--   a query with 5 sort/hash nodes × work_mem 256MB   = 1.25 GB
+--   × 100 concurrent connections                      = 125 GB
+-- ⚠ Setting work_mem globally to a large value is one of the most
+--   reliable ways to run a database out of memory. The failure is not
+--   gradual — the OOM killer terminates the backend, or worse, the
+--   postmaster.
+-- ✓ Target it instead:
+SET LOCAL work_mem = '256MB';                  -- one transaction
+ALTER ROLE reporting SET work_mem = '512MB';   -- one workload
+-- ✓ PG13+ has hash_mem_multiplier, letting hash nodes use more than sort
+--   nodes, since hash tables benefit disproportionately from fitting:
+ALTER SYSTEM SET hash_mem_multiplier = 2.0;
+
+-- ── WHEN SPILLING IS THE RIGHT ANSWER ───────────────────────────────────
+-- A query genuinely sorting 40GB SHOULD spill. External merge sort is a
+-- well-engineered algorithm, not a failure. The question is whether the
+-- query should be sorting 40GB at all — usually the real fix is an index
+-- that provides the order, a pre-aggregation, or a smaller result set.
+-- ✓ Chasing spills with more memory has a ceiling; removing the need to
+--   sort does not.
+
+-- ── PARALLEL QUERY CHANGES THE ARITHMETIC ───────────────────────────────
+SHOW max_parallel_workers_per_gather;   -- 2
+--  Gather  Workers Planned: 4
+--    -> Parallel Hash Join
+--         -> Parallel Seq Scan on orders
+--         -> Parallel Hash
+--              -> Parallel Seq Scan on users
+-- ✓ PARALLEL HASH (PG11+) builds ONE SHARED hash table across workers,
+--   rather than each worker building its own copy — a large memory and
+--   time saving over the earlier design.
+-- ⚠ Each worker gets its OWN work_mem allocation, so a parallel query
+--   with 4 workers can use 5× what you expected.
+-- ⚠ parallel_setup_cost defaults to 1000, so short queries never
+--   parallelise — correctly, since spawning workers would dominate.
+-- Parallelism is disabled entirely for: queries writing data, cursors,
+-- and functions not marked PARALLEL SAFE — a common reason a query that
+-- "should" parallelise does not.</pre>
+
+    <h2>Part 6 — Reading and Influencing Join Plans</h2>
+    <pre>-- ── THE DIAGNOSTIC SEQUENCE ─────────────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
+-- 1. ESTIMATED vs ACTUAL at each node. Find the LOWEST divergence —
+--    everything above inherited it (cost-models lesson).
+-- 2. MULTIPLY inner-node time by `loops`. This single step relocates
+--    most people's diagnosis to a different node entirely.
+-- 3. SPILL INDICATORS: external merge, Batches > 1, Disk Usage.
+-- 4. JOIN ALGORITHM vs INPUT SIZE: is there a nested loop over a large
+--    outer input? That is an estimate problem, not a join problem.
+-- 5. BUFFERS: hit versus read tells you cache state, and unlike timing
+--    it is stable across runs.
+
+-- ── THE FOUR COMMON SHAPES AND WHAT THEY MEAN ───────────────────────────
+-- A) Nested Loop, loops = 200,000
+--    → the outer estimate was wrong. Fix statistics; the planner will
+--      switch to a hash join by itself.
+-- B) Hash Join with Batches: 32
+--    → work_mem too small for this query, OR the build side is much
+--      bigger than estimated (check which side is in the Hash node).
+-- C) Merge Join with two Sort nodes, both spilling
+--    → the planner chose merge for its sorted output but is paying for
+--      two sorts. An index providing the order would remove both.
+-- D) Seq Scan on both sides of a Hash Join over huge tables
+--    → often correct! If the join genuinely touches most rows, this is
+--      the right plan and the problem is the query's scope, not its
+--      execution.
+
+-- ── TESTING A HYPOTHESIS ────────────────────────────────────────────────
+SET enable_nestloop = off;      -- diagnostic ONLY
+EXPLAIN ANALYZE SELECT ...;     -- is the hash join actually faster?
+RESET enable_nestloop;
+-- ✓ If forcing it is dramatically faster, that is EVIDENCE the estimates
+--   are wrong. Go fix them — do not ship the toggle, which applies to
+--   every query in the session (planner lesson).
+
+-- ── STRUCTURAL FIXES, IN ORDER OF PREFERENCE ────────────────────────────
+-- 1. ANALYZE / CREATE STATISTICS      correct the estimates
+-- 2. an index on the join key         enables indexed nested loop AND
+--                                     merge join without a sort
+-- 3. reduce the input size            filter earlier, pre-aggregate;
+--                                     the cheapest join is over fewer
+--                                     rows (SQL optimisation lesson)
+-- 4. targeted work_mem                stop a spill that matters
+-- 5. rewrite: aggregate before        avoids fan-out AND shrinks the
+--    joining                          join input
+-- 6. denormalise or materialise       when the join itself is the cost
+--                                     and the data tolerates staleness
+
+-- ── WHY THE SAME QUERY GETS DIFFERENT ALGORITHMS ────────────────────────
+-- Small table → nested loop. Grown table → hash join. Add an index →
+-- merge join. Add LIMIT → back to nested loop. None of that is
+-- instability; it is the planner correctly responding to different
+-- inputs. The instability worth investigating is when the SAME inputs
+-- produce different plans — which points at GEQO or plan caching rather
+-- than at the join algorithms themselves.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Blaming the algorithm</strong>
+        <pre>"Nested loops are slow, disable
+ them."
+"Force a hash join here."
+"Why won't it use my index for
+ this range join?"
+→ enable_nestloop=off shipped in
+  production, and the 1000×
+  estimate error still there.</pre></div>
+      <div><strong>✅ Reading the inputs</strong>
+        <pre>"loops=214,882 but estimated 41 →
+ the OUTER estimate is wrong."
+CREATE STATISTICS ...
+→ planner picks hash join itself.
+"Range joins can only be nested
+ loops — the fix is a different
+ query shape."</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Treating a nested loop as inherently bad</td><td>Disabling it degrades every small indexed join</td><td>It is optimal with few outer rows; the problem is the row estimate</td></tr>
+      <tr><td>Not multiplying inner time by <code>loops</code></td><td>Optimising a node that is 0.6% of the runtime</td><td>Per-loop timings hide the real cost</td></tr>
+      <tr><td>Ignoring <code>Batches &gt; 1</code></td><td>A silently spilled hash join running several times slower</td><td>Raise <code>work_mem</code> for that query or role</td></tr>
+      <tr><td>Raising <code>work_mem</code> globally</td><td>Out-of-memory under concurrency — it is per node per connection</td><td><code>SET LOCAL</code>, or per role</td></tr>
+      <tr><td>Expecting a hash or merge join for a range predicate</td><td>Confusion about why it "won't use the index"</td><td>Only nested loops support non-equi joins</td></tr>
+      <tr><td>Writing <code>UNION</code> when duplicates are impossible</td><td>A full sort or hash of the combined result for nothing</td><td><code>UNION ALL</code></td></tr>
+      <tr><td>Joining before aggregating</td><td>Fan-out inflates the join input and corrupts counts</td><td>Aggregate in CTEs, then join one row per key</td></tr>
+      <tr><td>Assuming <code>count(DISTINCT)</code> parallelises</td><td>A serial bottleneck in an otherwise parallel plan</td><td>Approximate with HyperLogLog, or restructure</td></tr>
+      <tr><td>Chasing spills with more memory indefinitely</td><td>Ceiling reached; the query still sorts 40GB</td><td>Remove the need to sort — index, pre-aggregate, or narrow the result</td></tr>
+      <tr><td>Joining on a column with a dominant value</td><td>Hash skew makes one bucket a linear scan</td><td>Filter the placeholder value out, or restructure the key</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Name the three join algorithms and when each is used.</summary>
+      <p>A nested loop takes each row from the outer relation and finds matching rows in the inner one,
+         normally using an index. Its cost is linear in the number of outer rows, so it is excellent when the
+         outer side is small and the inner join column is indexed, and it degrades badly as the outer side
+         grows. It is also the only algorithm that can handle non-equality joins, and it streams, so it
+         returns the first row immediately — which matters with <code>LIMIT</code>.</p>
+      <p>A hash join builds an in-memory hash table from the smaller relation and then probes it with the
+         larger one. Its cost is linear in the size of both inputs rather than their product, which is why it
+         wins decisively on large unsorted equi-joins. The constraints are that it requires equality, it
+         needs the build side to fit in <code>work_mem</code> or it spills to disk, and it is blocking — no
+         rows come out until the build finishes.</p>
+      <p>A merge join requires both inputs sorted on the join key and then walks them in lockstep. If the
+         inputs are already sorted, typically from index scans, it is often the cheapest option, and it has
+         two properties the others lack: bounded memory regardless of input size, and sorted output that can
+         satisfy a later <code>ORDER BY</code> or feed another merge join for free.</p>
+      <p>None is universally better. The planner chooses based on estimated row counts, available indexes and
+         required sort order, which is why a wrong estimate produces a wrong algorithm.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What does <code>Batches: 16</code> mean in a hash join?</summary>
+      <p>It means the hash table did not fit in <code>work_mem</code>, so the join spilled to disk. Rather
+         than building one table, the engine partitions both inputs by hash value into sixteen batches
+         written to temporary files, then processes one matching pair of partitions at a time so that each
+         partition's hash table does fit in memory.</p>
+      <p>The cost is that both inputs get written to disk and read back, which can make the join several
+         times slower. It is easy to miss, because the plan still says "Hash Join" and looks correct — the
+         only signal is that number, alongside the reported memory usage. A value of 1 means everything
+         stayed in memory.</p>
+      <p>The immediate fix is more memory for that specific query, using <code>SET LOCAL work_mem</code> or a
+         per-role setting, never a global increase, because <code>work_mem</code> is allocated per node per
+         connection and raising it globally is a well-known route to running the machine out of memory. But I
+         would also check whether the build side is much larger than the planner estimated, since choosing
+         the wrong side to hash is itself an estimate problem, and whether the query needs to join that many
+         rows at all.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why is an unexpected nested loop usually a statistics problem?</summary>
+      <p>Because of how its cost is computed. A nested loop's cost is the number of outer rows multiplied by
+         the cost of the inner lookup. If the planner underestimates the outer side by a factor of a
+         thousand, it underestimates the whole plan's cost by exactly that factor — so the nested loop looks
+         cheapest precisely when the estimate is most wrong. Hash and merge joins have costs linear in input
+         size, so the same error distorts them far less and they do not get selected.</p>
+      <p>That asymmetry makes it a reliable diagnostic. When I see a nested loop whose inner node reports a
+         large <code>loops</code> count, I do not conclude that nested loops are bad; I conclude the outer
+         estimate is wrong and go looking for why. The usual causes are stale statistics after a bulk load,
+         correlated predicates hitting the independence assumption, or a skewed column where the relevant
+         value is not in the most-common-values list.</p>
+      <p>The important consequence for how you fix it is that forcing a hash join with
+         <code>enable_nestloop = off</code> treats the symptom. It might make that one query faster, but the
+         bad estimate is still there and is distorting other plans, and the toggle applies to every query in
+         the session so it degrades unrelated work. Correcting the estimate — <code>ANALYZE</code>, a higher
+         statistics target, or extended statistics on correlated columns — makes the planner choose the hash
+         join on its own and improves everything else that touches those columns.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why does <code>work_mem</code> need care, and how would you set it?</summary>
+      <p>Because it is allocated per node per connection, not per query or per server. A single complex query
+         with several sorts and hash joins can allocate several multiples of <code>work_mem</code>
+         simultaneously, and that happens independently in every concurrent session. So a query with five
+         such nodes at 256 megabytes, running in a hundred connections, can theoretically demand well over a
+         hundred gigabytes. Parallel query compounds it further, because each worker gets its own
+         allocation.</p>
+      <p>The failure mode is not graceful degradation — it is the out-of-memory killer terminating a backend,
+         or in the worst case the postmaster, which takes the whole database down. That asymmetry is why the
+         default is deliberately small.</p>
+      <p>I would set a conservative global value and then target increases where they are justified. A
+         reporting role that runs a handful of heavy analytical queries can have a much larger setting
+         through <code>ALTER ROLE</code>, and an individual known-heavy query can use
+         <code>SET LOCAL</code> inside its transaction. On PostgreSQL 13 and later,
+         <code>hash_mem_multiplier</code> lets hash nodes have more than sort nodes, which is sensible
+         because hash tables benefit disproportionately from fitting entirely in memory.</p>
+      <p>I would also resist treating every spill as a problem. A query genuinely sorting tens of gigabytes
+         should spill; external merge sort is a well-engineered algorithm. The productive question is usually
+         whether the query should be sorting that much at all — an index providing the order, pre-aggregation,
+         or a narrower result set removes the need rather than paying for it.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A join is fast in staging and catastrophic in production. Walk through it.</summary>
+      <p>Identical SQL behaving differently means the difference is data volume, distribution, or resources,
+         so I would get the production plan with <code>EXPLAIN (ANALYZE, BUFFERS)</code> and compare it to
+         staging rather than reasoning about the query text.</p>
+      <p>The most common cause is a plan shape that is correct at one scale and disastrous at another. A
+         nested loop over a few hundred outer rows in staging becomes a nested loop over a million in
+         production, and because per-loop timings are reported rather than totals, the damage is easy to
+         miss — a node showing thirty microseconds with a million loops is thirty seconds. So multiplying by
+         <code>loops</code> is the first thing I do, and it frequently relocates the diagnosis to a different
+         node than the one that draws the eye.</p>
+      <p>Next I check estimated against actual rows, walking from the bottom of the tree, because errors
+         compound multiplicatively upward and the real problem is always the lowest divergent node. Staging
+         data is usually uniform while production is skewed, so the independence assumption on correlated
+         predicates bites in production and not in staging — which is exactly the shape of this symptom.</p>
+      <p>Then resource-dependent effects that are invisible in the SQL. A hash join that fits in
+         <code>work_mem</code> against staging's small dataset spills into sixteen batches in production; a
+         sort that was in-memory becomes an external merge. Those show up in the plan as
+         <code>Batches</code> and <code>Sort Method</code> lines. Cache state matters too, and buffer counts
+         answer that more reliably than timing.</p>
+      <p>The broader point I would make is that staging performance is not evidence about production unless
+         the data distribution matches, which it essentially never does. Plans are chosen from statistics,
+         and statistics are a property of the data. So the durable fix is not just correcting this query but
+         seeding staging with production-like distribution, and adding <code>auto_explain</code> so the next
+         instance arrives with its plan attached rather than needing to be reproduced.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> How would you approach a query joining six large tables that must run in under a second?</summary>
+      <p>I would start by questioning the requirement rather than optimising toward it, because a six-way
+         join over large tables in under a second is achievable in some shapes and impossible in others, and
+         knowing which situation I am in determines everything that follows.</p>
+      <p>The first question is how many rows the query actually needs to touch. If the filters are selective
+         and the result is small, sub-second is very achievable: the work is ensuring each join uses an
+         indexed nested loop or a well-sized hash join, that filters are pushed down so the join inputs are
+         small, and that estimates are accurate enough for the planner to pick correctly. Most of the effort
+         goes into making the first table's filter selective and indexed, because everything downstream
+         scales from that.</p>
+      <p>If instead the query genuinely aggregates over millions of rows across six tables, no join algorithm
+         makes that sub-second reliably, and continuing to tune is effort against a floor. That is the point
+         to change the shape of the problem: pre-aggregate into a summary table maintained incrementally,
+         use a materialised view refreshed on a schedule, or denormalise the specific columns being joined
+         for. The fastest join is the one that already happened.</p>
+      <p>Along the way I would look for structural wins. Aggregating before joining rather than after both
+         shrinks the inputs and avoids fan-out corrupting the numbers. Join elimination may remove tables
+         entirely if the necessary unique constraints exist — worth checking, because ORM-generated queries
+         often join tables whose columns are never selected. And with six tables I would confirm the join
+         count is below the GEQO threshold so planning stays deterministic.</p>
+      <p>Finally I would set an explicit budget and measure against it with <code>BUFFERS</code> rather than
+         wall-clock time, since buffer counts are stable across runs and cache states. If the honest answer
+         after that work is that the query cannot meet the target, I would say so and present the
+         pre-aggregation option with its staleness trade-off, rather than leaving a latency requirement
+         nominally accepted and actually unmet.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Force each join algorithm and compare.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE users (id bigint PRIMARY KEY, name text);
+CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint, total int);
+INSERT INTO users SELECT g, 'u'||g FROM generate_series(1,500000) g;
+INSERT INTO orders SELECT g, (random()*499999)::bigint+1, (random()*1000)::int
+FROM generate_series(1,5000000) g;
+CREATE INDEX ON orders (user_id);
+VACUUM ANALYZE users, orders;
+
+-- ── SMALL OUTER SIDE: NESTED LOOP WINS ──────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT u.name, o.total
+FROM users u JOIN orders o ON o.user_id = u.id WHERE u.id &lt; 50;
+--  Nested Loop  (actual rows=492 loops=1)  Time: 1.2 ms
+--    -> Index Scan on users (rows=49)
+--    -> Index Scan on orders (rows=10 loops=49)
+-- 49 outer rows × ~10 lookups. Optimal.
+
+SET enable_nestloop = off;
+EXPLAIN (ANALYZE) SELECT ... WHERE u.id &lt; 50;
+--  Hash Join  Time: 890 ms      ← 740× WORSE
+-- The hash join must scan all 5,000,000 orders to build/probe, to
+-- return 492 rows. Nested loop is not "the slow one" — it is correct
+-- here, and forcing it off is actively harmful.
+RESET enable_nestloop;
+
+-- ── LARGE OUTER SIDE: HASH WINS ─────────────────────────────────────────
+EXPLAIN (ANALYZE) SELECT u.name, sum(o.total)
+FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.name;
+--  HashAggregate
+--    -> Hash Join  (actual rows=5000000)  Time: 3,102 ms
+--         -> Seq Scan on orders
+--         -> Hash -> Seq Scan on users
+SET enable_hashjoin = off;
+--  Merge Join  Time: 6,840 ms       (two sorts)
+SET enable_mergejoin = off;
+--  Nested Loop  Time: 412,000 ms    ← 5M index descents. 133× worse.
+RESET ALL;
+
+-- ── SORTED INPUTS: MERGE WINS ───────────────────────────────────────────
+EXPLAIN (ANALYZE) SELECT u.id, o.id FROM users u JOIN orders o
+ON o.user_id = u.id ORDER BY u.id;
+--  Merge Join  Time: 2,410 ms
+--    -> Index Scan using users_pkey        ← already sorted
+--    -> Index Scan using orders_user_id_idx ← already sorted
+-- ✓ No sort cost AND the ORDER BY is satisfied for free. A hash join
+--   here would need a separate 5M-row sort afterwards.
+
+-- ── THE LESSON ──────────────────────────────────────────────────────────
+-- Same two tables. Nested loop is 740× better in one case and 133×
+-- worse in another. The algorithm is not the property — the INPUT SIZE
+-- is, and the planner's only guide to input size is its estimates.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Make a hash join spill, then fix it.
+      <details class="solution"><summary>Solution</summary>
+      <pre>SHOW work_mem;                     -- 4MB default
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id;
+--  Hash Join  (actual rows=5000000)  Time: 4,820 ms
+--    -> Seq Scan on orders
+--    -> Hash  (actual rows=500000)
+--         Buckets: 65536  Batches: 16  Memory Usage: 3841kB
+--                         ↑↑↑↑↑↑↑↑↑↑ SPILLED
+--  Buffers: shared read=68204, temp read=31022 written=31022
+--                                    ↑↑↑↑ 31,022 pages to TEMP FILES
+
+-- ── WHAT HAPPENED ───────────────────────────────────────────────────────
+-- The 500,000-row hash table needs ~48MB; work_mem is 4MB. So BOTH sides
+-- were partitioned into 16 batches, written to disk, and joined one pair
+-- at a time. That is 5.5 million rows written and read back.
+
+-- ── FIX: TARGETED MEMORY ────────────────────────────────────────────────
+SET LOCAL work_mem = '128MB';
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
+--  Hash  Buckets: 1048576  Batches: 1  Memory Usage: 48204kB   ✓
+--  Buffers: shared read=68204        ← NO temp
+--  Time: 2,140 ms                    ← 2.25× faster
+
+-- ── WHY NOT SET IT GLOBALLY ─────────────────────────────────────────────
+-- work_mem is PER NODE PER CONNECTION:
+--   this query has 1 hash node        → 128MB
+--   a query with 5 sort/hash nodes    → 640MB
+--   × 100 connections                 → 64 GB
+-- ⚠ The failure is not gradual — the OOM killer terminates a backend, or
+--   the postmaster. Target it:
+ALTER ROLE reporting SET work_mem = '256MB';
+ALTER SYSTEM SET hash_mem_multiplier = 2.0;   -- PG13+: hash nodes get
+                                              -- more than sort nodes
+
+-- ── AND THE BETTER QUESTION ─────────────────────────────────────────────
+-- This query returns 5,000,000 rows. Does anything consume them all?
+-- Adding a filter or aggregating server-side removes the need for the
+-- large hash entirely:
+EXPLAIN (ANALYZE) SELECT u.name, sum(o.total)
+FROM users u JOIN orders o ON o.user_id=u.id
+WHERE o.total > 900 GROUP BY u.name;
+--  Hash  Batches: 1  Memory Usage: 4102kB    ✓ fits in the DEFAULT 4MB
+-- ✓ Reducing the input beats increasing the memory, and it has no
+--   ceiling.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Diagnose a plan where the visible node is not the problem.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- THE PLAN
+EXPLAIN (ANALYZE, BUFFERS) SELECT o.id, u.name, r.name
+FROM orders o
+JOIN users u   ON u.id = o.user_id
+JOIN regions r ON r.id = u.region_id
+WHERE o.created_at > now() - interval '30 days' AND o.status = 'pending';
+--  Nested Loop  (cost=..0.86..14204) (actual time=0.09..38,412 rows=214,882)
+--    -> Nested Loop (actual time=0.07..21,004 rows=214,882)
+--         -> Seq Scan on orders
+--              (cost=..) (rows=48) (actual time=0.02..1,204 rows=214,882) ★
+--              Filter: (created_at > ... AND status = 'pending')
+--              Rows Removed by Filter: 41
+--         -> Index Scan on users
+--              (actual time=0.089..0.091 rows=1 loops=214,882)    ◆
+--    -> Index Scan on regions
+--              (actual time=0.041..0.042 rows=1 loops=214,882)    ◆
+--  Execution Time: 38,502 ms
+
+-- ── STEP 1: WHERE IS THE TIME? MULTIPLY BY loops ────────────────────────
+-- ◆ users:   0.091 ms × 214,882 = 19,554 ms   (51%)
+-- ◆ regions: 0.042 ms × 214,882 =  9,025 ms   (23%)
+-- ★ orders seq scan: 1,204 ms                  (3%)
+-- ⚠ The Seq Scan is what the eye lands on and it is 3% of the runtime.
+--   The two "fast" index scans at 0.09ms each are 74%. Multiplying by
+--   loops is the single most important step in reading a plan.
+
+-- ── STEP 2: WHY SO MANY LOOPS? ──────────────────────────────────────────
+-- ★ estimated rows=48, actual rows=214,882 → 4477× off.
+-- The planner chose nested loops because it expected 48 outer rows. At
+-- 48 rows, two nested loops are OPTIMAL. At 214,882 they are a disaster,
+-- because nested loop cost = outer × inner.
+-- ✓ The join algorithm is a SYMPTOM. The estimate is the disease.
+
+-- ── STEP 3: WHY IS THE ESTIMATE WRONG? ──────────────────────────────────
+SELECT count(*) FILTER (WHERE status='pending') AS pending,
+       count(*) FILTER (WHERE created_at > now()-'30 days'::interval) AS recent,
+       count(*) FILTER (WHERE status='pending'
+                        AND created_at > now()-'30 days'::interval) AS both,
+       count(*) AS total FROM orders;
+--  pending  | recent    | both    | total
+--  228,000  | 1,100,000 | 214,882 | 40,000,000
+-- Independence predicts 228000/40M × 1100000/40M × 40M = 6,270.
+-- Actual 214,882 — 34× higher. Pending orders are overwhelmingly recent,
+-- which is obvious to a human and invisible to the planner.
+
+-- ── STEP 4: FIX THE INPUT, NOT THE PLAN ─────────────────────────────────
+CREATE STATISTICS st_orders (dependencies, mcv) ON status, created_at
+  FROM orders;
+ANALYZE orders;
+EXPLAIN (ANALYZE) SELECT ...;
+--  Hash Join  (rows=210,400) (actual rows=214,882)
+--    -> Seq Scan on orders  (rows=210,400) (actual rows=214,882)  ✓
+--    -> Hash -> Seq Scan on users
+--  Execution Time: 1,882 ms          ← 38.5s → 1.9s, 20× faster
+-- ✓ The planner switched to hash joins ON ITS OWN once it knew the real
+--   size. No hints, no toggles, no query rewrite.
+
+-- ── WHAT NOT TO DO ──────────────────────────────────────────────────────
+SET enable_nestloop = off;   -- would also "fix" this query...
+-- ...while leaving the 4477× estimate error in place to damage other
+-- plans, and degrading every legitimately small indexed join in the
+-- session. Use it to TEST the hypothesis, then fix the cause.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Compare aggregation strategies.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── FEW GROUPS: HASH AGGREGATE ──────────────────────────────────────────
+EXPLAIN (ANALYZE) SELECT status, count(*), sum(total)
+FROM orders GROUP BY status;
+--  HashAggregate  (actual rows=4)  Time: 1,204 ms
+--    Group Key: status
+--    -> Seq Scan on orders (rows=5,000,000)
+-- 5 million rows, FOUR groups. The hash table holds 4 entries — trivial.
+-- ✓ Hash aggregate needs memory for GROUPS, not rows. That distinction
+--   matters: a billion rows in ten groups is perfectly fine.
+
+-- ── MANY GROUPS: WATCH IT SPILL ─────────────────────────────────────────
+SET work_mem = '4MB';
+EXPLAIN (ANALYZE) SELECT user_id, count(*) FROM orders GROUP BY user_id;
+--  HashAggregate  (actual rows=500,000)
+--    Peak Memory Usage: 4096kB  Disk Usage: 40960kB    ← SPILLED (PG13+)
+--    Time: 4,102 ms
+-- ⚠ Before PG13, HashAggregate could NOT spill. The planner's group-count
+--   estimate being wrong meant unbounded memory growth and sometimes a
+--   killed backend. PG13 turned a crash into a slowdown.
+SET work_mem = '256MB';
+--  HashAggregate  Peak Memory Usage: 61440kB   Time: 1,840 ms  ✓
+
+-- ── SORTED INPUT: GROUP AGGREGATE IS FREE ───────────────────────────────
+CREATE INDEX ON orders (user_id);
+SET enable_hashagg = off;
+EXPLAIN (ANALYZE) SELECT user_id, count(*) FROM orders
+GROUP BY user_id ORDER BY user_id;
+--  GroupAggregate  Time: 2,204 ms
+--    -> Index Scan using orders_user_id_idx     ← ALREADY SORTED
+-- ✓ No sort node at all, bounded memory, AND the ORDER BY is satisfied.
+--   With ORDER BY in the query this can beat hash aggregation outright,
+--   because the hash version would need a separate 500k-row sort after.
+RESET enable_hashagg;
+
+-- ── PARALLEL AGGREGATION ────────────────────────────────────────────────
+SET max_parallel_workers_per_gather = 4;
+EXPLAIN (ANALYZE) SELECT status, sum(total) FROM orders GROUP BY status;
+--  Finalize GroupAggregate
+--    -> Gather Merge  Workers Launched: 4
+--         -> Partial GroupAggregate
+--              -> Parallel Seq Scan on orders
+--  Time: 340 ms          ← 3.5× faster
+-- ✓ Works because sum/count/min/max are ASSOCIATIVE — each worker
+--   aggregates its slice and the leader combines partials.
+
+-- ── WHAT DOES NOT PARALLELISE ───────────────────────────────────────────
+EXPLAIN (ANALYZE) SELECT count(DISTINCT user_id) FROM orders;
+--  Aggregate  (no workers)  Time: 6,840 ms
+-- count(DISTINCT) must see every value to deduplicate, so it cannot be
+-- decomposed into partials.
+-- ✓ The alternatives:
+SELECT count(*) FROM (SELECT DISTINCT user_id FROM orders) s;  -- 2,104 ms
+--   (a parallel HashAggregate for the DISTINCT, then a trivial count)
+CREATE EXTENSION hll;                       -- approximate, ~2% error
+SELECT hll_cardinality(hll_add_agg(hll_hash_bigint(user_id))) FROM orders;
+--   340 ms — when an estimate is acceptable, which for dashboards it
+--   usually is.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Optimise a six-table analytical join.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- THE QUERY: revenue by region and category, last quarter. 42 seconds.
+SELECT r.name AS region, c.name AS category,
+       count(DISTINCT o.id) AS orders,
+       sum(oi.quantity * oi.unit_price) AS revenue
+FROM orders o
+JOIN users u      ON u.id = o.user_id
+JOIN regions r    ON r.id = u.region_id
+JOIN order_items oi ON oi.order_id = o.id
+JOIN products p   ON p.id = oi.product_id
+JOIN categories c ON c.id = p.category_id
+WHERE o.created_at >= '2026-04-01' AND o.created_at < '2026-07-01'
+GROUP BY r.name, c.name;
+
+-- ── STEP 1: WHAT IS EXPENSIVE? ──────────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) ...;
+--  GroupAggregate (actual rows=48) Time: 42,104 ms
+--    -> Sort (actual rows=18,204,882)  Sort Method: external merge
+--                                      Disk: 2,140,880kB      ★ SPILL
+--         -> Hash Join (actual rows=18,204,882)
+--              ...
+-- 18 MILLION intermediate rows collapse to 48 output rows. Almost all
+-- the work is producing rows that are immediately aggregated away.
+
+-- ── STEP 2: count(DISTINCT o.id) IS FORCING THE SORT ────────────────────
+-- The join to order_items FANS OUT: one order with 5 items becomes 5
+-- rows. So count(DISTINCT o.id) is needed for correctness — and it
+-- prevents parallel aggregation AND requires the whole set sorted.
+-- ⚠ This is the fan-out problem (SQL joins lesson) showing up as a
+--   performance issue rather than a correctness one.
+
+-- ── STEP 3: AGGREGATE BEFORE JOINING ────────────────────────────────────
+WITH q_orders AS (
+    SELECT o.id, o.user_id
+    FROM orders o
+    WHERE o.created_at >= '2026-04-01' AND o.created_at < '2026-07-01'
+), item_totals AS (
+    SELECT oi.order_id, p.category_id,
+           sum(oi.quantity * oi.unit_price) AS revenue
+    FROM order_items oi
+    JOIN products p ON p.id = oi.product_id
+    WHERE oi.order_id IN (SELECT id FROM q_orders)
+    GROUP BY oi.order_id, p.category_id       -- ← collapse the fan-out
+)                                             --   HERE, before joining
+SELECT r.name, c.name,
+       count(DISTINCT it.order_id) AS orders,
+       sum(it.revenue)             AS revenue
+FROM item_totals it
+JOIN q_orders o   ON o.id = it.order_id
+JOIN users u      ON u.id = o.user_id
+JOIN regions r    ON r.id = u.region_id
+JOIN categories c ON c.id = it.category_id
+GROUP BY r.name, c.name;
+--  Time: 3,840 ms       ← 11× faster
+-- ✓ The fan-out is collapsed at the earliest possible point, so the
+--   later joins carry 2.1M rows instead of 18.2M.
+
+-- ── STEP 4: SUPPORTING INDEXES ──────────────────────────────────────────
+CREATE INDEX ON orders (created_at) INCLUDE (id, user_id);   -- index-only
+CREATE INDEX ON order_items (order_id) INCLUDE (product_id, quantity,
+                                                unit_price);
+--  Time: 1,920 ms
+
+-- ── STEP 5: MEMORY FOR THE REMAINING SORT ───────────────────────────────
+SET LOCAL work_mem = '256MB';
+--  Sort Method: quicksort  Memory: 184320kB    ← no longer spilling
+--  Time: 1,204 ms
+
+-- ── STEP 6: ASK WHETHER IT SHOULD RUN AT ALL ────────────────────────────
+-- 1.2 seconds for a dashboard that loads on every page view is still
+-- wrong, and the data is a CLOSED QUARTER — it will never change.
+CREATE MATERIALIZED VIEW revenue_by_region_category AS
+SELECT date_trunc('quarter', o.created_at) AS quarter, r.name AS region,
+       c.name AS category, count(DISTINCT o.id) AS orders,
+       sum(oi.quantity * oi.unit_price) AS revenue
+FROM ... GROUP BY 1,2,3;
+CREATE UNIQUE INDEX ON revenue_by_region_category (quarter, region, category);
+REFRESH MATERIALIZED VIEW CONCURRENTLY revenue_by_region_category;
+--  Query time: 2 ms
+
+-- ── THE SHAPE OF THE ANSWER ─────────────────────────────────────────────
+-- 42s → 3.8s (restructure) → 1.9s (indexes) → 1.2s (memory) → 2ms
+-- (materialise). The restructuring won 11×; the materialisation won
+-- 600×. Recognising that a closed quarter never changes was worth more
+-- than every join optimisation combined.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Handle a join with severe key skew.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SITUATION: events joined to sessions. Usually fast; for one tenant it
+-- takes 90 seconds. Row counts alone do not explain it.
+
+-- ── STEP 1: FIND THE SKEW ───────────────────────────────────────────────
+SELECT session_id, count(*) FROM events
+GROUP BY 1 ORDER BY 2 DESC LIMIT 5;
+--  session_id | count
+--  NULL       | 41,882,004      ← ★ 40% of the table
+--  a1b2c3     |    204,118
+--  d4e5f6     |     41,002
+-- A placeholder/unknown value dominates. And:
+SELECT count(*) FROM events WHERE session_id IS NULL;   -- 41.8M
+
+-- ── STEP 2: WHY IT HURTS A HASH JOIN ────────────────────────────────────
+EXPLAIN (ANALYZE) SELECT e.*, s.started_at
+FROM events e JOIN sessions s ON s.id = e.session_id;
+--  Hash Join  (actual rows=62,000,000)  Time: 90,412 ms
+--    -> Seq Scan on events
+--    -> Hash -> Seq Scan on sessions
+--         Buckets: 1048576  Batches: 1
+-- ⚠ The hash table is fine. The problem is PROBE-SIDE SKEW: 41.8M rows
+--   all hash to the same bucket (or, for NULL, never match at all but
+--   are still hashed and probed). The cost model sees 62M rows and
+--   average distribution; reality is one bucket doing 40% of the work.
+--   Skew is INVISIBLE in the cost estimate.
+
+-- ── FIX 1: EXCLUDE THE PLACEHOLDER (usually correct) ────────────────────
+SELECT e.*, s.started_at FROM events e
+JOIN sessions s ON s.id = e.session_id
+WHERE e.session_id IS NOT NULL;
+--  Time: 12,204 ms       ← 7× faster
+-- ✓ An inner join already discards NULLs — but only AFTER hashing and
+--   probing them. Filtering explicitly lets the scan discard them first.
+--   A partial index makes it better still:
+CREATE INDEX ON events (session_id) WHERE session_id IS NOT NULL;
+
+-- ── FIX 2: SPLIT THE HOT KEY (when it is a real value) ──────────────────
+-- If the dominant key is a legitimate value that must be joined:
+SELECT e.*, s.started_at FROM events e
+JOIN sessions s ON s.id = e.session_id
+WHERE e.session_id &lt;&gt; 'a1b2c3'
+UNION ALL
+SELECT e.*, s.started_at FROM events e
+CROSS JOIN (SELECT started_at FROM sessions WHERE id='a1b2c3') s
+WHERE e.session_id = 'a1b2c3';
+-- ✓ The hot key joins to exactly ONE row, so a cross join to that single
+--   row avoids the skewed hash bucket entirely. Ugly, and sometimes the
+--   only thing that works.
+
+-- ── FIX 3: FIX THE MODEL ────────────────────────────────────────────────
+-- 40% NULL session_id means the column is optional and the "join" is
+-- really "attach a session where one exists". Consider:
+--   • splitting events into sessioned/unsessioned tables
+--   • a sentinel session row instead of NULL, so the FK is always valid
+--     (⚠ but then the sentinel becomes the hot key — moves the problem)
+--   • denormalising the one column being fetched onto events
+-- ✓ Skew at 40% is a modelling signal, not a tuning problem.
+
+-- ── STEP 3: HELP THE PLANNER SEE IT ─────────────────────────────────────
+ALTER TABLE events ALTER COLUMN session_id SET STATISTICS 1000;
+ANALYZE events;
+SELECT most_common_vals, most_common_freqs FROM pg_stats
+WHERE tablename='events' AND attname='session_id';
+-- With the dominant values in the MCV list, the planner estimates
+-- per-value selectivity correctly and may choose differently for
+-- queries filtering on the hot key versus a normal one.
+-- ⚠ But it still costs the JOIN by average distribution. There is no
+--   setting that makes the cost model skew-aware, which is why skew must
+--   be handled in the query or the schema.
+
+-- ── THE GENERAL LESSON ──────────────────────────────────────────────────
+-- Row counts predict join cost only when keys are evenly distributed.
+-- One dominant value — NULL, a placeholder, a default tenant, a
+-- celebrity user — breaks that assumption, and it shows up as a query
+-- being far slower than its row counts justify. Check the value
+-- distribution of the join key before concluding the algorithm is
+-- wrong.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Nested loop cost is linear in outer rows, hash join is linear in both inputs, merge join needs sorted inputs but bounded memory — none is universally better.</li>
+        <li>A nested loop's cost being outer × inner means an underestimated outer side makes the plan look cheapest exactly when it is most wrong.</li>
+        <li>Always multiply an inner node's per-loop time by <code>loops</code>; the node that draws the eye is frequently a few percent of the runtime.</li>
+        <li>Only nested loops support non-equi joins, so range and inequality joins have no faster alternative available.</li>
+        <li><code>Batches &gt; 1</code> means a hash join spilled to disk — easy to skim past, and often the whole difference between a fast and slow run.</li>
+        <li>Merge join is the only algorithm with memory bounded independently of input size, and its sorted output can eliminate a later sort.</li>
+        <li>Hash aggregation needs memory for <em>groups</em>, not rows, and could not spill before PostgreSQL 13.</li>
+        <li><code>work_mem</code> is per node per connection, and parallel workers each get their own — target it per query or role, never globally.</li>
+        <li>Aggregate before joining to collapse fan-out early: it fixes both wrong counts and enormous intermediate results.</li>
+        <li>Key skew is invisible to the cost model, so a dominant value like NULL or a placeholder makes a join far slower than row counts predict.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="cost-models.html">← Cost Models &amp; Statistics</a>
+      <a href="physical-design.html">Physical Schema Design for the Engine →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
