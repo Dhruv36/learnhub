@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Locking, Latches &amp; Deadlocks — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Locking, Latches &amp; Deadlocks <span class="level-badge level-ultra">Durability &amp; Concurrency</span></h1>
+    <p><strong>What you'll master:</strong> the distinction between locks and latches that most engineers
+       conflate, and why each needs a completely different mechanism, the full lock-mode hierarchy and how
+       to read a conflict matrix, why two-phase locking is the theoretical foundation even in engines that
+       do not use it for reads, how PostgreSQL implements row locks without a lock table — the trick is
+       genuinely clever — deadlock detection by wait-for graph versus timeout, the lock queue that turns a
+       two-millisecond <code>ALTER TABLE</code> into an outage, lightweight locks and the buffer-mapping
+       contention that appears at high core counts, and advisory locks for coordinating things the database
+       does not know about. Prerequisites: <a href="mvcc.html">MVCC &amp; Snapshot Isolation</a>. The
+       <a href="../sql/isolation.html">SQL isolation lesson</a> covers locking from the application's
+       perspective; this is the implementation.</p>
+
+    <h2>Part 1 — Locks Versus Latches</h2>
+    <pre>-- These two words are used interchangeably in conversation and mean
+-- entirely different things in an engine. Getting them straight is the
+-- prerequisite for everything else here.
+
+--                    LOCK                      LATCH
+--   protects         LOGICAL data              PHYSICAL structures
+--                    (a row, a table)          (a page, a hash bucket)
+--   held for         a TRANSACTION             ~microseconds
+--                    (seconds to minutes)
+--   deadlock         DETECTED and resolved     AVOIDED by strict
+--   handling         (a victim is killed)      ordering discipline
+--   visible in       pg_locks                  nowhere user-facing
+--   stored in        a shared LOCK TABLE       the object itself
+--   cost             hundreds of ns + memory   a few ns, no allocation
+--   waiting          the process SLEEPS        usually SPINS briefly
+--
+-- ── WHY THE DIFFERENCE EXISTS ───────────────────────────────────────────
+-- A lock is a PROMISE about transactional semantics: "no one else may
+-- modify this row until I commit". It must survive across statements, be
+-- inspectable, and participate in deadlock detection — so it needs a
+-- data structure the whole system can see.
+--
+-- A latch is a MUTEX over memory: "I am reading these bytes; do not
+-- change them for the next 200 nanoseconds". Recording it in a shared
+-- table would cost more than the operation it protects. So latches are
+-- embedded in the object, held briefly, and made deadlock-free by rule
+-- rather than by detection.
+--
+-- ⚠ THE PRACTICAL CONSEQUENCE: latch contention does NOT appear in
+--   pg_locks. Searching there for a problem that is actually
+--   buffer-mapping contention will waste an afternoon. Latch waits show
+--   up as LWLock wait events instead:
+SELECT wait_event_type, wait_event, count(*)
+FROM pg_stat_activity WHERE wait_event IS NOT NULL
+GROUP BY 1,2 ORDER BY 3 DESC;
+--  wait_event_type | wait_event      | count
+--  LWLock          | BufferMapping   |    18     ← LATCH contention
+--  Lock            | transactionid   |     4     ← LOCK waiting
+--  Client          | ClientRead      |    92     ← idle, not a problem
+
+-- ── AN EXAMPLE OF BOTH IN ONE OPERATION ─────────────────────────────────
+-- UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+--   1. LATCH the buffer-mapping partition to find the page   (ns)
+--   2. LATCH the page to read it                              (ns)
+--   3. take a ROW LOCK on the tuple                  (held to COMMIT)
+--   4. LATCH the page again to write the new version          (ns)
+--   5. release all latches; KEEP the row lock
+-- Three latch acquisitions measured in nanoseconds, and one lock held
+-- for the life of the transaction. Same statement, two mechanisms,
+-- utterly different lifetimes.</pre>
+
+    <h2>Part 2 — Lock Modes and the Conflict Matrix</h2>
+    <pre>-- Locks are not binary. A mode describes what you intend, and two modes
+-- either conflict or coexist. The whole system is one matrix.
+
+-- ── POSTGRES TABLE-LEVEL MODES, WEAKEST TO STRONGEST ────────────────────
+--  ACCESS SHARE            SELECT
+--  ROW SHARE               SELECT FOR UPDATE / FOR SHARE
+--  ROW EXCLUSIVE           INSERT, UPDATE, DELETE
+--  SHARE UPDATE EXCLUSIVE  VACUUM, ANALYZE, CREATE INDEX CONCURRENTLY,
+--                          ALTER TABLE ... VALIDATE CONSTRAINT
+--  SHARE                   CREATE INDEX (non-concurrent)
+--  SHARE ROW EXCLUSIVE     CREATE TRIGGER, some ALTER TABLE forms
+--  EXCLUSIVE               REFRESH MATERIALIZED VIEW (non-concurrent)
+--  ACCESS EXCLUSIVE        ALTER TABLE, DROP, TRUNCATE, VACUUM FULL,
+--                          REINDEX
+--
+-- ── THE ONLY TWO ROWS OF THE MATRIX WORTH MEMORISING ────────────────────
+--   ACCESS SHARE conflicts with exactly ONE mode: ACCESS EXCLUSIVE.
+--     → readers coexist with everything except schema changes
+--   ACCESS EXCLUSIVE conflicts with EVERYTHING, including plain SELECT.
+--     → any DDL excludes all other access
+--
+-- ⚠ AND THE ONE PEOPLE GET WRONG: ROW EXCLUSIVE does NOT conflict with
+--   itself. Two concurrent UPDATEs on the same TABLE do not block each
+--   other at the table level at all. They only contend if they touch the
+--   same ROW. The table-level mode is a coarse declaration of intent,
+--   not the real serialisation point — which is exactly why concurrent
+--   writes scale.
+
+-- ── ROW-LEVEL MODES ─────────────────────────────────────────────────────
+SELECT ... FOR UPDATE;         -- exclusive; blocks other FOR UPDATE,
+                               -- FOR SHARE, UPDATE, DELETE
+SELECT ... FOR NO KEY UPDATE;  -- weaker; what a normal UPDATE takes when
+                               -- it does not change a key
+SELECT ... FOR SHARE;          -- others may read-lock, none may write
+SELECT ... FOR KEY SHARE;      -- what a foreign-key check takes
+--
+-- ⚠ THE FK LOCK IS THE ONE THAT SURPRISES PEOPLE. Inserting a child row
+--   takes KEY SHARE on the PARENT row. A "default" tenant or a shared
+--   category row referenced by millions of children becomes a
+--   contention point for reasons invisible in the query text. The
+--   weaker KEY SHARE mode exists specifically so this does not conflict
+--   with ordinary updates to that parent — a deliberate design response
+--   to a real problem.
+
+-- ── WHY MODES EXIST AT ALL ──────────────────────────────────────────────
+-- A single exclusive mode would be correct and useless: every operation
+-- would serialise. The matrix exists so operations that genuinely cannot
+-- interfere are allowed to proceed together. Every weakening — KEY SHARE,
+-- NO KEY UPDATE, SHARE UPDATE EXCLUSIVE for CONCURRENTLY variants — was
+-- added to let more work happen in parallel.
+SELECT locktype, relation::regclass, mode, granted, pid
+FROM pg_locks WHERE relation IS NOT NULL ORDER BY relation, mode;</pre>
+
+    <h2>Part 3 — Two-Phase Locking, and How Postgres Avoids a Lock Table for Rows</h2>
+    <pre>-- ── 2PL: THE THEORY ─────────────────────────────────────────────────────
+-- A transaction has a GROWING phase (acquire locks, release none) and a
+-- SHRINKING phase (release locks, acquire none). Once you release
+-- anything, you may never acquire again.
+-- THEOREM: any schedule produced by 2PL is serialisable.
+--
+-- STRICT 2PL, which is what engines actually implement, holds all
+-- exclusive locks until COMMIT or ABORT. That additionally prevents
+-- cascading aborts — nobody can read your uncommitted change and then be
+-- forced to roll back when you do.
+-- ⚠ Note the relationship to MVCC: Postgres uses strict 2PL for WRITES,
+--   while reads use snapshots and take no locks at all. That combination
+--   is why readers never block writers, and it is the single most
+--   important architectural fact about its concurrency.
+
+-- ── THE PROBLEM: A LOCK TABLE DOES NOT SCALE TO ROWS ────────────────────
+-- A traditional lock manager stores an entry per locked object. An
+-- UPDATE touching 10 million rows would need 10 million entries —
+-- hundreds of megabytes of shared memory for one statement.
+-- InnoDB and others handle this with LOCK ESCALATION: past a threshold,
+-- promote many row locks into one table lock. That bounds memory and
+-- destroys concurrency exactly when the system is busiest, which is a
+-- notorious source of unpredictable stalls.
+
+-- ── POSTGRES'S TRICK: THE LOCK IS THE TUPLE ─────────────────────────────
+-- Postgres stores row locks IN THE ROW ITSELF. A locked tuple has its
+-- t_xmax set to the locking transaction's id, with infomask bits saying
+-- "this is a lock, not a delete".
+--
+--   to lock a row:    write my xid into the tuple's xmax
+--   to check a lock:  read xmax; if that transaction is still running,
+--                     wait on IT (a single lock-table entry per
+--                     TRANSACTION, not per row)
+--
+-- ✓ CONSEQUENCES, and they are large:
+--   • row locks cost ZERO shared memory — lock 10 million rows for free
+--   • NO LOCK ESCALATION EXISTS, so there is no threshold at which
+--     concurrency suddenly collapses
+--   • the number of lock-table entries is bounded by the number of
+--     TRANSACTIONS, not rows
+--   ✗ the cost: locking a row DIRTIES ITS PAGE, so a pure
+--     SELECT ... FOR UPDATE generates write I/O and WAL. Locking is not
+--     free, it is just paid in a different currency.
+--
+-- (Multiple sharers of one row need a MultiXact — a separate structure
+--  listing several transactions. Heavy FOR SHARE traffic can make
+--  MultiXact members a bottleneck of their own, which is an obscure but
+--  real production issue.)
+
+-- ── WHAT STILL LIVES IN THE LOCK TABLE ──────────────────────────────────
+SHOW max_locks_per_transaction;    -- 64 default; × max_connections
+-- Table-level locks, advisory locks, and transaction-id locks. A query
+-- touching many PARTITIONS takes a lock per partition, which is the
+-- usual cause of:
+--   ERROR: out of shared memory
+--   HINT:  You might need to increase max_locks_per_transaction.
+-- ⚠ A thousand-partition table plus a query that cannot prune is exactly
+--   how a well-intentioned partitioning scheme exhausts the lock table.</pre>
+    <div class="note">🔓 <strong>Storing the row lock inside the row is the reason PostgreSQL has no lock
+      escalation.</strong> Because a lock costs no shared memory, an <code>UPDATE</code> touching ten million
+      rows holds ten million locks without strain — where a conventional lock manager would escalate to a
+      table lock and stall every other writer. The price is that taking a row lock dirties the page, so
+      <code>SELECT ... FOR UPDATE</code> performs writes. Every design choice in this area buys one property
+      by spending another.</div>
+
+    <h2>Part 4 — Deadlocks: Detection, Not Prevention</h2>
+    <pre>-- T1 holds row A, wants row B. T2 holds row B, wants row A. Neither can
+-- proceed and neither will give up. No amount of waiting resolves it.
+
+-- ── WHY ENGINES DETECT RATHER THAN PREVENT ──────────────────────────────
+-- Prevention requires knowing every lock a transaction will need BEFORE
+-- it starts, so they can be acquired in a global order. Real
+-- transactions decide what to lock based on what they read, so that
+-- knowledge does not exist. Detection is the only practical option.
+
+-- ── THE WAIT-FOR GRAPH ──────────────────────────────────────────────────
+-- Nodes are transactions; an edge T1→T2 means "T1 waits for T2".
+-- A CYCLE is a deadlock, by definition.
+--     T1 ──waits──▶ T2
+--     ▲              │
+--     └────waits─────┘
+-- Postgres does not run this continuously — that would cost more than it
+-- saves. Instead, a waiter that has been blocked for deadlock_timeout
+-- (default 1 second) triggers a check.
+SHOW deadlock_timeout;
+-- ⚠ THE TUNING TRADE: lowering it detects deadlocks faster but runs the
+--   graph check more often, including for waits that would have resolved
+--   normally. 1 second is a deliberate balance; raising it to 5s is
+--   reasonable on a system with long legitimate waits, lowering it below
+--   ~200ms rarely is.
+
+-- ── WHAT THE LOG TELLS YOU (read it, do not guess) ──────────────────────
+-- ERROR:  deadlock detected
+-- DETAIL: Process 2841 waits for ShareLock on transaction 1002;
+--           blocked by process 2903.
+--         Process 2903 waits for ShareLock on transaction 1001;
+--           blocked by process 2841.
+-- HINT:   See server log for query details.
+-- CONTEXT: while updating tuple (0,12) in relation "accounts"
+-- ✓ With log_lock_waits = on you also get the STATEMENTS involved, which
+--   identifies the two code paths immediately. Turn it on before you
+--   need it.
+
+-- ── VICTIM SELECTION ────────────────────────────────────────────────────
+-- Postgres kills the transaction that DETECTED the cycle — effectively
+-- the last one to wait. InnoDB picks the one with the least work done,
+-- measured in rows modified. Either way one transaction receives an
+-- error and must retry; the survivor proceeds unaffected.
+
+-- ── PREVENTION IN APPLICATION CODE ──────────────────────────────────────
+-- ✓ 1. CONSISTENT LOCK ORDER — this fixes the large majority.
+SELECT * FROM accounts WHERE id IN (:a, :b) ORDER BY id FOR UPDATE;
+--      A cycle requires two parties to disagree about order. Sorting
+--      makes disagreement impossible. In batch jobs, ORDER BY the key in
+--      the driving subquery for the same reason — a job that updates
+--      rows in whatever order a query returned them will interleave
+--      differently on every run, which is why those deadlocks are
+--      intermittent.
+-- ✓ 2. SHORTER TRANSACTIONS — less overlap, less opportunity.
+-- ✓ 3. LOCK EVERYTHING UP FRONT rather than acquiring incrementally.
+-- ✓ 4. RETRY ON 40P01 REGARDLESS. Foreign-key locks, index page
+--      contention and other code paths can still produce cycles.
+--      Deadlocks are a normal operating condition, not a bug to
+--      eliminate to zero.
+
+-- ── DEADLOCKS THAT ARE NOT ROW-ORDERING PROBLEMS ────────────────────────
+-- • FOREIGN KEYS: inserting children of two parents in opposite orders.
+-- • UPSERTS: concurrent ON CONFLICT on overlapping key sets.
+-- • INDEX PAGES: two inserters splitting the same page.
+-- • UPGRADES: FOR SHARE then UPDATE, from two sessions. Both hold a
+--   shared lock and both want exclusive — a lock-upgrade deadlock, and
+--   the reason "take the strong lock immediately" is good advice.</pre>
+
+    <h2>Part 5 — The Lock Queue: How a 2ms ALTER Becomes an Outage</h2>
+    <pre>-- The single most damaging lock behaviour in practice, and it is not
+-- about how long a lock is HELD.
+
+-- ── THE MECHANISM ───────────────────────────────────────────────────────
+-- Lock requests are QUEUED IN ORDER. A request that conflicts with a
+-- held lock waits — and every LATER request that conflicts with the
+-- WAITER also waits, even if it would not have conflicted with the
+-- original holder.
+--
+--   1. a 20-minute analytics SELECT holds ACCESS SHARE       (running)
+--   2. ALTER TABLE requests ACCESS EXCLUSIVE  → conflicts   → QUEUES
+--   3. an ordinary SELECT requests ACCESS SHARE
+--        → does NOT conflict with (1)
+--        → but DOES conflict with the queued (2)
+--        → QUEUES BEHIND IT
+--   4. ...every subsequent query queues too
+--
+-- → The table is unavailable for TWENTY MINUTES. The ALTER itself, once
+--   it runs, takes 2 milliseconds.
+--
+-- ⚠ THE COUNTER-INTUITIVE PART: the outage duration is set by the
+--   pre-existing long query, not by the DDL. And "adding a nullable
+--   column is instant in PG11+" is TRUE and completely irrelevant —
+--   lock ACQUISITION, not lock HOLDING, took the site down.
+
+-- ── THE DEFENCE ─────────────────────────────────────────────────────────
+SET lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN note text;
+-- Now the worst case is that the migration fails in two seconds having
+-- blocked nothing. Retry in a loop until it catches a quiet moment:
+DO $$
+BEGIN
+  FOR i IN 1..50 LOOP
+    BEGIN
+      SET lock_timeout = '2s';
+      ALTER TABLE orders ADD COLUMN note text;
+      RETURN;
+    EXCEPTION WHEN lock_not_available THEN
+      PERFORM pg_sleep(5);
+    END;
+  END LOOP;
+  RAISE EXCEPTION 'could not acquire lock after 50 attempts';
+END $$;
+-- ✓ EVERY migration tool should do this by default. It is the single
+--   highest-value operational practice in this lesson.
+
+-- ── PRE-FLIGHT CHECK ────────────────────────────────────────────────────
+SELECT pid, now()-xact_start AS age, state, left(query,60)
+FROM pg_stat_activity
+WHERE now()-xact_start > interval '60 seconds' AND state <> 'idle';
+-- Refuse to migrate while anything long is running.
+
+-- ── CHEAP VS EXPENSIVE DDL (PG 11+) ─────────────────────────────────────
+-- ✓ metadata-only, milliseconds:
+--     ADD COLUMN (nullable, or with a CONSTANT default)
+--     DROP COLUMN, RENAME, ADD a constraint as NOT VALID
+-- ✗ rewrites or scans the whole table:
+--     changing a column type, ADD COLUMN with a VOLATILE default,
+--     SET NOT NULL (must scan to verify)
+-- ✓ THE SAFE TWO-STEP for constraints:
+ALTER TABLE orders ADD CONSTRAINT ck CHECK (total >= 0) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT ck;
+--   The first takes ACCESS EXCLUSIVE but is instant. The second scans
+--   the table but takes only SHARE UPDATE EXCLUSIVE, so writes continue.
+--   Splitting one blocking operation into a brief lock plus a
+--   non-blocking scan is the general pattern for online DDL.
+
+-- ── DIAGNOSING A LIVE PILE-UP ───────────────────────────────────────────
+SELECT pid, wait_event_type, wait_event, state,
+       pg_blocking_pids(pid) AS blocked_by,
+       now()-xact_start AS age, left(query,60)
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0 ORDER BY age DESC;
+-- ✓ Follow the chain to the ROOT BLOCKER — the one blocking others while
+--   blocked by nobody. Deal with THAT session, not the fifty victims.
+--   And cancel the queue HEAD (usually the DDL), not the long query:
+--   killing the long query just lets the ALTER acquire its lock and the
+--   queue re-forms behind it.
+SELECT pg_cancel_backend(pid);     -- cancels the query  (prefer this)
+SELECT pg_terminate_backend(pid);  -- kills the connection</pre>
+
+    <h2>Part 6 — Lightweight Locks and Advisory Locks</h2>
+    <pre>-- ── LWLOCKS: THE MIDDLE TIER ────────────────────────────────────────────
+-- Between transaction locks and raw spinlocks sit LIGHTWEIGHT LOCKS,
+-- protecting shared memory structures. Shared or exclusive, no deadlock
+-- detection, held briefly — a few microseconds — but longer than a
+-- spinlock, so waiters sleep rather than spin indefinitely.
+--
+-- What they protect: buffer mapping, the WAL insert buffers, the clog,
+-- the lock manager's own partitions, the procarray.
+--
+-- ⚠ At high core counts LWLock contention becomes the ceiling, and it is
+--   invisible in pg_locks:
+SELECT wait_event, count(*) FROM pg_stat_activity
+WHERE wait_event_type = 'LWLock' GROUP BY 1 ORDER BY 2 DESC;
+--  wait_event      | count
+--  WALWrite        |    24    ← WAL insertion contention
+--  BufferMapping   |    12    ← page lookup contention
+--  LockManager     |     8    ← the lock table's own partitions
+-- These are engine-internal bottlenecks. Fixes are structural — fewer
+-- connections, partitioned buffer pools, faster storage — not query
+-- tuning.
+
+-- ── ADVISORY LOCKS: MUTEXES FOR THINGS NOT IN A TABLE ───────────────────
+-- Coordinate application concerns using the database as the arbiter,
+-- with no row to lock.
+SELECT pg_try_advisory_xact_lock(hashtext('nightly-report'));
+-- true  → I hold it; proceed
+-- false → someone else is running it; skip
+--
+-- ✓ ALWAYS PREFER THE _xact_ VARIANT. It releases automatically at
+--   COMMIT or ROLLBACK. The session-scoped version
+--   (pg_advisory_lock) must be released explicitly, LEAKS on an
+--   unhandled exception, and — critically — does not survive a
+--   transaction-mode connection pooler, which may hand your session to
+--   someone else between statements.
+--
+-- Uses: singleton cron jobs across many app instances, serialising a
+-- migration, rate-limiting an expensive operation, leader election.
+SELECT locktype, objid, pid, granted FROM pg_locks WHERE locktype='advisory';
+
+-- ── SKIP LOCKED AND NOWAIT ──────────────────────────────────────────────
+SELECT ... FOR UPDATE NOWAIT;       -- error immediately if locked
+SELECT ... FOR UPDATE SKIP LOCKED;  -- silently ignore locked rows
+-- SKIP LOCKED is how you build a work queue in SQL: N workers each claim
+-- disjoint rows with zero contention (SQL isolation lesson). NOWAIT is
+-- for interactive paths where waiting is worse than failing.
+
+-- ── WHAT TO MONITOR ─────────────────────────────────────────────────────
+ALTER SYSTEM SET log_lock_waits = on;      -- logs waits over
+                                           -- deadlock_timeout — a
+                                           -- LEADING indicator, since it
+                                           -- catches near-misses before
+                                           -- they become deadlocks
+ALTER SYSTEM SET deadlock_timeout = '1s';
+ALTER SYSTEM SET lock_timeout = '5s';      -- per-role for migrations
+SELECT deadlocks FROM pg_stat_database WHERE datname=current_database();
+-- Alert on: deadlock rate, blocked-session count, longest lock wait,
+-- and any ACCESS EXCLUSIVE request waiting more than a few seconds.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Treating all waiting as one thing</strong>
+        <pre>"Queries are blocked — check
+ pg_locks."
+"The ALTER is fast, it can't be
+ the problem."
+"We deadlock sometimes, so
+ there's a bug to find."
+→ An afternoon in pg_locks while
+  the real issue is LWLock
+  BufferMapping contention.</pre></div>
+      <div><strong>✅ Naming the mechanism</strong>
+        <pre>"LWLock waits → engine-internal
+ latching, not pg_locks."
+"The ALTER queued behind a 20-min
+ query and everything queued
+ behind IT."
+"Deadlocks are normal; sort the
+ ids and retry on 40P01."</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Confusing locks with latches</td><td>Hunting microsecond page contention in <code>pg_locks</code></td><td>Latch waits appear as <code>LWLock</code> wait events</td></tr>
+      <tr><td>DDL without <code>lock_timeout</code></td><td>One long query plus one <code>ALTER</code> makes a table unavailable</td><td>Set it, retry in a loop, pre-flight for long transactions</td></tr>
+      <tr><td>Cancelling the long query instead of the DDL</td><td>The <code>ALTER</code> acquires its lock and the queue re-forms</td><td>Cancel the queue head</td></tr>
+      <tr><td>Inconsistent lock acquisition order</td><td>Intermittent deadlocks that vary run to run</td><td><code>ORDER BY</code> the key before <code>FOR UPDATE</code>, including in batch jobs</td></tr>
+      <tr><td>Not retrying on deadlock</td><td>User-visible errors from a normal operating condition</td><td>Retry on 40P01 with backoff and jitter</td></tr>
+      <tr><td>Session-scoped advisory locks behind a pooler</td><td>Locks leak or land on the wrong session</td><td>Use the <code>_xact_</code> variants</td></tr>
+      <tr><td>Assuming <code>SELECT ... FOR UPDATE</code> is read-only</td><td>Unexpected write I/O and WAL from a "read"</td><td>Row locks are written into the tuple, dirtying the page</td></tr>
+      <tr><td>Many partitions plus unprunable queries</td><td><code>out of shared memory</code> from lock-table exhaustion</td><td>Ensure the partition key is in queries; raise <code>max_locks_per_transaction</code></td></tr>
+      <tr><td>Upgrading <code>FOR SHARE</code> to <code>UPDATE</code></td><td>Lock-upgrade deadlocks between two sharers</td><td>Take the strong lock immediately</td></tr>
+      <tr><td>Ignoring foreign-key locks</td><td>A hot parent row serialises inserts across a child table</td><td>Know that child inserts lock the parent row</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between a lock and a latch?</summary>
+      <p>A lock protects logical data — a row or a table — and is held for the duration of a transaction,
+         potentially seconds or minutes. It lives in a shared lock table, is visible in
+         <code>pg_locks</code>, and participates in deadlock detection, because a transaction can legitimately
+         wait a long time and cycles must be resolved.</p>
+      <p>A latch protects a physical structure, typically a page in the buffer pool or a shared memory
+         region, and is held for microseconds while bytes are read or modified. It is stored in the object
+         itself rather than a table, has no deadlock detection, and relies on a strict acquisition ordering
+         discipline for correctness. Recording a latch in a shared structure would cost more than the
+         operation it guards.</p>
+      <p>The practical reason to keep them straight is diagnostic. Latch contention never appears in
+         <code>pg_locks</code>; it surfaces as <code>LWLock</code> wait events in
+         <code>pg_stat_activity</code>. So an investigation that only looks at <code>pg_locks</code> will find
+         nothing when the real bottleneck is buffer-mapping or WAL-insert contention, and that is a common
+         way to lose an afternoon.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> Why do two concurrent <code>UPDATE</code> statements on the same table not block each other?</summary>
+      <p>Because the table-level lock they take, <code>ROW EXCLUSIVE</code>, does not conflict with itself.
+         That mode is a declaration of intent — "I am going to modify rows in this table" — rather than a
+         serialisation point. Many transactions can hold it simultaneously.</p>
+      <p>Actual conflict happens at the row level. If the two statements touch disjoint rows they proceed in
+         parallel with no interaction at all. If they touch the same row, the second waits for the first to
+         commit or roll back, because a row lock is exclusive and held under strict two-phase locking until
+         the transaction ends.</p>
+      <p>This layering is what makes write concurrency possible. If table-level write locks conflicted, a
+         table could only ever have one writer, which would be correct and useless. The coarse table lock
+         exists mainly to conflict with schema changes: <code>ACCESS EXCLUSIVE</code>, taken by
+         <code>ALTER TABLE</code>, conflicts with everything, which is how DDL safely excludes all concurrent
+         access.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> How does PostgreSQL avoid lock escalation?</summary>
+      <p>By not storing row locks in a lock table at all. When a transaction locks a row, PostgreSQL writes
+         its transaction id into that tuple's <code>xmax</code> field with flag bits indicating a lock rather
+         than a deletion. Another transaction that wants the row reads <code>xmax</code>, sees a still-running
+         transaction, and waits on that transaction — so the lock table holds one entry per transaction
+         rather than one per row.</p>
+      <p>The consequence is that row locks consume no shared memory. An <code>UPDATE</code> touching ten
+         million rows holds ten million row locks without strain. Conventional lock managers cannot do this,
+         because ten million entries would be hundreds of megabytes, so they escalate: past a threshold, many
+         row locks are promoted into a single table lock. That bounds memory but destroys concurrency exactly
+         when the system is busiest, producing stalls that are hard to predict and harder to explain.</p>
+      <p>The trade-off is that taking a row lock modifies the tuple, which dirties the page. So
+         <code>SELECT ... FOR UPDATE</code> generates write I/O and WAL despite looking like a read, and a
+         large locking read can produce substantial write traffic. There is also a secondary structure,
+         MultiXact, for when several transactions share a lock on one row, and heavy
+         <code>FOR SHARE</code> usage can make that a bottleneck in its own right. As usual the design buys
+         one property by spending another — here, unlimited row locks paid for in write amplification.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> How are deadlocks detected, and how would you reduce them?</summary>
+      <p>By building a wait-for graph, where each node is a transaction and an edge means one is waiting on
+         another. A cycle in that graph is a deadlock by definition. Running the check continuously would
+         cost more than it saves, so PostgreSQL only runs it when a transaction has been waiting longer than
+         <code>deadlock_timeout</code>, one second by default. When a cycle is found, one transaction is
+         chosen as the victim and aborted so the others proceed.</p>
+      <p>Engines detect rather than prevent because prevention would require knowing every lock a transaction
+         will need before it starts, so they could be ordered globally. Real transactions decide what to lock
+         based on what they read, so that information does not exist in advance.</p>
+      <p>The most effective reduction is a consistent lock order, because a cycle requires two parties to
+         disagree about ordering. Sorting identifiers before locking —
+         <code>ORDER BY id ... FOR UPDATE</code> — makes disagreement structurally impossible, and that alone
+         resolves the majority of real deadlocks. In batch jobs the same applies to the driving query: a job
+         that updates rows in whatever order a query happened to return them will interleave differently on
+         every run, which is exactly why those deadlocks feel random. Shorter transactions help by reducing
+         overlap, and acquiring all needed locks up front helps more than acquiring them incrementally.</p>
+      <p>But I would not aim for zero. Foreign-key locks, index page contention and upsert conflicts can
+         produce cycles through paths the application does not control, so any writer should retry on
+         SQLSTATE 40P01 with backoff and jitter, and be idempotent so a retry is safe. Deadlocks are a normal
+         operating condition in a concurrent system, and treating them as an unexpected bug leads to fragile
+         code rather than robust code.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> An <code>ALTER TABLE</code> that takes 2ms caused an eight-minute outage. Explain precisely.</summary>
+      <p>The <code>ALTER TABLE</code> needed an <code>ACCESS EXCLUSIVE</code> lock, which conflicts with every
+         other lock mode including the <code>ACCESS SHARE</code> that a plain <code>SELECT</code> takes. A
+         long-running query was already holding <code>ACCESS SHARE</code>, so the <code>ALTER</code> could not
+         acquire its lock and entered the wait queue.</p>
+      <p>What turns a wait into an outage is that the lock queue is ordered. Once the <code>ALTER</code> is
+         queued, every subsequent request that conflicts with <em>it</em> queues behind it — including
+         ordinary <code>SELECT</code>s that would have coexisted perfectly well with the original reader. So
+         the table becomes completely unavailable for as long as the pre-existing query runs, not for as long
+         as the schema change takes. On PostgreSQL 11 and later, adding a nullable column or one with a
+         constant default is metadata-only and takes about two milliseconds, which is exactly why the timing
+         looks inexplicable if you only measure the statement.</p>
+      <p>The immediate mitigation during an incident is to cancel the queue head — the <code>ALTER</code> —
+         not the long query, because killing the long query simply lets the <code>ALTER</code> acquire its
+         lock and the queue re-forms behind the next long-running statement.</p>
+      <p>The durable fix is to set <code>lock_timeout</code> to a few seconds before any DDL, wrapped in a
+         retry loop, so a migration that cannot get its lock fails in seconds having blocked nothing and
+         tries again later. That should be built into the migration tool rather than left to whoever wrote
+         the file. Alongside it: a pre-flight check refusing to migrate while any transaction older than
+         about a minute is running, an <code>idle_in_transaction_session_timeout</code> so forgotten sessions
+         cannot hold a table hostage, and using the online patterns for expensive operations —
+         <code>CREATE INDEX CONCURRENTLY</code>, adding constraints as <code>NOT VALID</code> then validating
+         under a weaker lock, and expand-backfill-contract for type changes.</p>
+      <p>The sentence I would leave them with is that lock acquisition, not lock holding, is what takes sites
+         down.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A system shows heavy <code>LWLock</code> waits at high concurrency. How do you approach it?</summary>
+      <p>First I would establish that this is engine-internal contention rather than a query problem, because
+         the remedies are entirely different. <code>LWLock</code> waits are latches over shared memory
+         structures, so they will not appear in <code>pg_locks</code> and no amount of index tuning addresses
+         them. Grouping <code>pg_stat_activity</code> by <code>wait_event</code> tells me which structure is
+         contended, and that name usually identifies the cause directly.</p>
+      <p><code>BufferMapping</code> waits mean contention on the hash table that maps pages to buffer frames,
+         typically from very high page-lookup rates or a pool sized such that eviction is constant.
+         <code>WALWrite</code> or <code>WALInsert</code> waits point at the log as the bottleneck, which is
+         usually addressed with faster storage for the WAL, group commit tuning, or reducing WAL volume by
+         lengthening checkpoint intervals to cut full-page writes. <code>LockManager</code> waits mean the
+         lock table's own partitions are contended, which often traces to a partitioned table where queries
+         cannot prune and each one takes hundreds of locks.</p>
+      <p>The most common underlying cause at high core counts is simply too many connections. Each backend is
+         a process contending for the same shared structures, and past roughly twice the core count, adding
+         connections reduces throughput while increasing latch contention. A transaction-mode pooler that
+         reduces hundreds of application threads to a few dozen real connections frequently resolves what
+         looks like an engine limit — and it is worth trying before anything more exotic, because it is a
+         configuration change rather than a redesign.</p>
+      <p>Beyond that the remedies are structural: increasing <code>shared_buffers</code> so eviction is less
+         frequent, enabling huge pages to reduce TLB pressure on large pools, splitting the workload across
+         replicas, or upgrading, since each PostgreSQL release tends to reduce specific contention points. In
+         InnoDB the analogous lever is <code>innodb_buffer_pool_instances</code>, which shards the pool to cut
+         mutex contention directly.</p>
+      <p>What I would resist is treating this as a tuning puzzle before confirming the connection count is
+         sane, because that one factor explains a large share of these cases and everything else is more
+         expensive to change.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Observe lock modes and prove which conflict.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE t (id int PRIMARY KEY, v text);
+INSERT INTO t VALUES (1,'a'), (2,'b');
+
+-- ── SESSION 1: hold a read lock ─────────────────────────────────────────
+BEGIN;
+SELECT * FROM t;                  -- takes ACCESS SHARE
+SELECT locktype, relation::regclass, mode, granted
+FROM pg_locks WHERE relation = 't'::regclass;
+--  relation | t | AccessShareLock | true
+
+-- ── SESSION 2: another read — no conflict ───────────────────────────────
+BEGIN; SELECT * FROM t;           -- ✓ proceeds immediately
+-- ACCESS SHARE does not conflict with itself.
+
+-- ── SESSION 3: a write — still no table-level conflict ──────────────────
+BEGIN; UPDATE t SET v='x' WHERE id=1;    -- ✓ proceeds
+--  relation | t | RowExclusiveLock | true
+-- ⚠ ROW EXCLUSIVE does not conflict with ACCESS SHARE. Readers and
+--   writers coexist at the TABLE level — MVCC handles the rest.
+
+-- ── SESSION 4: DDL — conflicts with everything ──────────────────────────
+BEGIN; ALTER TABLE t ADD COLUMN w int;   -- ← BLOCKS
+SELECT pid, mode, granted, pg_blocking_pids(pid)
+FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+WHERE relation = 't'::regclass;
+--  pid  | mode                | granted | blocked_by
+--  1001 | AccessShareLock     | t       | {}
+--  1003 | RowExclusiveLock    | t       | {}
+--  1004 | AccessExclusiveLock | f       | {1001,1003}    ← waiting
+
+-- ── SESSION 5: THE QUEUE EFFECT — the important part ────────────────────
+BEGIN; SELECT * FROM t;           -- ← ALSO BLOCKS!
+--  1005 | AccessShareLock | f | {1004}
+-- ⚠ Session 5 does NOT conflict with sessions 1 or 3. It conflicts with
+--   the QUEUED session 4. Lock requests are ORDERED, so a plain SELECT
+--   now waits behind a DDL statement that has not even started.
+--   THIS is how one ALTER makes a table completely unavailable.
+
+-- ── PROVE THE FIX ───────────────────────────────────────────────────────
+-- session 4: ROLLBACK;   → sessions 5 onward unblock instantly
+-- Then retry the DDL safely:
+SET lock_timeout = '2s';
+ALTER TABLE t ADD COLUMN w int;
+-- ERROR: canceling statement due to lock timeout
+-- ✓ Failed in 2 seconds having blocked NOTHING. That is the entire
+--   difference between a failed migration and an outage.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Create a deadlock, read the report, then make it impossible.
+      <details class="solution"><summary>Solution</summary>
+      <pre>ALTER SYSTEM SET log_lock_waits = on;   -- do this BEFORE you need it
+SELECT pg_reload_conf();
+CREATE TABLE accounts (id int PRIMARY KEY, balance int);
+INSERT INTO accounts VALUES (1,100), (2,100);
+
+-- ── CAUSE IT ────────────────────────────────────────────────────────────
+-- Session 1                          | Session 2
+-- BEGIN;                             | BEGIN;
+-- UPDATE accounts SET balance=       |
+--   balance-10 WHERE id=1;           |
+--                                    | UPDATE accounts SET balance=
+--                                    |   balance-10 WHERE id=2;
+-- UPDATE ... WHERE id=2;  ← waits    |
+--                                    | UPDATE ... WHERE id=1;  ← waits
+--
+-- After deadlock_timeout (1s), the graph check runs and finds the cycle:
+-- ERROR:  deadlock detected
+-- DETAIL: Process 2841 waits for ShareLock on transaction 1002;
+--           blocked by process 2903.
+--         Process 2903 waits for ShareLock on transaction 1001;
+--           blocked by process 2841.
+-- CONTEXT: while updating tuple (0,1) in relation "accounts"
+--
+-- ⚠ Note the lock type: ShareLock on a TRANSACTION ID, not on a row.
+--   That is the mechanism from Part 3 — waiters queue on the holding
+--   TRANSACTION, which is why row locks cost no shared memory.
+
+-- ── MAKE IT STRUCTURALLY IMPOSSIBLE ─────────────────────────────────────
+BEGIN;
+SELECT id FROM accounts WHERE id IN (:a, :b) ORDER BY id FOR UPDATE;
+-- ↑ BOTH sessions now take id=1 first, then id=2. The second waits at
+--   the FIRST lock instead of acquiring one and demanding another. A
+--   cycle requires disagreement about order; there is none.
+UPDATE accounts SET balance = balance - 10 WHERE id = :a;
+UPDATE accounts SET balance = balance + 10 WHERE id = :b;
+COMMIT;
+
+-- ── THE BATCH-JOB VERSION OF THE SAME BUG ───────────────────────────────
+-- ✗ intermittent deadlocks, different every run:
+UPDATE items SET processed = true
+WHERE id IN (SELECT id FROM items WHERE NOT processed LIMIT 100);
+-- ✓ deterministic order:
+UPDATE items SET processed = true
+WHERE id IN (SELECT id FROM items WHERE NOT processed
+             ORDER BY id LIMIT 100);
+-- Without ORDER BY, each run locks rows in whatever order the plan
+-- produced — which is exactly why these deadlocks feel random.
+
+-- ── AND RETRY ANYWAY ────────────────────────────────────────────────────
+-- Consistent ordering removes the deadlocks you control. FK locks, index
+-- page splits and upsert conflicts can still create cycles.
+SELECT deadlocks FROM pg_stat_database WHERE datname=current_database();
+-- Track the rate. A nonzero but stable rate with retries in place is
+-- healthy; a rising rate means a new code path is misbehaving.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Prove that <code>SELECT ... FOR UPDATE</code> writes.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE TABLE t (id int PRIMARY KEY, v text);
+INSERT INTO t SELECT g, 'x' FROM generate_series(1,100000) g;
+VACUUM t;   -- clean baseline, hint bits set
+
+-- ── A PLAIN READ CHANGES NOTHING ────────────────────────────────────────
+SELECT pg_current_wal_lsn() AS w1 \gset
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM t;
+--  Buffers: shared hit=443 dirtied=0
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'w1'));
+--  0 bytes ✓
+
+-- ── A LOCKING READ WRITES ───────────────────────────────────────────────
+SELECT pg_current_wal_lsn() AS w2 \gset
+BEGIN;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t FOR UPDATE;
+--  Buffers: shared hit=443 dirtied=443        ← EVERY page dirtied
+COMMIT;
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'w2'));
+--  1.8 MB of WAL — from a SELECT.
+
+-- ── WHY: THE LOCK IS STORED IN THE TUPLE ────────────────────────────────
+BEGIN;
+SELECT * FROM t WHERE id = 1 FOR UPDATE;
+-- from another session:
+SELECT lp, t_xmin, t_xmax, t_infomask::bit(16)
+FROM heap_page_items(get_raw_page('t',0)) WHERE lp = 1;
+--  lp | t_xmin | t_xmax | t_infomask
+--   1 |    842 |    918 | 0000000100010000
+--                  ↑ the LOCKING transaction's id is written into xmax,
+--                    with infomask bits marking it a lock rather than a
+--                    delete.
+COMMIT;
+
+-- ── THE TRADE-OFF THIS BUYS ─────────────────────────────────────────────
+-- ✓ Row locks cost ZERO shared memory, so there is NO LOCK ESCALATION.
+--   Lock 10 million rows and nothing degrades:
+BEGIN;
+SELECT count(*) FROM (SELECT * FROM t FOR UPDATE) s;   -- 100k locks
+SELECT count(*) FROM pg_locks WHERE locktype = 'tuple';  -- 0 (!)
+SELECT count(*) FROM pg_locks WHERE locktype = 'transactionid';  -- 1
+COMMIT;
+-- ⚠ ONE lock-table entry for 100,000 locked rows. In an engine with a
+--   conventional lock table this would be 100,000 entries and would
+--   likely trigger escalation to a table lock, stalling every other
+--   writer.
+-- ✗ The cost: write I/O and WAL from a read-shaped statement, which
+--   surprises people profiling a "read-only" report that takes locks.
+
+-- ── PRACTICAL IMPLICATION ───────────────────────────────────────────────
+-- Do not use FOR UPDATE to "be safe" on reads you are not going to
+-- modify. It converts a free operation into a writing one, and on a
+-- large result set that is gigabytes of unnecessary WAL.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Build a safe migration runner.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── THE DANGEROUS VERSION ───────────────────────────────────────────────
+ALTER TABLE orders ADD COLUMN note text;
+-- If ANY long query holds ACCESS SHARE, this queues and takes the table
+-- down for the duration of that query.
+
+-- ── STEP 1: PRE-FLIGHT ──────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION safe_to_migrate() RETURNS boolean AS $$
+  SELECT NOT EXISTS (
+    SELECT 1 FROM pg_stat_activity
+    WHERE state <> 'idle'
+      AND backend_type = 'client backend'
+      AND pid <> pg_backend_pid()
+      AND now() - xact_start > interval '30 seconds');
+$$ LANGUAGE sql;
+SELECT safe_to_migrate();      -- refuse to start if false
+
+-- ── STEP 2: BOUNDED ACQUISITION WITH RETRY ──────────────────────────────
+CREATE OR REPLACE PROCEDURE run_ddl(stmt text, attempts int DEFAULT 50)
+LANGUAGE plpgsql AS $$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..attempts LOOP
+    BEGIN
+      SET LOCAL lock_timeout = '2s';
+      EXECUTE stmt;
+      RAISE NOTICE 'succeeded on attempt %', i;
+      RETURN;
+    EXCEPTION WHEN lock_not_available THEN
+      RAISE NOTICE 'attempt % could not acquire lock', i;
+      COMMIT;                       -- release, back off, retry
+      PERFORM pg_sleep(5);
+    END;
+  END LOOP;
+  RAISE EXCEPTION 'gave up after % attempts', attempts;
+END $$;
+
+CALL run_ddl('ALTER TABLE orders ADD COLUMN note text');
+-- ✓ Worst case: fails in 2s having blocked nothing, then tries again.
+--   The site never notices.
+
+-- ── STEP 3: KNOW WHICH DDL IS CHEAP ─────────────────────────────────────
+-- INSTANT (metadata only) — safe with the pattern above:
+ALTER TABLE t ADD COLUMN c text;                  -- nullable
+ALTER TABLE t ADD COLUMN c int DEFAULT 0;         -- CONSTANT default, PG11+
+ALTER TABLE t DROP COLUMN c;
+ALTER TABLE t RENAME COLUMN a TO b;
+-- SCANS or REWRITES — needs the online pattern instead:
+ALTER TABLE t ALTER COLUMN c TYPE bigint;         -- full rewrite
+ALTER TABLE t ADD COLUMN c uuid DEFAULT gen_random_uuid();  -- VOLATILE
+ALTER TABLE t ALTER COLUMN c SET NOT NULL;        -- must scan
+
+-- ── STEP 4: THE ONLINE PATTERNS ─────────────────────────────────────────
+-- constraint in two steps: brief lock, then a non-blocking scan
+ALTER TABLE orders ADD CONSTRAINT ck CHECK (total >= 0) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT ck;   -- SHARE UPDATE EXCLUSIVE:
+                                             -- writes continue
+-- NOT NULL via a constraint (PG12+ recognises it and skips the scan)
+ALTER TABLE orders ADD CONSTRAINT nn CHECK (note IS NOT NULL) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT nn;
+ALTER TABLE orders ALTER COLUMN note SET NOT NULL;   -- now instant
+-- indexes
+CREATE INDEX CONCURRENTLY ...;    -- SHARE UPDATE EXCLUSIVE, not SHARE
+SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;  -- verify
+-- type change: expand → backfill → contract, never one ALTER
+
+-- ── STEP 5: THE GUARDRAIL THAT MAKES IT PERMANENT ───────────────────────
+ALTER ROLE migration_user SET lock_timeout = '2s';
+ALTER ROLE migration_user SET idle_in_transaction_session_timeout = '30s';
+-- ✓ Now even a hand-run migration cannot cause the outage. Enforcing it
+--   at the ROLE level beats relying on every author remembering.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Diagnose a live lock pile-up under pressure.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- INCIDENT: connections at the pool cap, p99 30s, error rate climbing.
+
+-- ── STEP 1: WHAT IS EVERYONE WAITING ON? ────────────────────────────────
+SELECT wait_event_type, wait_event, state, count(*)
+FROM pg_stat_activity WHERE backend_type='client backend'
+GROUP BY 1,2,3 ORDER BY 4 DESC;
+--  wait_event_type | wait_event    | state  | count
+--  Lock            | relation      | active |   287     ← lock waits
+--  LWLock          | BufferMapping | active |     3
+--  Client          | ClientRead    | idle   |    12
+-- ✓ `Lock`/`relation` means TABLE-level lock contention — a pg_locks
+--   problem, not a latch problem. (If LWLock had dominated, pg_locks
+--   would have been the wrong place to look entirely.)
+
+-- ── STEP 2: FIND THE ROOT BLOCKER ───────────────────────────────────────
+SELECT pid, state, wait_event, pg_blocking_pids(pid) AS blocked_by,
+       now()-xact_start AS txn_age, left(query,70) AS q
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0 OR state <> 'idle'
+ORDER BY xact_start LIMIT 10;
+--  pid  | blocked_by | txn_age  | q
+--  9001 | {}         | 00:22:14 | SELECT ... FROM orders o JOIN ... (report)
+--  9002 | {9001}     | 00:03:41 | ALTER TABLE orders ADD COLUMN ...
+--  9003 | {9002}     | 00:03:40 | SELECT * FROM orders WHERE id=...
+--  9004 | {9002}     | 00:03:39 | INSERT INTO orders ...
+--  ...287 more, ALL blocked_by {9002}
+
+-- ── STEP 3: READ THE STRUCTURE ──────────────────────────────────────────
+-- 9001 blocks nobody directly — it just holds ACCESS SHARE (a 22-minute
+--   report that should never have run on the primary).
+-- 9002 wants ACCESS EXCLUSIVE → conflicts → QUEUES behind 9001.
+-- Everything after 9002 conflicts with the QUEUED 9002 and queues too,
+--   including trivial SELECTs that would happily coexist with 9001.
+-- ⚠ THE ROOT CAUSE IS THE PAIR, not either alone. And the outage length
+--   is set by the REPORT's duration, while the ALTER itself is ~2ms.
+
+-- ── STEP 4: RESOLVE — CANCEL THE QUEUE HEAD ─────────────────────────────
+SELECT pg_cancel_backend(9002);       -- ✓ the ALTER
+-- The 287 blocked queries drain IMMEDIATELY.
+-- ✗ DO NOT cancel 9001 instead: the ALTER would then acquire its lock,
+--   and the queue re-forms behind the next long query. Cancelling the
+--   head is the correct move, and it is counter-intuitive under
+--   pressure.
+-- Prefer pg_cancel_backend (cancels the statement) over
+-- pg_terminate_backend (drops the connection) — less collateral damage.
+
+-- ── STEP 5: RE-RUN THE MIGRATION SAFELY ─────────────────────────────────
+SET lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN note text;    -- retry in a loop (ex. 4)
+
+-- ── STEP 6: PREVENT THE CLASS, NOT THE INSTANCE ─────────────────────────
+-- 1. lock_timeout enforced by the migration tool and at the role level.
+-- 2. statement_timeout globally, with a per-role override for reporting
+--    — a 22-minute query has no business on an OLTP primary.
+-- 3. Route reporting to a replica.
+-- 4. Pre-flight check refusing to migrate while long transactions run.
+-- 5. Alert on any ACCESS EXCLUSIVE request waiting > 5s, and on blocked
+--    session count. This one query is the whole alert:
+SELECT count(*) FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+
+-- ── THE WRITE-UP ────────────────────────────────────────────────────────
+-- "The ALTER was instant" and "the ALTER caused an 8-minute outage" are
+-- both true statements. Lock ACQUISITION, not lock HOLDING, is what took
+-- the site down — and that single distinction is the lesson.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design coordination for a distributed job scheduler.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- REQUIREMENT: 20 app instances. Some jobs must run EXACTLY ONCE per
+-- schedule; others may run in parallel across instances. No new
+-- infrastructure — use Postgres.
+
+-- ── PROBLEM 1: SINGLETON JOBS ───────────────────────────────────────────
+-- ✗ SELECT then INSERT a "running" row: check-then-act; two instances
+--   both see nothing and both run.
+-- ✗ A `locks` table with INSERT and a unique constraint: works, but a
+--   crashed instance leaves the row behind and the job never runs again
+--   until someone cleans up manually.
+-- ✓ TRANSACTION-SCOPED ADVISORY LOCK:
+BEGIN;
+SELECT pg_try_advisory_xact_lock(hashtext('nightly-billing'));
+-- false → another instance holds it; COMMIT and skip.
+-- true  → run the job, then COMMIT.
+COMMIT;   -- lock released AUTOMATICALLY, including on crash or error
+-- ✓ Crash safety is the point: the lock dies with the connection, so
+--   there is nothing to clean up. This is why the _xact_ variant matters.
+-- ⚠ NEVER use pg_advisory_lock (session-scoped) here: it leaks on an
+--   unhandled exception and does not survive a transaction-mode pooler,
+--   which may hand your session to another client between statements.
+
+-- ── PROBLEM 2: PARALLEL WORK, NO OVERLAP ────────────────────────────────
+UPDATE jobs SET status='running', claimed_by=:instance, claimed_at=now()
+WHERE id IN (
+    SELECT id FROM jobs
+    WHERE status='queued' AND run_after <= now()
+    ORDER BY run_after, id            -- consistent order → no deadlocks
+    FOR UPDATE SKIP LOCKED            -- ← the whole design
+    LIMIT 10)
+RETURNING *;
+-- SKIP LOCKED ignores rows another transaction has locked rather than
+-- waiting, so 20 instances claim 20 disjoint batches with ZERO blocking.
+-- Plain FOR UPDATE would make all 20 queue on the same row.
+
+-- ── PROBLEM 3: CRASHED WORKERS ──────────────────────────────────────────
+-- A worker that dies mid-job leaves the row 'running' forever: the ROW
+-- LOCK died with the connection, but the STATUS column did not.
+UPDATE jobs SET status='queued', claimed_by=NULL
+WHERE status='running' AND claimed_at < now() - interval '10 minutes';
+-- ⚠ The timeout must exceed the longest legitimate runtime or you will
+--   duplicate in-progress work. Better: workers heartbeat claimed_at, so
+--   the reaper distinguishes "slow" from "dead".
+-- ⚠ And accept the consequence: delivery is AT-LEAST-ONCE, so handlers
+--   must be idempotent. Exactly-once across a process boundary does not
+--   exist.
+
+-- ── PROBLEM 4: A JOB THAT MUST NOT OVERLAP ITSELF ───────────────────────
+-- Singleton per KEY, not globally:
+SELECT pg_try_advisory_xact_lock(hashtext('sync-tenant'), :tenant_id);
+-- The two-argument form gives a namespace plus a key, so tenant 7 and
+-- tenant 9 sync concurrently while tenant 7 never overlaps itself.
+-- ⚠ hashtext collisions are possible (32-bit). For a fixed small set of
+--   job names, assign explicit integer ids instead of hashing.
+
+-- ── PROBLEM 5: OBSERVABILITY ────────────────────────────────────────────
+SELECT locktype, classid, objid, pid, granted,
+       now()-a.xact_start AS held_for
+FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+WHERE locktype = 'advisory' ORDER BY held_for DESC;
+-- Alert on an advisory lock held far longer than the job's expected
+-- runtime — that is a hung job, and it will silently block every
+-- subsequent schedule.
+
+-- ── WHAT THIS DESIGN DELIBERATELY DOES NOT DO ───────────────────────────
+-- • No distributed consensus. The database IS the arbiter; if it is down
+--   nothing runs anyway, so adding etcd or ZooKeeper buys nothing here
+--   and adds an operational dependency.
+-- • No leader election. Advisory locks per job are simpler than
+--   electing one instance to run everything, and they degrade better:
+--   one stuck job does not stop the rest.
+-- • No exactly-once claims. At-least-once plus idempotent handlers is
+--   the honest guarantee, and pretending otherwise is how duplicate
+--   charges happen.
+-- ⚠ WHERE IT STOPS SCALING: advisory locks and SKIP LOCKED queues are
+--   excellent to roughly thousands of jobs/second. Beyond that the
+--   UPDATE churn dominates — every claim and completion is a write, so
+--   dead tuples and vacuum become the bottleneck (MVCC lesson). That is
+--   the point to move to a purpose-built broker, and knowing WHY is
+--   better than knowing that people say so.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Locks protect logical data for a transaction and appear in <code>pg_locks</code>; latches protect physical memory for microseconds and appear as <code>LWLock</code> wait events.</li>
+        <li><code>ROW EXCLUSIVE</code> does not conflict with itself, so concurrent writers only contend at the row level — the table lock is a declaration of intent.</li>
+        <li>PostgreSQL stores row locks inside the tuple, so there is no lock escalation at any scale — paid for by dirtying pages, which makes <code>FOR UPDATE</code> a writing operation.</li>
+        <li>Deadlocks are detected with a wait-for graph after <code>deadlock_timeout</code>, not prevented, because required locks are not knowable in advance.</li>
+        <li>Sorting rows before locking makes deadlock cycles structurally impossible, and it applies to batch jobs' driving queries too.</li>
+        <li>Retry on 40P01 regardless — foreign-key locks, page splits and upserts create cycles the application cannot order away.</li>
+        <li>Lock acquisition, not lock holding, causes outages: a queued <code>ACCESS EXCLUSIVE</code> request blocks every later query behind it.</li>
+        <li>Set <code>lock_timeout</code> with a retry loop for all DDL, and enforce it at the role level rather than trusting each author.</li>
+        <li>Foreign-key checks lock the parent row, so a hot shared parent serialises child inserts for reasons invisible in the query.</li>
+        <li>Use transaction-scoped advisory locks for coordination — they release on crash and survive transaction-mode pooling, unlike session-scoped ones.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="mvcc.html">← MVCC &amp; Snapshot Isolation</a>
+      <a href="query-planner.html">Parser, Rewriter &amp; Planner →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
