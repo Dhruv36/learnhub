@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pages, Heap Files &amp; Row Layout — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Pages, Heap Files &amp; Row Layout <span class="level-badge level-basic">Foundations</span></h1>
+    <p><strong>What you'll master:</strong> the exact anatomy of a database page and why the slotted-page
+       design with its indirection layer is nearly universal, how a row is physically laid out and why
+       column <em>order</em> silently costs you disk through alignment padding, what a tuple identifier is
+       and why it makes index maintenance the hidden cost of updates, how heap files track free space and
+       what makes a table bloat, how large values get pushed out of line into overflow storage and the
+       surprising performance cliff that creates, why <code>UPDATE</code> in an MVCC engine is really an
+       insert plus a tombstone, and what HOT updates are — the optimisation that decides whether your
+       write-heavy table stays healthy. Prerequisites:
+       <a href="index.html">How a Database Stores Data</a>. Examples are PostgreSQL with InnoDB contrasts,
+       because the two engines made opposite choices here and the comparison teaches more than either
+       alone.</p>
+
+    <h2>Part 1 — Anatomy of a Page</h2>
+    <pre>-- A Postgres page is exactly 8192 bytes. Every table and index is an
+-- array of these. Here is what is actually inside one:
+
+  byte 0    ┌────────────────────────────────────────┐
+            │ PageHeaderData (24 bytes)              │
+            │   pd_lsn      last WAL record to touch │ ← ties the page
+            │               this page                │   to the log
+            │   pd_checksum corruption detection     │
+            │   pd_lower    end of the pointer array │
+            │   pd_upper    start of tuple data      │
+            │   pd_special  index-specific area      │
+            ├────────────────────────────────────────┤
+            │ ItemIdData[]  4 bytes each  ↓ grows    │
+            │   (offset, length, flags) per tuple    │
+     lower  ├────────────────────────────────────────┤
+            │                                        │
+            │            FREE SPACE                  │
+            │                                        │
+     upper  ├────────────────────────────────────────┤
+            │            ↑ grows                     │
+            │ tuple 3 | tuple 2 | tuple 1            │
+  byte 8191 └────────────────────────────────────────┘
+
+-- Pointers grow down from the header; tuple data grows up from the end.
+-- Free space is what remains between pd_lower and pd_upper. When they
+-- meet, the page is full.
+
+-- ── WHY THE INDIRECTION? (the design question worth asking) ─────────────
+-- Why not have indexes point straight at a byte offset?
+-- Because then a tuple could never MOVE. When a page is compacted to
+-- reclaim space from dead tuples, live tuples slide toward the end of
+-- the page. With direct pointers, every index entry referencing them
+-- would have to be found and rewritten — impossible in practice.
+--
+-- The ItemId array solves it with one level of indirection: an index
+-- points at (page, SLOT NUMBER), and the slot holds the current offset.
+-- Compaction rewrites offsets inside the page and touches NO index.
+-- This is the SLOTTED PAGE design, and essentially every disk-based
+-- database uses it.
+
+-- ── SEE IT DIRECTLY ─────────────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT lower, upper, special, pagesize
+FROM page_header(get_raw_page('users', 0));
+--  lower | upper | special | pagesize
+--     92 |  7104 |    8192 |     8192
+-- → (92-24)/4 = 17 tuples on this page; 7104-92 = 7012 bytes free.
+
+SELECT lp, lp_off, lp_len, t_xmin, t_xmax
+FROM heap_page_items(get_raw_page('users', 0)) LIMIT 5;
+--  lp | lp_off | lp_len | t_xmin | t_xmax
+--   1 |   8112 |     80 |    842 |      0
+--   2 |   8032 |     80 |    842 |      0
+-- lp = the slot number an index points at; lp_off = where it currently
+-- lives. Change the second, keep the first, and indexes stay valid.</pre>
+
+    <h2>Part 2 — Row Layout, and the Padding You Are Paying For</h2>
+    <pre>-- Every Postgres tuple carries a 23-byte header, padded to 24:
+--   t_xmin       creating transaction id       ← MVCC (lesson 7)
+--   t_xmax       deleting/superseding txn id   ← MVCC
+--   t_cid/t_ctid command id / next version pointer
+--   t_infomask   flags: has nulls? has varlena? frozen?
+--   t_hoff       where user data starts
+--   [null bitmap, 1 bit per column, if any column is nullable]
+--   ─────────── user data begins here ───────────
+
+-- ⚠ 24 BYTES OF OVERHEAD PER ROW. For a table of (int, int) — 8 bytes of
+--   actual data — the row is 32 bytes: 75% overhead. Very narrow tables
+--   are far less efficient than they look, which is worth knowing before
+--   you split a table "for normalisation" into something tiny.
+
+-- ── ALIGNMENT: THE COST HIDING IN COLUMN ORDER ──────────────────────────
+-- CPUs read aligned memory faster, so each type must start at a multiple
+-- of its alignment: int2→2, int4→4, int8/timestamptz/float8→8.
+-- The engine INSERTS PADDING to make that true. Padding is dead space
+-- you store forever.
+
+-- ✗ BADLY ORDERED
+CREATE TABLE bad (
+    a smallint,     -- 2 bytes  offset 0
+                    -- 6 bytes PADDING (bigint needs offset % 8 == 0)
+    b bigint,       -- 8 bytes  offset 8
+    c smallint,     -- 2 bytes  offset 16
+                    -- 6 bytes PADDING
+    d bigint,       -- 8 bytes  offset 24
+    e boolean       -- 1 byte   offset 32
+                    -- 7 bytes trailing PADDING
+);                  -- total: 40 bytes of payload, 19 of it PADDING
+
+-- ✓ WELL ORDERED: widest first, narrowest last
+CREATE TABLE good (
+    b bigint,       -- 8   offset 0
+    d bigint,       -- 8   offset 8
+    a smallint,     -- 2   offset 16
+    c smallint,     -- 2   offset 18
+    e boolean       -- 1   offset 20
+                    -- 3 bytes trailing padding
+);                  -- total: 24 bytes. 40% SMALLER, same columns.
+
+-- ── MEASURE IT ──────────────────────────────────────────────────────────
+SELECT pg_column_size(ROW(1::smallint, 1::bigint, 1::smallint,
+                          1::bigint, true)) AS bad_bytes,
+       pg_column_size(ROW(1::bigint, 1::bigint, 1::smallint,
+                          1::smallint, true)) AS good_bytes;
+-- Find the padding in an existing table:
+SELECT a.attname, t.typname, t.typalign, t.typlen
+FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+WHERE a.attrelid = 'bad'::regclass AND a.attnum > 0
+ORDER BY a.attnum;
+
+-- ⚠ IS THIS WORTH DOING? On a 10-row config table, no. On a 500-million
+--   row events table, 16 bytes per row is 8GB — which is 8GB of buffer
+--   pool, backups, and replication traffic, forever. Order columns
+--   widest-to-narrowest when you create a large table; it costs nothing
+--   at design time and cannot be changed cheaply later.
+
+-- ── VARIABLE-LENGTH VALUES ──────────────────────────────────────────────
+-- text/varchar/jsonb/numeric are "varlena": a length header (1 byte if
+-- the value is under 127 bytes, otherwise 4) then the bytes.
+-- ✓ varchar(50) and text cost THE SAME for the same content. The limit
+--   is a constraint, not an optimisation — a persistent misconception.
+-- ✓ NULLs cost nothing beyond their bit in the null bitmap; they are not
+--   stored in the tuple body at all.</pre>
+
+    <h2>Part 3 — The Tuple Identifier, and Why Updates Cost More Than You Think</h2>
+    <pre>-- Every tuple has a ctid: (block number, slot number). This is its
+-- physical address, and it is what every index entry points at.
+SELECT ctid, id, name FROM users LIMIT 3;
+--   ctid  | id |  name
+--  (0,1)  |  1 | Asha     ← page 0, slot 1
+--  (0,2)  |  2 | Ben
+--  (17,4) |  3 | Cleo     ← page 17, slot 4
+
+-- ⚠ A ctid IS NOT STABLE. Any UPDATE can move the row to a new page, and
+--   VACUUM FULL rewrites the entire table. Never store a ctid; it is a
+--   physical address, not an identity.
+
+-- ── THE COST THIS CREATES: INDEX MAINTENANCE ────────────────────────────
+-- In an MVCC engine, an UPDATE does not overwrite the row. It writes a
+-- NEW TUPLE at a new ctid and marks the old one dead (lesson 7).
+-- New ctid → every index entry pointing at the old one must be updated.
+--
+-- A table with SIX indexes: updating one column writes a new tuple AND
+-- inserts six new index entries. The "small update" touched seven data
+-- structures, and dirtied at least seven pages.
+--
+-- ✓ THIS is the concrete reason index count degrades write performance,
+--   and it is much worse than the intuition "indexes cost a little on
+--   write" suggests.
+
+-- ── THE OPTIMISATION THAT SAVES IT: HOT UPDATES ─────────────────────────
+-- Heap-Only Tuple. If BOTH conditions hold:
+--   1. NO INDEXED COLUMN changed, and
+--   2. the new version FITS ON THE SAME PAGE
+-- ...then Postgres chains the old tuple to the new one via t_ctid and
+-- updates NO INDEX AT ALL. Indexes still point at the old slot, and the
+-- engine follows the chain.
+--
+-- The payoff is large: a HOT update dirties one page instead of seven.
+
+-- ── HOW TO ACTUALLY GET HOT UPDATES ─────────────────────────────────────
+SELECT relname, n_tup_upd, n_tup_hot_upd,
+       round(100.0*n_tup_hot_upd/NULLIF(n_tup_upd,0), 1) AS hot_pct
+FROM pg_stat_user_tables WHERE n_tup_upd > 0 ORDER BY n_tup_upd DESC;
+-- A low hot_pct on a write-heavy table is a real, fixable problem.
+--
+-- ✓ FIX 1: do not index columns that change frequently. An index on
+--   `last_seen_at` or `updated_at` disqualifies EVERY update from HOT.
+--   That single index can be the difference between a healthy table and
+--   a bloated one.
+-- ✓ FIX 2: leave room on the page so the new version fits:
+ALTER TABLE sessions SET (fillfactor = 70);   -- keep 30% free
+--   Default fillfactor is 100 for tables (pack them full), which is
+--   right for append-only data and wrong for update-heavy tables.
+--   ⚠ It applies to NEW pages only; run VACUUM FULL or pg_repack to
+--     apply it to existing data.
+
+-- ── INNODB DID IT DIFFERENTLY ───────────────────────────────────────────
+-- InnoDB tables are CLUSTERED: the table IS the primary key's B+tree,
+-- and secondary indexes store the PRIMARY KEY as the row reference, not
+-- a physical address.
+--   ✓ a row can move freely; secondary indexes never need updating for
+--     a move, because the PK does not change
+--   ✗ every secondary-index lookup needs a SECOND B+tree descent to
+--     fetch the row by PK
+--   ✗ a wide primary key inflates EVERY secondary index
+-- Two coherent designs, opposite trade-offs. Postgres pays on update;
+-- InnoDB pays on secondary read. Knowing which you are using tells you
+-- which cost to design around.</pre>
+    <div class="note">🔑 <strong>The most actionable fact in this lesson.</strong> On an update-heavy table,
+      an index on a frequently-changing column — <code>updated_at</code>, <code>last_seen</code>,
+      <code>status</code> — silently disqualifies every update from the HOT optimisation, turning one dirtied
+      page into one per index plus the heap. Check <code>n_tup_hot_upd</code> against <code>n_tup_upd</code>
+      before adding an index to such a table, and set <code>fillfactor</code> below 100 so the new version
+      has room to land on the same page.</div>
+
+    <h2>Part 4 — Heap Files and Free Space</h2>
+    <pre>-- A heap is an UNORDERED collection of pages. "Heap" here means "no
+-- order guarantee", not the data structure. Rows go wherever there is
+-- room — which is why a query without ORDER BY has no defined order, and
+-- why relying on the order rows happen to come back is a bug waiting for
+-- a vacuum to expose it.
+
+-- ── FINDING SPACE FOR A NEW ROW: THE FREE SPACE MAP ─────────────────────
+-- Scanning every page to find room would be O(n) per insert. The FSM is
+-- a small tree alongside the table storing approximate free space per
+-- page, so an insert finds a home in a couple of lookups.
+SELECT * FROM pg_freespace('users') WHERE avail > 0 LIMIT 5;
+--  blkno | avail
+--     12 |  3520
+--     47 |  1216
+-- ⚠ The FSM is APPROXIMATE and updated by VACUUM. If vacuum falls
+--   behind, the engine does not know about reusable space and EXTENDS
+--   THE FILE instead — the table grows even though it has free room
+--   inside. This is a large part of how bloat compounds.
+
+-- ── THE ANATOMY OF BLOAT ────────────────────────────────────────────────
+-- 1. UPDATE writes a new tuple; the old one is dead but still occupies
+--    space.
+-- 2. VACUUM marks that space reusable and records it in the FSM.
+-- 3. New rows reuse it. Steady state: the table stops growing.
+--
+-- Break step 2 — a long-running transaction, an abandoned replication
+-- slot, autovacuum tuned too lazily — and dead tuples accumulate
+-- permanently. The file grows, the working set exceeds RAM, and the
+-- cache hit rate collapses (exercise 6 of the previous lesson).
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+SELECT * FROM pgstattuple('users');
+--  table_len | tuple_count | dead_tuple_count | free_percent
+--  419430400 |     210000  |        6800000   |        71.2
+-- ⚠ VACUUM does NOT return space to the OS — it makes it reusable
+--   internally. Only VACUUM FULL (exclusive lock, rewrites the table) or
+--   pg_repack (online) shrinks the file.
+
+-- ── SEQUENTIAL SCANS AND PHYSICAL ORDER ─────────────────────────────────
+-- A Seq Scan reads pages in physical order, which is why it is fast. But
+-- physical order drifts from logical order as rows are updated and
+-- moved:
+SELECT correlation FROM pg_stats
+WHERE tablename='orders' AND attname='created_at';
+--  correlation = 0.98   → physical order matches created_at; index range
+--                         scans fetch nearly-sequential pages. Cheap.
+--  correlation = 0.02   → the same index range scan is scattered random
+--                         I/O. Far more expensive.
+-- The planner uses this number directly. It is why an index on a
+-- naturally-ordered column (an append-only timestamp) performs so much
+-- better than the same index on a shuffled one.
+CLUSTER orders USING orders_created_at_idx;   -- physically reorder
+-- ⚠ One-time and exclusive-locking; new writes drift again immediately.
+--   Useful for read-mostly tables, not a maintenance routine.</pre>
+
+    <h2>Part 5 — When a Value Will Not Fit: TOAST and Overflow</h2>
+    <pre>-- A tuple cannot span pages. So what happens to a 2MB JSON document in
+-- an 8KB page?
+
+-- ── POSTGRES: TOAST (The Oversized-Attribute Storage Technique) ─────────
+-- Above ~2KB per row, Postgres compresses variable-length values and, if
+-- still too large, moves them to a side table in ~2KB chunks. The main
+-- tuple keeps an 18-byte pointer.
+SELECT reltoastrelid::regclass FROM pg_class WHERE relname='documents';
+SELECT pg_size_pretty(pg_relation_size('documents'))       AS main,
+       pg_size_pretty(pg_total_relation_size('documents')) AS with_toast;
+--  main    | with_toast
+--  240 MB  | 14 GB          ← the visible table is 2% of the real size
+
+-- ── THE PERFORMANCE CLIFF, AND IT IS SHARP ──────────────────────────────
+SELECT id, title FROM documents WHERE ...;    -- ✓ fast: TOAST untouched
+SELECT * FROM documents WHERE ...;            -- ✗ a SEPARATE FETCH per
+                                              --   row, plus decompression
+-- ⚠ THIS is the real cost of SELECT * on a table with big columns, and
+--   it is much larger than "a few extra bytes over the wire". Each
+--   toasted value is an index lookup and several page reads in another
+--   table.
+-- ✓ COROLLARY: a big jsonb or text column does NOT slow down queries
+--   that do not select it. Large columns are cheaper than people fear —
+--   provided you stop writing SELECT *.
+
+-- ── CONTROLLING IT ──────────────────────────────────────────────────────
+ALTER TABLE documents ALTER COLUMN body SET STORAGE EXTERNAL;
+--   PLAIN     never toast (only for small fixed types)
+--   EXTENDED  compress, then move out of line   ← default
+--   EXTERNAL  move out of line WITHOUT compressing — better for
+--             substring/prefix access, since compressed values must be
+--             decompressed whole
+--   MAIN      compress, keep in-line if at all possible
+ALTER TABLE t SET (toast_tuple_target = 4096);   -- raise the threshold
+
+-- ── INNODB'S VERSION ────────────────────────────────────────────────────
+-- Overflow pages, with the row format deciding how much stays in-line:
+--   COMPACT/REDUNDANT  keep the first 768 bytes locally + a pointer
+--   DYNAMIC (default)  a 20-byte pointer; the whole value overflows
+-- ⚠ InnoDB has a hard limit: a row must fit in HALF a page (~8KB of the
+--   16KB page) excluding overflow. Too many large columns produces
+--   "Row size too large" AT INSERT TIME rather than degrading quietly.
+
+-- ── THE DESIGN CONSEQUENCE ──────────────────────────────────────────────
+-- Vertical partitioning — moving cold, wide columns to a side table — is
+-- often the highest-leverage change for a hot wide table:
+CREATE TABLE documents_body (document_id bigint PRIMARY KEY
+                             REFERENCES documents(id), body text);
+-- The hot table becomes narrow, so more rows per page, so scans read a
+-- fraction of the I/O. TOAST does some of this automatically, but it
+-- cannot help the columns that are 500 bytes each — too small to toast,
+-- big enough to wreck your rows-per-page.</pre>
+
+    <h2>Part 6 — Reading the Physical Layer</h2>
+    <pre>-- ── THE DIAGNOSTIC TOOLKIT ──────────────────────────────────────────────
+-- 1. HOW BIG, AND WHERE?
+SELECT pg_size_pretty(pg_relation_size('t'))        AS heap,
+       pg_size_pretty(pg_indexes_size('t'))         AS indexes,
+       pg_size_pretty(pg_total_relation_size('t'))  AS total;
+-- ⚠ If indexes exceed the heap on an OLTP table, ask what they are all
+--   for — each one taxes every write and every HOT opportunity.
+
+-- 2. HOW MUCH IS WASTE?
+SELECT * FROM pgstattuple('t');       -- exact, but scans the table
+SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname='t';
+
+-- 3. ROWS PER PAGE (the scan-cost number)
+SELECT relpages, reltuples, round(reltuples/NULLIF(relpages,0)) AS per_page
+FROM pg_class WHERE relname = 't';
+
+-- 4. ARE UPDATES CHEAP?
+SELECT n_tup_upd, n_tup_hot_upd,
+       round(100.0*n_tup_hot_upd/NULLIF(n_tup_upd,0),1) AS hot_pct
+FROM pg_stat_user_tables WHERE relname='t';
+
+-- 5. IS PHYSICAL ORDER STILL USEFUL?
+SELECT attname, correlation FROM pg_stats WHERE tablename='t';
+
+-- ── A WORKED READING ────────────────────────────────────────────────────
+--  heap 412 GB | indexes 380 GB | live 210M | dead 680M
+--  per_page 3  | hot_pct 4.2    | correlation(created_at) 0.11
+--
+-- Every number tells part of one story:
+--   dead ≫ live       → vacuum is not keeping up; find the blocker
+--   per_page = 3      → very wide rows; scans are I/O-bound. Candidate
+--                       for vertical partitioning.
+--   hot_pct = 4%      → nearly every update rewrites all indexes. Look
+--                       for an index on a frequently-updated column, and
+--                       lower fillfactor.
+--   indexes ≈ heap    → the index set is probably over-grown; audit it
+--   correlation 0.11  → range scans on created_at are effectively random
+--                       I/O despite the index
+-- Five queries, a complete physical diagnosis, and each finding maps to
+-- a specific fix. This is what "knowing the internals" buys you.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Reasoning about logical schema only</strong>
+        <pre>"The table has 12 columns and
+ 200 million rows."
+"We added an index on
+ updated_at for the admin page."
+"varchar(20) saves space over
+ text."
+→ No prediction possible; the
+  real costs are invisible at
+  this level.</pre></div>
+      <div><strong>✅ Reasoning physically</strong>
+        <pre>"3 rows/page → scans are
+ I/O-bound; split the wide cols."
+"That updated_at index killed
+ HOT updates — hot_pct is 4%."
+"varchar(20) and text are
+ byte-identical; the limit is a
+ constraint, not an optimisation."
+→ Each observation names a fix.</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Ignoring column order on a large table</td><td>Alignment padding wastes gigabytes forever</td><td>Order widest to narrowest at creation time</td></tr>
+      <tr><td>Believing <code>varchar(n)</code> saves space over <code>text</code></td><td>False economy; <code>n</code> becomes a painful constraint later</td><td>Identical storage — use the limit only when it is a real business rule</td></tr>
+      <tr><td>Indexing a frequently-updated column</td><td>Destroys HOT updates; every update rewrites every index</td><td>Check <code>n_tup_hot_upd</code> first; drop the index or accept the cost knowingly</td></tr>
+      <tr><td>Leaving <code>fillfactor</code> at 100 on an update-heavy table</td><td>New versions cannot fit on the page, so no HOT updates</td><td><code>fillfactor = 70–90</code>, then repack to apply it</td></tr>
+      <tr><td>Storing a <code>ctid</code> as an identifier</td><td>It changes on update and on <code>VACUUM FULL</code></td><td>It is a physical address; use the primary key</td></tr>
+      <tr><td><code>SELECT *</code> on a table with toasted columns</td><td>A separate fetch and decompression per row</td><td>Select the columns you need; large columns are cheap if unread</td></tr>
+      <tr><td>Expecting <code>VACUUM</code> to shrink the file</td><td>Disk stays full; confusion about whether vacuum worked</td><td>Vacuum makes space reusable; <code>pg_repack</code> returns it to the OS</td></tr>
+      <tr><td>Relying on row order without <code>ORDER BY</code></td><td>A heap has no order; results change after any vacuum or update</td><td>Always state the order you need</td></tr>
+      <tr><td>Assuming narrow tables are always efficient</td><td>24 bytes of header can dwarf 8 bytes of data</td><td>Very narrow tables carry large proportional overhead</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What is a slotted page and why do databases use one?</summary>
+      <p>A slotted page has three regions: a header, an array of slot pointers that grows downward from the
+         header, and the tuple data itself which grows upward from the end of the page. Free space is
+         whatever remains in the middle, and the page is full when the two regions meet. Each slot entry
+         records where its tuple currently starts and how long it is.</p>
+      <p>The reason for the indirection is that it lets a tuple move within its page without breaking
+         anything that references it. Indexes point at a page number and a slot number rather than a byte
+         offset, so when the page is compacted to reclaim space from dead tuples, the engine slides the live
+         tuples together and rewrites the offsets in the slot array. No index entry changes. Without that
+         indirection, compacting a page would mean finding and updating every index entry that pointed into
+         it, which is not feasible.</p>
+      <p>It also handles variable-length rows naturally, since the slot carries the length, and it makes free
+         space easy to compute from two header fields. Essentially every disk-based database uses this
+         layout, which is a good sign that the trade-off is the right one.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> Does <code>varchar(50)</code> use less space than <code>text</code>?</summary>
+      <p>No. In PostgreSQL they are stored identically. Both are variable-length types consisting of a length
+         header — one byte for values under 127 bytes, otherwise four — followed by the actual bytes. A
+         fifty-character string occupies the same space in either column, and the <code>varchar</code> limit
+         is enforced as a constraint at write time rather than affecting the layout.</p>
+      <p>The practical implication is that choosing <code>varchar(n)</code> for space reasons is a false
+         economy, and it has a real cost: the limit is a schema decision that becomes painful when
+         requirements change, and widening it on a large table historically required a rewrite. I would use
+         <code>text</code> by default, and add a length limit only when it expresses a genuine business rule
+         — and often a <code>CHECK</code> constraint communicates that intent more clearly.</p>
+      <p>What genuinely does affect space is column ordering, because of alignment padding, and whether large
+         values get pushed out of line into TOAST. Those are worth attention on big tables; the
+         <code>varchar</code> versus <code>text</code> question is not.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What is a HOT update and how do you make them more likely?</summary>
+      <p>In an MVCC engine an update does not modify the row in place — it writes a new tuple at a new
+         physical location and marks the old one dead. Because indexes point at physical locations, the new
+         tuple normally requires a new entry in every index on the table. On a table with six indexes, one
+         update writes seven things.</p>
+      <p>A Heap-Only Tuple update avoids all of that. If no indexed column changed and the new version fits
+         on the same page, PostgreSQL links the old tuple to the new one with a pointer and updates no index
+         at all. Index entries still reference the original slot, and the engine follows the chain to reach
+         the current version. One dirtied page instead of seven, which is a very large difference on a
+         write-heavy table.</p>
+      <p>Two conditions must hold, so there are two levers. First, avoid indexing columns that change often —
+         an index on <code>updated_at</code> or <code>last_seen</code> disqualifies effectively every update,
+         and that single index can be the difference between a healthy table and a bloating one. Second,
+         ensure the new version has room on the page by lowering <code>fillfactor</code> below its default of
+         100, typically to seventy or eighty for update-heavy tables, remembering that it only applies to
+         newly written pages so an existing table needs repacking.</p>
+      <p>I would measure rather than guess: <code>pg_stat_user_tables</code> exposes
+         <code>n_tup_hot_upd</code> against <code>n_tup_upd</code>, and a low ratio on a busy table is a
+         concrete, fixable problem that usually points straight at one offending index.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Explain TOAST and its performance implications.</summary>
+      <p>A tuple cannot span pages, so PostgreSQL needs a strategy for values larger than a page can hold.
+         Once a row exceeds roughly two kilobytes, TOAST first tries compressing its variable-length
+         attributes, and if the row is still too large it moves the biggest values into a separate side table
+         in chunks, leaving an eighteen-byte pointer in the main tuple.</p>
+      <p>The consequence people find surprising is that this is mostly good news. Because the large value
+         lives elsewhere, the main table's rows stay narrow, so scans and queries that do not touch the big
+         column are fast. A table with a two-megabyte JSON column per row can still have an efficiently
+         scannable main heap. Large columns are much cheaper than people assume — as long as you do not read
+         them.</p>
+      <p>The cost arrives precisely when you do. Selecting a toasted column means an extra lookup into the
+         TOAST table and reading several chunk rows, plus decompression, and that happens per row returned.
+         So <code>SELECT *</code> on such a table is dramatically more expensive than selecting the columns
+         you actually need, far beyond the extra bytes on the wire. Storage strategy can be tuned per column:
+         <code>EXTERNAL</code> skips compression, which is better when you frequently read only a prefix or
+         substring, since a compressed value must be decompressed in full.</p>
+      <p>It is also worth knowing that <code>pg_relation_size</code> excludes the TOAST table, so a table that
+         reports 240MB can really occupy fourteen gigabytes. Use <code>pg_total_relation_size</code> when
+         reasoning about actual storage.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> Contrast PostgreSQL's heap with InnoDB's clustered index. What follows from the difference?</summary>
+      <p>PostgreSQL stores rows in an unordered heap: a new row goes wherever there is free space, and every
+         index — including the primary key's — is a separate structure holding pointers to physical
+         locations. InnoDB clusters the table by its primary key, meaning the table <em>is</em> the primary
+         key's B+tree with full rows in the leaf pages, and every secondary index stores the primary key
+         value as its row reference rather than a physical address.</p>
+      <p>Several consequences follow directly. In InnoDB a primary-key lookup is a single tree descent that
+         arrives at the row itself, and rows with adjacent keys are physically adjacent, so range scans on
+         the primary key are excellent. But a secondary-index lookup needs a second descent through the
+         clustered index to fetch the row, and every secondary index carries a full copy of the primary key,
+         so a wide primary key inflates all of them. That is why "keep the primary key narrow" is much
+         stronger advice in MySQL, and why a random UUID primary key is more damaging there — it scatters
+         inserts across the table itself, not merely an index.</p>
+      <p>In PostgreSQL, rows can be located anywhere, so all indexes are symmetric and none is privileged.
+         The price is paid on update: because index entries hold physical addresses, moving a row means
+         updating every index, which is what the HOT optimisation exists to avoid. PostgreSQL also keeps old
+         row versions in the table itself, so update-heavy tables bloat and depend on vacuum, whereas InnoDB
+         keeps old versions in an undo log and instead suffers growing undo chains that slow reads during
+         long transactions.</p>
+      <p>In practice this changes design decisions. On InnoDB I would care intensely about primary-key width
+         and monotonicity, and be aware of the secondary-index double lookup, which makes covering indexes
+         valuable. On PostgreSQL I would care about index count on update-heavy tables, about not indexing
+         volatile columns, about fillfactor, and about vacuum health. Same schema, different things to watch
+         — and both are coherent designs rather than one being better.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A table is 400GB with 90GB of live data and queries have gradually slowed. Diagnose it physically.</summary>
+      <p>A four-fold gap between physical size and live data is bloat, and the gradual decay tells me it
+         accumulated rather than happened. I would confirm with <code>pgstattuple</code> or
+         <code>pg_stat_user_tables</code> to get the dead-tuple count and the last successful autovacuum, and
+         check the cache hit rate, which has almost certainly collapsed because the inflated table no longer
+         fits in the buffer pool. That explains the symptom directly: the same query is fast when cached and
+         slow when not.</p>
+      <p>Then I would find why space is not being reclaimed, because vacuum failing is the root cause rather
+         than the bloat itself. Vacuum cannot remove any row version potentially visible to the oldest
+         running transaction, so I would look for a long-lived or abandoned transaction in
+         <code>pg_stat_activity</code>, an inactive replication slot holding back the horizon, or an orphaned
+         prepared transaction. Any one of those freezes cleanup database-wide, not just on the affected
+         table. If none is present, the cause is more likely autovacuum tuned too conservatively for a table
+         of this size, since the default scale factor of twenty percent means a huge table accumulates an
+         enormous number of dead tuples before vacuum even triggers.</p>
+      <p>Alongside that I would check the physical shape: rows per page from <code>pg_class</code> to see
+         whether the table is also unnecessarily wide, the HOT update ratio to see whether every update is
+         rewriting all indexes, and the total index size, since indexes bloat too and a bloated index is
+         often the larger share of the waste.</p>
+      <p>For remediation, plain <code>VACUUM</code> makes space reusable but does not return it to the
+         operating system, so the working set stays too large. <code>VACUUM FULL</code> would fix it but
+         takes an exclusive lock and rewrites the whole table, which is an outage at this size, so
+         <code>pg_repack</code> is the practical choice because it does the same job online. Then I would fix
+         the cause: remove the blocker, tune autovacuum for this table specifically, and lower fillfactor if
+         the HOT ratio is poor.</p>
+      <p>Finally I would add alerting on leading indicators — oldest transaction age, dead tuple ratio,
+         replication slot lag and cache hit rate — because every one of those would have surfaced this in
+         the first week rather than after three months of decay.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Inspect a real page and account for every byte.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE TABLE demo (id bigint, name text, created_at timestamptz);
+INSERT INTO demo SELECT g, 'user' || g, now()
+FROM generate_series(1, 100) g;
+
+-- ── THE PAGE HEADER ─────────────────────────────────────────────────────
+SELECT lsn, checksum, lower, upper, special, pagesize
+FROM page_header(get_raw_page('demo', 0));
+--  lower | upper | special | pagesize
+--    424 |  4696 |    8192 |     8192
+
+-- ACCOUNT FOR IT:
+--   header                     24 bytes
+--   line pointers   424 - 24 = 400 bytes → 400/4 = 100 tuples ✓
+--   free space     4696 - 424 = 4272 bytes
+--   tuple data     8192 - 4696 = 3496 bytes → 3496/100 ≈ 35 bytes each
+-- Total: 24 + 400 + 4272 + 3496 = 8192 ✓ every byte accounted for.
+
+-- ── THE TUPLES ──────────────────────────────────────────────────────────
+SELECT lp, lp_off, lp_len, t_xmin, t_xmax, t_ctid
+FROM heap_page_items(get_raw_page('demo', 0)) LIMIT 3;
+--  lp | lp_off | lp_len | t_xmin | t_xmax | t_ctid
+--   1 |   8152 |     40 |    889 |      0 | (0,1)
+--   2 |   8112 |     40 |    889 |      0 | (0,2)
+-- t_xmin identical → all inserted by one transaction.
+-- t_xmax = 0       → all live.
+-- t_ctid points at itself → no newer version exists.
+
+-- ── WATCH AN UPDATE ─────────────────────────────────────────────────────
+UPDATE demo SET name = 'changed' WHERE id = 1;
+SELECT lp, lp_len, t_xmin, t_xmax, t_ctid
+FROM heap_page_items(get_raw_page('demo', 0))
+WHERE lp IN (1, 101);
+--  lp  | lp_len | t_xmin | t_xmax | t_ctid
+--    1 |     40 |    889 |    890 | (0,101)   ← old: xmax set, points on
+--  101 |     43 |    890 |      0 | (0,101)   ← new version, same page
+--
+-- ✓ The old tuple is NOT erased — it is marked dead and CHAINED to its
+--   successor. That chain is both MVCC (lesson 7) and, here, a HOT
+--   update: same page, no indexed column changed, so no index touched.
+
+-- ── PROVE THE SPACE IS NOT RETURNED ─────────────────────────────────────
+DELETE FROM demo WHERE id &lt;= 50;
+SELECT count(*) FROM heap_page_items(get_raw_page('demo',0))
+WHERE t_xmax &lt;&gt; 0;                       -- 51 dead tuples, still present
+VACUUM demo;
+SELECT lower, upper FROM page_header(get_raw_page('demo', 0));
+-- upper has risen: space reclaimed WITHIN the page and recorded in the
+-- FSM. The FILE is still the same size — that is vacuum's contract.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Measure alignment padding and reclaim it.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE bad  (a smallint, b bigint, c smallint, d bigint, e boolean);
+CREATE TABLE good (b bigint, d bigint, a smallint, c smallint, e boolean);
+
+INSERT INTO bad  SELECT 1,1,1,1,true FROM generate_series(1,1000000);
+INSERT INTO good SELECT 1,1,1,1,true FROM generate_series(1,1000000);
+VACUUM ANALYZE bad, good;
+
+SELECT 'bad'  AS t, pg_size_pretty(pg_relation_size('bad')),
+       (SELECT relpages FROM pg_class WHERE relname='bad')
+UNION ALL
+SELECT 'good', pg_size_pretty(pg_relation_size('good')),
+       (SELECT relpages FROM pg_class WHERE relname='good');
+--  bad  | 65 MB | 8334
+--  good | 50 MB | 6370       ← 23% smaller, identical data
+
+-- ── WHERE THE BYTES WENT ────────────────────────────────────────────────
+-- bad:  a(2) +pad(6) + b(8) + c(2) +pad(6) + d(8) + e(1) +pad(7) = 40
+-- good: b(8) + d(8) + a(2) + c(2) + e(1) +pad(3)               = 24
+-- 16 bytes of pure padding per row, plus the 24-byte tuple header.
+
+-- ── THE RULE ────────────────────────────────────────────────────────────
+-- Order columns WIDEST FIRST:
+--   bigint/timestamptz/double (8) → int/float4/date (4)
+--   → smallint (2) → bool/char (1) → variable-length last
+SELECT a.attname, t.typname, t.typalign, t.typlen
+FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid
+WHERE a.attrelid='bad'::regclass AND a.attnum>0 ORDER BY a.attnum;
+-- typalign: c=1 byte, s=2, i=4, d=8 — the alignment each type demands.
+
+-- ── IS IT WORTH IT? ─────────────────────────────────────────────────────
+-- 1M rows:    15 MB saved. Irrelevant.
+-- 500M rows:   8 GB saved — of disk, of BUFFER POOL, of every backup,
+--              and of replication bandwidth, permanently.
+-- ⚠ Reordering an existing table requires a rewrite, so this is a
+--   design-time decision. It costs nothing then and cannot be had
+--   cheaply later — the same shape as most storage decisions.
+
+-- ── AND THE HONEST CAVEAT ───────────────────────────────────────────────
+-- Column order is also documentation. On a 20-column table nobody will
+-- thank you for interleaving unrelated fields to save 4 bytes. Optimise
+-- the huge tables; leave the rest readable.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Prove that an index on a volatile column destroys HOT updates.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE sessions (
+    id bigint PRIMARY KEY,
+    user_id bigint NOT NULL,
+    data text,
+    last_seen timestamptz NOT NULL DEFAULT now());
+INSERT INTO sessions SELECT g, g%10000, repeat('x',100), now()
+FROM generate_series(1,500000) g;
+CREATE INDEX ON sessions (user_id);
+VACUUM ANALYZE sessions;
+
+-- ── BASELINE: update a NON-indexed column ───────────────────────────────
+SELECT pg_stat_reset_single_table_counters('sessions'::regclass);
+UPDATE sessions SET last_seen = now() WHERE id &lt;= 100000;
+SELECT n_tup_upd, n_tup_hot_upd,
+       round(100.0*n_tup_hot_upd/n_tup_upd,1) AS hot_pct
+FROM pg_stat_user_tables WHERE relname='sessions';
+--  100000 | 98412 | 98.4     ← almost all HOT ✓
+SELECT pg_size_pretty(pg_total_relation_size('sessions'));  -- 78 MB
+
+-- ── NOW ADD THE "HARMLESS" INDEX THE ADMIN PAGE WANTED ──────────────────
+CREATE INDEX ON sessions (last_seen);
+VACUUM FULL sessions;
+SELECT pg_stat_reset_single_table_counters('sessions'::regclass);
+UPDATE sessions SET last_seen = now() WHERE id &lt;= 100000;
+SELECT n_tup_upd, n_tup_hot_upd,
+       round(100.0*n_tup_hot_upd/n_tup_upd,1) AS hot_pct
+FROM pg_stat_user_tables WHERE relname='sessions';
+--  100000 | 0 | 0.0          ← ZERO. Every update now rewrites indexes.
+SELECT pg_size_pretty(pg_total_relation_size('sessions'));  -- 121 MB
+
+-- ── WHAT CHANGED ────────────────────────────────────────────────────────
+-- last_seen is now indexed, so condition 1 for HOT fails on EVERY
+-- update. Each update writes a new heap tuple AND inserts into both
+-- indexes. Write volume roughly tripled, bloat accelerated, and vacuum
+-- now has three structures to clean instead of one.
+-- ⚠ Nothing about the UPDATE statement changed. A CREATE INDEX on
+--   another day, for an unrelated feature, silently tripled the write
+--   cost of the hottest table in the system.
+
+-- ── FIX 1: DO NOT INDEX IT ──────────────────────────────────────────────
+DROP INDEX sessions_last_seen_idx;
+-- Ask what the index was for. "Find sessions idle over 30 minutes" runs
+-- once a minute over a small table — a Seq Scan is fine. Serve the
+-- reaper with a PARTIAL index on a stable column instead, or accept the
+-- scan.
+
+-- ── FIX 2: LEAVE ROOM FOR THE NEW VERSION ───────────────────────────────
+ALTER TABLE sessions SET (fillfactor = 70);
+VACUUM FULL sessions;              -- fillfactor applies to NEW pages
+-- Helps condition 2 (does the new version fit on this page?). With a
+-- volatile column indexed, condition 1 still fails — so fillfactor
+-- helps the ordinary case, not this one. Both conditions must hold.
+
+-- ── THE MONITORING QUERY WORTH KEEPING ──────────────────────────────────
+SELECT relname, n_tup_upd, n_tup_hot_upd,
+       round(100.0*n_tup_hot_upd/NULLIF(n_tup_upd,0),1) AS hot_pct
+FROM pg_stat_user_tables
+WHERE n_tup_upd > 100000 AND
+      100.0*n_tup_hot_upd/NULLIF(n_tup_upd,0) &lt; 50
+ORDER BY n_tup_upd DESC;
+-- Update-heavy tables with poor HOT ratios, ranked. Each row is usually
+-- one index away from being fixed.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Quantify the TOAST cliff and design around it.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE docs (
+    id bigint PRIMARY KEY,
+    title text NOT NULL,
+    status text NOT NULL,
+    body text);                       -- ~40KB per document
+INSERT INTO docs SELECT g, 'Doc '||g, 'published', repeat('lorem ipsum ', 3500)
+FROM generate_series(1, 50000) g;
+VACUUM ANALYZE docs;
+
+-- ── WHERE THE DATA ACTUALLY LIVES ───────────────────────────────────────
+SELECT pg_size_pretty(pg_relation_size('docs'))       AS main_heap,
+       pg_size_pretty(pg_total_relation_size('docs')) AS everything,
+       (SELECT reltoastrelid::regclass FROM pg_class
+        WHERE relname='docs')                         AS toast_table;
+--  main_heap | everything | toast_table
+--  3512 kB   | 728 MB     | pg_toast.pg_toast_16412
+-- The visible table is 0.5% of the real storage.
+
+-- ── THE CLIFF ───────────────────────────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT id, title, status FROM docs;
+-- Seq Scan  Buffers: shared hit=439      Time: 21 ms   ✓
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM docs;
+-- Seq Scan  Buffers: shared hit=439 ...  Time: 4,180 ms ✗ 200× slower
+-- Same rows, same scan of the main heap. The difference is 50,000
+-- separate TOAST fetches plus decompression — and BUFFERS on the main
+-- relation does not even show them, which is why this surprises people.
+
+-- ── THE GOOD NEWS ───────────────────────────────────────────────────────
+-- A 40KB column per row costs NOTHING for queries that do not read it.
+-- The main heap stayed at 3.5MB and scans in 21ms. Large columns are far
+-- cheaper than feared — the cost is entirely in SELECT *.
+
+-- ── WHEN TOAST DOES NOT SAVE YOU ────────────────────────────────────────
+ALTER TABLE docs ADD COLUMN summary text;      -- ~600 bytes each
+UPDATE docs SET summary = repeat('s', 600);
+VACUUM FULL docs;
+SELECT relpages, round(reltuples/relpages) AS rows_per_page
+FROM pg_class WHERE relname='docs';
+--  before: 439 pages, 114 rows/page
+--  after: 3891 pages,  13 rows/page       ← 9× more I/O on every scan
+-- ⚠ 600 bytes is TOO SMALL to be toasted (the row stays under 2KB) and
+--   BIG ENOUGH to wreck rows-per-page. This middle band — a few hundred
+--   bytes to 2KB — is where wide columns do real damage, and TOAST does
+--   not help at all.
+
+-- ── THE FIX: VERTICAL PARTITIONING ──────────────────────────────────────
+CREATE TABLE doc_content (
+    doc_id bigint PRIMARY KEY REFERENCES docs(id) ON DELETE CASCADE,
+    summary text, body text);
+-- docs keeps only what listings and filters need; content joins on
+-- demand. The hot table goes back to ~114 rows/page and every list
+-- query, count and filter reads a fraction of the I/O.
+
+-- ── TUNING KNOBS IF SPLITTING IS NOT WORTH IT ───────────────────────────
+ALTER TABLE docs ALTER COLUMN body SET STORAGE EXTERNAL;  -- no compression
+--   ✓ better when you read prefixes/substrings — a compressed value must
+--     be decompressed WHOLE even to read 100 characters
+--   ✗ more disk
+ALTER TABLE docs SET (toast_tuple_target = 2048);   -- toast sooner
+-- ⚠ Always use pg_total_relation_size when reasoning about real storage.
+--   pg_relation_size excludes TOAST and will mislead you by 100×.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Diagnose a 400GB table from physical statistics alone.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- Given only these numbers, produce a complete diagnosis and plan.
+--   heap 412 GB · indexes 380 GB · live 210M · dead 680M
+--   rows/page 3 · hot_pct 4.2 · correlation(created_at) 0.11
+--   cache hit 71% · last_autovacuum 3 months ago
+
+-- ── FINDING 1: VACUUM HAS STOPPED (the root cause) ──────────────────────
+-- 680M dead vs 210M live = 76% waste, and autovacuum last ran 3 months
+-- ago. Everything else is downstream of this.
+SELECT pid, now()-xact_start AS age, state, left(query,50)
+FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start;
+SELECT slot_name, active, restart_lsn FROM pg_replication_slots;
+SELECT gid, prepared FROM pg_prepared_xacts;
+-- Exactly three things freeze the horizon: a long-running transaction,
+-- an inactive replication slot, or an orphaned prepared transaction.
+-- Vacuum cannot reclaim ANY version newer than the oldest of them —
+-- database-wide, not just here.
+
+-- ── FINDING 2: THE CACHE COLLAPSED BECAUSE OF FINDING 1 ─────────────────
+-- 71% hit rate means ~29% of reads go to disk. The live data is ~90GB
+-- and would fit in RAM; 412GB does not. The bloat, not the data, blew
+-- the working set. This is why it decayed GRADUALLY.
+
+-- ── FINDING 3: EVERY UPDATE REWRITES EVERY INDEX ────────────────────────
+-- hot_pct 4.2% → 96% of updates are non-HOT.
+SELECT indexrelid::regclass, idx_scan, pg_size_pretty(
+       pg_relation_size(indexrelid)) FROM pg_stat_user_indexes
+WHERE relname='orders' ORDER BY pg_relation_size(indexrelid) DESC;
+-- Look for an index on a volatile column (updated_at, status,
+-- last_seen). That one index is likely responsible, and it is also
+-- FEEDING finding 1 by generating dead tuples far faster than normal.
+
+-- ── FINDING 4: THE ROWS ARE TOO WIDE ────────────────────────────────────
+-- 3 rows/page → ~2.7KB per row. Every scan is I/O-bound by construction.
+-- Candidate for vertical partitioning (exercise 4).
+
+-- ── FINDING 5: INDEXES ≈ HEAP SIZE ──────────────────────────────────────
+-- 380GB of indexes is suspicious on an OLTP table. Some is bloat (they
+-- bloat too), some is probably an over-grown index set. Audit after
+-- repacking, when the sizes are honest again.
+
+-- ── FINDING 6: PHYSICAL ORDER IS GONE ───────────────────────────────────
+-- correlation 0.11 on created_at → range scans that "use the index" are
+-- scattered random I/O. Partly a symptom of bloat; re-measure after.
+
+-- ── THE PLAN, IN ORDER, WITH REASONS ────────────────────────────────────
+-- 1. REMOVE THE BLOCKER. Nothing else works until vacuum can run.
+SELECT pg_terminate_backend(:pid);   -- or drop the dead slot
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';
+-- 2. VACUUM to stop the growth (does NOT shrink the file).
+VACUUM (VERBOSE, ANALYZE) orders;
+-- 3. RECLAIM 320GB. VACUUM FULL needs an ACCESS EXCLUSIVE lock — an
+--    outage at this size. Use pg_repack: same result, online.
+pg_repack -t orders --no-superuser-check
+-- 4. FIX THE HOT RATIO. Drop or reconsider the volatile-column index;
+ALTER TABLE orders SET (fillfactor = 85);   -- then repack to apply
+-- 5. TUNE AUTOVACUUM FOR THE SIZE. The 20% default means 42M dead rows
+--    before it even triggers.
+ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.01,
+                        autovacuum_vacuum_cost_limit = 2000);
+-- 6. RE-MEASURE, THEN audit indexes and consider splitting wide columns.
+
+-- ── EXPECTED OUTCOME ────────────────────────────────────────────────────
+-- 412GB → ~95GB. Working set fits RAM again; hit rate 71% → 99%.
+-- Most query times return to normal WITHOUT touching a single query —
+-- because none of this was ever a query problem.
+
+-- ── AND THE REAL DELIVERABLE ────────────────────────────────────────────
+-- Alerts on the leading indicators: oldest transaction age, dead-tuple
+-- ratio, slot lag, cache hit rate, HOT ratio. Every one would have
+-- caught this in week one. The fix is easy; noticing was the hard part,
+-- and that is what monitoring is for.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design the physical layout of a high-volume events table.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- REQUIREMENT: 200M events/month. Queries: "events for device X in the
+-- last 24h" and hourly aggregates. 90-day retention. Minimise storage
+-- and scan cost.
+
+-- ── ✗ THE NAIVE VERSION ─────────────────────────────────────────────────
+CREATE TABLE events (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    device_id uuid NOT NULL,
+    is_error boolean,
+    event_type text,
+    recorded_at timestamptz,
+    value double precision,
+    seq integer,
+    metadata jsonb);
+-- Five separate physical mistakes, none visible in the logical schema.
+
+-- ── ✓ DESIGNED FOR THE PHYSICAL LAYER ───────────────────────────────────
+CREATE TABLE events (
+    recorded_at timestamptz NOT NULL,   -- 8  ┐
+    device_id   bigint      NOT NULL,   -- 8  │ widest first:
+    value       double precision,       -- 8  │ zero padding
+    id          bigint GENERATED ALWAYS AS IDENTITY,  -- 8 ┘
+    seq         integer,                -- 4
+    event_type  smallint    NOT NULL,   -- 2   ← enum, not text
+    is_error    boolean     NOT NULL,   -- 1
+                                        -- 1 byte trailing pad
+    metadata    jsonb,                  -- varlena, last
+    PRIMARY KEY (recorded_at, id)
+) PARTITION BY RANGE (recorded_at);
+CREATE INDEX ON events (device_id, recorded_at DESC);
+
+-- ── DECISION 1: uuid → bigint KEYS ──────────────────────────────────────
+-- uuid is 16 bytes and RANDOM. As a PK it scatters inserts across the
+-- whole B-tree, so every insert dirties a different page and the working
+-- set balloons. bigint is 8 bytes and sequential — inserts append to one
+-- hot page that stays cached.
+-- Saving: 8 bytes × 2 columns × 600M rows = 9.6 GB, plus far better
+-- insert locality. If UUIDs are required externally, use UUIDv7
+-- (time-ordered) or keep a separate public_id.
+
+-- ── DECISION 2: text → smallint FOR event_type ──────────────────────────
+-- 'temperature_reading' is 20 bytes per row = 12 GB at 600M rows.
+CREATE TABLE event_types (id smallint PRIMARY KEY, name text NOT NULL);
+-- 2 bytes per row = 1.2 GB. Saves ~11 GB and makes typos impossible.
+-- (An enum type is the alternative; a lookup table is easier to extend.)
+
+-- ── DECISION 3: COLUMN ORDER ────────────────────────────────────────────
+-- The naive version pays ~14 bytes of padding per row = 8.4 GB of
+-- nothing. Widest-first removes essentially all of it.
+
+-- ── DECISION 4: PARTITION BY MONTH ──────────────────────────────────────
+CREATE TABLE events_2026_08 PARTITION OF events
+    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+-- • retention becomes DETACH + DROP (milliseconds) instead of a
+--   200M-row DELETE that would generate 200M dead tuples and a vacuum
+--   crisis. On a 90-day-retention table this is the single most
+--   important decision.
+-- • the 24h query prunes to one partition
+-- • per-partition indexes are shallower and the hot one stays cached
+-- ⚠ The partition key MUST be in the primary key — hence
+--   (recorded_at, id) rather than id alone.
+
+-- ── DECISION 5: fillfactor = 100 ────────────────────────────────────────
+ALTER TABLE events SET (fillfactor = 100);
+-- Append-only data is never updated, so leaving free space would waste
+-- it. The opposite of the sessions-table advice, for the opposite
+-- reason — the knob follows the workload, not a rule.
+
+-- ── THE ARITHMETIC ──────────────────────────────────────────────────────
+--   naive: ~145 bytes/row → 600M rows ≈ 87 GB + indexes
+--   tuned: ~ 64 bytes/row → 600M rows ≈ 38 GB + indexes
+-- 56% smaller for identical information. And because rows/page roughly
+-- doubles, every scan reads half the pages — the storage saving and the
+-- speed-up are the same fact.
+
+-- ── WHAT I DELIBERATELY DID NOT DO ──────────────────────────────────────
+-- • No index on is_error: low cardinality, and it is always queried with
+--   device_id anyway. A partial index if error-only queries appear.
+-- • No index on event_type: same reasoning.
+-- • metadata stays jsonb rather than being normalised — genuinely sparse
+--   and variable, and TOAST keeps it out of the main heap. Add a GIN
+--   index only if it is actually filtered on.
+-- ⚠ Every index on a 200M-rows-per-month table is a permanent tax on
+--   ingest. Add them when a query proves it needs one, not in advance.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>The slotted-page layout — header, downward-growing slot array, upward-growing tuple data — lets rows move within a page without touching a single index entry.</li>
+        <li>Every tuple carries about 24 bytes of header, so very narrow tables have large proportional overhead.</li>
+        <li>Alignment padding is real storage: ordering columns widest-to-narrowest can shrink a large table by 20–40% with no other change.</li>
+        <li><code>varchar(n)</code> and <code>text</code> are stored identically — the limit is a constraint, never an optimisation.</li>
+        <li>A <code>ctid</code> is a physical address that changes on update and on <code>VACUUM FULL</code>; never store it as an identity.</li>
+        <li>Because index entries hold physical addresses, a normal update rewrites every index — HOT updates avoid that entirely when no indexed column changed and the new version fits on the page.</li>
+        <li>Indexing a volatile column such as <code>updated_at</code> silently disqualifies every update from HOT; measure <code>n_tup_hot_upd</code> before adding one.</li>
+        <li><code>VACUUM</code> makes space reusable and updates the free space map; only <code>VACUUM FULL</code> or <code>pg_repack</code> returns space to the operating system.</li>
+        <li>TOAST keeps large values out of the main heap, so big columns are cheap until you <code>SELECT *</code> — but values of a few hundred bytes are too small to toast and still destroy rows-per-page.</li>
+        <li>Five queries — size, dead tuples, rows per page, HOT ratio, correlation — give a complete physical diagnosis, and each finding maps to a specific fix.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="index.html">← How a Database Stores Data</a>
+      <a href="btrees.html">B+Trees In Depth →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
