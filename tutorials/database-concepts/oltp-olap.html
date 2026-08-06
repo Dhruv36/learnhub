@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OLTP vs OLAP &amp; Row vs Columnar — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>OLTP vs OLAP &amp; Row vs Columnar <span class="level-badge level-ultra">Design Perspective</span></h1>
+    <p><strong>What you'll master:</strong> why transactional and analytical workloads want physically
+       opposite storage layouts, and the arithmetic that shows a columnar scan reading fifty times less data
+       for the same query, how columnar compression achieves ten-to-one where row storage manages two-to-one
+       — run-length, dictionary, delta and frame-of-reference encoding explained by what they exploit,
+       vectorised execution and late materialisation as the two engine techniques that make columnar fast
+       beyond just I/O, why columnar stores are bad at point lookups and updates and what that means for
+       your architecture, the practical middle ground of hybrid systems and PostgreSQL columnar extensions,
+       and how to decide where a given workload belongs rather than defaulting to one engine for
+       everything. Prerequisites: <a href="index.html">How a Database Stores Data</a> and
+       <a href="physical-design.html">Physical Schema Design</a>.</p>
+
+    <h2>Part 1 — Two Workloads, Two Physical Requirements</h2>
+    <pre>-- ── OLTP: Online Transaction Processing ─────────────────────────────────
+SELECT * FROM orders WHERE id = 4182;
+UPDATE accounts SET balance = balance - 100 WHERE id = 7;
+INSERT INTO order_items VALUES (...);
+-- shape: touch FEW rows, but ALL columns of them. High concurrency,
+--        millisecond latency, heavy writes, strict transactional
+--        guarantees.
+
+-- ── OLAP: Online Analytical Processing ──────────────────────────────────
+SELECT region, date_trunc('month', created_at), sum(total_cents)
+FROM orders WHERE created_at >= '2026-01-01' GROUP BY 1, 2;
+-- shape: touch MANY rows — often all of them — but FEW columns. Low
+--        concurrency, seconds are acceptable, read-mostly, bulk loads.
+
+-- ── THE CONFLICT, STATED PRECISELY ──────────────────────────────────────
+-- Storage is physically linear. You must choose whether values ADJACENT
+-- on disk are "the other columns of this row" or "the same column of
+-- other rows". You cannot have both.
+--
+-- ROW STORE (N-ary storage model):
+--   [id=1|name=Asha|region=EU|total=500][id=2|name=Ben|region=US|total=300]
+--   ✓ reading one whole row is one page read
+--   ✗ reading one column of a million rows touches every page
+--
+-- COLUMN STORE (decomposition storage model):
+--   ids:     [1][2][3][4]...
+--   names:   [Asha][Ben][Cleo]...
+--   regions: [EU][US][EU]...
+--   totals:  [500][300][900]...
+--   ✓ reading one column reads only that column's pages
+--   ✗ reconstructing one whole row touches every column file
+
+-- ── THE ARITHMETIC THAT DECIDES IT ──────────────────────────────────────
+-- Table: 100M rows × 20 columns, ~400 bytes/row = 40 GB.
+-- Query: sum(total_cents) — ONE 8-byte column.
+--
+--   ROW STORE:    must read all 40 GB (the column is interleaved with
+--                 the other 392 bytes of every row)
+--   COLUMN STORE: reads 100M × 8 bytes = 800 MB, before compression
+--                 → with 10× compression, ~80 MB
+--
+--   40 GB vs 80 MB = 500× less I/O.
+-- ⚠ THIS is the whole argument, and it is not a constant factor to be
+--   engineered away — it is a consequence of physical layout. No amount
+--   of indexing makes a row store read only one column.
+
+-- ── AND THE REVERSE ─────────────────────────────────────────────────────
+SELECT * FROM orders WHERE id = 4182;
+--   ROW STORE:    one index descent, one page read.        ~4 reads
+--   COLUMN STORE: locate the row position, then fetch that position from
+--                 EACH of 20 column files.                ~20+ reads
+-- ✓ Neither layout is better. Each is optimal for the access pattern it
+--   was designed for, and catastrophic for the other.</pre>
+    <table class="tbl">
+      <tr><th></th><th>OLTP (row store)</th><th>OLAP (columnar)</th></tr>
+      <tr><td>Rows per query</td><td>One to a few hundred</td><td>Millions to billions</td></tr>
+      <tr><td>Columns per query</td><td>All of them</td><td>Two to five of many</td></tr>
+      <tr><td>Latency target</td><td>Milliseconds</td><td>Seconds to minutes</td></tr>
+      <tr><td>Concurrency</td><td>Thousands of sessions</td><td>Tens</td></tr>
+      <tr><td>Writes</td><td>Constant single-row</td><td>Bulk loads, append-only</td></tr>
+      <tr><td>Updates/deletes</td><td>Normal and frequent</td><td>Rare, awkward, sometimes unsupported</td></tr>
+      <tr><td>Compression</td><td>2–3×</td><td>10–30×</td></tr>
+      <tr><td>Typical engines</td><td>PostgreSQL, MySQL, Oracle, SQL Server</td><td>ClickHouse, DuckDB, BigQuery, Snowflake, Redshift</td></tr>
+    </table>
+
+    <h2>Part 2 — Why Columnar Compresses So Much Better</h2>
+    <pre>-- Compression is not a secondary benefit — it is often the larger half
+-- of the performance story, because it multiplies the I/O advantage.
+
+-- ── THE REASON: HOMOGENEITY ─────────────────────────────────────────────
+-- A ROW mixes types and value ranges:
+--   [4182 | 'Asha Patel' | 'EU' | 2026-08-06 | 50000 | true | ...]
+--   Bytes with no statistical relationship to their neighbours. General
+--   compressors find little to exploit — 2-3× is typical.
+--
+-- A COLUMN is one type with one distribution:
+--   region:  ['EU','EU','EU','US','US','EU','EU','EU',...]
+--   status:  [1,1,1,1,2,1,1,1,1,1,3,1,...]
+--   ts:      [1754...01, 1754...05, 1754...09, ...]  ← near-constant deltas
+--   Enormously redundant, and the redundancy has STRUCTURE.
+
+-- ── THE FOUR ENCODINGS THAT DO THE WORK ─────────────────────────────────
+-- 1. RUN-LENGTH (RLE) — for sorted or low-cardinality columns
+--    ['EU','EU','EU','EU','US','US'] → [('EU',4),('US',2)]
+--    On a column sorted by region, this approaches the compression of
+--    storing one value per distinct region. Sort order is therefore a
+--    COMPRESSION decision in a columnar store, not just a query one.
+--
+-- 2. DICTIONARY — for repeated strings
+--    ['temperature','temperature','humidity'] → dict{0:'temperature',
+--    1:'humidity'}, data [0,0,1]
+--    20-byte strings become 1-byte codes. ✓ AND predicates evaluate
+--    against the dictionary: `WHERE type='humidity'` becomes a scan for
+--    the integer 1, which is far faster than string comparison.
+--
+-- 3. DELTA / DELTA-OF-DELTA — for sequential numerics and timestamps
+--    [1000, 1005, 1010, 1015] → base 1000, deltas [5,5,5]
+--    Regular-interval timestamps compress to almost nothing. This is why
+--    time-series columnar storage is so effective.
+--
+-- 4. FRAME OF REFERENCE / BIT-PACKING — for bounded ranges
+--    ages 18-95 need 7 bits, not 32. Store the minimum, then pack the
+--    offsets.
+--
+-- ⚠ Real engines choose per column AND per block, then apply a general
+--   compressor (LZ4, ZSTD) on top. That layering is why 10-30× is
+--   routine rather than optimistic.
+
+-- ── COMPRESSION IS A PERFORMANCE FEATURE, NOT A STORAGE ONE ─────────────
+-- 10× compression means 10× fewer bytes read from disk AND 10× more data
+-- fitting in memory. On the 40 GB example:
+--   row store    40 GB → does not fit in a 32 GB cache
+--   columnar     800 MB for the needed column → fits trivially
+-- ✓ The dataset moves from disk-bound to memory-bound, which is a larger
+--   effect than the raw compression ratio suggests.
+
+-- ── LATE MATERIALISATION ────────────────────────────────────────────────
+SELECT name, total FROM orders WHERE region = 'EU' AND total > 1000;
+-- ✗ EARLY: reconstruct every row, then filter. Reads all columns.
+-- ✓ LATE:  scan `region` (compressed, integer-coded) → a bitmap of
+--          matching positions. Scan `total` at those positions only →
+--          narrow the bitmap. ONLY THEN fetch `name` for the survivors.
+-- If the filters select 0.1% of rows, `name` is read for 0.1% of them.
+-- ✓ Combined with dictionary encoding, the filter never touches a string
+--   at all — it compares small integers over packed arrays.</pre>
+    <div class="note">🗜️ <strong>Compression is why columnar wins by more than the column-count ratio
+      suggests.</strong> Reading one column of twenty is a 20× I/O reduction; ten-to-one compression on that
+      column makes it 200×. And because the working set shrinks by the same factor, data that was disk-bound
+      in a row store becomes memory-resident in a columnar one — which changes the performance class, not
+      just the constant. The corollary is that <em>sort order</em> is a compression decision in a columnar
+      store, since run-length encoding depends on it.</div>
+
+    <h2>Part 3 — Vectorised Execution</h2>
+    <pre>-- Layout and compression explain the I/O advantage. Vectorised execution
+-- explains the CPU advantage, and it is roughly as large.
+
+-- ── THE ROW-AT-A-TIME (VOLCANO) MODEL ───────────────────────────────────
+-- From the planner lesson: every node implements next(), and the tree
+-- pulls one row at a time.
+while (row = child.next()) {
+    if (predicate(row)) emit(row);
+}
+-- For one billion rows that is a billion virtual function calls per plan
+-- node. The CPU spends most of its time on call overhead, branch
+-- mispredictions and pointer chasing rather than on the actual
+-- comparison.
+
+-- ── THE VECTORISED MODEL ────────────────────────────────────────────────
+while (batch = child.next_batch()) {      // ~1024 values of ONE column
+    for (i = 0; i < batch.size; i++)      // tight loop over an array
+        selection[i] = batch.values[i] > 1000;
+}
+-- ✓ One call per 1024 values instead of per value.
+-- ✓ The inner loop is over a CONTIGUOUS ARRAY of one type — no pointer
+--   chasing, predictable branches, and the compiler can auto-vectorise
+--   it to SIMD instructions that compare 8-16 values per CPU cycle.
+-- ✓ Data stays in L1/L2 cache for the whole batch.
+-- Measured effect: 10-100× on scan-and-filter work. Not an optimisation
+-- around the edges — a different performance class.
+
+-- ⚠ IT REQUIRES COLUMNAR LAYOUT. You cannot vectorise efficiently over
+--   rows, because the values you want to compare are 400 bytes apart in
+--   memory instead of 8. Layout, compression and execution model are
+--   three aspects of ONE design, which is why hybrid attempts get
+--   complicated.
+
+-- ── HOW ROW STORES CLOSE PART OF THE GAP ────────────────────────────────
+SET jit = on;      -- PostgreSQL: compile expressions to machine code at
+                   -- runtime, removing interpretation overhead
+-- ✓ Real gains on long analytical queries.
+-- ⚠ Compilation costs 10-100ms, which is pure loss on a 2ms OLTP query.
+--   jit_above_cost gates it, and a badly-set threshold is a common cause
+--   of latency regressions after an upgrade.
+-- Postgres also has parallel query (multiple workers per scan), which
+-- multiplies throughput but does not change the per-row cost.
+
+-- ── AND THE OTHER STRUCTURAL ADVANTAGES ─────────────────────────────────
+-- ZONE MAPS / MIN-MAX INDEXES: per block of ~8000 values, store the min
+--   and max. `WHERE total > 5000` skips any block whose max is 4000 —
+--   without an index and without reading the block. On sorted or
+--   naturally-ordered data this eliminates most of the scan.
+--   (This is exactly what BRIN does in Postgres — a columnar idea
+--   retrofitted into a row store.)
+-- NO PER-ROW OVERHEAD: a Postgres tuple carries 24 bytes of MVCC header
+--   (lesson 2). Columnar formats store bare values, so a column of
+--   8-byte integers costs 8 bytes per value, not 32.</pre>
+
+    <h2>Part 4 — What Columnar Is Bad At</h2>
+    <pre>-- The failure modes are as structural as the strengths, and they
+-- determine where columnar belongs in an architecture.
+
+-- ── 1. POINT LOOKUPS ────────────────────────────────────────────────────
+SELECT * FROM orders WHERE id = 4182;
+-- Twenty separate column reads to reconstruct one row, and most columnar
+-- engines have no B-tree to find the position in the first place — they
+-- rely on zone maps and scanning. ClickHouse's answer is a sparse
+-- primary index over the sort key, which narrows to a granule of ~8192
+-- rows rather than to one row.
+-- ⚠ A columnar store as the primary key-value lookup for an application
+--   is the wrong tool, and the difference is orders of magnitude.
+
+-- ── 2. UPDATES AND DELETES ──────────────────────────────────────────────
+UPDATE orders SET status = 'shipped' WHERE id = 4182;
+-- Changing one value means rewriting a compressed block — and the block
+-- holds thousands of values, possibly run-length encoded such that one
+-- change alters the encoding of its neighbours.
+-- Engines handle it by NOT doing it:
+--   • ClickHouse: ALTER TABLE ... UPDATE is a MUTATION — an
+--     asynchronous background rewrite of whole parts. Not transactional,
+--     not immediate.
+--   • Most warehouses: append + a delete bitmap, compacted later.
+--   • Some formats: no updates at all. Rewrite the partition.
+-- ✓ CONSEQUENCE: design columnar tables as APPEND-ONLY with derived
+--   state. If your model needs frequent single-row updates, you have
+--   chosen the wrong storage.
+
+-- ── 3. SINGLE-ROW INSERTS ───────────────────────────────────────────────
+-- Every insert must touch every column file, and compression works on
+-- blocks. One row at a time defeats the entire design.
+-- ✓ Columnar engines want BATCHES — thousands to millions of rows per
+--   insert. ClickHouse explicitly recommends batching and will create a
+--   new "part" per insert otherwise, then spend background I/O merging
+--   them.
+
+-- ── 4. TRANSACTIONS AND CONSTRAINTS ─────────────────────────────────────
+-- Most columnar engines offer no multi-statement ACID transactions, no
+-- foreign keys, and often no unique constraints. ClickHouse has no
+-- transactions; BigQuery and Snowflake have limited support.
+-- ⚠ This is not an oversight. Enforcing a unique constraint requires a
+--   lookup structure, and referential integrity requires cross-table
+--   checks per write — both of which are exactly what the layout is
+--   optimised against.
+
+-- ── 5. HIGH CONCURRENCY ─────────────────────────────────────────────────
+-- Analytical engines are built for tens of concurrent queries each using
+-- many cores, not thousands of concurrent sessions each using a little.
+-- Pointing an application's request path at one is a capacity mistake as
+-- much as a latency one.
+
+-- ── THE HONEST SUMMARY ──────────────────────────────────────────────────
+-- Columnar trades: point lookups, updates, transactions and concurrency
+-- FOR: scan speed, compression and aggregation throughput.
+-- That is a good trade for analytics and a terrible one for an
+-- application backend — which is why almost every mature system runs
+-- both.</pre>
+
+    <h2>Part 5 — The Middle Ground</h2>
+    <pre>-- Most real systems need both, and there are several ways to get there.
+
+-- ── OPTION 1: ROW STORE + PRE-AGGREGATION (start here) ──────────────────
+CREATE MATERIALIZED VIEW revenue_monthly AS
+SELECT date_trunc('month', created_at) AS month, region,
+       sum(total_cents) AS revenue, count(*) AS orders
+FROM orders GROUP BY 1, 2;
+CREATE UNIQUE INDEX ON revenue_monthly (month, region);
+REFRESH MATERIALIZED VIEW CONCURRENTLY revenue_monthly;
+-- ✓ A 500-row summary answers dashboard queries in milliseconds from a
+--   row store. No second system, no ETL, no consistency question.
+-- ⚠ Only works for KNOWN queries. Ad-hoc analytical exploration over raw
+--   data is exactly what it cannot serve.
+-- ✓ THE RULE: this handles far more cases than people expect, and it
+--   should be exhausted before adding an analytical database.
+
+-- ── OPTION 2: COLUMNAR EXTENSIONS INSIDE POSTGRES ───────────────────────
+-- Hydra / Citus columnar: columnar-storage tables in the same database.
+CREATE TABLE events_archive (...) USING columnar;
+-- ✓ same SQL, same transactions on the row tables, same connection
+-- ✓ 5-10× compression and much faster scans on the columnar tables
+-- ✗ columnar tables are append-only (no UPDATE/DELETE)
+-- ✗ no index support on them — zone maps only
+-- ✓ THE SWEET SPOT: hot recent data in normal row tables, older
+--   partitions converted to columnar. One database, and the analytical
+--   queries over history get most of the columnar benefit.
+-- (TimescaleDB does effectively this with its compression feature, which
+--  is columnar storage applied to older chunks.)
+
+-- ── OPTION 3: A SEPARATE ANALYTICAL DATABASE ────────────────────────────
+--   OLTP (Postgres) ──CDC/logical replication──▶ ClickHouse / DuckDB /
+--                                                 BigQuery / Snowflake
+-- ✓ each engine does what it is good at, and they scale independently
+-- ✗ a pipeline to build and operate, plus eventual consistency between
+--   them, plus schema changes now happen in two places
+-- ✓ Justified when: analytical volume genuinely exceeds what
+--   pre-aggregation can serve, or analysts need ad-hoc exploration over
+--   raw history.
+-- ⚠ THE HONEST COST: the pipeline is usually harder to operate than
+--   either database. Budget for it explicitly rather than treating it as
+--   plumbing.
+
+-- ── OPTION 4: EMBEDDED ANALYTICS (DuckDB) ───────────────────────────────
+-- DuckDB is columnar, vectorised, in-process, and queries Parquet
+-- directly:
+--   SELECT region, sum(total) FROM 'exports/*.parquet' GROUP BY region;
+-- ✓ No server, no cluster, no pipeline. Scans hundreds of millions of
+--   rows on a laptop.
+-- ✓ Increasingly the right answer for reporting jobs and data-science
+--   workloads: export Parquet from Postgres on a schedule, query it with
+--   DuckDB. Two moving parts instead of a warehouse.
+
+-- ── OPTION 5: HTAP ──────────────────────────────────────────────────────
+-- SingleStore, TiDB, SAP HANA: maintain BOTH a row store and a column
+-- store, routing queries to the appropriate one.
+-- ✓ genuinely one system with both access patterns
+-- ✗ double the storage, considerable complexity, and the analytical side
+--   is usually not as fast as a dedicated warehouse while the
+--   transactional side is not as mature as Postgres
+-- → A real option, not a default one.</pre>
+
+    <h2>Part 6 — Deciding Where a Workload Belongs</h2>
+    <pre>-- ── THE QUESTIONS, IN ORDER ─────────────────────────────────────────────
+-- 1. HOW MANY ROWS DOES THE QUERY TOUCH?
+--    < 1000  → row store, always. Columnar has nothing to offer.
+--    millions with few columns → columnar territory.
+-- 2. HOW MANY COLUMNS OF HOW MANY?
+--    3 of 50 → the columnar advantage is ~17× before compression.
+--    all 50  → the advantage largely disappears.
+-- 3. WHAT IS THE LATENCY REQUIREMENT?
+--    milliseconds on the request path → row store or pre-aggregation.
+--    seconds in a dashboard or notebook → columnar is fine.
+-- 4. HOW DOES DATA ARRIVE?
+--    single-row inserts and updates → row store.
+--    batches, append-only → columnar is comfortable.
+-- 5. ARE TRANSACTIONS, FKs OR UNIQUENESS REQUIRED?
+--    yes → row store; most columnar engines do not offer them.
+-- 6. IS THE QUERY SET KNOWN OR AD-HOC?
+--    known → pre-aggregate in the row store and stop there.
+--    ad-hoc over raw history → this is the real case for columnar.
+
+-- ── THE ESCALATION LADDER ───────────────────────────────────────────────
+-- 1. Fix the query and add the right index.        (SQL optimisation)
+-- 2. Pre-aggregate: materialised view or summary table maintained on
+--    write. Handles most "the dashboard is slow" cases outright.
+-- 3. Move analytics to a REPLICA — removes the contention even if the
+--    query stays slow, and stops reports evicting the OLTP working set
+--    (buffer pool lesson).
+-- 4. Columnar storage for historical partitions, in the same database.
+-- 5. A separate analytical database with a CDC pipeline.
+-- ⚠ Teams routinely jump from 1 to 5. Steps 2 and 3 are cheap,
+--   reversible, and sufficient more often than the industry's
+--   enthusiasm for warehouses suggests.
+
+-- ── THE ARCHITECTURE THAT USUALLY RESULTS ───────────────────────────────
+--   application ──writes──▶ PostgreSQL (row, OLTP)
+--                              │
+--                              ├─ replica ──▶ operational reporting
+--                              │
+--                              └─ CDC ──▶ columnar warehouse ──▶ BI,
+--                                                                analysts
+-- Each engine serves the access pattern it is physically suited to, and
+-- the coupling between them is explicitly eventually-consistent.
+
+-- ── WHAT TO SAY IN A DESIGN REVIEW ──────────────────────────────────────
+-- "This query reads 3 of 40 columns across 200 million rows. In a row
+--  store that is 60 GB of I/O regardless of indexing, because the
+--  columns are interleaved with the other 37. Columnar reads ~400 MB
+--  compressed. That is a layout problem, not a tuning problem — so the
+--  options are pre-aggregation, columnar storage, or accepting the
+--  latency."
+-- ✓ Naming it as a physical-layout consequence, with the arithmetic,
+--   moves the conversation from preference to evidence.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ One engine for everything</strong>
+        <pre>"Postgres can do analytics too —
+ just add indexes."
+"Let's put the app on ClickHouse,
+ it's faster."
+"We need a warehouse" (for a
+ dashboard with 12 known
+ queries).
+→ Either a slow dashboard or an
+  application that cannot update
+  a row.</pre></div>
+      <div><strong>✅ Matching layout to pattern</strong>
+        <pre>"3 of 40 columns over 200M rows
+ → layout problem, not indexing."
+"12 known queries → materialised
+ view, 2ms, no new system."
+"Ad-hoc over 5 years of history →
+ that is the real case for
+ columnar."</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr>
+      <tr><td>Expecting indexes to fix a wide analytical scan</td><td>An index cannot make a row store read one column of twenty</td><td>Recognise it as a layout problem: pre-aggregate or go columnar</td></tr>
+      <tr><td>Running analytics on the OLTP primary</td><td>Sequential flooding evicts the working set for everyone</td><td>A replica at minimum; ideally a separate system</td></tr>
+      <tr><td>Using a columnar store for point lookups</td><td>Twenty column reads to reconstruct one row, orders of magnitude slower</td><td>Row store for the request path</td></tr>
+      <tr><td>Single-row inserts into a columnar engine</td><td>Defeats block compression; endless background merging</td><td>Batch thousands of rows per insert</td></tr>
+      <tr><td>Frequent updates in a columnar model</td><td>Rewrites whole compressed blocks; often asynchronous and non-transactional</td><td>Design append-only with derived state</td></tr>
+      <tr><td>Building a warehouse for a known dashboard</td><td>A pipeline to operate for something a materialised view answers</td><td>Pre-aggregate first; escalate only with evidence</td></tr>
+      <tr><td>Assuming columnar means "faster"</td><td>Surprise when transactional workloads are far worse</td><td>It trades lookups, updates and concurrency for scan throughput</td></tr>
+      <tr><td>Ignoring sort order in a columnar table</td><td>Run-length encoding cannot work; compression drops several-fold</td><td>Sort order is a compression decision, not only a query one</td></tr>
+      <tr><td>Treating the CDC pipeline as plumbing</td><td>It is usually harder to operate than either database</td><td>Budget for it explicitly when choosing a two-system architecture</td></tr>
+      <tr><td>Expecting transactions or foreign keys in a warehouse</td><td>Data-integrity assumptions silently do not hold</td><td>Enforce integrity upstream in the OLTP system</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What is columnar storage and why is it faster for analytics?</summary>
+      <p>In a row store, all the values of one row are written next to each other on disk, so reading a
+         record is a single contiguous read. In a columnar store, all the values of one column are written
+         together instead, so a table becomes one file per column.</p>
+      <p>Analytical queries typically read a few columns across an enormous number of rows — summing a total
+         grouped by a region, for example. A row store cannot avoid reading everything, because the column
+         you want is interleaved with all the others on every page. If a table is forty gigabytes and the
+         query needs one eight-byte column, the row store still reads forty gigabytes while the columnar
+         store reads eight hundred megabytes. No index changes that, because it is a consequence of physical
+         layout rather than of access method.</p>
+      <p>Compression amplifies it further. A column contains one type with one distribution, so it is highly
+         redundant and compresses ten to thirty times, where a row of mixed types manages two or three. That
+         turns the eight hundred megabytes into perhaps eighty, and often means the working set fits in
+         memory when the row version did not.</p>
+      <p>The trade is symmetric though. Reading one complete row means fetching a value from every column
+         file, so point lookups are much worse, and updating a single value means rewriting a compressed
+         block. That is why columnar suits analytics and row storage suits transactional work.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between OLTP and OLAP?</summary>
+      <p>They describe two workload shapes with opposite requirements. OLTP — online transaction processing —
+         is the application's request path: fetching one order by its identifier, updating a balance,
+         inserting a row. Each query touches very few rows but usually all of their columns, latency is
+         measured in milliseconds, concurrency is high, writes are constant, and transactional guarantees
+         matter.</p>
+      <p>OLAP — online analytical processing — is reporting and analysis: revenue by region by month over two
+         years. Each query touches millions of rows but only a handful of columns, seconds of latency are
+         acceptable, concurrency is low, and data arrives in bulk rather than one row at a time.</p>
+      <p>The reason the distinction matters physically is that storage is linear, so a database must choose
+         whether adjacent bytes are the other columns of the same row or the same column of other rows. Row
+         layout is optimal for OLTP and poor for OLAP; columnar layout is the reverse. You cannot have
+         both in one layout, which is why most mature systems run a transactional database and feed an
+         analytical one from it.</p>
+      <p>The practical caution is that many workloads described as analytical are actually a fixed set of
+         known aggregate queries, and those are served well by pre-aggregating inside the transactional
+         database. The genuine case for a separate analytical system is ad-hoc exploration over large
+         history.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why does columnar data compress so much better, and why does that matter beyond disk space?</summary>
+      <p>Because a column is homogeneous. Every value has the same type and comes from the same distribution,
+         so the data is highly redundant in structured ways that specialised encodings exploit. Run-length
+         encoding collapses repeated values, which is extremely effective on low-cardinality or sorted
+         columns. Dictionary encoding replaces repeated strings with small integer codes. Delta encoding
+         stores differences rather than absolute values, which reduces regularly-spaced timestamps to almost
+         nothing. Bit-packing stores values in the minimum number of bits their range requires. Engines pick
+         per column and per block, then layer a general compressor on top.</p>
+      <p>A row mixes types and ranges, so consecutive bytes have no statistical relationship and a general
+         compressor finds much less to work with — two or three times rather than ten to thirty.</p>
+      <p>It matters beyond storage cost for two reasons. First, compression multiplies the I/O advantage: if
+         a query reads one column of twenty that is a twentyfold reduction, and ten-to-one compression makes
+         it two hundredfold. Second, and more important, the working set shrinks by the same factor, so data
+         that was disk-bound in a row store can become memory-resident in a columnar one. That is a change of
+         performance class rather than a constant factor.</p>
+      <p>There is also a subtler consequence worth knowing: dictionary-encoded columns let predicates be
+         evaluated against integer codes rather than strings, so filtering is faster as well as smaller. And
+         because run-length encoding depends on adjacency, the sort order of a columnar table is a
+         compression decision, not only a query-performance one.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What is vectorised execution and why does it need columnar storage?</summary>
+      <p>Traditional query execution uses the volcano model: every plan node exposes a "next row" call and
+         the tree pulls one row at a time. For a billion rows that is a billion virtual calls per node, and
+         the CPU spends most of its time on call overhead, branch prediction and pointer chasing rather than
+         on the comparison you actually wanted.</p>
+      <p>Vectorised execution processes a batch — typically around a thousand values of a single column — per
+         call. The inner loop then runs over a contiguous array of one type, which means no pointer chasing,
+         highly predictable branches, and code the compiler can turn into SIMD instructions that handle eight
+         or sixteen values per cycle. The batch also stays in L1 or L2 cache throughout. The measured effect
+         on scan-and-filter work is ten to a hundred times, which is a different performance class rather
+         than an incremental gain.</p>
+      <p>It requires columnar layout because the technique depends on the values being adjacent in memory. In
+         a row store, consecutive values of the same column are separated by the width of the whole row, so
+         you cannot fill a vector register usefully and cache lines carry mostly data you are not using.
+         Layout, compression and execution model are really three aspects of one design, which is why
+         retrofitting vectorisation onto a row engine only goes so far.</p>
+      <p>Row stores do close part of the gap. PostgreSQL uses just-in-time compilation to remove
+         interpretation overhead on expressions, which helps long analytical queries — though it adds
+         compilation cost that is pure loss on short transactional ones, and a badly-set threshold is a
+         recognised cause of latency regressions. Parallel query multiplies throughput across workers but
+         does not reduce the per-row cost.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A dashboard on your PostgreSQL primary takes 40 seconds. Walk through the options.</summary>
+      <p>I would first characterise the query rather than reaching for an architecture. How many rows does it
+         touch, how many columns of how many, is the query set fixed or exploratory, and how fresh must the
+         answer be? Those four answers determine which of the available options is appropriate, and they
+         differ enormously in cost.</p>
+      <p>The cheapest possibilities come first. Often a supposedly analytical query is actually a badly
+         planned one — a missing index, a correlated-column estimate error producing a nested loop, or an
+         aggregate computed after a fan-out join rather than before it. Fixing that can be a ten-times win
+         for an afternoon's work, and I would rule it out before concluding anything about storage layout.</p>
+      <p>If the query genuinely scans a large fraction of a large table, no index helps and it becomes a
+         layout question. The next cheapest answer is pre-aggregation: a materialised view refreshed on a
+         schedule, or a summary table maintained incrementally on write. For a dashboard with a fixed set of
+         queries this usually ends the discussion — a few hundred summary rows answer in milliseconds, with
+         no second system and no pipeline. Historical periods are immutable, so recomputing them on every
+         page load was the real error.</p>
+      <p>Independently of speed, I would move the query off the primary to a replica, because a large scan
+         evicts the OLTP working set and degrades everything else. That is worth doing even if the query
+         stays slow.</p>
+      <p>Only if the workload is genuinely ad-hoc exploration over large history would I consider columnar
+         storage. Inside PostgreSQL, a columnar extension or TimescaleDB compression on older partitions
+         gives most of the benefit with one database. Beyond that, a separate analytical engine fed by change
+         data capture — and I would be explicit that the pipeline is usually harder to operate than either
+         database, and that the coupling is eventually consistent.</p>
+      <p>The failure mode I would name in the review is jumping from "the dashboard is slow" to "we need a
+         warehouse", skipping two steps that are cheap, reversible and frequently sufficient.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> When would you introduce a separate analytical database, and what does it cost?</summary>
+      <p>I would introduce one when analytical demand has outgrown what pre-aggregation can serve, and the
+         clearest signal is the query set being genuinely unpredictable. If analysts need to explore raw
+         history along dimensions nobody anticipated, materialised views cannot help, because they only
+         answer questions you knew about. Other legitimate triggers are analytical volume large enough that
+         it interferes with transactional work even on a replica, and retention requirements where keeping
+         years of raw data in the OLTP system is uneconomical compared with compressed columnar storage.</p>
+      <p>The costs are usually understated. The pipeline itself is the largest one: change data capture,
+         schema evolution in two places, backfills, and monitoring for lag and correctness. It is frequently
+         harder to operate than either database, and it needs an owner. Then there is the consistency
+         question — the analytical copy is eventually consistent, so numbers can disagree with the
+         application, and someone will eventually make a decision on stale data unless the lag is visible.
+         Data modelling also diverges, since the analytical schema wants denormalisation and wide fact
+         tables while the transactional one wants normalisation. And there are the ordinary costs of a second
+         system: expertise, on-call, access control, and a second place where personal data lives, which is a
+         compliance question as much as a technical one.</p>
+      <p>Given that, I would sequence it deliberately. Exhaust query tuning, then pre-aggregation, then a
+         read replica for reporting, then columnar storage for historical partitions inside the same
+         database. Each of those is reversible. Before building a pipeline I would also consider the
+         lightweight option: scheduled exports to Parquet queried with DuckDB, which serves a surprising
+         range of reporting and data-science needs with two moving parts rather than a warehouse and a
+         streaming pipeline.</p>
+      <p>When it is justified, I would say so plainly and make sure the pipeline is resourced as a system
+         rather than treated as plumbing — because the common failure is not choosing wrongly, it is choosing
+         correctly and then under-investing in the integration.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure the I/O difference for a narrow aggregate.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── SET UP A WIDE TABLE ─────────────────────────────────────────────────
+CREATE TABLE orders_wide (
+    id bigint, tenant_id int, total_cents bigint, created_at timestamptz,
+    c1 text, c2 text, c3 text, c4 text, c5 text,
+    c6 text, c7 text, c8 text, notes text);
+INSERT INTO orders_wide
+SELECT g, (random()*1000)::int, (random()*100000)::bigint, now(),
+       repeat('x',40), repeat('y',40), repeat('z',40), repeat('a',40),
+       repeat('b',40), repeat('c',40), repeat('d',40), repeat('e',40),
+       repeat('n',60)
+FROM generate_series(1,3000000) g;
+VACUUM ANALYZE orders_wide;
+
+SELECT pg_size_pretty(pg_relation_size('orders_wide')),
+       relpages, round(reltuples/relpages) AS rows_per_page
+FROM pg_class WHERE relname='orders_wide';
+--  1284 MB | 164,384 pages | 18 rows/page
+
+-- ── THE ANALYTICAL QUERY: ONE COLUMN OF THIRTEEN ────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT sum(total_cents) FROM orders_wide;
+--  Seq Scan  Buffers: shared read=164,384       Time: 1,412 ms
+-- ⚠ It read the ENTIRE 1.28 GB to sum an 8-byte column. 3M × 8 bytes is
+--   24 MB of actual data — a 53× read amplification, and no index can
+--   change it because the column is interleaved with the other 12.
+
+-- ── PROVE AN INDEX DOES NOT FIX IT ──────────────────────────────────────
+CREATE INDEX ON orders_wide (total_cents);
+EXPLAIN (ANALYZE, BUFFERS) SELECT sum(total_cents) FROM orders_wide;
+--  Seq Scan ... (the index is not used for a full aggregate)
+
+-- ── BUT A COVERING INDEX SIMULATES COLUMNAR ─────────────────────────────
+VACUUM ANALYZE orders_wide;    -- update the visibility map
+EXPLAIN (ANALYZE, BUFFERS) SELECT sum(total_cents) FROM orders_wide;
+--  Index Only Scan using orders_wide_total_cents_idx
+--    Heap Fetches: 0
+--    Buffers: shared read=8,214            Time: 184 ms
+-- ✓ 20× fewer pages, 7.7× faster. The index IS a single-column store —
+--   which is exactly the columnar idea, retrofitted one column at a time.
+
+-- ── AND THE MULTI-COLUMN CASE ───────────────────────────────────────────
+CREATE INDEX ON orders_wide (tenant_id) INCLUDE (total_cents);
+VACUUM ANALYZE orders_wide;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT tenant_id, sum(total_cents) FROM orders_wide GROUP BY tenant_id;
+--  Index Only Scan  Buffers: read=12,402   Time: 402 ms
+-- vs Seq Scan: 164,384 buffers, 1,880 ms
+-- ✓ THE INSIGHT: a covering index is column-store storage for the
+--   specific columns you named. It works, and it scales badly — you
+--   cannot build a covering index for every ad-hoc combination, which
+--   is precisely the gap a real columnar store fills.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Demonstrate why column data compresses better.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── SIMULATE ROW vs COLUMN LAYOUT AND COMPRESS BOTH ─────────────────────
+-- ROW-ORIENTED: mixed types adjacent
+COPY (SELECT id::text||'|'||region||'|'||status||'|'||created_at::text
+             ||'|'||total_cents::text
+      FROM orders LIMIT 1000000) TO '/tmp/rows.txt';
+
+-- COLUMN-ORIENTED: one column per file
+COPY (SELECT region      FROM orders LIMIT 1000000) TO '/tmp/col_region.txt';
+COPY (SELECT status      FROM orders LIMIT 1000000) TO '/tmp/col_status.txt';
+COPY (SELECT created_at  FROM orders LIMIT 1000000) TO '/tmp/col_ts.txt';
+COPY (SELECT total_cents FROM orders LIMIT 1000000) TO '/tmp/col_total.txt';
+
+-- $ gzip -k /tmp/*.txt && ls -l /tmp/*.gz
+--   rows.txt.gz         18.2 MB   from 61 MB   → 3.4×
+--   col_region.txt.gz    0.04 MB  from 3.0 MB  → 75×   ← 4 distinct values
+--   col_status.txt.gz    0.05 MB  from 8.0 MB  → 160×
+--   col_ts.txt.gz        2.1 MB   from 26 MB   → 12×   ← regular deltas
+--   col_total.txt.gz     3.8 MB   from 7.0 MB  → 1.8×  ← random values
+--   columns total        6.0 MB   vs rows 18.2 MB      → 3× better
+
+-- ── READ THE PER-COLUMN RESULTS ─────────────────────────────────────────
+-- region/status compress enormously: few distinct values repeated
+--   millions of times → dictionary + run-length encoding territory.
+-- timestamps compress well: near-constant deltas → delta-of-delta.
+-- total_cents barely compresses: genuinely random values have no
+--   redundancy to exploit.
+-- ✓ THE POINT: compression ratio depends on the column's DISTRIBUTION,
+--   and mixing distributions in a row destroys all of it. A real
+--   columnar engine picks the encoding per column, which gzip cannot do.
+
+-- ── PROVE SORT ORDER IS A COMPRESSION DECISION ──────────────────────────
+COPY (SELECT region FROM orders ORDER BY region LIMIT 1000000)
+  TO '/tmp/col_region_sorted.txt';
+-- $ gzip -k → 0.008 MB     ← 5× better than unsorted
+-- Run-length encoding needs adjacency: sorted ['EU','EU',...,'US','US']
+-- becomes a handful of (value, count) pairs.
+-- ⚠ This is why ClickHouse's ORDER BY clause is a STORAGE declaration,
+--   not just a query hint — and why choosing it badly costs both
+--   compression and scan performance.
+
+-- ── AND WHAT POSTGRES ALREADY DOES ──────────────────────────────────────
+SELECT pg_size_pretty(pg_relation_size('orders')),
+       pg_size_pretty(pg_total_relation_size('orders'));
+-- TOAST compresses large values out of line (lesson 2), but the main
+-- heap stores rows uncompressed — because compressing a row of mixed
+-- types has little to exploit, and because random access into a
+-- compressed page is expensive when you need to update it.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Replace an analytical query with pre-aggregation.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- THE DASHBOARD QUERY: 8.4 seconds, runs on every page load.
+SELECT date_trunc('month', o.created_at) AS month, r.name AS region,
+       count(*) AS orders, sum(o.total_cents) AS revenue,
+       count(DISTINCT o.user_id) AS customers
+FROM orders o JOIN regions r ON r.id = o.region_id
+WHERE o.created_at >= now() - interval '24 months'
+GROUP BY 1, 2 ORDER BY 1 DESC, 2;
+
+-- ── STEP 1: UNDERSTAND WHY IT IS SLOW ───────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) ...;
+--  Buffers: shared read=1,204,882          -- 9.4 GB
+--  rows=576 output from 42,000,000 scanned
+-- 42 million rows read to produce 576. No index helps: the query needs
+-- an aggregate over most of the table, and in a row store that means
+-- reading every column of every row.
+
+-- ── STEP 2: THE KEY OBSERVATION ─────────────────────────────────────────
+-- January 2025's revenue will NEVER CHANGE. Recomputing 24 months of
+-- immutable history on every page load is the actual error — not the
+-- lack of an index.
+
+-- ── STEP 3: MATERIALISE ─────────────────────────────────────────────────
+CREATE MATERIALIZED VIEW revenue_monthly AS
+SELECT date_trunc('month', o.created_at) AS month, o.region_id,
+       count(*) AS orders, sum(o.total_cents) AS revenue,
+       count(DISTINCT o.user_id) AS customers
+FROM orders o GROUP BY 1, 2;
+CREATE UNIQUE INDEX ON revenue_monthly (month, region_id);  -- ⚠ REQUIRED
+                                                            -- for
+                                                            -- CONCURRENTLY
+REFRESH MATERIALIZED VIEW CONCURRENTLY revenue_monthly;
+
+SELECT m.month, r.name, m.orders, m.revenue, m.customers
+FROM revenue_monthly m JOIN regions r ON r.id = m.region_id
+WHERE m.month >= now() - interval '24 months' ORDER BY 1 DESC, 2;
+--  Time: 2 ms          ← 4200× faster
+
+-- ── STEP 4: MAKE THE REFRESH CHEAP TOO ──────────────────────────────────
+-- A full refresh still scans 42M rows (8s hourly — acceptable, but it
+-- grows). For the CURRENT month only, maintain incrementally:
+INSERT INTO revenue_monthly (month, region_id, orders, revenue, customers)
+VALUES (date_trunc('month', now()), :region, 1, :cents, 1)
+ON CONFLICT (month, region_id) DO UPDATE
+SET orders = revenue_monthly.orders + 1,
+    revenue = revenue_monthly.revenue + EXCLUDED.revenue;
+-- ⚠ count(DISTINCT user_id) CANNOT be maintained this way — distinctness
+--   is not additive. Options: recompute the current month only, or store
+--   a HyperLogLog sketch, which IS mergeable:
+CREATE EXTENSION hll;
+--   customers_hll hll  →  hll_union_agg() across months, ~2% error.
+
+-- ── STEP 5: ADD THE DRIFT CHECK ─────────────────────────────────────────
+SELECT m.month, m.region_id, m.revenue AS cached,
+       (SELECT sum(total_cents) FROM orders o
+        WHERE date_trunc('month',o.created_at)=m.month
+          AND o.region_id=m.region_id) AS actual
+FROM revenue_monthly m WHERE m.month >= now() - interval '3 months'
+  AND m.revenue &lt;&gt; (SELECT ...);
+-- Nightly, alerting on any row. A maintained aggregate WILL eventually
+-- diverge, and silent wrongness on a revenue dashboard is far worse than
+-- slowness.
+
+-- ── THE CONCLUSION ──────────────────────────────────────────────────────
+-- 8.4s → 2ms with no new system, no pipeline, no consistency question.
+-- ✓ This handles the majority of "we need a data warehouse" requests.
+--   The genuine case for columnar is AD-HOC exploration, where you
+--   cannot know the aggregate in advance.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Choose the right store for six workloads.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- For each: which store, and why? Answer with the ACCESS PATTERN.
+
+-- ── A) User login: fetch one user by email, check a hash ────────────────
+-- ROW STORE. One row, all columns, sub-millisecond, high concurrency,
+-- needs a unique constraint. Columnar would need N column reads and has
+-- no unique constraint to offer.
+
+-- ── B) "Revenue by region by month, last 3 years" on a dashboard ────────
+-- NEITHER, initially — PRE-AGGREGATE in the row store. The query set is
+-- FIXED and history is immutable, so a materialised view answers in
+-- milliseconds with no second system (exercise 3). Escalate only if the
+-- refresh itself becomes the problem.
+
+-- ── C) Analysts exploring 5 years of clickstream, queries unknown ───────
+-- COLUMNAR. This is the genuine case: you cannot pre-aggregate questions
+-- nobody has asked yet, the queries touch few columns of billions of
+-- rows, seconds of latency are fine, and the data is append-only.
+
+-- ── D) IoT: 200k readings/sec ingest, "last 24h for device X" ───────────
+-- BOTH, and the split matters. Ingest and per-device reads are a
+-- time-series/LSM workload (lesson 4) — TimescaleDB or ClickHouse.
+-- Note this is TWO workloads wearing one name: high-rate ingest with
+-- point-ish reads, plus analytical aggregation. ClickHouse serves both
+-- adequately; Postgres + Timescale serves the first better and the
+-- second well enough with continuous aggregates.
+
+-- ── E) Order management: place orders, update status, ship ──────────────
+-- ROW STORE, decisively. Frequent single-row updates, multi-statement
+-- transactions, foreign keys, uniqueness. Columnar engines offer none of
+-- those, and updates rewrite compressed blocks asynchronously.
+
+-- ── F) Compliance: 7 years of audit logs, occasional date-range export ──
+-- COLUMNAR ARCHIVE. Append-only, enormous, rarely queried, and
+-- compression is the dominant concern — 10-30× on 7 years is the
+-- difference between affordable and not.
+-- ✓ The practical shape: recent audit data in Postgres partitions for
+--   operational queries; older partitions exported to Parquet in object
+--   storage, queried with DuckDB or Athena when compliance asks.
+
+-- ── THE PATTERN ACROSS ALL SIX ──────────────────────────────────────────
+-- Ask: how many ROWS, how many COLUMNS of how many, what LATENCY, are
+-- there UPDATES, are TRANSACTIONS needed, and is the query set KNOWN?
+-- Those six answers determine the store. Notice that TWO of the six
+-- cases (B and F) are solved without an analytical database at all, and
+-- one (D) is really two workloads — which is why "OLTP or OLAP" is a
+-- less useful question than "what is the access pattern".</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Design a hybrid architecture and be honest about its costs.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SITUATION: e-commerce on Postgres. 400 GB, growing 15 GB/month.
+-- The application is healthy. Analysts run ad-hoc queries against a
+-- replica; some take 20 minutes and the replica lags during them.
+-- Leadership wants "a data platform".
+
+-- ── STEP 1: SEPARATE THE REAL REQUIREMENTS ──────────────────────────────
+-- Interview the actual users. Typically three distinct needs hide here:
+--  (a) OPERATIONAL DASHBOARDS — 12 fixed queries, refreshed hourly
+--  (b) AD-HOC ANALYSIS — unpredictable, over full history
+--  (c) ML FEATURE EXTRACTION — large batch reads, weekly
+-- ⚠ Only (b) genuinely needs columnar. Treating all three as one
+--   requirement is how a six-month platform project starts.
+
+-- ── STEP 2: SOLVE (a) WITHOUT NEW INFRASTRUCTURE ────────────────────────
+CREATE MATERIALIZED VIEW dash_revenue_monthly AS SELECT ...;
+CREATE MATERIALIZED VIEW dash_cohort_retention AS SELECT ...;
+-- 12 queries → 12 materialised views, refreshed hourly on the replica.
+-- Dashboard latency: 20 min → 5 ms. Cost: a cron job.
+-- ✓ Do this FIRST. It removes most of the visible pain and buys time to
+--   design the rest properly.
+
+-- ── STEP 3: SOLVE (b) AND (c) WITH ONE PIPELINE ─────────────────────────
+--   Postgres ──logical replication/Debezium──▶ ClickHouse
+--            OR
+--   Postgres ──nightly export──▶ Parquet in S3 ──▶ DuckDB / Athena
+--
+-- ✓ CHOOSE THE SECOND IF freshness of hours is acceptable. It is
+--   dramatically simpler: a scheduled export, object storage, and a
+--   query engine with no cluster to run. For 400 GB it is entirely
+--   adequate and analysts can query it from a laptop.
+-- ✓ CHOOSE THE FIRST IF analysts need near-real-time, or the volume
+--   outgrows what a nightly export can move.
+-- ⚠ Most teams reach for the first and discover the pipeline is the
+--   hardest component they own.
+
+-- ── STEP 4: THE COSTS, STATED PLAINLY ───────────────────────────────────
+-- • THE PIPELINE IS A SYSTEM, not plumbing. It needs an owner, lag
+--   monitoring, backfill tooling, and a plan for schema changes — which
+--   now happen in two places and can break the pipeline silently.
+-- • EVENTUAL CONSISTENCY. The analytical copy is minutes or hours
+--   behind. Someone WILL make a decision on stale numbers unless the
+--   lag is displayed alongside the data.
+-- • DIVERGENT MODELLING. The warehouse wants denormalised wide tables;
+--   the OLTP schema is normalised. That transformation is code that must
+--   be maintained and tested.
+-- • NO CONSTRAINTS DOWNSTREAM. No foreign keys, no uniqueness — data
+--   integrity must be enforced upstream and validated after load.
+-- • A SECOND COPY OF PERSONAL DATA. Access control, retention and
+--   deletion requests now apply in two systems. This is frequently the
+--   most expensive item and it is rarely raised in the design review.
+
+-- ── STEP 5: WHAT I WOULD ACTUALLY PROPOSE ───────────────────────────────
+-- Phase 1 (2 weeks): materialised views for the 12 dashboard queries.
+--   Removes 80% of the complaints.
+-- Phase 2 (2 weeks): nightly Parquet export to S3, DuckDB for analysts.
+--   Serves (b) and (c) with two moving parts.
+-- Phase 3 (only with evidence): if freshness or volume demands it,
+--   replace the export with CDC into ClickHouse.
+-- ✓ Each phase is independently valuable and reversible, and phase 3
+--   may never be needed. Presenting it this way also makes the eventual
+--   cost of phase 3 a deliberate decision rather than a default.
+
+-- ── STEP 6: THE MEASUREMENT THAT DECIDES PHASE 3 ────────────────────────
+-- Instrument analyst queries: how many are answered by the Parquet
+-- export within acceptable latency? If that number stays above ~90%,
+-- phase 3 is not justified — and having the number turns an
+-- architectural argument into an evidence-based one.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Predict how three engines handle the same query, then explain the differences.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- THE TABLE: 2 billion rows, 40 columns, ~500 bytes/row (~1 TB).
+-- THE QUERY:
+SELECT country, date_trunc('day', ts) AS day, count(*), avg(latency_ms)
+FROM requests
+WHERE ts >= now() - interval '30 days' AND status_code >= 500
+GROUP BY 1, 2;
+-- 4 columns of 40. Filter selects ~0.3% of rows. Output ~5,000 rows.
+
+-- ── POSTGRES (row store) ────────────────────────────────────────────────
+-- PREDICT: the filter is selective (0.3%), so an index on
+--   (ts, status_code) is usable — but each matching row requires a HEAP
+--   FETCH of the full 500-byte row to read 4 columns.
+--   6 million matching rows × random heap fetches ≈ minutes.
+-- ✓ MITIGATION: a covering index turns it index-only:
+CREATE INDEX ON requests (ts, status_code)
+       INCLUDE (country, latency_ms);
+--   Now it reads a narrow index instead of the heap — effectively a
+--   4-column store for this one query. Perhaps 20-40 seconds.
+-- ⚠ The mitigation does not generalise: you cannot build a covering
+--   index per ad-hoc query, and each one taxes every write.
+-- Partitioning by ts would prune to 30 partitions, helping further.
+
+-- ── CLICKHOUSE (columnar, MergeTree) ────────────────────────────────────
+-- PREDICT: reads only 4 of 40 columns. With ORDER BY (ts, status_code)
+--   as the table's sort key:
+--   • the sparse primary index skips to the relevant granules
+--   • ZONE MAPS skip blocks whose status_code max &lt; 500 without reading
+--     them
+--   • the columns are compressed 10-20× (country is low-cardinality →
+--     dictionary + RLE; ts is delta-encoded)
+--   • vectorised execution processes ~1024 values per call with SIMD
+--   Data actually read: ~200 MB of ~1 TB. Expect 1-3 SECONDS.
+-- ⚠ THE COST OF THIS CHOICE: no transactions, updates are asynchronous
+--   mutations, single-row inserts are an anti-pattern, and a point
+--   lookup by id would be far slower than Postgres.
+
+-- ── DUCKDB OVER PARQUET IN S3 ───────────────────────────────────────────
+-- PREDICT: Parquet stores per-row-group column statistics, so:
+--   • PREDICATE PUSHDOWN skips row groups by min/max on ts and
+--     status_code — often without downloading them at all
+--   • PROJECTION PUSHDOWN fetches only the 4 needed column chunks
+--   • if the files are partitioned by date in the path, 30 days of
+--     files are read and the rest are never listed
+--   Expect 5-20 seconds, dominated by network rather than CPU.
+-- ✓ THE APPEAL: no cluster, no pipeline, no server. The data sits in
+--   object storage and is queried on demand.
+-- ⚠ Cold-start latency and network bandwidth are the limits, and
+--   concurrency is poor — it is a single-process engine.
+
+-- ── THE COMPARISON, AND WHAT EXPLAINS IT ────────────────────────────────
+--   Postgres (naive)        several minutes
+--   Postgres (covering idx) 20-40 s      ← manual, per-query columnar
+--   DuckDB/Parquet          5-20 s       ← columnar + pushdown, no server
+--   ClickHouse              1-3 s        ← columnar + zone maps +
+--                                          vectorisation, purpose-built
+--
+-- The 100× spread comes from THREE compounding factors, not one:
+--   1. reading 4 columns instead of 40      (~10×)
+--   2. compression on those columns         (~10×)
+--   3. vectorised execution instead of      (~10×)
+--      row-at-a-time
+-- ⚠ Note that factor 1 alone is available in Postgres via a covering
+--   index, which is why that mitigation helps so much — and why it is
+--   worth trying before adopting a new engine.
+
+-- ── THE DESIGN CONCLUSION ───────────────────────────────────────────────
+-- If this query is one of a fixed set: covering index or materialised
+-- view in Postgres, and stop.
+-- If it is one of hundreds of unpredictable queries over 1 TB: that is
+-- the genuine case for columnar, and the arithmetic above is the
+-- argument to present.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Storage is linear, so a layout must choose between adjacency of a row's columns or of a column's rows — you cannot have both.</li>
+        <li>An analytical query reading one column of twenty reads the whole table in a row store; no index changes that, because it is layout rather than access method.</li>
+        <li>Columnar compresses 10–30× against a row store's 2–3× because a column is homogeneous, and that shrinks the working set as well as the I/O.</li>
+        <li>Run-length, dictionary, delta and bit-packing encodings each exploit a specific kind of redundancy, so sort order is a compression decision.</li>
+        <li>Vectorised execution processes batches of one column with SIMD, giving another 10–100× — and it requires columnar layout to work.</li>
+        <li>Columnar is structurally bad at point lookups, single-row updates, small inserts, transactions and high concurrency, which is why applications stay on row stores.</li>
+        <li>A covering index is effectively a small column store for the columns you named — it works, and it does not generalise to ad-hoc queries.</li>
+        <li>Pre-aggregation in the row store answers most fixed dashboard requirements outright, with no second system and no consistency question.</li>
+        <li>The genuine case for columnar is ad-hoc exploration over large history, where you cannot know the aggregate in advance.</li>
+        <li>A CDC pipeline is usually harder to operate than either database, and a second copy of personal data is a compliance cost that design reviews routinely miss.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="physical-design.html">← Physical Schema Design for the Engine</a>
+      <a href="engine-landscape.html">The Engine Landscape →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
