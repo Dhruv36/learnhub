@@ -1,0 +1,959 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Parser, Rewriter &amp; Planner — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Parser, Rewriter &amp; Planner <span class="level-badge level-ultra">Query Processing</span></h1>
+    <p><strong>What you'll master:</strong> the full path from SQL text to an executable plan and what each
+       stage is actually responsible for, why the rewriter means the query you wrote is frequently not the
+       query that gets planned, how the planner searches an exponentially large space of join orders without
+       taking exponential time — and what happens when it gives up and switches to a genetic algorithm, the
+       transformations that matter most in practice such as subquery pull-up and predicate pushdown, why
+       plan caching produces the "fast for weeks then suddenly catastrophic" failure mode, how the executor's
+       demand-driven iterator model works and why vectorised execution beats it for analytics, and how to
+       read the planner's decisions rather than fight them. Prerequisites:
+       <a href="../sql/indexes.html">the SQL track's indexes lesson</a> for reading <code>EXPLAIN</code>.
+       The next two lessons cover <a href="cost-models.html">cost models and statistics</a> and
+       <a href="join-algorithms.html">join algorithms</a> in depth; this one is the architecture around
+       them.</p>
+
+    <h2>Part 1 — The Pipeline</h2>
+    <pre>SELECT name FROM active_users WHERE signup_date > '2026-01-01';
+
+--   ┌──────────────────────────────────────────────────────────────┐
+--   │ 1. PARSER            text → raw parse tree                   │
+--   │    pure syntax. Knows SQL grammar, knows NOTHING about your   │
+--   │    tables. "SELCT" fails here; "SELECT * FROM nonexistent"    │
+--   │    does not.                                                  │
+--   ├──────────────────────────────────────────────────────────────┤
+--   │ 2. ANALYSER          parse tree → query tree                 │
+--   │    resolves names against the catalog: does the table exist,  │
+--   │    do the columns, what are their types, does this role have  │
+--   │    permission? Adds implicit casts. Resolves * to a column    │
+--   │    list.                                                      │
+--   ├──────────────────────────────────────────────────────────────┤
+--   │ 3. REWRITER          query tree → query tree                 │
+--   │    expands VIEWS into their definitions, injects ROW-LEVEL    │
+--   │    SECURITY predicates, applies RULES.                        │
+--   │    ⚠ The query being planned is often NOT the query you wrote.│
+--   ├──────────────────────────────────────────────────────────────┤
+--   │ 4. PLANNER/OPTIMISER query tree → PLAN tree                  │
+--   │    the interesting stage: transform, enumerate access paths   │
+--   │    and join orders, cost each, pick the cheapest.             │
+--   ├──────────────────────────────────────────────────────────────┤
+--   │ 5. EXECUTOR          plan tree → rows                        │
+--   │    walks the plan, pulling rows through a tree of iterators.  │
+--   └──────────────────────────────────────────────────────────────┘
+
+-- ── WHY THE SPLIT MATTERS ───────────────────────────────────────────────
+-- Each stage has exactly one job, and knowing which stage an error came
+-- from tells you what kind of problem you have:
+--   syntax error                  → parser
+--   relation does not exist       → analyser
+--   permission denied             → analyser
+--   a plan you did not expect     → planner (and usually statistics)
+--   correct plan, slow execution  → executor, or the data itself
+
+-- ── SEE EACH STAGE ──────────────────────────────────────────────────────
+EXPLAIN (VERBOSE) SELECT * FROM active_users;
+--   Output shows the REWRITTEN query — the view expanded into its
+--   underlying tables. That is the planner's actual input.
+SET debug_print_parse = on;      -- raw parse tree (server log)
+SET debug_print_rewritten = on;  -- after view expansion and RLS
+SET debug_print_plan = on;       -- the final plan tree
+-- Verbose, but occasionally the fastest way to understand why a query is
+-- being planned the way it is.</pre>
+
+    <h2>Part 2 — The Rewriter: Your Query Is Not What Runs</h2>
+    <pre>-- ── VIEW EXPANSION ──────────────────────────────────────────────────────
+CREATE VIEW active_users AS
+  SELECT * FROM users WHERE deleted_at IS NULL;
+SELECT name FROM active_users WHERE signup_date > '2026-01-01';
+-- becomes:
+SELECT name FROM users
+WHERE deleted_at IS NULL AND signup_date > '2026-01-01';
+-- ✓ A view is a MACRO, not a stored result. It costs nothing at runtime
+--   and the planner optimises the combined query as a whole.
+-- ⚠ But nesting compounds. A view over a view over a view expands into
+--   one enormous query, and each level may add joins the outer query
+--   does not need. "Why is this simple SELECT joining nine tables?" is
+--   almost always a view stack.
+
+-- ── ROW-LEVEL SECURITY IS INJECTED HERE ─────────────────────────────────
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON orders
+  USING (tenant_id = current_setting('app.tenant_id')::bigint);
+SELECT * FROM orders WHERE status = 'paid';
+-- actually planned as:
+SELECT * FROM orders
+WHERE status='paid' AND tenant_id = current_setting(...)::bigint;
+-- ⚠ RLS predicates are added to EVERY query on the table, so they must
+--   be indexable. A policy calling a slow function, or one the planner
+--   cannot push down, silently taxes every single query. This is a real
+--   and frequently-missed performance trap in multi-tenant systems.
+
+-- ── THE OPTIMISATION FENCE THAT ISN'T (ANY MORE) ────────────────────────
+WITH recent AS (SELECT * FROM orders WHERE created_at > :d)
+SELECT * FROM recent WHERE tenant_id = 7;
+-- Before PG12: the CTE was an OPTIMISATION FENCE — materialised
+--   separately, so `tenant_id = 7` could NOT be pushed inside it. People
+--   exploited this deliberately to force a plan.
+-- PG12+: CTEs are INLINED by default when referenced once and
+--   side-effect free, so the predicate pushes down. Much better plans,
+--   and a behaviour change that surprised people on upgrade.
+WITH recent AS MATERIALIZED (...)      -- force the old behaviour
+WITH recent AS NOT MATERIALIZED (...)  -- force inlining
+-- ⚠ Worth knowing when reading old advice: "use a CTE to force
+--   materialisation" was correct for years and is now wrong unless you
+--   say MATERIALIZED explicitly.
+
+-- ── SUBQUERY PULL-UP ────────────────────────────────────────────────────
+SELECT * FROM users u
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+-- rewritten into a SEMI-JOIN:
+--   Hash Semi Join  (users × orders)
+-- ✓ This is the transformation that makes EXISTS efficient. Without it,
+--   the subquery would run per outer row. With it, the planner can use
+--   hash or merge strategies over the whole set — and it is why EXISTS
+--   generally beats a correlated subquery you write by hand.
+
+-- ── WHAT THE REWRITER DOES NOT FIX ──────────────────────────────────────
+-- It applies mechanical, always-safe transformations. It will NOT
+-- rewrite a non-sargable predicate into a sargable one, because
+-- date_trunc('day', x) = d and x >= d AND x < d+1 are not provably
+-- equivalent for all types and time zones. Some rewrites remain your
+-- job (SQL optimisation lesson).</pre>
+    <div class="note">🔍 <strong>Always check what is actually being planned.</strong> Views expand, RLS
+      policies inject predicates, CTEs inline or do not depending on your version, and <code>EXISTS</code>
+      becomes a semi-join. <code>EXPLAIN (VERBOSE)</code> shows the planner's real input, and when a query
+      behaves inexplicably, the gap between what you wrote and what is being optimised is one of the first
+      places to look — particularly in systems with layered views or row-level security.</div>
+
+    <h2>Part 3 — The Search Problem</h2>
+    <pre>-- The planner's job: among all correct ways to execute this query, find
+-- the cheapest. The space is enormous.
+
+-- ── HOW LARGE ───────────────────────────────────────────────────────────
+-- Join orders alone, for n tables, counting only left-deep trees: n!
+--    2 tables →        2
+--    5 tables →      120
+--    8 tables →   40,320
+--   10 tables → 3,628,800
+--   12 tables → 479,001,600
+-- Counting bushy trees it is far worse. Multiply by the access-path
+-- choices per table (seq scan, or any of k indexes) and the join
+-- ALGORITHM per join (nested loop, hash, merge), and a 10-table query
+-- has billions of candidate plans.
+-- ⚠ Exhaustive search is impossible. Every real planner is a heuristic
+--   search that is expected to find a good plan, not the best one.
+
+-- ── DYNAMIC PROGRAMMING (the System R approach, still used) ─────────────
+-- Build up optimal plans for progressively larger subsets:
+--   level 1: the best access path for each single table
+--   level 2: the best plan for each PAIR, built from level 1
+--   level 3: the best plan for each TRIPLE, built from levels 1 and 2
+--   ...
+-- KEY IDEA: to build the best plan for {A,B,C}, you only need the best
+-- plans for its subsets — you never revisit their internals. That cuts
+-- n! down to roughly 2^n, which is tractable to about 10-12 tables.
+--
+-- ⚠ THE SUBTLETY: "cheapest" is not enough. A more expensive plan that
+--   produces rows ALREADY SORTED may win overall by eliminating a later
+--   sort or enabling a merge join. So the planner keeps, for each
+--   subset, both the cheapest plan and the cheapest plan for each useful
+--   sort order — INTERESTING ORDERS. This is why a plan that looks
+--   locally suboptimal can be globally correct.
+
+-- ── WHEN IT GIVES UP: GEQO ──────────────────────────────────────────────
+SHOW geqo_threshold;      -- 12
+-- Beyond 12 join relations, Postgres switches to a GENETIC ALGORITHM:
+-- random candidate plans, "mutated" and "bred", keeping the fittest.
+-- ✓ Bounded planning time on huge queries.
+-- ✗ NON-DETERMINISTIC. The same query can get a different plan on
+--   different runs, which produces the maddening symptom of a report
+--   that is fast most days and slow occasionally with no change to data
+--   or code.
+SET geqo = off;                    -- force exhaustive search
+SET geqo_threshold = 20;           -- or raise the threshold
+SET join_collapse_limit = 8;       -- limit how many FROM items are
+SET from_collapse_limit = 8;       -- flattened into one search
+-- ⚠ Lowering the collapse limits makes the planner RESPECT your written
+--   join order rather than searching, which is a legitimate way to tame
+--   a very large query — you trade optimality for predictability.
+
+-- ── PLANNING TIME IS NOT FREE ───────────────────────────────────────────
+EXPLAIN (ANALYZE) SELECT ...;
+--  Planning Time: 42.104 ms
+--  Execution Time: 1.882 ms
+-- ⚠ For a 2ms query executed thousands of times per second, 42ms of
+--   planning is the entire cost. Causes: too many tables, too many
+--   partitions to consider, or too many indexes per table. Prepared
+--   statements amortise it — see Part 5.</pre>
+
+    <h2>Part 4 — Transformations That Matter</h2>
+    <pre>-- Before costing anything, the planner applies logical transformations.
+-- These often matter more than the cost model, because they change what
+-- is possible rather than which option is chosen.
+
+-- ── PREDICATE PUSHDOWN ──────────────────────────────────────────────────
+SELECT * FROM (SELECT * FROM orders JOIN users USING (user_id)) t
+WHERE t.tenant_id = 7;
+-- pushed down to:
+SELECT * FROM (SELECT * FROM orders WHERE tenant_id=7
+               JOIN users USING (user_id)) t;
+-- ✓ Filter EARLY so the join input is small. This single transformation
+--   is frequently the difference between milliseconds and minutes,
+--   because join cost scales with input size.
+-- ⚠ It is BLOCKED by things that make it unsafe: a volatile function in
+--   the predicate, a subquery with LIMIT, a window function, and
+--   (before PG12) a materialised CTE. When a filter mysteriously is not
+--   pushed down, look for one of those.
+
+-- ── JOIN ELIMINATION ────────────────────────────────────────────────────
+SELECT o.* FROM orders o
+LEFT JOIN users u ON u.id = o.user_id;
+-- If nothing from `u` is selected AND u.id is UNIQUE, the join cannot
+-- change the result — it is REMOVED entirely.
+-- ✓ This is why ORM-generated queries with unnecessary joins are often
+--   less catastrophic than they look. It requires the uniqueness
+--   constraint to exist: without a PK or UNIQUE on the joined column,
+--   the planner cannot prove the join is safe to drop.
+
+-- ── CONSTANT FOLDING AND EQUIVALENCE CLASSES ────────────────────────────
+WHERE price > 10 * 5           → WHERE price > 50
+WHERE a.id = b.id AND b.id = 7 → also infers a.id = 7
+-- ✓ The equivalence class inference is powerful: the planner deduces a
+--   predicate you did not write, which may enable an index scan on `a`
+--   that would otherwise be impossible.
+
+-- ── OUTER JOIN SIMPLIFICATION ───────────────────────────────────────────
+SELECT * FROM a LEFT JOIN b ON a.id=b.a_id WHERE b.status = 'active';
+-- The WHERE clause discards rows where b is NULL, so the LEFT JOIN
+-- cannot produce anything an INNER JOIN would not → converted to INNER.
+-- ✓ That matters because an inner join can be REORDERED freely, while
+--   outer joins constrain join order. One rewrite unlocks the whole
+--   search space.
+-- ⚠ And it is the mechanism behind a classic bug: putting a condition on
+--   the right table in WHERE instead of ON silently turns your LEFT JOIN
+--   into an INNER JOIN (SQL joins lesson).
+
+-- ── PARTITION PRUNING ───────────────────────────────────────────────────
+SELECT * FROM events WHERE created_at >= '2026-08-01';
+--   Append -> Seq Scan on events_2026_08     (one of 60 partitions)
+-- PLAN-TIME pruning uses constants; RUN-TIME pruning (PG11+) handles
+-- parameters and nested-loop join keys:
+--   Subplans Removed: 59
+-- ⚠ A query without the partition key prunes nothing and scans every
+--   partition — slower than the unpartitioned table would have been.
+
+-- ── WHAT YOU CAN SEE ────────────────────────────────────────────────────
+EXPLAIN (VERBOSE, COSTS OFF) SELECT ...;
+-- Compare the Filter and Index Cond lines against what you wrote. A
+-- predicate appearing as `Filter` rather than `Index Cond` means it was
+-- not pushed into the scan — and that is usually the whole problem.</pre>
+
+    <h2>Part 5 — Plan Caching and the Parameter Problem</h2>
+    <pre>-- Planning is expensive, so it is cached. That caching produces one of
+-- the most confusing production failure modes there is.
+
+-- ── PREPARED STATEMENTS ─────────────────────────────────────────────────
+PREPARE q(int) AS SELECT * FROM orders WHERE tenant_id = $1;
+EXECUTE q(7);
+-- Postgres plans it CUSTOM (using the actual value) for the first five
+-- executions, then compares: if a GENERIC plan (chosen without knowing
+-- the value) is not much worse on average, it switches to generic and
+-- stops planning altogether.
+
+-- ── WHY THAT BREAKS ON SKEWED DATA ──────────────────────────────────────
+--   tenant 7:  200 rows      → index scan is correct
+--   tenant 88: 12,000,000 rows → sequential scan is correct
+-- A generic plan must choose ONE strategy for both. Whichever it picks
+-- is catastrophic for the other population, and WHICH one gets cached
+-- depends on the order of the first executions.
+--
+-- ⚠ SYMPTOM: the query is fast for weeks, then suddenly slow, with no
+--   deploy and no data change. A connection was recycled, the first five
+--   executions happened to use small tenants, and the cached generic
+--   plan is now wrong for the big one. This is genuinely hard to
+--   diagnose without knowing the mechanism.
+
+-- ── CONTROLLING IT ──────────────────────────────────────────────────────
+SET plan_cache_mode = force_custom_plan;   -- re-plan EVERY execution
+SET plan_cache_mode = force_generic_plan;  -- never re-plan
+SET plan_cache_mode = auto;                -- default heuristic
+-- ✓ For skewed multi-tenant workloads, force_custom_plan is frequently
+--   correct: you pay planning time on every execution and get a plan
+--   sized for the actual parameter. Measure the planning cost first —
+--   if planning is 40ms and execution is 2ms, the cure may be worse.
+
+-- ── ORACLE AND SQL SERVER CALL IT BIND PEEKING ──────────────────────────
+-- Same problem, same cause, different names. SQL Server's OPTION
+-- (RECOMPILE) and OPTIMIZE FOR hints, and Oracle's adaptive cursor
+-- sharing, all exist to address it. It is a universal consequence of
+-- caching plans for parameterised queries, not a Postgres quirk.
+
+-- ── THE EXECUTOR: DEMAND-DRIVEN ITERATORS ───────────────────────────────
+-- Every plan node implements the same interface: open, next, close. The
+-- top node asks for a row; it asks its child; and so on down.
+--
+--   Limit          ← asks for 10 rows, then STOPS
+--     └ Sort       ← must consume ALL input before returning any
+--         └ HashJoin
+--             ├ SeqScan(orders)
+--             └ Hash → SeqScan(users)
+--
+-- ✓ CONSEQUENCE 1: memory is bounded — rows stream through rather than
+--   being materialised at every level.
+-- ✓ CONSEQUENCE 2: LIMIT can stop early, so a plan that avoids a sort
+--   returns the first rows almost instantly. This is why the planner
+--   tracks BOTH startup cost and total cost, and why it may choose a
+--   plan with a higher total cost when there is a LIMIT.
+-- ⚠ BLOCKING NODES break the streaming: Sort, Hash build, and
+--   HashAggregate must consume their entire input before producing
+--   anything. That is why adding an ORDER BY to a LIMIT query can turn
+--   4ms into 4 seconds.
+
+-- ── WHY ANALYTICS ENGINES DO IT DIFFERENTLY ─────────────────────────────
+-- One function call per ROW per NODE is a lot of overhead when you are
+-- processing a billion rows. Columnar engines use VECTORISED execution:
+-- each call processes a BATCH of ~1000 values from one column, which
+-- amortises the call overhead and lets the CPU use SIMD instructions.
+-- 10-100× faster for analytical scans, and it is the main reason
+-- ClickHouse and DuckDB outperform row engines on aggregation
+-- (lesson 13). Postgres uses JIT compilation to close part of the gap:
+SET jit = on;   -- ⚠ helps long analytical queries, but its compilation
+                --   overhead can ADD 100ms+ to short OLTP queries.
+                --   Check jit_above_cost if short queries regress.</pre>
+
+    <h2>Part 6 — Working With the Planner</h2>
+    <pre>-- ── POSTGRES HAS NO HINTS, AND THAT IS DELIBERATE ───────────────────────
+-- Oracle, MySQL and SQL Server let you write /*+ INDEX(t idx) */.
+-- Postgres refuses, on the argument that hints encode today's data
+-- distribution into the application and become wrong as data changes —
+-- and that a hinted bad plan is harder to diagnose than an unhinted one.
+-- You may disagree, but it means the supported path is always to fix the
+-- planner's INPUTS rather than override its OUTPUT.
+
+-- ── THE DIAGNOSTIC TOGGLES ARE NOT FIXES ────────────────────────────────
+SET enable_seqscan = off;      -- costs seq scans absurdly high; does NOT
+SET enable_nestloop = off;     -- actually disable them
+SET enable_hashjoin = off;
+EXPLAIN ANALYZE ...;           -- is the alternative genuinely faster?
+RESET ALL;
+-- ✓ USE: to test a hypothesis in seconds. If the forced plan wins, that
+--   is EVIDENCE that estimates or cost constants are wrong.
+-- ✗ DO NOT SHIP: they apply to every query in the session, so you fix
+--   one query and degrade the rest.
+
+-- ── FIX THE INPUTS INSTEAD ──────────────────────────────────────────────
+-- 1. STATISTICS — the most common cause of a bad plan by far
+ANALYZE orders;
+ALTER TABLE orders ALTER COLUMN status SET STATISTICS 1000;
+CREATE STATISTICS s (dependencies, ndistinct) ON city, country FROM addr;
+-- 2. COST CONSTANTS — the defaults assume spinning disks
+ALTER SYSTEM SET random_page_cost = 1.1;         -- SSD/NVMe
+ALTER SYSTEM SET effective_cache_size = '24GB';  -- a HINT about cache
+-- 3. INDEXES the planner can actually use (sargability, column order)
+-- 4. THE QUERY ITSELF — rewrite what the rewriter cannot
+-- 5. STRUCTURE — partitioning, materialised views, pre-aggregation
+
+-- ── STRUCTURAL WAYS TO CONSTRAIN THE SEARCH ─────────────────────────────
+SET join_collapse_limit = 1;   -- respect my written JOIN order exactly
+-- A blunt but legitimate tool for a huge generated query where planning
+-- time or GEQO non-determinism is the actual problem.
+-- The pg_hint_plan extension adds Oracle-style hints if you truly need
+-- them — third-party, and a considered decision rather than a default.
+
+-- ── READING THE DECISION ────────────────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) SELECT ...;
+-- SETTINGS shows any non-default planner parameters in effect — which
+-- catches the case where someone left enable_nestloop off in a session,
+-- or a role has an unexpected override.
+SELECT name, setting, source FROM pg_settings
+WHERE category LIKE 'Query Tuning%' AND source <> 'default';
+-- ✓ Worth running on any system where plans look inexplicable. A
+--   forgotten SET in a connection-pool init script has caused more
+--   confusion than any cost-model subtlety.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Fighting the planner</strong>
+        <pre>SET enable_seqscan = off;   -- in
+                            -- production
+"The optimiser is dumb."
+"Add a hint."
+→ One query fixed, twelve
+  degraded, and the real cause
+  (estimates off by 1000×) still
+  there.</pre></div>
+      <div><strong>✅ Fixing its inputs</strong>
+        <pre>"estimated 200, actual 214,882 →
+ the plan was optimal FOR 200."
+ANALYZE; CREATE STATISTICS;
+random_page_cost = 1.1
+→ correct plan chosen on its own,
+  and every other query benefits
+  too.</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Assuming the planner sees the query you wrote</td><td>Confusion over joins and filters you never typed</td><td><code>EXPLAIN (VERBOSE)</code> — views expand and RLS injects predicates</td></tr>
+      <tr><td>Deeply nested views</td><td>A "simple" <code>SELECT</code> plans as a nine-table join</td><td>Flatten the view stack; check the expanded query</td></tr>
+      <tr><td>Non-indexable RLS policies</td><td>Every query on the table pays a hidden cost</td><td>Make policy predicates sargable and indexed</td></tr>
+      <tr><td>Assuming CTEs are still optimisation fences</td><td>Advice written pre-PG12 no longer applies</td><td>CTEs inline now; say <code>MATERIALIZED</code> if you want the old behaviour</td></tr>
+      <tr><td>Shipping <code>enable_*</code> toggles</td><td>One query fixed, every other query in the session degraded</td><td>Diagnostic only; fix statistics or cost constants</td></tr>
+      <tr><td>Ignoring planning time</td><td>40ms of planning on a 2ms query executed thousands of times per second</td><td>Prepared statements; fewer indexes and partitions to consider</td></tr>
+      <tr><td>Not knowing about generic plans</td><td>"Fast for weeks, suddenly slow" with no change</td><td><code>plan_cache_mode = force_custom_plan</code> for skewed parameters</td></tr>
+      <tr><td>Very large join counts</td><td>GEQO produces non-deterministic plans; intermittent slowness</td><td>Raise <code>geqo_threshold</code>, or lower the collapse limits</td></tr>
+      <tr><td>Adding <code>ORDER BY</code> to a <code>LIMIT</code> query without a matching index</td><td>A blocking sort consumes the entire input before returning a row</td><td>Index matching the sort order so the plan streams</td></tr>
+      <tr><td>Leaving <code>random_page_cost</code> at 4.0 on SSD</td><td>Index scans systematically over-costed; unnecessary sequential scans</td><td>Set it to ~1.1 and re-measure</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> Walk through what happens between submitting SQL and getting rows.</summary>
+      <p>Five stages. The parser turns the text into a raw parse tree using only SQL grammar — it knows
+         nothing about your schema, so a typo in a keyword fails here but a reference to a non-existent table
+         does not. The analyser then resolves everything against the catalog: confirming the tables and
+         columns exist, checking permissions, adding implicit casts, and expanding <code>*</code> into a
+         concrete column list.</p>
+      <p>The rewriter transforms the query tree. Views are expanded into their definitions, row-level
+         security predicates are injected, and rules are applied. This is where the query you wrote can stop
+         resembling the query that runs, which matters when debugging.</p>
+      <p>The planner is the interesting stage. It applies logical transformations, enumerates the ways to
+         access each table and the orders in which to join them, estimates a cost for each candidate using
+         table statistics, and selects the cheapest. Finally the executor walks the chosen plan, pulling rows
+         through a tree of iterators until the result is produced.</p>
+      <p>Knowing the split is practically useful because it tells you what kind of problem you have: a syntax
+         error is the parser, a permission error is the analyser, an unexpected plan is the planner and
+         almost always its statistics, and a correct plan that runs slowly is the executor or the data
+         itself.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> Why is the query being planned sometimes different from the one you wrote?</summary>
+      <p>Because the rewriter transforms it before the planner sees it. The most common cause is views: a
+         view is a macro, not a stored result, so referencing one expands it inline into your query. That is
+         usually good — the planner optimises the combined query and can push your filters into the view's
+         own conditions — but nested views compound, so a query against a view over a view can expand into
+         something joining many tables you never mentioned.</p>
+      <p>Row-level security is the other big one. An enabled policy injects its predicate into every query
+         against the table, so a simple filter on status is actually planned with an additional tenant
+         condition. That matters for performance, because if the policy predicate is not indexable it
+         silently taxes every query on that table.</p>
+      <p>There are also structural rewrites. An <code>EXISTS</code> subquery is typically pulled up into a
+         semi-join so it can be executed with hash or merge strategies rather than per row. And since
+         PostgreSQL 12, common table expressions are inlined by default rather than materialised, which
+         changed long-standing advice — a lot of older guidance about using CTEs as optimisation fences is
+         now wrong unless you explicitly write <code>MATERIALIZED</code>.</p>
+      <p>The practical takeaway is to use <code>EXPLAIN (VERBOSE)</code> when something is inexplicable,
+         because it shows the planner's real input rather than your text.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> How does the planner search a space that grows factorially?</summary>
+      <p>It does not search it exhaustively — that is impossible. With ten tables there are over three million
+         left-deep join orders before you even consider bushy trees, access paths per table, or join
+         algorithms per join.</p>
+      <p>The classical approach, still used, is dynamic programming from the System R optimiser. It computes
+         the best plan for each single table, then for each pair using the single-table results, then each
+         triple using those, and so on. The insight that makes it work is that the best plan for a set of
+         tables can be built from the best plans for its subsets, so you never re-examine their internals.
+         That reduces factorial growth to roughly two to the power of n, which is tractable up to about ten
+         or twelve tables.</p>
+      <p>There is an important refinement: cheapest is not the only criterion. A slightly more expensive plan
+         that happens to produce rows already sorted may win overall by eliminating a later sort or enabling
+         a merge join. So for each subset the planner keeps both the cheapest plan and the cheapest plan for
+         each useful sort order — what the literature calls interesting orders. That is why a plan can look
+         locally suboptimal and be globally correct.</p>
+      <p>Beyond a threshold of twelve join relations, PostgreSQL switches to a genetic algorithm, which
+         bounds planning time but is non-deterministic. That produces a distinctive symptom: the same large
+         report query getting a different plan on different runs, fast most days and slow occasionally with
+         no change to code or data. Raising <code>geqo_threshold</code> or lowering the collapse limits so
+         the written join order is respected are both reasonable responses.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> What is predicate pushdown and when does it fail?</summary>
+      <p>Predicate pushdown moves a filter as close to the data source as possible, so rows are eliminated
+         before they reach expensive operations. If you filter the result of a join, the planner tries to
+         apply that filter to the underlying table first, so the join processes far fewer rows. Since join
+         cost scales with input size, this single transformation is often the difference between
+         milliseconds and minutes.</p>
+      <p>It fails in specific, identifiable cases, all of which come down to the transformation not being
+         provably safe. A volatile function in the predicate cannot be moved, because the number of times it
+         is evaluated would change. A subquery containing <code>LIMIT</code> blocks it, because filtering
+         before the limit selects a different set of rows than filtering after. Window functions block it for
+         the same reason — the window is computed over a specific row set. Before PostgreSQL 12, a CTE was a
+         materialisation boundary and predicates could not cross it, which people exploited deliberately.</p>
+      <p>Diagnosing it is straightforward once you know to look: in <code>EXPLAIN</code>, a condition
+         appearing as <code>Filter</code> on a high-level node rather than as <code>Index Cond</code> or a
+         filter on the scan means it was not pushed down. A large <code>Rows Removed by Filter</code> count
+         high in the plan tree is the same signal. The fix is usually to restructure so the filter is written
+         where it can apply, or to remove whatever is blocking it.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A query is fast for weeks, then suddenly slow with no deploy or data change. Explain.</summary>
+      <p>The most likely cause is plan caching interacting with skewed data. PostgreSQL plans a prepared
+         statement using the actual parameter values for its first five executions, then evaluates whether a
+         generic plan — one chosen without knowing the value — is competitive on average. If so, it switches
+         to that generic plan and stops re-planning.</p>
+      <p>With skew this is a trap. If most tenants have a few hundred rows and one has twelve million, an
+         index scan is right for the former and a sequential scan for the latter. A generic plan must commit
+         to one strategy, so whichever it picks is catastrophic for the other population. Which one gets
+         cached depends on the accident of which parameters appeared in the first five executions on that
+         connection. So a connection recycles, the first executions happen to be small tenants, the cached
+         plan is now wrong for the large one, and the query is suddenly slow — with nothing in the deploy
+         history to explain it.</p>
+      <p>I would confirm by comparing plans across executions, and test <code>plan_cache_mode =
+         force_custom_plan</code>, which re-plans every time. For skewed multi-tenant workloads that is often
+         the correct setting: you pay planning time on each execution and get a plan sized for the actual
+         parameter. The check to do first is whether planning cost is significant — if planning is forty
+         milliseconds and execution is two, the cure may be worse than the disease, and the better answer is
+         reducing planning cost by trimming indexes or partitions.</p>
+      <p>The other candidates I would rule out are statistics drift, where autovacuum has not caught up after
+         a bulk load, and data crossing a threshold where the planner legitimately flips strategy — both of
+         which look similar from the outside. This is not a PostgreSQL quirk either; it is bind peeking in
+         Oracle and parameter sniffing in SQL Server, and every engine that caches plans for parameterised
+         queries has some version of it.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> PostgreSQL has no query hints. Is that the right design?</summary>
+      <p>I think the argument for it is stronger than it first appears, though it is genuinely a trade-off
+         rather than an obvious win.</p>
+      <p>The case against hints is that they freeze today's data distribution into application code. A hint
+         forcing an index scan is correct when the table has a thousand rows and wrong when it has ten
+         million, but it does not stop being applied — so the system silently loses the ability to adapt, and
+         the failure appears long after the person who added the hint has moved on. Hints also mask the
+         underlying problem: a hint that fixes a query usually indicates bad estimates or misconfigured cost
+         constants, and those are affecting every other query too. Fixing the input helps the whole workload;
+         hinting helps one query and hides the signal.</p>
+      <p>The case for hints is operational reality. When production is down at 3am and the planner has chosen
+         a catastrophic plan, "fix the statistics and re-measure" is not a five-minute action, whereas a hint
+         is. Oracle and SQL Server shops rely on this, and it is not unreasonable.</p>
+      <p>In practice PostgreSQL provides most of the escape hatches under different names. The
+         <code>enable_*</code> parameters let you test a hypothesis immediately, and while they should not
+         ship, they answer the diagnostic question in seconds. Lowering <code>join_collapse_limit</code>
+         makes the planner respect your written join order, which is a legitimate structural control for
+         large generated queries. Extended statistics, per-column statistics targets and cost constants
+         address the root causes. And <code>pg_hint_plan</code> exists as an extension when a team genuinely
+         needs hints — which makes it a deliberate decision rather than a default.</p>
+      <p>My own position is that the no-hints stance produces better long-term outcomes because it forces
+         diagnosis, but that it is a defensible philosophy rather than a technical necessity, and I would not
+         argue it is the only correct answer.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Watch the rewriter transform your query.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE users (id bigint PRIMARY KEY, name text, tenant_id bigint,
+                    deleted_at timestamptz);
+CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint REFERENCES users,
+                     tenant_id bigint, total int, status text);
+CREATE VIEW active_users AS SELECT * FROM users WHERE deleted_at IS NULL;
+
+-- ── VIEW EXPANSION ──────────────────────────────────────────────────────
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT name FROM active_users WHERE tenant_id = 7;
+--  Seq Scan on public.users
+--    Output: users.name
+--    Filter: ((users.deleted_at IS NULL) AND (users.tenant_id = 7))
+-- ✓ The view VANISHED. Both predicates were merged and will be
+--   considered together for index selection — a view costs nothing at
+--   runtime because it is a macro, not a stored result.
+
+-- ── ROW-LEVEL SECURITY IS INJECTED ──────────────────────────────────────
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY iso ON orders USING (tenant_id = 7);
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM orders WHERE status='paid';
+--  Seq Scan on public.orders
+--    Filter: ((orders.tenant_id = 7) AND (orders.status = 'paid'::text))
+-- ⚠ A predicate you never wrote is now on EVERY query against this
+--   table. If it were not indexable, every query would pay for it — a
+--   real and easily-missed cost in multi-tenant systems.
+
+-- ── JOIN ELIMINATION ────────────────────────────────────────────────────
+EXPLAIN (COSTS OFF)
+SELECT o.id, o.total FROM orders o LEFT JOIN users u ON u.id = o.user_id;
+--  Seq Scan on orders o
+-- ✓ THE JOIN IS GONE. Nothing from `u` is selected and u.id is unique,
+--   so the join provably cannot change the result.
+-- Prove it depends on the constraint:
+ALTER TABLE users DROP CONSTRAINT users_pkey CASCADE;
+EXPLAIN (COSTS OFF) SELECT o.id FROM orders o LEFT JOIN users u ON u.id=o.user_id;
+--  Hash Left Join ...      ← the join is BACK
+-- Without uniqueness the join could duplicate rows, so it cannot be
+-- eliminated. Constraints are optimiser INFORMATION, not just validation.
+
+-- ── EXISTS BECOMES A SEMI-JOIN ──────────────────────────────────────────
+EXPLAIN (COSTS OFF) SELECT * FROM users u
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+--  Hash Semi Join
+-- ✓ Not a per-row subquery — a set operation the planner can cost.
+
+-- ── CTE INLINING (PG12+) ────────────────────────────────────────────────
+EXPLAIN (COSTS OFF)
+WITH recent AS (SELECT * FROM orders WHERE total > 100)
+SELECT * FROM recent WHERE tenant_id = 7;
+--  Seq Scan on orders
+--    Filter: ((total > 100) AND (tenant_id = 7))   ← pushed INSIDE
+WITH recent AS MATERIALIZED (SELECT * FROM orders WHERE total > 100)
+SELECT * FROM recent WHERE tenant_id = 7;
+--  CTE Scan on recent
+--    Filter: (tenant_id = 7)          ← blocked; the CTE runs whole
+-- ⚠ Pre-PG12 the second was the ONLY behaviour, which is why old advice
+--   about "using a CTE to force materialisation" is now misleading.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Measure planning time and make it matter.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- ── A SIMPLE QUERY: EXECUTION DOMINATES ─────────────────────────────────
+EXPLAIN (ANALYZE) SELECT * FROM orders WHERE id = 42;
+--  Planning Time: 0.091 ms
+--  Execution Time: 0.024 ms
+-- ⚠ Planning is already 4× execution — but both are trivial.
+
+-- ── ADD INDEXES: PLANNING GROWS ─────────────────────────────────────────
+DO $$ BEGIN FOR i IN 1..15 LOOP
+  EXECUTE format('CREATE INDEX idx_%s ON orders (total, status, user_id, id)
+                  WHERE total > %s', i, i*100);
+END LOOP; END $$;
+EXPLAIN (ANALYZE) SELECT * FROM orders WHERE id = 42;
+--  Planning Time: 1.412 ms      ← 15× worse
+-- Every index is a candidate the planner must consider and cost.
+
+-- ── ADD PARTITIONS: MUCH WORSE ──────────────────────────────────────────
+CREATE TABLE ev (id bigint, created_at timestamptz, v text)
+  PARTITION BY RANGE (created_at);
+DO $$ DECLARE d date := '2020-01-01';
+BEGIN WHILE d < '2026-12-01' LOOP
+  EXECUTE format('CREATE TABLE ev_%s PARTITION OF ev
+                  FOR VALUES FROM (%L) TO (%L)',
+                 to_char(d,'YYYY_MM'), d, d + interval '1 month');
+  d := d + interval '1 month';
+END LOOP; END $$;                              -- 83 partitions
+
+EXPLAIN (ANALYZE) SELECT * FROM ev WHERE created_at = '2026-08-05';
+--  Planning Time: 8.204 ms
+--  Execution Time: 0.031 ms       ← planning is 265× execution!
+
+-- ── A QUERY WITHOUT THE PARTITION KEY ───────────────────────────────────
+EXPLAIN (ANALYZE) SELECT * FROM ev WHERE v = 'x';
+--  Append (83 subplans)
+--  Planning Time: 41.882 ms       ← every partition considered
+-- ⚠ At thousands of executions per second, 42ms of planning is the
+--   entire cost of the query, and no index helps.
+
+-- ── FIX 1: PREPARED STATEMENTS AMORTISE IT ──────────────────────────────
+PREPARE p(date) AS SELECT * FROM ev WHERE created_at = $1;
+EXPLAIN (ANALYZE) EXECUTE p('2026-08-05');
+-- executions 1-5: full planning each time
+-- execution 6+:   Planning Time: 0.008 ms    ← cached
+-- ⚠ But see exercise 4: caching brings the generic-plan problem with it.
+
+-- ── FIX 2: FEWER OBJECTS TO CONSIDER ────────────────────────────────────
+-- Drop unused indexes; use coarser partitions (monthly not daily);
+-- ensure queries carry the partition key so run-time pruning applies:
+EXPLAIN (ANALYZE) SELECT * FROM ev WHERE created_at = '2026-08-05';
+--  Subplans Removed: 82
+-- ✓ Pruning cuts BOTH planning and execution.
+
+-- ── THE RULE ────────────────────────────────────────────────────────────
+-- Always read Planning Time alongside Execution Time. For OLTP queries
+-- run thousands of times per second, planning is frequently the larger
+-- number, and it is invisible if you only look at execution.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Find where predicate pushdown stops.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE orders (id bigint PRIMARY KEY, tenant_id bigint,
+                     created_at timestamptz, total int);
+INSERT INTO orders SELECT g, (random()*1000)::int,
+       now() - (random()*interval '365 days'), (random()*1000)::int
+FROM generate_series(1,2000000) g;
+CREATE INDEX ON orders (tenant_id);
+ANALYZE orders;
+
+-- ── ✓ PUSHDOWN WORKS ────────────────────────────────────────────────────
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT * FROM (SELECT * FROM orders WHERE total > 500) s
+WHERE tenant_id = 7;
+--  Bitmap Heap Scan on orders
+--    Recheck Cond: (tenant_id = 7)
+--    Filter: (total > 500)
+--    rows=1012
+-- ✓ tenant_id was pushed into the INDEX scan. Only ~2000 rows read.
+
+-- ── ✗ BLOCKED BY LIMIT ──────────────────────────────────────────────────
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT * FROM (SELECT * FROM orders ORDER BY created_at LIMIT 100000) s
+WHERE tenant_id = 7;
+--  Subquery Scan on s
+--    Filter: (s.tenant_id = 7)
+--    Rows Removed by Filter: 99,904      ← filtered AFTER
+--    -> Limit -> Sort -> Seq Scan on orders
+-- ⚠ CORRECT, not a bug: filtering before LIMIT would select a DIFFERENT
+--   100,000 rows. The transformation is not semantics-preserving, so it
+--   is refused.
+
+-- ── ✗ BLOCKED BY A WINDOW FUNCTION ──────────────────────────────────────
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT * FROM (SELECT *, row_number() OVER (ORDER BY total) rn
+               FROM orders) s
+WHERE tenant_id = 7;
+--  Subquery Scan  Filter: (s.tenant_id = 7)
+--  Rows Removed by Filter: 1,998,988
+-- The window is computed over ALL rows by definition; filtering first
+-- would change every row_number. Also correct.
+-- ✓ THE FIX when you actually want per-tenant numbering:
+SELECT *, row_number() OVER (PARTITION BY tenant_id ORDER BY total)
+FROM orders WHERE tenant_id = 7;      -- now pushdown applies
+
+-- ── ✗ BLOCKED BY A VOLATILE FUNCTION ────────────────────────────────────
+CREATE FUNCTION vol(int) RETURNS int AS
+  'SELECT $1' LANGUAGE sql VOLATILE;
+EXPLAIN (COSTS OFF) SELECT * FROM orders WHERE vol(tenant_id) = 7;
+--  Seq Scan  Filter: (vol(tenant_id) = 7)
+-- Volatile functions may return different values per call, so they
+-- cannot be reordered or pushed. Mark functions IMMUTABLE or STABLE
+-- when they genuinely are:
+CREATE FUNCTION stbl(int) RETURNS int AS
+  'SELECT $1' LANGUAGE sql IMMUTABLE;
+-- ⚠ Mislabelling volatility is a correctness bug, not a tuning trick.
+
+-- ── ✗ BLOCKED BY A MATERIALIZED CTE ─────────────────────────────────────
+EXPLAIN (COSTS OFF)
+WITH c AS MATERIALIZED (SELECT * FROM orders) SELECT * FROM c WHERE tenant_id=7;
+--  CTE Scan on c  Filter: (tenant_id = 7)     ← 2M rows materialised
+
+-- ── HOW TO SPOT IT IN ANY PLAN ──────────────────────────────────────────
+-- A predicate appearing as `Filter` HIGH in the tree, with a large
+-- `Rows Removed by Filter`, means it was not pushed down. That one
+-- observation identifies the problem faster than reading the SQL.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Reproduce the generic-plan failure.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE events (id bigserial PRIMARY KEY, tenant_id int,
+                     created_at timestamptz DEFAULT now());
+-- Deliberate skew: one whale, many minnows.
+INSERT INTO events (tenant_id) SELECT 88 FROM generate_series(1,5000000);
+INSERT INTO events (tenant_id) SELECT (random()*999+1)::int
+FROM generate_series(1,200000);
+CREATE INDEX ON events (tenant_id);
+ANALYZE events;
+
+-- ── THE TWO POPULATIONS WANT DIFFERENT PLANS ────────────────────────────
+EXPLAIN (ANALYZE, COSTS OFF) SELECT count(*) FROM events WHERE tenant_id=7;
+--  Bitmap Heap Scan   rows=205    Time: 0.4 ms     ← index is right
+EXPLAIN (ANALYZE, COSTS OFF) SELECT count(*) FROM events WHERE tenant_id=88;
+--  Seq Scan           rows=5000000 Time: 412 ms    ← seq scan is right
+
+-- ── NOW PREPARE IT AND WATCH THE SWITCH ─────────────────────────────────
+PREPARE q(int) AS SELECT count(*) FROM events WHERE tenant_id = $1;
+EXPLAIN (ANALYZE) EXECUTE q(7);    -- 1: custom  → Bitmap  0.4ms
+EXPLAIN (ANALYZE) EXECUTE q(7);    -- 2: custom
+EXPLAIN (ANALYZE) EXECUTE q(7);    -- 3
+EXPLAIN (ANALYZE) EXECUTE q(7);    -- 4
+EXPLAIN (ANALYZE) EXECUTE q(7);    -- 5: last custom plan
+EXPLAIN (ANALYZE) EXECUTE q(7);    -- 6: GENERIC PLAN chosen
+--  Bitmap Heap Scan  (cost=... rows=5202)      ← generic: average-sized
+--                                                estimate, index plan
+
+EXPLAIN (ANALYZE) EXECUTE q(88);   -- the whale, with the CACHED plan
+--  Bitmap Heap Scan  rows=5000000   Time: 3,840 ms
+--                                   ↑ 9× SLOWER than the seq scan
+-- ⚠ The generic plan was built for the AVERAGE tenant. Applied to the
+--   whale it is catastrophic — and nothing about the query changed.
+
+-- ── AND IT DEPENDS ON EXECUTION ORDER ───────────────────────────────────
+DEALLOCATE q;
+PREPARE q(int) AS SELECT count(*) FROM events WHERE tenant_id = $1;
+-- run the first five with 88 instead:
+EXECUTE q(88); EXECUTE q(88); EXECUTE q(88); EXECUTE q(88); EXECUTE q(88);
+EXPLAIN (ANALYZE) EXECUTE q(7);
+--  Seq Scan  rows=205  Time: 380 ms        ← now the MINNOWS suffer
+-- ✓ THIS is why the symptom is "fast for weeks then suddenly slow": a
+--   connection recycles and the first five executions decide the plan
+--   for everything that follows.
+
+-- ── FIX ─────────────────────────────────────────────────────────────────
+SET plan_cache_mode = force_custom_plan;
+EXPLAIN (ANALYZE) EXECUTE q(7);    -- Bitmap  0.4ms  ✓
+EXPLAIN (ANALYZE) EXECUTE q(88);   -- Seq Scan 412ms ✓
+-- Each execution is planned for its actual parameter.
+-- ⚠ Check the cost first: if Planning Time is 40ms and execution is 2ms,
+--   re-planning every time is worse than the disease. Measure both.
+
+-- ── AND THE STRUCTURAL ALTERNATIVE ──────────────────────────────────────
+-- Extreme skew like this often wants a different design: give the whale
+-- its own partition, or route it separately. A single query shape
+-- serving both a 200-row and a 5-million-row population is asking one
+-- plan to do two incompatible jobs.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Tame a 15-table generated query.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SYMPTOM: an ORM-generated report joins 15 tables. Usually 800ms,
+-- occasionally 45 SECONDS. Same parameters. No pattern anyone can find.
+
+-- ── STEP 1: PLANNING OR EXECUTION? ──────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
+--  run A:  Planning Time: 412 ms   Execution Time:   390 ms
+--  run B:  Planning Time: 388 ms   Execution Time: 44,102 ms
+-- Planning is stable; EXECUTION varies 100×. So the planner is choosing
+-- DIFFERENT PLANS for identical input.
+
+-- ── STEP 2: WHY WOULD THE PLAN CHANGE? ──────────────────────────────────
+SHOW geqo_threshold;        -- 12
+SHOW join_collapse_limit;   -- 8
+-- 15 join relations > 12, so GEQO is active. The genetic algorithm is
+-- NON-DETERMINISTIC: it seeds randomly, so the same query gets different
+-- plans on different runs. Most are fine; occasionally it lands on a
+-- terrible one.
+-- ✓ That exactly matches "same query, same data, wildly different time,
+--   no pattern" — which is otherwise a very confusing symptom.
+
+-- ── STEP 3: CONFIRM ─────────────────────────────────────────────────────
+SET geqo = off;
+-- run it 20 times: Execution Time stable at 380-410 ms every time.
+SET geqo = on;
+-- run it 20 times: mostly ~400ms, occasionally 40s+. Confirmed.
+
+-- ── STEP 4: THE OPTIONS, WITH TRADE-OFFS ────────────────────────────────
+-- A) EXHAUSTIVE SEARCH
+SET geqo_threshold = 20;      -- or geqo = off
+--    ✓ deterministic, optimal plans
+--    ✗ planning time grows fast: 412ms → 3.2 SECONDS here. For a report
+--      run hourly that is fine; for anything interactive it is not.
+--
+-- B) CONSTRAIN THE SEARCH INSTEAD
+SET join_collapse_limit = 1;
+--    Respects the JOIN order exactly as written, so there is no search
+--    at all. Planning: 412ms → 18ms. ✓ deterministic AND fast.
+--    ✗ You now own the join order — it is only as good as what the ORM
+--      emitted, so verify the resulting plan.
+--
+-- C) REDUCE THE JOIN COUNT (the real fix)
+--    15 tables usually means an ORM eagerly loading relations the report
+--    does not display. Trimming to the 6 actually needed puts it back
+--    under the GEQO threshold and removes the problem entirely.
+
+-- ── STEP 5: WHAT I WOULD ACTUALLY DO ────────────────────────────────────
+-- 1. Audit which of the 15 tables the output uses. Usually several are
+--    joined for a single column that could be denormalised, or are
+--    eliminable if the missing UNIQUE constraint existed (exercise 1).
+-- 2. For the remainder, set geqo_threshold above the join count for
+--    this ROLE only, so the hourly report gets deterministic planning
+--    without slowing OLTP queries:
+ALTER ROLE reporting SET geqo_threshold = 20;
+-- 3. If the report is heavy regardless, materialise it — the fastest
+--    query is the one that already ran (SQL optimisation lesson).
+
+-- ── THE DIAGNOSTIC WORTH REMEMBERING ────────────────────────────────────
+-- Intermittent plan changes with no input change means either GEQO
+-- non-determinism (many joins) or plan-cache switching (exercise 4).
+-- Both are invisible if you only look at query text and data — and
+-- checking the join count against geqo_threshold takes ten seconds.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Decide when to override the planner, and when not to.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- SITUATION: a critical query does a Seq Scan; forcing an index scan is
+-- 20× faster. The team wants to ship SET enable_seqscan = off.
+
+-- ── STEP 1: ESTABLISH THE FACTS ─────────────────────────────────────────
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders
+WHERE tenant_id = 42 AND status = 'pending';
+--  Seq Scan on orders  (cost=0..184220 rows=41000)
+--                      (actual time=0.3..3,412 rows=118)
+--                                          ↑↑↑
+-- ⚠ estimated 41,000, actual 118 — off by 347×. The planner chose a
+--   plan that is OPTIMAL FOR 41,000 ROWS. It is not stupid; it is
+--   MISINFORMED. That distinction determines the entire response.
+
+SET enable_seqscan = off;
+EXPLAIN (ANALYZE) SELECT ...;      -- Index Scan, 4ms. Confirms the
+RESET enable_seqscan;              -- hypothesis. DIAGNOSTIC ONLY.
+
+-- ── STEP 2: WHY IS THE ESTIMATE WRONG? ──────────────────────────────────
+SELECT last_analyze, last_autoanalyze, n_mod_since_analyze
+FROM pg_stat_user_tables WHERE relname='orders';
+ANALYZE orders;                    -- estimate → 8,200. Better, still off.
+
+-- The columns are CORRELATED: pending orders cluster in recent tenants.
+-- The planner multiplies selectivities assuming independence.
+CREATE STATISTICS s_orders (dependencies, ndistinct)
+  ON tenant_id, status FROM orders;
+ANALYZE orders;
+EXPLAIN (ANALYZE) SELECT ...;
+--  Bitmap Heap Scan  (cost=... rows=142) (actual rows=118)  4.1 ms ✓
+-- ✓ FIXED AT THE SOURCE. And every OTHER query filtering on these two
+--   columns now gets better estimates too — a hint would have helped
+--   exactly one query.
+
+-- ── STEP 3: WHY NOT SHIP THE TOGGLE ─────────────────────────────────────
+-- enable_seqscan = off applies to EVERY query in the session. Small
+-- lookup tables that should be scanned will now use indexes, which is
+-- slower. You fix one query and quietly degrade dozens.
+-- It also does not truly disable anything — it assigns an absurd cost —
+-- so a query with no usable index still seq-scans, just with a
+-- distorted plan around it.
+
+-- ── STEP 4: THE ESCALATION LADDER ───────────────────────────────────────
+-- 1. ANALYZE                        stale stats — the most common cause
+-- 2. SET STATISTICS higher          skewed single columns
+-- 3. CREATE STATISTICS              correlated columns  ← this case
+-- 4. random_page_cost = 1.1         SSD; fixes systematic index
+--                                   under-selection across the workload
+-- 5. effective_cache_size           tells the planner what is cacheable
+-- 6. a better index                 make the right plan cheaper rather
+--                                   than the wrong one costlier
+-- 7. rewrite the query              sargability, pre-aggregation
+-- 8. join_collapse_limit            structural control for huge queries
+-- 9. pg_hint_plan                   a deliberate, documented last resort
+
+-- ── STEP 5: WHEN OVERRIDING IS LEGITIMATE ───────────────────────────────
+-- ✓ A 3am incident: set it at the SESSION level for the specific job,
+--   with a ticket to fix the root cause. Stopping the bleeding is valid.
+-- ✓ A single batch job whose shape is known and stable, set inside that
+--   job's own connection — not globally.
+-- ✗ In application code as a permanent fix. It encodes today's data
+--   distribution and will be wrong later, silently, long after whoever
+--   added it has moved on.
+
+-- ── WHAT I WOULD TELL THE TEAM ──────────────────────────────────────────
+-- "The toggle proved the diagnosis — that was useful. But the cause is a
+--  347× estimate error from correlated columns, and CREATE STATISTICS
+--  fixes it in one line, permanently, for every query on this table.
+--  Shipping the toggle would fix this query and degrade the rest, and
+--  we would still have the bad estimates."
+-- ✓ Use the override to LEARN; fix the input to SHIP.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Five stages — parser, analyser, rewriter, planner, executor — and knowing which one produced an error tells you what kind of problem you have.</li>
+        <li>The rewriter means the planned query often differs from the written one: views expand, RLS injects predicates, <code>EXISTS</code> becomes a semi-join.</li>
+        <li>CTEs are inlined since PostgreSQL 12, which invalidated years of advice about using them as optimisation fences.</li>
+        <li>Join-order search is factorial, so planners use dynamic programming over subsets — and track interesting orders, because a pricier sorted plan can win overall.</li>
+        <li>Beyond twelve join relations GEQO takes over and is non-deterministic, producing intermittent slowness with no input change.</li>
+        <li>Predicate pushdown is often the difference between milliseconds and minutes, and it is blocked by <code>LIMIT</code>, window functions and volatile functions — correctly.</li>
+        <li>Join elimination depends on uniqueness constraints existing: constraints are optimiser information, not just validation.</li>
+        <li>Planning time is invisible if you only read execution time, and on high-frequency OLTP queries it is frequently the larger number.</li>
+        <li>Cached generic plans plus skewed parameters produce "fast for weeks, suddenly slow" — a universal consequence of plan caching, not a PostgreSQL quirk.</li>
+        <li>Use <code>enable_*</code> toggles to test a hypothesis, never to ship; fix statistics, cost constants or indexes so the whole workload benefits.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="locking-latches.html">← Locking, Latches &amp; Deadlocks</a>
+      <a href="cost-models.html">Cost Models &amp; Statistics →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
