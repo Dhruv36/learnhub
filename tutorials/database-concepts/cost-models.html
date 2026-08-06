@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cost Models &amp; Statistics — Database Concepts — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Cost Models &amp; Statistics <span class="level-badge level-ultra">Query Processing</span></h1>
+    <p><strong>What you'll master:</strong> the actual cost formula and how to compute a plan's cost by hand,
+       so <code>EXPLAIN</code> numbers stop being opaque, what statistics the engine collects and how
+       histograms, most-common-value lists and n-distinct estimates combine to produce a row count, why
+       selectivity estimation errors compound multiplicatively through a join tree and turn a 2× mistake at
+       the leaf into a 1000× mistake at the root, the independence assumption that causes most catastrophic
+       plans and how extended statistics fix it, why <code>random_page_cost</code> and
+       <code>effective_cache_size</code> are the two settings most worth changing, how sampling works and
+       why n-distinct is the hardest thing to estimate from a sample, and how to diagnose whether a bad plan
+       is a statistics problem or a cost-constant problem. Prerequisites:
+       <a href="query-planner.html">Parser, Rewriter &amp; Planner</a>.</p>
+
+    <h2>Part 1 — The Cost Formula</h2>
+    <pre>-- "Cost" is not milliseconds. It is an abstract unit where 1.0 is
+-- defined as the cost of reading one page sequentially. Everything else
+-- is calibrated against that.
+
+-- ── THE CONSTANTS ───────────────────────────────────────────────────────
+SELECT name, setting FROM pg_settings WHERE name LIKE '%cost%';
+--  seq_page_cost           1.0     read one page sequentially
+--  random_page_cost        4.0     read one page randomly
+--  cpu_tuple_cost          0.01    process one row
+--  cpu_index_tuple_cost    0.005   process one index entry
+--  cpu_operator_cost       0.0025  evaluate one operator/function
+--  parallel_tuple_cost     0.1     pass a row between workers
+--  parallel_setup_cost     1000.0  start parallel workers
+
+-- ── COMPUTE A SEQUENTIAL SCAN BY HAND ───────────────────────────────────
+SELECT relpages, reltuples FROM pg_class WHERE relname = 'orders';
+--  relpages | reltuples
+--     54054 |  10000000
+EXPLAIN SELECT * FROM orders WHERE total > 500;
+--  Seq Scan on orders  (cost=0.00..179054.00 rows=3333333 width=45)
+--
+--   pages × seq_page_cost      = 54054 × 1.0    =  54,054
+--   rows  × cpu_tuple_cost     = 10000000 × 0.01 = 100,000
+--   rows  × cpu_operator_cost  = 10000000 × 0.0025 = 25,000   (the >)
+--                                                   ─────────
+--                                        TOTAL     = 179,054  ✓
+-- ✓ It matches exactly. The cost model is simple arithmetic over
+--   statistics — not a black box, and being able to reproduce it is what
+--   makes EXPLAIN output interpretable.
+
+-- ── STARTUP COST vs TOTAL COST ──────────────────────────────────────────
+--   cost=0.00..179054.00
+--        ↑        ↑
+--     startup   total
+-- STARTUP is what must happen before the FIRST row can be returned.
+-- A Seq Scan can emit its first row immediately → 0.00.
+-- A Sort must consume its ENTIRE input first → startup ≈ total.
+--
+-- ⚠ THIS IS WHY LIMIT CHANGES PLANS. With LIMIT 10 the planner
+--   optimises for startup + (10/rows) × (total - startup), so a plan
+--   that streams beats a plan that sorts, even if its total cost is far
+--   higher. That is not a heuristic — it falls out of the two numbers.
+
+-- ── AN INDEX SCAN ───────────────────────────────────────────────────────
+EXPLAIN SELECT * FROM orders WHERE id = 42;
+--  Index Scan using orders_pkey  (cost=0.43..8.45 rows=1 width=45)
+--   startup 0.43  = descending the tree (~3 index pages, mostly cached)
+--   total   8.45  = descent + 1 random heap fetch (4.0) + CPU
+-- The heap fetch at random_page_cost is the dominant term — which is
+-- exactly why selectivity decides between index and sequential scans.</pre>
+
+    <h2>Part 2 — What the Engine Knows About Your Data</h2>
+    <pre>-- Costs are computed from ROW ESTIMATES, and row estimates come from
+-- statistics gathered by ANALYZE. Three structures do the work.
+
+-- ── TABLE-LEVEL ─────────────────────────────────────────────────────────
+SELECT relname, relpages, reltuples, relallvisible
+FROM pg_class WHERE relname = 'orders';
+-- relpages/reltuples are updated by ANALYZE and VACUUM. relallvisible
+-- drives index-only scan costing.
+
+-- ── COLUMN-LEVEL: THE THREE THAT MATTER ─────────────────────────────────
+SELECT attname, null_frac, n_distinct, correlation,
+       most_common_vals, most_common_freqs
+FROM pg_stats WHERE tablename = 'orders' AND attname = 'status';
+--  null_frac        | 0
+--  n_distinct       | 4
+--  correlation      | 0.31
+--  most_common_vals | {paid,pending,shipped,cancelled}
+--  most_common_freqs| {0.82,0.11,0.05,0.02}
+--
+-- 1. MCV LIST — the most frequent values and their exact frequencies.
+--    For any value IN this list, the estimate is essentially EXACT.
+--    WHERE status='paid' → 0.82 × 10,000,000 = 8,200,000. Precise.
+-- 2. HISTOGRAM — equi-depth buckets covering everything NOT in the MCV
+--    list, so range estimates work on skewed data.
+SELECT histogram_bounds FROM pg_stats
+WHERE tablename='orders' AND attname='total';
+--  {0,47,103,158,...,9912}     ← 100 buckets by default; each holds
+--                                 1% of the non-MCV rows
+-- 3. N_DISTINCT — the number of distinct values. Negative means a
+--    RATIO: -0.5 = "half the rows are distinct", which scales as the
+--    table grows.
+-- 4. CORRELATION — how well physical order matches sorted order (-1..1).
+--    Near 1 means index range scans fetch nearly-sequential pages and
+--    are cheap; near 0 means they are random I/O (lesson 2).
+
+-- ── HOW A SELECTIVITY IS COMPUTED ───────────────────────────────────────
+-- equality, value in MCV     → its exact frequency
+-- equality, not in MCV       → (1 - sum(mcv_freqs)) / (n_distinct - n_mcv)
+-- range                      → interpolate across histogram buckets
+-- IS NULL                    → null_frac
+-- LIKE 'abc%'                → prefix range over the histogram
+-- LIKE '%abc%'               → a fixed guess (0.005 in Postgres)
+-- no statistics at all       → hardcoded defaults: 0.005 for equality,
+--                              0.3333 for inequality
+-- ⚠ THAT LAST LINE MATTERS. A table that has never been analysed gets
+--   pure guesses, which is why the first query after a bulk load is
+--   often planned catastrophically.
+
+-- ── SAMPLING, AND WHY n_distinct IS THE HARD ONE ────────────────────────
+SHOW default_statistics_target;    -- 100
+-- ANALYZE reads a random sample of 300 × target = 30,000 rows, not the
+-- whole table. Frequencies and histograms estimate well from a sample.
+-- ⚠ n_distinct DOES NOT. Estimating the number of distinct values in a
+--   population from a sample is a known-hard statistical problem: a
+--   sample of 30,000 from 100 million cannot distinguish "1,000 distinct
+--   values" from "1,000,000 distinct values" when the distribution is
+--   skewed. Postgres can be badly wrong here, and it matters because
+--   n_distinct drives GROUP BY sizing and join estimates.
+-- ✓ When you KNOW the truth, tell it:
+ALTER TABLE orders ALTER COLUMN tenant_id SET (n_distinct = 5000);
+ANALYZE orders;      -- a fixed, correct value instead of a bad estimate</pre>
+    <div class="note">📊 <strong>Every bad plan is one of two problems.</strong> Either the row estimates are
+      wrong, or the cost constants do not match your hardware. That is the entire diagnostic space. Compare
+      estimated against actual rows in <code>EXPLAIN ANALYZE</code>: if they diverge, it is statistics — run
+      <code>ANALYZE</code>, raise the statistics target, or add extended statistics. If estimates are
+      accurate but the planner still picks the slower option, it is the cost model — almost always
+      <code>random_page_cost</code> left at its spinning-disk default.</div>
+
+    <h2>Part 3 — The Independence Assumption</h2>
+    <pre>-- The single largest source of catastrophic plans, and it has a precise
+-- cause.
+
+-- ── THE PROBLEM ─────────────────────────────────────────────────────────
+WHERE city = 'Paris' AND country = 'France'
+-- The planner computes each selectivity independently and MULTIPLIES:
+--   P(Paris)  = 0.001
+--   P(France) = 0.010
+--   combined  = 0.00001  →  100 rows out of 10 million
+-- Reality: every Paris row IS France, so the true selectivity is 0.001
+-- and the answer is 10,000 rows. A 100× UNDERESTIMATE.
+--
+-- ⚠ WHY THIS IS SO DAMAGING: the planner sizes the entire plan around
+--   that number. Expecting 100 rows it chooses a nested loop, which
+--   receives 10,000 and performs 10,000 index descents into the other
+--   side. A plan optimal for 100 rows is catastrophic for 10,000 —
+--   and the error grows through the join tree (Part 4).
+
+-- ── EXTENDED STATISTICS: THE FIX ────────────────────────────────────────
+CREATE STATISTICS st_city_country (dependencies, ndistinct, mcv)
+  ON city, country FROM addresses;
+ANALYZE addresses;
+SELECT * FROM pg_stats_ext WHERE statistics_name = 'st_city_country';
+
+-- The three kinds do different jobs:
+-- DEPENDENCIES  functional dependencies: "city determines country" with
+--   a strength 0..1. Fixes multi-column EQUALITY estimates.
+-- NDISTINCT     the number of distinct COMBINATIONS. Fixes GROUP BY on
+--   several columns, which otherwise multiplies per-column n_distinct
+--   and wildly overestimates.
+-- MCV           most-common COMBINATIONS with real frequencies. The most
+--   powerful and most expensive; handles skew that dependencies cannot.
+
+-- ── WHEN TO REACH FOR IT ────────────────────────────────────────────────
+-- ✓ columns that are logically related: city/country, state/zip,
+--   brand/model, category/subcategory, tenant/region
+-- ✓ any multi-column filter where EXPLAIN ANALYZE shows estimates off by
+--   an order of magnitude
+-- ✓ GROUP BY over several correlated columns
+-- ⚠ It is NOT free: extra work per ANALYZE and more planning time. Add
+--   it where you have EVIDENCE of an estimate error, not everywhere.
+
+-- ── THE OTHER ASSUMPTIONS WORTH KNOWING ─────────────────────────────────
+-- • UNIFORMITY within a histogram bucket. Skew inside one bucket is
+--   invisible; raising the statistics target creates narrower buckets.
+-- • INCLUSION for joins: it assumes the smaller side's values all appear
+--   in the larger side. Wrong when a foreign key is largely unmatched.
+-- • INDEPENDENCE between a filter and a join key — extended statistics
+--   do not cover this case at all.
+-- ⚠ These are simplifications the model NEEDS to stay tractable. The
+--   skill is recognising which one your query violates.</pre>
+
+    <h2>Part 4 — Error Propagation Through Joins</h2>
+    <pre>-- A single-table estimate being 2× off is survivable. The same error
+-- inside a join tree is not, because errors MULTIPLY.
+
+-- ── THE JOIN SIZE FORMULA ───────────────────────────────────────────────
+-- For an equi-join on a column present in both sides:
+--   rows = (rows_A × rows_B) / max(n_distinct_A, n_distinct_B)
+-- Intuition: each distinct key matches a proportional share of each
+-- side. Every input to that formula is itself an estimate.
+
+-- ── HOW A SMALL ERROR BECOMES A DISASTER ────────────────────────────────
+-- A 4-table join where each leaf estimate is 3× low:
+--   leaf estimates:      3× low
+--   join of 2:           3 × 3  =    9× low
+--   join of 3:                  =   27× low
+--   join of 4:                  =   81× low
+-- The planner sizes the top of the tree for 1/81 of the real rows. It
+-- chooses a nested loop where a hash join was needed, and the query goes
+-- from seconds to hours.
+--
+-- ✓ THE DIAGNOSTIC RULE: in EXPLAIN ANALYZE, find the LOWEST node where
+--   estimated and actual diverge. Everything above it is a consequence,
+--   not a cause. Fixing the leaf fixes the whole tree; fixing the top
+--   node fixes nothing.
+
+-- ── WORKED EXAMPLE ──────────────────────────────────────────────────────
+EXPLAIN ANALYZE
+SELECT * FROM orders o
+JOIN users u   ON u.id = o.user_id
+JOIN regions r ON r.id = u.region_id
+WHERE o.status='pending' AND o.created_at > now() - interval '7 days';
+--  Nested Loop  (rows=12) (actual rows=48,201)          ← 4000× off
+--    -> Nested Loop  (rows=8) (actual rows=48,201)      ← 6000× off
+--         -> Seq Scan on orders (rows=41) (actual rows=48,201) ★ 1176×
+--              Filter: status='pending' AND created_at > ...
+--         -> Index Scan on users  (rows=1) (actual rows=1)     ✓
+--    -> Index Scan on regions (rows=1) (actual rows=1)         ✓
+--
+-- ★ The ONLY real error is at the leaf: status and created_at are
+--   correlated (pending orders are recent), so the independence
+--   assumption underestimates by 1176×. The two joins above are correct
+--   given their inputs — they inherited the error.
+CREATE STATISTICS s (dependencies, mcv) ON status, created_at FROM orders;
+ANALYZE orders;
+-- → leaf estimate 46,000; the planner switches to a hash join; 40s → 2s.
+
+-- ── WHY NESTED LOOPS AMPLIFY MISTAKES ───────────────────────────────────
+-- Nested loop cost = outer_rows × inner_cost. If outer_rows is
+-- underestimated 1000×, the plan's cost is underestimated 1000× and it
+-- looks like the cheapest option. Hash and merge joins scale far more
+-- gracefully with input-size errors.
+-- ✓ CONSEQUENCE: an unexpected nested loop over a large input is the
+--   single most common signature of an estimate problem — more reliable
+--   than any other tell.</pre>
+
+    <h2>Part 5 — Calibrating the Cost Constants</h2>
+    <pre>-- The defaults were chosen for spinning disks around 2000. On modern
+-- hardware two of them are simply wrong.
+
+-- ── random_page_cost: THE MOST IMPACTFUL SETTING ────────────────────────
+SHOW random_page_cost;      -- 4.0
+-- This says a random page read costs 4× a sequential one. Measured:
+--   spinning disk   ~50-100×   (4.0 was actually generous)
+--   SATA SSD        ~1.5-2×
+--   NVMe            ~1.1-1.5×
+--   fully cached    ~1.0
+-- ⚠ Left at 4.0 on SSD, the planner systematically OVER-CHARGES every
+--   index scan and picks sequential scans that are genuinely slower.
+ALTER SYSTEM SET random_page_cost = 1.1;    -- NVMe
+-- ✓ This one change fixes more "why is it ignoring my index" complaints
+--   than any query rewrite, and most installations never touch it.
+
+-- ── effective_cache_size: A HINT, NOT AN ALLOCATION ─────────────────────
+SHOW effective_cache_size;   -- 4GB default
+-- It allocates NOTHING. It tells the planner how much data is likely to
+-- be cached between shared_buffers and the OS page cache, which affects
+-- how it costs repeated index access in a nested loop.
+ALTER SYSTEM SET effective_cache_size = '24GB';   -- ~75% of RAM
+-- Too low → the planner assumes cold reads and avoids index-driven
+-- plans that would in fact be served from memory.
+
+-- ── THE OTHERS, AND WHEN THEY MATTER ────────────────────────────────────
+-- cpu_tuple_cost (0.01)  raise slightly (0.02-0.03) if your CPU work per
+--   row is heavy — many expressions, expensive functions.
+-- parallel_setup_cost (1000)  lower it if parallel plans are being
+--   skipped on queries that would benefit; raise it if short queries are
+--   spawning workers wastefully.
+-- jit_above_cost (100000)  JIT compilation helps long analytical queries
+--   and ADDS 100ms+ to short ones. If OLTP latency regressed after an
+--   upgrade, this is a prime suspect.
+
+-- ── CALIBRATE WITH EVIDENCE, NOT FOLKLORE ───────────────────────────────
+-- 1. Find a query where the planner chooses wrongly.
+-- 2. Force the alternative and measure BOTH:
+SET enable_seqscan = off;
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;      -- index: 4ms,  cost 41,000
+RESET enable_seqscan;
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;      -- seq:  380ms, cost 18,000
+-- 3. The planner preferred cost 18,000 but reality is 95× slower. The
+--    ratio between predicted and actual tells you the constant is wrong,
+--    and in which direction.
+-- 4. Adjust, then RE-CHECK A RANGE OF QUERIES — a constant that fixes
+--    one query and breaks five is not a fix.
+-- ⚠ Change cost constants globally and carefully. Unlike an index, they
+--   affect every plan in the system.
+
+-- ── PER-TABLESPACE OVERRIDES ────────────────────────────────────────────
+ALTER TABLESPACE archive_hdd SET (random_page_cost = 4.0);
+ALTER TABLESPACE hot_nvme SET (random_page_cost = 1.05);
+-- ✓ Mixed storage is exactly what this is for, and it is rarely used.</pre>
+
+    <h2>Part 6 — Keeping Statistics Healthy</h2>
+    <pre>-- ── WHEN ANALYZE RUNS, AND WHEN IT DOES NOT ─────────────────────────────
+SHOW autovacuum_analyze_scale_factor;   -- 0.1 → after 10% of rows change
+SHOW autovacuum_analyze_threshold;      -- 50
+SELECT relname, last_analyze, last_autoanalyze, n_mod_since_analyze
+FROM pg_stat_user_tables ORDER BY n_mod_since_analyze DESC LIMIT 5;
+-- ⚠ THE THREE GAPS THAT BITE:
+--   1. BULK LOADS. Inserting 10M rows into a 100M-row table is 10% — it
+--      may only just trigger, and autoanalyze runs AFTERWARDS, so the
+--      first queries run on stale statistics. Always ANALYZE explicitly
+--      at the end of a load.
+--   2. NEW TABLES AND INDEXES. A freshly created table has NO
+--      statistics; the planner uses hardcoded guesses (0.005 for
+--      equality). This is why the first queries against new data are
+--      often planned terribly.
+--   3. AFTER A RESTORE OR MAJOR UPGRADE. pg_upgrade does NOT carry
+--      statistics across. Run ANALYZE on the whole database
+--      immediately, or the first hours are catastrophically slow — a
+--      well-known and still frequently-forgotten upgrade step.
+
+-- ── PER-COLUMN STATISTICS TARGETS ───────────────────────────────────────
+ALTER TABLE orders ALTER COLUMN tenant_id SET STATISTICS 1000;
+ANALYZE orders;
+-- 1000 → an MCV list of up to 1000 values and 1000 histogram buckets,
+-- from a sample of 300,000 rows.
+-- ✓ WORTH IT FOR: skewed columns with many distinct values, where the
+--   big tenants must land in the MCV list to be estimated correctly. In
+--   a multi-tenant system this single change often fixes the "one
+--   customer's queries are slow" class of problem.
+-- ✗ NOT WORTH IT: low-cardinality columns (already exact), or
+--   uniformly-distributed ones (the default is fine).
+-- ⚠ It costs ANALYZE time and planning time. Target the specific
+--   columns, do not raise default_statistics_target globally without
+--   measuring.
+
+-- ── EXPRESSION AND PARTIAL INDEX STATISTICS ─────────────────────────────
+CREATE INDEX ON orders (lower(email));
+ANALYZE orders;
+-- ✓ Postgres gathers statistics on the INDEXED EXPRESSION automatically,
+--   so WHERE lower(email)=... gets a real estimate rather than a guess.
+-- Without such an index, an expression predicate gets the default 0.005
+-- guess — a good reason to create the index even when a scan would be
+-- acceptable.
+
+-- ── THE MONITORING QUERY WORTH KEEPING ──────────────────────────────────
+SELECT schemaname, relname, n_live_tup, n_mod_since_analyze,
+       round(100.0*n_mod_since_analyze/NULLIF(n_live_tup,0),1) AS pct_stale,
+       last_autoanalyze
+FROM pg_stat_user_tables
+WHERE n_mod_since_analyze > 10000
+ORDER BY pct_stale DESC NULLS LAST LIMIT 10;
+-- Tables whose statistics have drifted furthest, ranked. On a system
+-- with unexplained plan instability this is the first thing to check.
+
+-- ── AND THE TOOL THAT MEASURES THE MODEL ITSELF ─────────────────────────
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+-- Combined with auto_explain, this captures the plan AND the estimate
+-- error from the moment a query was slow:
+ALTER SYSTEM SET auto_explain.log_min_duration = '3s';
+ALTER SYSTEM SET auto_explain.log_analyze = on;
+-- ⚠ Reproducing a bad plan later usually gives a different plan and a
+--   wasted afternoon. Capture it when it happens.</pre>
+    <div class="mistake-pair">
+      <div><strong>❌ Treating cost as time</strong>
+        <pre>"Cost is 18,000, that's slow."
+"Lower the cost to make it fast."
+"The planner is broken — it
+ picked a seq scan."
+→ Comparing costs across
+  different queries, which is
+  meaningless, and never checking
+  the estimate error.</pre></div>
+      <div><strong>✅ Reading estimates</strong>
+        <pre>"estimated 41, actual 48,201 at
+ the LEAF → 1176× off. Everything
+ above inherited it."
+"status and created_at are
+ correlated → CREATE STATISTICS."
+→ One fix at the source; the
+  whole tree corrects.</pre></div>
+    </div>
+
+    <h2>Common Mistakes</h2>
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr>
+      <tr><td>Comparing costs between different queries</td><td>Cost is only meaningful <em>within</em> one query's plan candidates</td><td>Compare estimated vs actual rows, and measure time</td></tr>
+      <tr><td>Not running <code>ANALYZE</code> after a bulk load</td><td>The first queries are planned on stale or absent statistics</td><td>Explicit <code>ANALYZE</code> at the end of every load</td></tr>
+      <tr><td>Forgetting <code>ANALYZE</code> after <code>pg_upgrade</code></td><td>Hours of catastrophic plans post-upgrade</td><td>It is a required step; statistics do not carry over</td></tr>
+      <tr><td>Leaving <code>random_page_cost</code> at 4.0 on SSD</td><td>Index scans systematically over-costed</td><td>Set to ~1.1 for NVMe, ~1.5 for SATA SSD</td></tr>
+      <tr><td>Ignoring correlated columns</td><td>Estimates off by 100× or more; catastrophic nested loops</td><td><code>CREATE STATISTICS</code> on the correlated pair</td></tr>
+      <tr><td>Fixing the top node of a plan tree</td><td>The real error is at a leaf and the fix changes nothing</td><td>Find the lowest node where estimate and actual diverge</td></tr>
+      <tr><td>Raising <code>default_statistics_target</code> globally</td><td>Slower <code>ANALYZE</code> and slower planning everywhere</td><td>Raise it per column, where evidence justifies it</td></tr>
+      <tr><td>Trusting <code>n_distinct</code> on a large skewed column</td><td>Sampling estimates it poorly; join and <code>GROUP BY</code> sizing goes wrong</td><td>Set it explicitly with <code>ALTER TABLE ... SET (n_distinct = ...)</code></td></tr>
+      <tr><td>Assuming a query on a new table will be planned well</td><td>No statistics means hardcoded guesses</td><td><code>ANALYZE</code> immediately after creating and populating</td></tr>
+      <tr><td>Tuning cost constants to fix one query</td><td>Fixes one plan, degrades many others</td><td>Verify across a representative set of queries</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+    <details class="solution"><summary><strong>Beginner:</strong> What does the cost number in <code>EXPLAIN</code> actually mean?</summary>
+      <p>It is an abstract unit, not a time. By definition, reading one page sequentially costs 1.0, and every
+         other operation is calibrated against that: a random page read defaults to 4.0, processing one row
+         costs 0.01, evaluating one operator costs 0.0025. The planner computes a total for each candidate
+         plan and picks the smallest.</p>
+      <p>The number appears as a range, such as <code>cost=0.43..8.45</code>. The first figure is the startup
+         cost — work that must happen before the first row can be returned — and the second is the total cost
+         to return all rows. A sequential scan has a startup cost near zero because it can emit its first row
+         immediately, whereas a sort must consume its entire input first, so its startup cost is close to its
+         total. That distinction is why adding <code>LIMIT</code> can change the chosen plan entirely: with a
+         limit, the planner weights startup cost heavily, so a plan that streams beats one that sorts even at
+         a much higher total.</p>
+      <p>The important caveat is that costs are only meaningful for comparing candidate plans <em>within one
+         query</em>. Comparing a cost of 18,000 in one query to 4,000 in another tells you nothing, because
+         they are estimates over different data. For judging actual performance you want
+         <code>EXPLAIN ANALYZE</code> and the buffer counts.</p></details>
+    <details class="solution"><summary><strong>Beginner:</strong> What statistics does the planner use, and where do they come from?</summary>
+      <p><code>ANALYZE</code> gathers them, either explicitly or via autovacuum, by reading a random sample —
+         by default around thirty thousand rows rather than the whole table. They are stored in the catalog
+         and visible through the <code>pg_stats</code> view.</p>
+      <p>Four things matter most. The most-common-values list holds the frequent values with their exact
+         frequencies, so equality predicates on those values are estimated almost perfectly. A histogram
+         covers everything else in equal-depth buckets, which is what makes range estimates work on skewed
+         data. <code>n_distinct</code> records how many distinct values exist, driving <code>GROUP BY</code>
+         and join sizing. And correlation measures how closely the physical row order matches the sorted
+         order of a column, which determines whether an index range scan fetches nearly-sequential pages or
+         scattered ones.</p>
+      <p>Two gaps are worth knowing. A table that has never been analysed has no statistics at all, so the
+         planner falls back to hardcoded guesses — 0.005 selectivity for equality — which is why the first
+         queries against freshly loaded data are frequently planned badly. And <code>n_distinct</code> is
+         genuinely hard to estimate from a sample; a sample of thirty thousand from a hundred million rows
+         cannot reliably distinguish a thousand distinct values from a million. When you know the real
+         cardinality, setting it explicitly on the column is better than hoping.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> Why do correlated columns cause such bad plans?</summary>
+      <p>Because the planner assumes column predicates are independent and multiplies their selectivities.
+         For <code>city = 'Paris' AND country = 'France'</code> it computes the probability of each
+         separately and multiplies, arriving at something like one in a hundred thousand. In reality every
+         Paris row is also France, so the true selectivity is just the city selectivity — often a hundred
+         times higher.</p>
+      <p>The damage is not the estimate itself but what the planner does with it. Believing it will get a
+         hundred rows, it chooses a nested loop, which is genuinely optimal at that size. Receiving ten
+         thousand rows, that same plan performs ten thousand index descents into the other side, and the
+         query goes from milliseconds to minutes. Nested loops amplify estimate errors because their cost is
+         literally outer rows multiplied by inner cost, whereas hash and merge joins degrade far more
+         gracefully.</p>
+      <p>The fix is extended statistics: <code>CREATE STATISTICS</code> on the correlated column set. The
+         <code>dependencies</code> kind teaches the planner that one column functionally determines another,
+         which corrects multi-column equality estimates. <code>ndistinct</code> corrects the number of
+         distinct combinations, which matters for grouping. The <code>mcv</code> kind stores the most common
+         combinations with real frequencies and handles skew the other two cannot.</p>
+      <p>It is not free — it costs analyse time and planning time — so I would add it where
+         <code>EXPLAIN ANALYZE</code> shows an actual order-of-magnitude estimate error, rather than
+         speculatively. And it is worth knowing that this is one of the most under-used fixes available; a
+         lot of teams reach for query rewrites or hints when one line of extended statistics would have
+         resolved it permanently.</p></details>
+    <details class="solution"><summary><strong>Mid:</strong> How do you decide whether a bad plan is a statistics problem or a cost problem?</summary>
+      <p>By comparing estimated to actual rows in <code>EXPLAIN ANALYZE</code>, which cleanly separates the
+         two cases.</p>
+      <p>If the estimates are badly wrong, it is a statistics problem, and no amount of cost tuning helps
+         because the planner is reasoning correctly from false premises. I would check when the table was
+         last analysed, run <code>ANALYZE</code>, and if the error persists look at why — a skewed column
+         needing a higher statistics target so the big values land in the MCV list, correlated columns
+         needing extended statistics, or an <code>n_distinct</code> that sampling got wrong and should be set
+         explicitly.</p>
+      <p>If the estimates are accurate but the planner still chose the slower option, the cost model is
+         mis-calibrated for the hardware. The overwhelmingly common case is
+         <code>random_page_cost</code> left at its default of 4.0, which encodes a spinning disk; on NVMe the
+         true ratio is closer to 1.1, so index scans are systematically over-charged and sequential scans
+         win when they should not. <code>effective_cache_size</code> set too low has a similar effect,
+         because the planner assumes repeated index access will hit disk when it would be served from
+         memory.</p>
+      <p>The confirming experiment is to force the alternative with an <code>enable_*</code> toggle and
+         measure both plans. If the forced plan's actual time is far better than its higher cost suggested,
+         the ratio between predicted and observed tells me which constant is wrong and by roughly how much.
+         I would use that purely as evidence, then change the constant globally and re-check a representative
+         set of queries — a constant that fixes one query and breaks five is not a fix.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> A four-table join has an estimate that is 4000× wrong at the top. How do you approach it?</summary>
+      <p>I would not look at the top node at all, because estimate errors propagate multiplicatively through
+         a join tree. If each leaf is three times low, a two-way join is nine times low, three-way is
+         twenty-seven, four-way is eighty-one — so a large error at the root is usually a modest error at a
+         leaf that has compounded. Attacking the top node fixes nothing.</p>
+      <p>So the first move is to walk the plan from the bottom and find the lowest node where estimated and
+         actual diverge. Everything above that point has inherited the error and will correct itself once
+         the source is fixed. In practice there is usually exactly one offending leaf, and it is often a
+         scan with two or more predicates on correlated columns — the classic example being a filter on
+         status combined with a recency filter, where pending records are disproportionately recent.</p>
+      <p>Having found it, I diagnose that node specifically: are statistics stale, is a column skewed enough
+         that the relevant values are not in the MCV list, or are the predicates correlated? The remedies in
+         order of likelihood are <code>ANALYZE</code>, a raised per-column statistics target, and extended
+         statistics on the correlated set.</p>
+      <p>I would also note the plan shape as corroboration. An unexpected nested loop over a large input is
+         the most reliable signature of an underestimate, because nested loop cost is outer rows times inner
+         cost — underestimate the outer side and the plan looks cheapest by exactly that factor. Seeing a
+         nested loop where a hash join belongs tells me to look for an estimate problem before I look at
+         anything else.</p>
+      <p>Finally I would capture the evidence properly with <code>auto_explain</code> rather than trying to
+         reproduce it, because a bad plan reproduced later often plans differently and the afternoon is
+         wasted. And if the query is generated with many joins, I would check whether GEQO is involved, since
+         non-deterministic planning produces intermittent versions of this same symptom.</p></details>
+    <details class="solution"><summary><strong>Senior:</strong> How would you approach calibrating cost constants for a new production system?</summary>
+      <p>Carefully and with evidence, because unlike an index these settings affect every plan in the system,
+         so a change that helps one workload can quietly degrade another.</p>
+      <p>I would start with the two that are almost always wrong by default.
+         <code>random_page_cost</code> at 4.0 encodes a spinning disk; on SSD the measured ratio between
+         random and sequential reads is around 1.5, and on NVMe closer to 1.1. Leaving it at the default
+         systematically over-charges index scans, which is the single most common cause of "the planner
+         ignores my index". <code>effective_cache_size</code> allocates nothing but tells the planner how
+         much data is likely cached across shared buffers and the OS page cache; set too low it assumes cold
+         reads and avoids index-driven plans that would be served from memory. Roughly seventy-five percent
+         of RAM is the usual starting point.</p>
+      <p>To calibrate rather than guess, I would measure the actual sequential-versus-random ratio on the
+         real hardware with a dataset exceeding memory, since that ratio is precisely what
+         <code>random_page_cost</code> encodes. Then I would assemble a representative query set — ideally
+         the top entries from <code>pg_stat_statements</code> by total time — capture baseline plans and
+         timings, change one constant, and re-measure the whole set. The success criterion is aggregate
+         improvement across the set, not one query getting faster.</p>
+      <p>Beyond those two, I would leave most constants alone unless there is a specific signal.
+         <code>parallel_setup_cost</code> matters if parallel plans are being skipped or spawned wastefully.
+         <code>jit_above_cost</code> is worth checking if short OLTP queries regressed after an upgrade,
+         since JIT compilation can add a hundred milliseconds to a query that runs in two. And for mixed
+         storage, per-tablespace overrides let archive data on spinning disks keep a high random page cost
+         while hot data on NVMe gets a low one — a rarely-used feature that is exactly right when it
+         applies.</p>
+      <p>Throughout, I would treat statistics health as the prerequisite. Calibrating cost constants against
+         a system with stale or missing statistics means tuning the model to compensate for bad inputs, which
+         produces settings that are wrong once the statistics are fixed. Get <code>ANALYZE</code> coverage
+         and extended statistics right first, then calibrate.</p></details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Reproduce the planner's cost arithmetic by hand.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE t (id bigint, v int, payload text);
+INSERT INTO t SELECT g, (random()*1000)::int, repeat('x',100)
+FROM generate_series(1,1000000) g;
+VACUUM ANALYZE t;
+
+-- ── THE INPUTS ──────────────────────────────────────────────────────────
+SELECT relpages, reltuples FROM pg_class WHERE relname='t';
+--  relpages | reltuples
+--     16394 |   1000000
+
+-- ── PREDICT, THEN CHECK ─────────────────────────────────────────────────
+-- Seq Scan with one comparison:
+--   16394 pages × seq_page_cost 1.0        = 16,394
+--   1,000,000 rows × cpu_tuple_cost 0.01   = 10,000
+--   1,000,000 rows × cpu_operator_cost .0025 = 2,500
+--                                            ────────
+--                                    TOTAL  = 28,894
+EXPLAIN SELECT * FROM t WHERE v > 500;
+--  Seq Scan on t  (cost=0.00..28894.00 rows=498533 width=112)  ✓ EXACT
+
+-- ── ADD A SECOND PREDICATE ──────────────────────────────────────────────
+-- one more operator: +1,000,000 × 0.0025 = +2,500 → 31,394
+EXPLAIN SELECT * FROM t WHERE v > 500 AND v < 800;
+--  Seq Scan  (cost=0.00..31394.00 rows=149560)   ✓
+
+-- ── STARTUP vs TOTAL ────────────────────────────────────────────────────
+EXPLAIN SELECT * FROM t ORDER BY v;
+--  Sort  (cost=127337.34..129837.34 rows=1000000)
+--        ↑ startup ≈ total: a Sort must consume EVERYTHING before it can
+--          return the first row.
+EXPLAIN SELECT * FROM t;
+--  Seq Scan  (cost=0.00..26394.00)
+--        ↑ startup 0: the first row is available immediately.
+
+-- ── WHY LIMIT CHANGES THE PLAN ──────────────────────────────────────────
+CREATE INDEX ON t (v);
+EXPLAIN SELECT * FROM t ORDER BY v LIMIT 10;
+--  Limit  (cost=0.42..1.05 rows=10)
+--    -> Index Scan using t_v_idx  (cost=0.42..62834.42 rows=1000000)
+-- ⚠ The index scan's TOTAL cost (62,834) is far HIGHER than the sort
+--   plan's (129,837 — comparable), but its STARTUP is 0.42 versus
+--   127,337. With LIMIT 10 the planner computes
+--   startup + (10/1000000) × (total - startup) ≈ 1.05 and wins easily.
+-- ✓ This is exactly why "add an index matching the ORDER BY" transforms
+--   a LIMIT query — and why the same index is irrelevant without the
+--   LIMIT.
+
+-- ── SEE THE CONSTANTS MOVE THE ANSWER ───────────────────────────────────
+SET random_page_cost = 4.0;
+EXPLAIN SELECT * FROM t WHERE v = 500;   -- may choose Seq Scan
+SET random_page_cost = 1.1;
+EXPLAIN SELECT * FROM t WHERE v = 500;   -- now prefers the index
+RESET random_page_cost;
+-- Same data, same statistics, different plan — because one constant
+-- describes hardware the planner cannot measure for itself.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Inspect the statistics behind an estimate.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE orders (id bigint, status text, total int, tenant_id int);
+INSERT INTO orders
+SELECT g,
+       CASE WHEN random() &lt; 0.82 THEN 'paid'
+            WHEN random() &lt; 0.6  THEN 'pending'
+            WHEN random() &lt; 0.7  THEN 'shipped' ELSE 'cancelled' END,
+       (random()*1000)::int, (random()*500)::int
+FROM generate_series(1,1000000) g;
+ANALYZE orders;
+
+-- ── THE MCV LIST GIVES EXACT ESTIMATES ──────────────────────────────────
+SELECT attname, n_distinct, most_common_vals, most_common_freqs
+FROM pg_stats WHERE tablename='orders' AND attname='status';
+--  n_distinct: 4
+--  most_common_vals:  {paid,pending,shipped,cancelled}
+--  most_common_freqs: {0.8203,0.1071,0.0501,0.0225}
+
+EXPLAIN SELECT * FROM orders WHERE status='paid';
+--  rows=820300      → 0.8203 × 1,000,000. EXACT, because the value is
+--                     in the MCV list.
+EXPLAIN SELECT * FROM orders WHERE status='cancelled';
+--  rows=22500       → also exact.
+-- ✓ For low-cardinality columns every value is in the MCV list, so
+--   equality estimates are essentially perfect.
+
+-- ── THE HISTOGRAM HANDLES RANGES ────────────────────────────────────────
+SELECT histogram_bounds FROM pg_stats
+WHERE tablename='orders' AND attname='total';
+--  {0,10,20,...,990,1000}      ← 100 equi-depth buckets
+EXPLAIN SELECT * FROM orders WHERE total BETWEEN 100 AND 200;
+--  rows=100420      → ~10 buckets of 1% each. Interpolated, close.
+
+-- ── WHAT HAPPENS WITH NO STATISTICS ─────────────────────────────────────
+CREATE TABLE fresh AS SELECT * FROM orders;    -- never analysed
+EXPLAIN SELECT * FROM fresh WHERE status='paid';
+--  rows=5000        ← a HARDCODED GUESS (0.005 selectivity)
+-- The real answer is 820,300 — off by 164×.
+ANALYZE fresh;
+EXPLAIN SELECT * FROM fresh WHERE status='paid';
+--  rows=820300 ✓
+-- ⚠ THIS is why the first queries after a bulk load or a restore are
+--   planned catastrophically, and why ANALYZE is a required step after
+--   pg_upgrade — statistics are NOT carried across.
+
+-- ── CORRELATION AND WHY IT MATTERS ──────────────────────────────────────
+SELECT attname, correlation FROM pg_stats WHERE tablename='orders';
+--  id        |  1.00     ← inserted in order: index ranges are cheap
+--  status    |  0.31
+--  total     |  0.00     ← random: an index range scan on total does
+--                          scattered random I/O despite the index
+-- The planner uses this number directly when costing index scans, which
+-- is why the same index performs so differently on an append-ordered
+-- column versus a shuffled one.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Cause and fix a correlated-column disaster.
+      <details class="solution"><summary>Solution</summary>
+      <pre>CREATE TABLE addresses (id bigserial PRIMARY KEY, city text, country text);
+-- Perfectly correlated: city DETERMINES country.
+INSERT INTO addresses (city, country)
+SELECT c.city, c.country FROM (VALUES
+  ('Paris','France'),('Lyon','France'),('Berlin','Germany'),
+  ('Munich','Germany'),('Madrid','Spain'),('Rome','Italy')) AS c(city,country),
+  generate_series(1,200000);
+ANALYZE addresses;
+
+-- ── THE ESTIMATE IS BADLY WRONG ─────────────────────────────────────────
+EXPLAIN ANALYZE SELECT * FROM addresses
+WHERE city='Paris' AND country='France';
+--  Seq Scan  (cost=... rows=55556) (actual rows=200000)
+-- Estimated 55,556; actual 200,000. The planner computed:
+--   P(Paris) = 1/6 = 0.1667
+--   P(France)= 2/6 = 0.3333
+--   0.1667 × 0.3333 = 0.0556 → 66,667 (roughly what it shows)
+-- Reality: P(Paris AND France) = P(Paris) = 0.1667 → 200,000.
+-- ⚠ Only 3.6× here because cardinality is low. With realistic data —
+--   thousands of cities — it is easily 100× or more.
+
+-- ── MAKE IT REALISTIC AND WATCH IT EXPLODE ──────────────────────────────
+TRUNCATE addresses;
+INSERT INTO addresses (city, country)
+SELECT 'city_'||(g%5000), 'country_'||((g%5000)/50)
+FROM generate_series(1,5000000) g;
+ANALYZE addresses;
+EXPLAIN ANALYZE SELECT * FROM addresses
+WHERE city='city_42' AND country='country_0';
+--  (cost=... rows=10) (actual rows=1000)      ← 100× off
+
+-- ── NOW JOIN IT AND WATCH THE ERROR PROPAGATE ───────────────────────────
+CREATE TABLE people (id bigserial, address_id bigint, name text);
+INSERT INTO people (address_id, name)
+SELECT (random()*5000000)::bigint+1, 'p' FROM generate_series(1,5000000);
+CREATE INDEX ON people (address_id);
+ANALYZE people;
+
+EXPLAIN ANALYZE
+SELECT p.* FROM people p JOIN addresses a ON a.id = p.address_id
+WHERE a.city='city_42' AND a.country='country_0';
+--  Nested Loop  (rows=10) (actual rows=1002)
+--    -> Seq Scan on addresses (rows=10) (actual rows=1000)   ★ the leaf
+--    -> Index Scan on people  (rows=1)  (actual rows=1 loops=1000)
+--  Execution Time: 840 ms
+-- ⚠ The planner chose a NESTED LOOP because it expected 10 outer rows.
+--   It got 1000, so it performed 1000 index descents. Nested loop cost
+--   is outer × inner, so an underestimate makes the plan look cheapest
+--   by exactly that factor — the classic signature.
+
+-- ── THE FIX: ONE LINE ───────────────────────────────────────────────────
+CREATE STATISTICS st_city_country (dependencies, ndistinct, mcv)
+  ON city, country FROM addresses;
+ANALYZE addresses;
+EXPLAIN ANALYZE SELECT p.* FROM people p JOIN addresses a ON a.id=p.address_id
+WHERE a.city='city_42' AND a.country='country_0';
+--  Hash Join  (rows=1002) (actual rows=1002)
+--    -> Seq Scan on addresses (rows=1000) (actual rows=1000)  ✓
+--  Execution Time: 121 ms                        ← 7× faster
+-- ✓ Estimate corrected at the LEAF; the planner then chose the right
+--   join algorithm on its own.
+
+SELECT dependencies FROM pg_stats_ext WHERE statistics_name='st_city_country';
+--  {"1 => 2": 1.000000}    ← "city fully determines country"</pre>
+      </details></div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Trace error propagation to its source.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- GIVEN this plan, identify the single node to fix.
+EXPLAIN ANALYZE SELECT ...;
+--  Sort (rows=48) (actual rows=214,882)                          4470× ✗
+--    -> HashAggregate (rows=48) (actual rows=214,882)            4470× ✗
+--         -> Nested Loop (rows=182) (actual rows=1,204,882)      6620× ✗
+--              -> Nested Loop (rows=91) (actual rows=48,201)      530× ✗
+--                   -> Seq Scan on orders
+--                        (rows=41) (actual rows=48,201)          1176× ★
+--                        Filter: status='pending'
+--                                AND created_at > now()-'7d'
+--                   -> Index Scan on users
+--                        (rows=1) (actual rows=1 loops=48201)      ✓
+--              -> Index Scan on order_items
+--                   (rows=2) (actual rows=25 loops=48201)         12× ✗
+
+-- ── STEP 1: WALK FROM THE BOTTOM ────────────────────────────────────────
+-- users index scan:      rows=1, actual=1        ✓ perfect
+-- orders seq scan:       rows=41, actual=48,201  ★ 1176× — THE SOURCE
+-- order_items:           rows=2, actual=25       12× — a second, smaller
+--                                                  error
+-- Everything above inherits: 1176 × 12 ≈ 14,000, and the observed
+-- top-level error is the same order of magnitude. The maths confirms
+-- the diagnosis.
+
+-- ── STEP 2: DIAGNOSE THE LEAF ───────────────────────────────────────────
+SELECT last_analyze, last_autoanalyze, n_mod_since_analyze
+FROM pg_stat_user_tables WHERE relname='orders';
+ANALYZE orders;    -- estimate → 3,200. Better; still 15× off.
+-- Two predicates. Are they correlated?
+SELECT count(*) FILTER (WHERE status='pending') AS pending,
+       count(*) FILTER (WHERE created_at > now()-'7 days'::interval) AS recent,
+       count(*) FILTER (WHERE status='pending'
+                        AND created_at > now()-'7 days'::interval) AS both,
+       count(*) AS total FROM orders;
+--  pending | recent  | both   | total
+--   52,000 | 210,000 | 48,201 | 8,000,000
+-- Independent would predict 52000/8M × 210000/8M × 8M = 1,365.
+-- Actual is 48,201 — 35× higher. STRONGLY correlated: pending orders are
+-- overwhelmingly recent, which is obvious in hindsight and invisible to
+-- the planner.
+
+-- ── STEP 3: FIX THE SOURCE ──────────────────────────────────────────────
+CREATE STATISTICS st_orders (dependencies, mcv) ON status, created_at
+  FROM orders;
+ANALYZE orders;
+-- leaf estimate → 46,800 (actual 48,201) ✓
+
+-- ── STEP 4: THE SECOND ERROR ────────────────────────────────────────────
+-- order_items rows=2 vs actual=25 is an n_distinct problem: the planner
+-- thinks there are far more distinct order_ids than there are.
+ALTER TABLE order_items ALTER COLUMN order_id SET STATISTICS 1000;
+ANALYZE order_items;
+
+-- ── STEP 5: RE-CHECK ────────────────────────────────────────────────────
+--  Hash Join (rows=1,180,000) (actual rows=1,204,882)   ✓ 2% off
+--  Execution Time: 40,102 ms → 2,204 ms
+-- ✓ The planner abandoned the nested loops on its own once the inputs
+--   were right. No hints, no rewrites, no forced plans.
+
+-- ── THE RULE ────────────────────────────────────────────────────────────
+-- Fix the LOWEST divergent node. Errors multiply upward, so a 4470×
+-- error at the root is usually one leaf being ~1000× off. Attacking the
+-- top node achieves nothing, and it is where most people start.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Calibrate <code>random_page_cost</code> with measurements.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- GOAL: replace the default 4.0 with a value derived from THIS hardware.
+
+-- ── STEP 1: MEASURE THE REAL RATIO ──────────────────────────────────────
+-- Use a dataset well beyond RAM so the OS cache cannot hide the
+-- difference — otherwise you measure your cache, not your disk.
+CREATE TABLE bench AS SELECT g AS id, repeat('x',400) AS v
+FROM generate_series(1,30000000) g;          -- ~13 GB
+CREATE INDEX ON bench (id);
+VACUUM ANALYZE bench;
+-- restart Postgres and drop OS caches between runs.
+
+-- SEQUENTIAL:
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM bench;
+--  Buffers: shared read=1,562,500   Time: 12,400 ms
+--  → 1,562,500 pages / 12.4s = 126,008 pages/sec sequential
+
+-- RANDOM:
+EXPLAIN (ANALYZE, BUFFERS) SELECT count(v) FROM bench
+WHERE id = ANY(ARRAY(SELECT (random()*30000000)::int
+                     FROM generate_series(1,200000)));
+--  Buffers: shared read=198,412     Time: 18,900 ms
+--  → 198,412 / 18.9s = 10,498 pages/sec random
+
+-- RATIO = 126,008 / 10,498 = 12.0
+-- ⚠ On this (SATA SSD) machine the raw ratio is 12, NOT 1.1.
+
+-- ── STEP 2: BUT DO NOT SET IT TO 12 ─────────────────────────────────────
+-- random_page_cost is not the raw device ratio. It must account for
+-- CACHING: in production a large share of random reads are served from
+-- shared_buffers or the OS page cache, at RAM speed. The effective ratio
+-- is much closer to 1.
+-- ✓ This is precisely what effective_cache_size communicates, and why
+--   the two settings must be tuned together:
+ALTER SYSTEM SET effective_cache_size = '24GB';   -- ~75% of RAM
+
+-- ── STEP 3: TEST AGAINST A REAL QUERY SET ───────────────────────────────
+-- Take the top 20 by total time from pg_stat_statements, capture
+-- baseline plans and timings, then sweep:
+DO $$ DECLARE c numeric;
+BEGIN FOR c IN SELECT unnest(ARRAY[1.0,1.1,1.5,2.0,3.0,4.0]) LOOP
+  EXECUTE format('SET random_page_cost = %s', c);
+  RAISE NOTICE 'rpc=%', c;   -- run the query set, record totals
+END LOOP; END $$;
+
+--  rpc | total time across 20 queries | plans changed
+--  1.0 |  4,102 ms                    | 14   ← some now over-use indexes
+--  1.1 |  3,884 ms                    | 12   ★ best
+--  1.5 |  4,201 ms                    |  9
+--  2.0 |  5,640 ms                    |  6
+--  4.0 |  9,882 ms                    |  0   (baseline)
+
+-- ── STEP 4: APPLY AND VERIFY ────────────────────────────────────────────
+ALTER SYSTEM SET random_page_cost = 1.1;
+SELECT pg_reload_conf();
+-- ⚠ VERIFY ACROSS THE WHOLE SET, not one query. The failure mode of
+--   setting it too low is the planner over-using indexes on medium-
+--   selectivity queries where a scan was genuinely better — which is
+--   why 1.0 scored worse than 1.1 above.
+
+-- ── STEP 5: MIXED STORAGE ───────────────────────────────────────────────
+CREATE TABLESPACE archive LOCATION '/mnt/hdd';
+ALTER TABLESPACE archive SET (random_page_cost = 4.0);
+ALTER TABLE old_events SET TABLESPACE archive;
+-- ✓ Per-tablespace overrides are exactly right for tiered storage and
+--   are almost never used.
+
+-- ── THE PRINCIPLE ───────────────────────────────────────────────────────
+-- Measure the hardware to know the DIRECTION and rough magnitude, then
+-- choose the value empirically against your actual workload. The device
+-- ratio alone is the wrong number, because the planner is costing reads
+-- that are frequently cached — and that is the point of the second
+-- setting.</pre>
+      </details></div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a statistics health check for a production system.
+      <details class="solution"><summary>Solution</summary>
+      <pre>-- GOAL: catch statistics problems BEFORE they become bad plans.
+
+-- ── CHECK 1: STALENESS ──────────────────────────────────────────────────
+SELECT schemaname, relname, n_live_tup, n_mod_since_analyze,
+       round(100.0*n_mod_since_analyze/NULLIF(n_live_tup,0),1) AS pct_stale,
+       last_autoanalyze, last_analyze
+FROM pg_stat_user_tables
+WHERE n_live_tup > 10000
+  AND n_mod_since_analyze > GREATEST(1000, n_live_tup * 0.1)
+ORDER BY pct_stale DESC NULLS LAST;
+-- ⚠ The default autoanalyze threshold is 10% of the table. On a
+--   200M-row table that is 20 MILLION modifications before it runs.
+--   Tune it per table for the large ones:
+ALTER TABLE orders SET (autovacuum_analyze_scale_factor = 0.02);
+
+-- ── CHECK 2: TABLES WITH NO STATISTICS AT ALL ───────────────────────────
+SELECT c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND NOT EXISTS (SELECT 1 FROM pg_stats s WHERE s.tablename=c.relname);
+-- These get HARDCODED GUESSES (0.005 for equality). Every query against
+-- them is planned blind. Usually: newly created tables, or a fresh
+-- restore where nobody ran ANALYZE.
+
+-- ── CHECK 3: SUSPICIOUS n_distinct ──────────────────────────────────────
+SELECT tablename, attname, n_distinct, null_frac
+FROM pg_stats
+WHERE schemaname='public' AND n_distinct BETWEEN -1 AND -0.9
+ORDER BY tablename;
+-- n_distinct near -1 means "almost every row is unique". Correct for a
+-- key; WRONG for a foreign key or a category column, and it badly
+-- distorts join and GROUP BY sizing.
+-- Compare against the truth on a suspect column:
+SELECT count(DISTINCT tenant_id) AS actual,
+       (SELECT n_distinct FROM pg_stats
+        WHERE tablename='orders' AND attname='tenant_id') AS estimated
+FROM orders;
+-- If they diverge badly, pin it:
+ALTER TABLE orders ALTER COLUMN tenant_id SET (n_distinct = 5000);
+ANALYZE orders;
+
+-- ── CHECK 4: CANDIDATES FOR EXTENDED STATISTICS ─────────────────────────
+-- Multi-column filters are where independence hurts. Find them in
+-- pg_stat_statements, then test each pair:
+SELECT count(*) FILTER (WHERE a) AS ca, count(*) FILTER (WHERE b) AS cb,
+       count(*) FILTER (WHERE a AND b) AS cboth, count(*) AS total
+FROM (SELECT status='pending' AS a,
+             created_at > now()-'7 days'::interval AS b FROM orders) s;
+-- If cboth ≫ (ca × cb / total), the columns are correlated:
+CREATE STATISTICS st (dependencies, mcv) ON status, created_at FROM orders;
+SELECT statistics_name, dependencies FROM pg_stats_ext;
+
+-- ── CHECK 5: THE OUTCOME METRIC (the one that matters) ──────────────────
+-- Everything above is a proxy. This measures the real thing:
+ALTER SYSTEM SET auto_explain.log_min_duration = '3s';
+ALTER SYSTEM SET auto_explain.log_analyze = on;
+ALTER SYSTEM SET auto_explain.log_nested_statements = on;
+-- Then scrape the logs for plans where estimated and actual rows differ
+-- by more than ~10×, and rank by frequency. That list IS your statistics
+-- backlog, ordered by real impact.
+-- ⚠ Capture plans WHEN THEY ARE SLOW. Reproducing later usually gives a
+--   different plan and a wasted afternoon.
+
+-- ── CHECK 6: THE OPERATIONAL RUNBOOK ITEMS ──────────────────────────────
+-- • ANALYZE at the end of every bulk load — not optional
+-- • ANALYZE the whole database after pg_upgrade or a restore; statistics
+--   do NOT carry across, and skipping it means hours of terrible plans
+-- • ANALYZE after creating an expression index (it gathers statistics on
+--   the expression, which nothing else provides)
+-- • alert on tables exceeding the staleness threshold
+
+-- ── WHAT I WOULD AUTOMATE ───────────────────────────────────────────────
+-- Checks 1, 2 and 5 as a scheduled job with alerting; 3 and 4 as a
+-- quarterly review, since they need judgement. The highest-value single
+-- item is check 5, because it measures whether the statistics are
+-- actually producing correct estimates rather than whether they are
+-- recent — and recency is only a proxy for correctness.</pre>
+      </details></div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Cost is an abstract unit anchored at "one sequential page read = 1.0", and the arithmetic is simple enough to reproduce by hand from <code>pg_class</code> and the cost constants.</li>
+        <li>Startup versus total cost is why <code>LIMIT</code> changes plans — the planner weights the first-row cost when only a few rows are needed.</li>
+        <li>Costs are only comparable between candidate plans for one query; comparing costs across different queries is meaningless.</li>
+        <li>Estimates come from an MCV list (exact for frequent values), a histogram (ranges), <code>n_distinct</code> and correlation — and a table with no statistics gets hardcoded guesses.</li>
+        <li><code>n_distinct</code> is genuinely hard to estimate from a sample; set it explicitly when you know the true cardinality.</li>
+        <li>The independence assumption on correlated columns is the largest single source of catastrophic plans, and <code>CREATE STATISTICS</code> fixes it in one line.</li>
+        <li>Estimate errors multiply through a join tree, so always fix the <em>lowest</em> divergent node — everything above it inherited the error.</li>
+        <li>An unexpected nested loop over a large input is the most reliable signature of an underestimate, because its cost is outer rows times inner cost.</li>
+        <li>Every bad plan is either wrong estimates or wrong cost constants; comparing estimated to actual rows tells you which in one look.</li>
+        <li><code>random_page_cost</code> at its 4.0 default and a too-small <code>effective_cache_size</code> are the two most impactful misconfigurations on modern hardware.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="query-planner.html">← Parser, Rewriter &amp; Planner</a>
+      <a href="join-algorithms.html">Join &amp; Aggregation Algorithms →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
