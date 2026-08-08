@@ -6,12 +6,15 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-06)
+## ▶️ RESUME HERE (last updated 2026-08-07)
 
-**Current task:** Database Concepts & Architecture — **all 15 lessons DONE**, quiz bank **still to write**.
-Next action: write `tutorials/database-concepts/quiz-bank-1.js` (sets 1–5) + `quiz-bank-2.js` (sets 6–10),
-20 Qs each with `explain` on every question, then validate `10 200 0`. `nav.js`, `quiz.html` and the
-root `index.html` card already exist.
+**Current task:** ✅ **Database Concepts & Architecture is COMPLETE** — 15 lessons + quiz bank (`10 200 0`,
+0 duplicate questions), whole track passes `validate.py` with 0 errors. Also fixed the stale
+`← CSS Track` nav link in its `quiz.html` (copy-paste from the CSS template, same bug found in SQL).
+
+**Next action: build Vector Databases & RAG** (`tutorials/vector-databases/`) — new track, ~14 lessons at
+v4 depth + a 10×20 quiz bank. `quiz.html` is already scaffolded; `nav.js`, the lessons, both quiz banks
+and the root `index.html` card under `#databases` still need writing. Draft curriculum is in section B below.
 
 **How to work:** write each lesson at v4 depth, then
 ```
@@ -21,8 +24,7 @@ must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair. A forward li
 not-yet-written next lesson shows as a "broken link" error — that is expected and clears when the
 next file lands; re-run the whole-track validate at the end to confirm 0 errors.
 
-**Then, in order:** DB Concepts quiz bank → Vector Databases & RAG (new, 14 lessons + bank) →
-LeetCode v4 (21) → infra six (~70).
+**Then, in order:** Vector Databases & RAG (new, 14 lessons + bank) → LeetCode v4 (21) → infra six (~70).
 
 **Quiz-bank recipe (per the 2026-08-05 decision — a track is not done without it):**
 sets are `{title:"Quiz N · Topic", desc, questions:[{q, options:[3], answer:<idx>, explain}×20]}`,
@@ -58,7 +60,7 @@ Validate with the node one-liner at the bottom of this file → must print `10 2
 | 17 | ASP.NET Core | 23 (v4) | 200 | ✅ **v4 DONE 23/23** (2026-08-04) |
 | 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | ✅ v3 done · ⏳ v4 pending |
 | 19 | System Design | 36 lessons (Fundamentals ×11 + Deep Dives ×6 + Case Studies ×12 + Senior/Staff ×7) | 200 | ✅ DONE (v4) |
-| 20 | 🆕 Database Concepts & Architecture | **15 (v4)** | ⏳ to write | 🔄 **lessons 15/15 DONE** (2026-08-06) · quiz bank pending |
+| 20 | 🆕 Database Concepts & Architecture | **15 (v4)** | 200 | ✅ **DONE 15/15 + quiz bank** (2026-08-07) |
 | 21 | 🆕 Vector Databases & RAG | ~14 (planned) | 200 (to write) | ⏳ **NEW TRACK — not started** (quiz.html scaffolded) |
 
 **v3 build-out done: 19 full tracks (3,800 quiz questions), all committed & pushed.**
@@ -128,13 +130,13 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 3. ~~**ASP.NET Core**~~ ✅ **COMPLETE 2026-08-04** — 23/23 lessons, 0 validation errors
 4. ~~**Python**~~ ✅ **COMPLETE 2026-08-04** — 12/12 lessons, 0 validation errors
 5. ~~**SQL**~~ ✅ **COMPLETE 2026-08-05** — 12/12 lessons (47–57KB) + quiz bank retuned to v4 (20 swaps)
-6. 🔄 **Database Concepts & Architecture** — ✅ **lessons 15/15 COMPLETE 2026-08-06** · ⏳ quiz bank pending ← **CURRENT**
-7. 🆕 **Vector Databases & RAG** — NEW track, not started (see below)
+6. ~~**Database Concepts & Architecture**~~ ✅ **COMPLETE 2026-08-07** — 15/15 lessons (50–59KB) + quiz bank `10 200 0`
+7. 🆕 **Vector Databases & RAG** — NEW track, not started (see below) ← **CURRENT**
 8. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
 9. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
 
-**Remaining: ~105 lessons across 4 tracks + 2 quiz banks**
-(DB Concepts bank + Vector/RAG 14 lessons & bank + LeetCode 21 + infra six ~70 under the approved expansion).
+**Remaining: ~105 lessons across 3 tracks + 1 quiz bank**
+(Vector/RAG 14 lessons & bank + LeetCode 21 + infra six ~70 under the approved expansion).
 
 #### SQL v4 — per-lesson status (as of 2026-08-05)
 Rebuilt in place, no redirect stubs needed. Every done lesson `det=12 ex=6`, 0 validation errors.
@@ -169,7 +171,11 @@ Scope confirmed by user: **"based on design perspective and storage engine inter
 3. *Query Processing* ×3 — `query-planner.html` (5 stages, rewriter/views/RLS/CTE inlining, join-order search & GEQO, pushdown, **generic plan failure**) · `cost-models.html` (**cost formula by hand**, MCV/histogram/n_distinct, **independence assumption**, error propagation, calibrating random_page_cost) · `join-algorithms.html` (3 algorithms + costs, **nested loop as estimate-error signature**, hash spill batches, aggregation strategies, key skew)
 4. *Design Perspective* ×4 — `physical-design.html` (**reversibility hierarchy**, key choice, row width, write-path design, partition key from query logs) · `oltp-olap.html` (row vs columnar arithmetic, **4 compression encodings**, vectorised execution, what columnar is bad at, the middle ground) · `engine-landscape.html` (**6 characterising questions**, Postgres/InnoDB/SQLite/DuckDB/LSM personalities) · `choosing-a-database.html` (6 workload dimensions, why PG is the default, decision tree, **costs evaluations miss**, PoC that can fail, ADRs)
 
-⏳ **REMAINING: the quiz bank only.** `nav.js`, `quiz.html` and the root `index.html` card are done and pushed.
+✅ **Quiz bank DONE 2026-08-07** — sets 1–10 written from scratch against the v4 curriculum, one set per
+theme: 1 How a DB Stores Data · 2 Pages/Heap/Row Layout · 3 B-Trees & LSM-Trees · 4 Buffer Pool ·
+5 WAL/Recovery/Durability · 6 MVCC/Locking/Latches · 7 Query Planner · 8 Cost Models & Join Algorithms ·
+9 Physical Design/OLTP-OLAP/Engine Choice · 10 mixed mock exam. Validates `10 200 0`, 0 duplicate stems.
+**Track 20 is fully complete.**
 
 **B. Vector Databases & RAG** (`tutorials/vector-databases/`)
 Scope confirmed: **vector stores + RAG patterns** (the full practical track, incl. evaluation and production ops). Draft curriculum:
@@ -182,6 +188,12 @@ Both need: `nav.js`, `quiz.html` + `quiz-bank-1.js`/`quiz-bank-2.js` (10 sets ×
 
 ### ✅ Settled decision: infra six scope (2026-08-05)
 **FULL EXPANSION — ~20 lessons each, ~70 total.** The build recommendation to deepen in place at 12 each (~40) was put to the user and **declined**; build out the curricula. Applies to Docker, Kubernetes, AWS, CI/CD, MongoDB and Redis.
+
+### Session note 2026-08-07
+Database Concepts quiz bank written and validated (`10 200 0`, no duplicate question stems) — track 20 done.
+The `← CSS Track` nav bug from the quiz.html template struck again here (it was fixed in SQL on 2026-08-05);
+**when scaffolding a new track's quiz.html from `tutorials/css/quiz.html`, replace all three strings, and
+grep the new file for `CSS` before committing.** Next up: Vector Databases & RAG from zero.
 
 ### Session note 2026-08-06
 SQL v4 finished (5 lessons: transactions → indexes → isolation → optimization → scaling) **and its quiz bank retuned** — the first track to satisfy the new "not done without the bank" rule. Then Database Concepts built from zero: nav.js, quiz.html, root index card, and all 15 lessons.
