@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Processes, fork &amp; exec — Unix &amp; Linux — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Processes, fork &amp; exec <span class="level-badge level-adv">Processes &amp; The Kernel</span></h1>
+    <p><strong>What you'll master:</strong> the process lifecycle as a state machine you can read off
+       <code>ps</code> output — including why <code>D</code> state cannot be killed and what that tells you
+       about storage — how <code>fork</code> returns twice and what copy-on-write actually copies, why zombies
+       exist and why they are the parent's fault, how orphans get re-parented and what changes inside a
+       container, the difference between PID/PPID/PGID/SID that makes signals and job control comprehensible,
+       and how to read <code>/proc/PID</code> to answer almost any question about a running process.
+       Prerequisites: <a href="index.html">How Unix Is Put Together</a> and
+       <a href="shell.html">The Shell Executes a Line</a>.</p>
+
+    <h2>Part 1 — The Process State Machine</h2>
+
+    <p>A process is always in exactly one state, and the letter in <code>ps</code>'s <code>STAT</code> column
+       tells you what it is waiting for. Reading it correctly redirects an investigation in seconds.</p>
+
+<pre>
+                    ┌─────────────┐
+        fork() ───→ │  R  runnable │ ←──────────────┐
+                    │  (or running)│                │
+                    └──────┬───────┘                │
+                           │                        │
+          waits for I/O,   │                   event occurs,
+          lock, or timer   │                   scheduler picks it
+                           ▼                        │
+              ┌────────────────────────┐            │
+              │  S  interruptible sleep │───────────┤
+              │     (can be signalled)  │            │
+              └────────────────────────┘            │
+              ┌────────────────────────┐            │
+              │  D  UNinterruptible     │───────────┘
+              │     (cannot be killed)  │
+              └────────────────────────┘
+                           │ exit()
+                           ▼
+                    ┌─────────────┐    parent calls wait()
+                    │  Z  zombie   │ ──────────────────→ gone
+                    │ (exit status │
+                    │   retained)  │
+                    └─────────────┘
+</pre>
+
+    <table class="tbl">
+      <tr><th>State</th><th>Meaning</th><th>What it tells you</th></tr>
+      <tr><td><code>R</code></td><td>Running or runnable</td><td>Using CPU, or queued for it. High counts = CPU contention</td></tr>
+      <tr><td><code>S</code></td><td>Interruptible sleep</td><td>Normal waiting — network, timer, lock. Signals work</td></tr>
+      <tr><td><code>D</code></td><td>Uninterruptible sleep</td><td><strong>Block I/O or NFS.</strong> Cannot be killed, not even with -9</td></tr>
+      <tr><td><code>Z</code></td><td>Zombie</td><td>Dead; parent has not reaped it. Holds only a PID</td></tr>
+      <tr><td><code>T</code></td><td>Stopped</td><td>SIGSTOP/SIGTSTP, or under a debugger</td></tr>
+      <tr><td><code>I</code></td><td>Idle kernel thread</td><td>Ignore — does not count toward load</td></tr>
+    </table>
+
+    <p>Suffixes add detail: <code>&lt;</code> high priority, <code>N</code> low priority, <code>s</code>
+       session leader, <code>+</code> foreground process group, <code>l</code> multi-threaded.</p>
+
+<pre>
+$ ps -eo pid,stat,wchan:20,cmd --sort=-stat | head -6
+    PID STAT WCHAN                CMD
+   2210 Ss   ep_poll              /usr/sbin/nginx: master process
+  48901 S    inet_csk_accept      ./api-server
+  51022 D    io_schedule          /usr/bin/rsync -a /data /backup
+  51190 Z    -                    [worker] &lt;defunct&gt;
+</pre>
+
+    <p><code>WCHAN</code> names the kernel function the process is parked in, which is far more specific than
+       the state letter alone. <code>ep_poll</code> means waiting on epoll (idle server, healthy),
+       <code>inet_csk_accept</code> means waiting for a TCP connection, <code>io_schedule</code> means waiting
+       on a block device, and <code>futex_wait</code> means blocked on a userspace lock — often a deadlock.</p>
+
+    <div class="note">🔑 <strong>Why <code>D</code> state ignores SIGKILL.</strong> An uninterruptible sleep
+       means the process is inside a kernel operation that cannot safely be abandoned — typically mid-way
+       through a block device request where unwinding would corrupt kernel state. Signals are only delivered
+       when a process transitions back to userspace, and a <code>D</code>-state process never gets there until
+       the I/O completes. So a pile of unkillable <code>D</code> processes is not an application problem: it
+       is a storage problem, or a hung NFS server. Fix the device, or the processes never leave.</div>
+
+    <h2>Part 2 — fork() Returns Twice</h2>
+
+    <p><code>fork</code> is the only system call that returns twice — once in each of two now-independent
+       processes. This is genuinely strange the first time you see it, and it is the foundation of everything
+       else in this lesson.</p>
+
+<pre>
+pid_t pid = fork();
+
+if (pid == 0) {
+    // We are the CHILD. fork() returned 0 here.
+} else if (pid &gt; 0) {
+    // We are the PARENT. fork() returned the child's PID.
+} else {
+    // fork failed (-1): out of memory, or hit RLIMIT_NPROC
+}
+</pre>
+
+    <p>The child is a near-exact duplicate: same code, same variables, same open file descriptors, same current
+       directory. The differences are few and specific:</p>
+
+    <table class="tbl">
+      <tr><th>Inherited by the child</th><th>Different in the child</th></tr>
+      <tr><td>Memory contents (copy-on-write)</td><td>PID and PPID</td></tr>
+      <tr><td>Open file descriptors (<em>shared offsets</em>)</td><td>Pending signals are cleared</td></tr>
+      <tr><td>Environment, cwd, umask</td><td>CPU time counters reset to zero</td></tr>
+      <tr><td>Signal handlers, resource limits</td><td>File locks are not inherited</td></tr>
+      <tr><td>Real/effective UID and GID</td><td>Timers are not inherited</td></tr>
+    </table>
+
+    <p>That "shared offsets" detail matters more than it looks. Parent and child share the same open file
+       <em>description</em>, so they share a read/write position:</p>
+
+<pre>
+$ cat &gt; /tmp/shared.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+exec 3&lt; /tmp/data.txt
+( read -r line &lt;&amp;3; echo "child read: $line" ) &amp;
+wait
+read -r line &lt;&amp;3
+echo "parent read: $line"
+EOF
+$ printf 'first\nsecond\n' &gt; /tmp/data.txt
+$ bash /tmp/shared.sh
+child read: first
+parent read: second        # the parent continued from where the child left off
+</pre>
+
+    <p>This is exactly why two processes appending to the same log file with <code>&gt;&gt;</code> do not
+       overwrite each other — they share the offset — while two processes that each opened the file separately
+       do clobber one another.</p>
+
+    <p><strong>Copy-on-write</strong> makes <code>fork</code> cheap. The child does not get a physical copy of
+       the parent's memory; both processes share the same physical pages, marked read-only. A page is only
+       duplicated when one of them writes to it:</p>
+
+<pre>
+$ python3 -c "
+import os, time
+data = bytearray(500 * 1024 * 1024)      # 500 MB
+pid = os.fork()
+if pid == 0:
+    time.sleep(3); os._exit(0)
+time.sleep(1)
+print(open('/proc/%d/status' % pid).read().split('VmRSS:')[1].split(chr(10))[0])
+os.wait()
+"
+	 12345 kB                # the child's RSS is tiny, not 500 MB
+</pre>
+
+    <p>The consequence people meet in production: a large process forking is fast, but if the child then
+       <em>writes</em> across its inherited memory, pages get copied and memory use spikes. This is why a
+       memory-heavy service forking workers can OOM under load despite each worker "sharing" memory — and why
+       <code>vfork</code> and <code>posix_spawn</code> exist for the common fork-then-exec case where the
+       copy is pure waste.</p>
+
+    <h2>Part 3 — Zombies and Orphans</h2>
+
+    <p>These two are opposites and are constantly confused. Both arise from the parent/child relationship
+       outliving one party.</p>
+
+    <p>A <strong>zombie</strong> is a process that has exited but whose parent has not yet collected its exit
+       status. The kernel must keep the status somewhere until someone asks, so it retains a minimal entry —
+       no memory, no descriptors, just a PID and the status.</p>
+
+<pre>
+$ cat &gt; /tmp/zombie.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+sleep 1 &amp;                        # child exits after 1s
+sleep 30                         # parent ignores it for 30s
+EOF
+$ bash /tmp/zombie.sh &amp;
+$ sleep 3; ps -eo pid,ppid,stat,cmd | awk '$3 ~ /^Z/'
+  52301  52300 Z    [sleep] &lt;defunct&gt;
+</pre>
+
+    <p><strong>Zombies are always the parent's bug.</strong> The fix is for the parent to call
+       <code>wait()</code>. You cannot kill a zombie — it is already dead; signals have no effect. Killing the
+       <em>parent</em> works, because the zombie is then re-parented to init, which reaps it immediately.</p>
+
+    <p>A handful of zombies is harmless. Thousands exhaust the PID space and prevent new processes from
+       starting, which presents as a system that cannot fork — often reported as "everything is broken".</p>
+
+<pre>
+$ ps -eo stat | grep -c '^Z'
+2847
+$ cat /proc/sys/kernel/pid_max
+4194304
+</pre>
+
+    <p>An <strong>orphan</strong> is the reverse: the parent died first. The kernel immediately re-parents the
+       child, traditionally to PID 1:</p>
+
+<pre>
+$ (sleep 300 &amp; echo "child PID: $!"; exit)
+child PID: 52890
+$ ps -o pid,ppid,cmd -p 52890
+    PID    PPID CMD
+  52890       1 sleep 300        # PPID became 1
+</pre>
+
+    <p>Modern Linux allows a process to declare itself a <em>subreaper</em>
+       (<code>PR_SET_CHILD_SUBREAPER</code>), so orphans are re-parented to the nearest subreaper ancestor
+       rather than PID 1. systemd uses this so a service's orphaned children stay within its unit and are
+       cleaned up with it.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Running an application directly as PID 1 in a container.</strong> PID 1 has special
+         semantics: it does not get default signal handlers, so a process that has not explicitly installed a
+         SIGTERM handler <em>ignores</em> it — <code>docker stop</code> then waits ten seconds and SIGKILLs.
+         It is also responsible for reaping every orphan in the container, which most applications never do,
+         so zombies accumulate.</p>
+      <p>✅ <strong>Use an init that handles both</strong> — <code>docker run --init</code>, or
+         <code>tini</code>/<code>dumb-init</code> as the entrypoint. It forwards signals to your application
+         and reaps orphans. The symptoms it prevents — containers that take exactly ten seconds to stop, and
+         slowly accumulating <code>&lt;defunct&gt;</code> entries — are both extremely common and both look
+         like application bugs.</p>
+    </div>
+
+    <h2>Part 4 — PID, PPID, PGID, SID</h2>
+
+    <p>Four identifiers, each answering a different question. Confusing them is why job control and signal
+       delivery feel arbitrary.</p>
+
+    <table class="tbl">
+      <tr><th>ID</th><th>What it identifies</th><th>Used for</th></tr>
+      <tr><td><strong>PID</strong></td><td>This process</td><td>Signalling one process</td></tr>
+      <tr><td><strong>PPID</strong></td><td>Its parent</td><td>Reaping; orphan detection</td></tr>
+      <tr><td><strong>PGID</strong></td><td>Its process <em>group</em> — usually one pipeline</td><td><strong>Signalling a whole job at once</strong></td></tr>
+      <tr><td><strong>SID</strong></td><td>Its session — usually one terminal login</td><td>Terminal ownership; SIGHUP on disconnect</td></tr>
+    </table>
+
+<pre>
+$ sleep 100 | cat &amp;
+$ ps -eo pid,ppid,pgid,sid,cmd | grep -E 'sleep 100|PID'
+    PID    PPID    PGID     SID CMD
+  53201   53100   53201   53100 sleep 100
+  53202   53100   53201   53100 cat
+                  ^^^^^^ same PGID — one job, two processes
+</pre>
+
+    <p>Both stages of the pipeline share a PGID. That is why Ctrl-C stops the entire pipeline rather than one
+       stage: the terminal driver sends SIGINT to the whole foreground process <em>group</em>. You can do the
+       same manually with a negative PID:</p>
+
+<pre>
+$ kill -TERM -53201          # note the minus: signal the GROUP
+</pre>
+
+    <p>This is the reliable way to kill a process and everything it spawned. Killing only the parent leaves
+       children running as orphans — a common cause of "I stopped the service but the port is still in
+       use".</p>
+
+    <p>Sessions explain SIGHUP. When a terminal closes, the kernel sends SIGHUP to the foreground process group
+       of that session, and the default action is to terminate. That is why closing an SSH window kills your
+       jobs, and why the tools to prevent it work the way they do:</p>
+
+    <table class="tbl">
+      <tr><th>Tool</th><th>Mechanism</th></tr>
+      <tr><td><code>nohup cmd</code></td><td>Ignores SIGHUP; redirects output to <code>nohup.out</code></td></tr>
+      <tr><td><code>setsid cmd</code></td><td>New session with no controlling terminal — cannot receive terminal signals</td></tr>
+      <tr><td><code>disown -h %1</code></td><td>Tells bash not to send SIGHUP to that job</td></tr>
+      <tr><td><code>tmux</code> / <code>screen</code></td><td>The session persists on the server; you detach rather than disconnect</td></tr>
+      <tr><td><code>systemd-run --user</code></td><td>Runs it under systemd, fully detached from your session</td></tr>
+    </table>
+
+    <p>For anything that must survive genuinely, a systemd unit is the right answer — <code>nohup</code> is a
+       convenience for interactive work, not a supervision strategy. See
+       <a href="systemd.html">systemd &amp; Service Management</a>.</p>
+
+    <h2>Part 5 — Reading /proc/PID</h2>
+
+    <p><code>/proc/PID</code> is the definitive interface for inspecting a running process. Every tool —
+       <code>ps</code>, <code>top</code>, <code>htop</code> — is a parser over these files, so knowing them
+       directly means never being blocked by a missing tool.</p>
+
+    <table class="tbl">
+      <tr><th>Path</th><th>Contains</th></tr>
+      <tr><td><code>/proc/PID/status</code></td><td>Human-readable summary: state, memory, UIDs, threads, capabilities</td></tr>
+      <tr><td><code>/proc/PID/cmdline</code></td><td>Full argv, NUL-separated</td></tr>
+      <tr><td><code>/proc/PID/environ</code></td><td>Environment at exec time, NUL-separated</td></tr>
+      <tr><td><code>/proc/PID/fd/</code></td><td>Symlinks to every open file, pipe, socket</td></tr>
+      <tr><td><code>/proc/PID/cwd</code></td><td>Symlink to the working directory</td></tr>
+      <tr><td><code>/proc/PID/exe</code></td><td>Symlink to the binary — resolves even if deleted</td></tr>
+      <tr><td><code>/proc/PID/maps</code></td><td>Memory map: libraries, heap, stack</td></tr>
+      <tr><td><code>/proc/PID/limits</code></td><td>Soft and hard resource limits</td></tr>
+      <tr><td><code>/proc/PID/wchan</code></td><td>The kernel function it is sleeping in</td></tr>
+      <tr><td><code>/proc/PID/task/</code></td><td>One directory per thread</td></tr>
+    </table>
+
+<pre>
+$ pid=$(pgrep -n nginx)
+$ tr '\0' ' ' &lt; /proc/$pid/cmdline; echo
+nginx: master process /usr/sbin/nginx -g daemon on; master_process on;
+
+$ grep -E '^(State|Threads|VmRSS|FDSize)' /proc/$pid/status
+State:  S (sleeping)
+Threads:        1
+VmRSS:      8412 kB
+FDSize:     128
+</pre>
+
+    <p><code>/proc/PID/exe</code> resolving even for a deleted binary is genuinely useful — it identifies
+       processes still running code that has been replaced by an upgrade:</p>
+
+<pre>
+$ ls -l /proc/*/exe 2&gt;/dev/null | grep deleted
+lrwxrwxrwx 1 root root 0 Aug  9 10:12 /proc/2210/exe -&gt; /usr/sbin/nginx (deleted)
+</pre>
+
+    <p>Those processes are still running the <em>old</em> code and must be restarted for a security patch to
+       take effect — an entire class of "we patched it but the CVE scanner still flags us".</p>
+
+    <p><code>/proc/PID/environ</code> is worth a security note: it is readable only by the process owner and
+       root, because environments routinely hold secrets. That is precisely why passing credentials via
+       environment variables is weaker than it looks — any process running as the same user can read them, and
+       they are inherited by every child.</p>
+
+    <h2>Part 6 — Finding and Signalling Processes</h2>
+
+    <p>The tooling divides into finding processes and acting on them, and the modern options are considerably
+       safer than the traditional ones.</p>
+
+<pre>
+$ pgrep -a nginx                  # -a shows the full command line
+2210 nginx: master process /usr/sbin/nginx
+2211 nginx: worker process
+
+$ pgrep -u www-data -f 'worker'   # by user, matching the full command
+$ pgrep -P 2210                   # children of a given PID
+$ pkill -TERM -u baduser          # signal every process of a user
+</pre>
+
+    <p><code>pgrep -f</code> matches against the whole command line rather than just the process name, which
+       is essential for anything run through an interpreter — <code>python worker.py</code> has a process name
+       of <code>python</code>, so a name-only match finds every Python process on the box.</p>
+
+    <p>The classic mistake is <code>ps aux | grep name</code>, which matches its own grep process and is
+       fragile:</p>
+
+<pre>
+$ ps aux | grep nginx
+www-data  2210  ... nginx: master process
+alice    54012  ... grep --color=auto nginx      # matched itself
+
+$ pgrep -a nginx                                  # no such problem
+</pre>
+
+    <p>For process trees, <code>pstree</code> shows relationships that a flat list hides:</p>
+
+<pre>
+$ pstree -ps $(pgrep -n nginx)
+systemd(1)───nginx(2210)─┬─nginx(2211)
+                         └─nginx(2212)
+</pre>
+
+    <p>Signalling escalates in a specific order, and skipping steps causes data loss:</p>
+
+    <table class="tbl">
+      <tr><th>Step</th><th>Signal</th><th>Effect</th></tr>
+      <tr><td>1</td><td><code>SIGTERM</code> (15)</td><td>Polite request to exit. <strong>Catchable</strong> — lets the process flush and clean up</td></tr>
+      <tr><td>2</td><td>Wait</td><td>Give it time. Databases may need tens of seconds to flush</td></tr>
+      <tr><td>3</td><td><code>SIGKILL</code> (9)</td><td>Immediate, uncatchable. Buffered data is lost</td></tr>
+    </table>
+
+<pre>
+$ kill 2210                       # SIGTERM by default
+$ sleep 10
+$ kill -0 2210 2&gt;/dev/null &amp;&amp; kill -9 2210     # -0 tests existence without signalling
+</pre>
+
+    <p><code>kill -9</code> as a first resort is one of the most common bad habits in operations. It skips the
+       process's own shutdown path: unflushed writes are lost, lock files remain, and — as
+       <a href="inodes-links.html">Files, Inodes &amp; Links</a> showed — deleted-but-open files never release
+       their disk space because no orderly close happens.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td><code>kill -9</code> as the first attempt</td><td>Skips cleanup — lost buffers, stale locks, unreleased disk space</td><td>SIGTERM, wait, then SIGKILL only if needed</td></tr>
+      <tr><td>Trying to kill a <code>D</code>-state process</td><td>It cannot receive signals until its I/O completes</td><td>Fix the storage or NFS mount; the process leaves on its own</td></tr>
+      <tr><td>Trying to kill a zombie</td><td>It is already dead — there is nothing to signal</td><td>Fix or restart the <em>parent</em>, which must call <code>wait()</code></td></tr>
+      <tr><td>Killing a parent and expecting children to die</td><td>They are re-parented and keep running</td><td>Signal the process group: <code>kill -TERM -PGID</code></td></tr>
+      <tr><td><code>ps aux | grep name</code></td><td>Matches its own grep; fragile parsing</td><td><code>pgrep -a</code> / <code>pkill</code></td></tr>
+      <tr><td><code>pgrep python</code> for a script</td><td>Matches every Python process on the machine</td><td><code>pgrep -f 'python worker.py'</code></td></tr>
+      <tr><td>Running an app as PID 1 in a container</td><td>Default signal handlers are absent; orphans are never reaped</td><td><code>docker run --init</code>, or <code>tini</code></td></tr>
+      <tr><td>Assuming <code>fork</code> copies memory</td><td>Copy-on-write shares pages until one side writes</td><td>Expect spikes when the child writes widely; use <code>posix_spawn</code> for fork+exec</td></tr>
+      <tr><td>Passing secrets in environment variables</td><td>Readable via <code>/proc/PID/environ</code> by the same user, and inherited by children</td><td>Files with tight permissions, or a secrets manager</td></tr>
+      <tr><td><code>nohup</code> as a supervision strategy</td><td>No restart, no logging, no dependency ordering</td><td>A systemd unit</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is a zombie process and how do you get rid of one?</summary>
+      <p>A zombie is a process that has already exited but whose parent has not yet collected its exit status.
+         The kernel keeps a minimal entry — just the PID and the status — because the parent might still ask
+         for it via <code>wait()</code>. It holds no memory and no file descriptors.</p>
+      <p><strong>You cannot kill a zombie.</strong> It is already dead; signals have no meaning for it.
+         <code>kill -9</code> does nothing.</p>
+      <p>The fix is always in the parent, because a zombie is a parent bug: the parent must call
+         <code>wait()</code> or <code>waitpid()</code> to reap its children. If you cannot fix the code,
+         killing or restarting the <em>parent</em> works — the zombie is then re-parented to init (PID 1),
+         which reaps it immediately.</p>
+      <p>A few zombies are harmless. Thousands are a real problem because each holds a PID, and exhausting the
+         PID space means nothing on the system can fork — which presents as a machine where every command
+         fails. This is a common container symptom when an application runs as PID 1 without reaping orphans;
+         <code>docker run --init</code> or <code>tini</code> solves it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does <code>D</code> state mean in <code>ps</code>, and why can't you kill it?</summary>
+      <p><code>D</code> is uninterruptible sleep. The process is blocked inside a kernel operation that cannot
+         safely be abandoned partway — almost always a block device request, or a network filesystem like NFS
+         waiting on an unresponsive server.</p>
+      <p>Signals are only delivered when a process transitions from kernel mode back to userspace. A
+         <code>D</code>-state process never makes that transition until the underlying operation completes, so
+         the signal sits pending. Even SIGKILL, which cannot be caught or ignored, cannot be
+         <em>delivered</em>.</p>
+      <p>The diagnostic value is high: <strong>a pile of D-state processes is a storage problem, not an
+         application problem.</strong> Restarting the application will not help, and the processes are not
+         "stuck" in the sense of being buggy. I would check <code>/proc/PID/wchan</code> for the specific
+         function (<code>io_schedule</code> for block I/O), then <code>iostat -x 1</code> for device
+         saturation or errors, then <code>dmesg</code> for device or NFS timeouts.</p>
+      <p>The practical resolutions are fixing the device, recovering the NFS server, or — for NFS specifically
+         — mounting with <code>soft</code> and a timeout so operations fail rather than hanging forever, though
+         that trades hangs for potential data errors and is a deliberate choice.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain copy-on-write and its practical consequences.</summary>
+      <p>When a process forks, the child does not receive a physical copy of the parent's memory. Both
+         processes' page tables point at the <em>same</em> physical pages, marked read-only. When either one
+         writes to a page, the CPU raises a fault, and the kernel then copies just that page and lets the write
+         proceed.</p>
+      <p>This makes <code>fork</code> cheap and nearly independent of the parent's size — forking a 500 MB
+         process does not copy 500 MB, and the child's initial RSS is a few megabytes.</p>
+      <p><strong>The consequences that matter in production:</strong></p>
+      <ul>
+        <li><strong>Memory can spike unexpectedly later.</strong> If the child writes across its inherited
+            memory, pages get copied one at a time. A forking web server can OOM under load even though
+            <code>fork</code> itself was cheap — the cost is deferred, not avoided.</li>
+        <li><strong>Reported memory is misleading.</strong> Summing RSS across forked workers double-counts
+            shared pages. <code>PSS</code> (proportional set size, in <code>/proc/PID/smaps</code>) divides
+            shared pages among users and is the honest number.</li>
+        <li><strong>Garbage collectors defeat it.</strong> A GC that touches object headers across the heap
+            dirties nearly every page, so a forked Python or Ruby worker gradually stops sharing anything.
+            This is why <code>gc.freeze()</code> exists in Python before forking.</li>
+        <li><strong>Redis's background save relies on it</strong> — it forks and writes the snapshot from the
+            child's frozen view. If the parent then receives heavy writes, memory use can approach double,
+            which is why Redis hosts need headroom.</li>
+      </ul>
+      <p>For the common fork-immediately-exec case, all of this copying machinery is pure waste, which is why
+         <code>posix_spawn</code> and <code>vfork</code> exist and why they measurably help large processes
+         that spawn frequently.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why does Ctrl-C kill an entire pipeline rather than just one command?</summary>
+      <p>Because the signal goes to a process <em>group</em>, not a process.</p>
+      <p>When bash builds a pipeline, it puts every stage into a single new process group, and makes that group
+         the terminal's foreground group. The terminal line discipline — kernel code, not bash — maps Ctrl-C to
+         SIGINT and delivers it to <em>every</em> process in the foreground group.</p>
+<pre>
+$ sleep 100 | cat &amp;
+$ ps -eo pid,pgid,cmd | grep -E 'sleep 100|cat'
+  53201   53201 sleep 100
+  53202   53201 cat            # same PGID
+</pre>
+      <p>You can do this manually with a negative PID: <code>kill -TERM -53201</code> signals the whole group.
+         That is the reliable way to stop a process and everything it spawned, and it is the fix for the common
+         situation where killing a parent leaves orphaned children holding a port open.</p>
+      <p>Sessions are the level above: a session usually corresponds to one terminal login and contains
+         multiple process groups (one per job). When the terminal disconnects, the kernel sends SIGHUP to the
+         foreground group of that session — which is why closing an SSH window kills your jobs, and why
+         <code>nohup</code>, <code>disown</code>, <code>setsid</code>, and tmux each break that chain at a
+         different point.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A service will not stop cleanly — <code>systemctl stop</code> hangs for 90 seconds then reports failure. Diagnose it.</summary>
+      <p>The 90 seconds is a strong clue on its own: it is systemd's default <code>TimeoutStopSec</code>. So
+         SIGTERM was sent, nothing exited, and systemd eventually escalated to SIGKILL. The question is why the
+         process ignored SIGTERM.</p>
+      <p><strong>1. Confirm what systemd is waiting for.</strong></p>
+<pre>
+$ systemctl status myapp
+$ journalctl -u myapp -n 50
+$ systemctl show myapp -p TimeoutStopUSec,KillMode,KillSignal,ExecStop
+</pre>
+      <p><code>KillMode=</code> matters here: the default <code>control-group</code> signals every process in
+         the unit, but <code>KillMode=process</code> signals only the main PID, leaving children running and
+         the unit "still active".</p>
+      <p><strong>2. Determine the process state</strong>, because the three cases need different fixes:</p>
+<pre>
+$ ps -o pid,stat,wchan:25,cmd -p $(systemctl show -p MainPID --value myapp)
+</pre>
+      <ul>
+        <li><code>D</code> state — it is blocked on I/O and <em>cannot</em> receive the signal. This is a
+            storage problem; no amount of signalling helps.</li>
+        <li><code>S</code> state — it received SIGTERM and is either ignoring it or doing slow cleanup.</li>
+        <li><code>T</code> state — it is stopped, perhaps by a debugger, and will never process anything.</li>
+      </ul>
+      <p><strong>3. Check whether the signal is masked or handled.</strong> This is the case people miss:</p>
+<pre>
+$ grep -E 'SigBlk|SigIgn|SigCgt' /proc/$PID/status
+SigIgn: 0000000000001000      # bit 15 set = SIGTERM is being IGNORED
+SigCgt: 0000000180004a03
+</pre>
+      <p>Decoding is straightforward: SIGTERM is signal 15, so bit 15 (value 0x4000 counting from 1). A process
+         that inherited an ignored SIGTERM — common when a poorly written wrapper script spawned it — will
+         never respond. Applications running as PID 1 in a container have the same symptom for a different
+         reason: PID 1 gets no default handlers, so an unhandled SIGTERM is simply discarded.</p>
+      <p><strong>4. Watch what it is actually doing</strong> rather than assuming it is stuck:</p>
+<pre>
+$ sudo strace -p $PID -f -e trace=none -e signal=all
+$ sudo cat /proc/$PID/stack           # kernel-side, if it is in D state
+</pre>
+      <p>A process legitimately flushing a large write buffer looks identical to a hung one for the first
+         thirty seconds. Distinguishing them matters — killing a database mid-flush is how you get a corrupt
+         recovery.</p>
+      <p><strong>The fixes, matched to the cause:</strong> install a real SIGTERM handler that begins graceful
+         shutdown; raise <code>TimeoutStopSec=</code> if shutdown legitimately takes longer than 90s; add
+         <code>ExecStop=</code> for services that need a specific drain command; set
+         <code>KillMode=mixed</code> so the main process gets SIGTERM and stragglers get SIGKILL; and in
+         containers, run an init that forwards signals. I would treat "hangs then gets killed" as a real bug
+         rather than cosmetic — every stop is an unclean shutdown, and the data-loss risk is only visible after
+         it bites.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a supervisor that manages worker processes correctly. What must it get right?</summary>
+      <p>The requirements sound simple and the failure modes are all in the details. I would build around five
+         obligations.</p>
+      <p><strong>1. Reap every child, unconditionally.</strong> Missing this is what produces zombie
+         accumulation and eventual PID exhaustion. The subtlety is that SIGCHLD is not queued — several
+         children exiting close together produce <em>one</em> signal, so the handler must loop:</p>
+<pre>
+while ((pid = waitpid(-1, &amp;status, WNOHANG)) &gt; 0) {
+    handle_exit(pid, status);        // loop until no more, not just once
+}
+</pre>
+      <p>A handler that reaps a single child per signal leaks zombies under load and works perfectly in
+         testing.</p>
+      <p><strong>2. Distinguish exit causes.</strong> The exit status encodes how the process died, and
+         restarting blindly is wrong for at least two of them: a clean exit 0, a nonzero failure, a signal
+         death (<code>WIFSIGNALED</code>, reported as 128+N by shells), and specifically SIGKILL from the OOM
+         killer — which means restarting immediately will just OOM again.</p>
+      <p><strong>3. Shut down in the right order, with escalation.</strong> Signal the process
+         <em>group</em> so grandchildren are included, wait a bounded time, then escalate:</p>
+<pre>
+kill(-pgid, SIGTERM);
+if (!all_exited_within(timeout)) kill(-pgid, SIGKILL);
+</pre>
+      <p>Signalling only the main PID is the standard bug — children are re-parented and keep holding ports and
+         locks, so the restart fails with "address already in use".</p>
+      <p><strong>4. Back off on restarts.</strong> A worker that crashes on startup will otherwise spin at
+         thousands of forks per second, which is indistinguishable from a fork bomb. Exponential backoff with
+         jitter, plus a circuit breaker that stops trying after N failures in a window, is the minimum. systemd
+         expresses this as <code>RestartSec=</code>, <code>StartLimitBurst=</code> and
+         <code>StartLimitIntervalSec=</code>.</p>
+      <p><strong>5. Handle the PID-reuse race.</strong> PIDs wrap. A supervisor that records a PID and later
+         signals it can, in principle, kill an unrelated process that inherited that number. Signalling the
+         process group narrows the window; on modern Linux, <code>pidfd_open()</code> eliminates it entirely by
+         giving a stable handle to a specific process. Cgroup membership is the other robust identity — which
+         is exactly what systemd uses.</p>
+      <p><strong>What I would actually do:</strong> not write this. systemd already implements all five
+         correctly, plus dependency ordering, socket activation, resource limits, and journal integration. The
+         legitimate reasons to write a supervisor are a language-specific worker pool inside one service
+         (gunicorn, puma) or a platform that has no init — and in the container case the answer is
+         <code>tini</code>, which is roughly 200 lines because that is genuinely all a correct minimal init
+         needs to be.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Observe every process state on a live system and interpret
+       what each is waiting for.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ ps -eo stat --no-headers | sed 's/[^A-Za-z].*//' | sort | uniq -c | sort -rn
+    142 S
+     38 I
+      4 R
+      1 D
+      1 Z
+</pre>
+      <p>Now identify what each is blocked on — the <code>WCHAN</code> is far more informative than the state
+         letter:</p>
+<pre>
+$ ps -eo pid,stat,wchan:22,cmd --sort=stat | awk '$2 ~ /^[DRZT]/'
+    PID STAT WCHAN                  CMD
+  51022 D    io_schedule            rsync -a /data /backup
+  53190 R    -                      python3 train.py
+  53191 Z    -                      [worker] &lt;defunct&gt;
+</pre>
+      <table class="tbl">
+        <tr><th>Observation</th><th>Interpretation</th></tr>
+        <tr><td><code>D</code> + <code>io_schedule</code></td><td>Blocked on block I/O — check the device, not the app</td></tr>
+        <tr><td><code>R</code> with no WCHAN</td><td>Actually on CPU right now</td></tr>
+        <tr><td><code>Z</code></td><td>Parent has not reaped it — find the parent</td></tr>
+        <tr><td>Many <code>I</code></td><td>Idle kernel threads; ignore them entirely</td></tr>
+      </table>
+      <p><strong>Create each state deliberately</strong> to confirm:</p>
+<pre>
+# S — interruptible sleep
+$ sleep 100 &amp; ps -o stat= -p $!
+S
+
+# R — spinning
+$ (while :; do :; done) &amp; ps -o stat= -p $!; kill $!
+R
+
+# T — stopped
+$ sleep 100 &amp; kill -STOP $!; ps -o stat= -p $!; kill $!
+T
+
+# Z — zombie (parent sleeps without waiting)
+$ bash -c 'sleep 0.1 &amp; sleep 5' &amp; sleep 1; ps -eo stat,cmd | grep defunct
+Z    [sleep] &lt;defunct&gt;
+</pre>
+      <p><code>D</code> is deliberately hard to create on purpose — which is itself the lesson: if you see it
+         persisting for more than a moment, real storage is struggling.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Demonstrate that fork returns twice and that copy-on-write
+       defers the memory cost.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 &lt;&lt;'EOF'
+import os
+print("before fork, pid =", os.getpid())
+pid = os.fork()
+if pid == 0:
+    print("  CHILD : fork() returned", pid, "my pid is", os.getpid())
+    os._exit(0)
+else:
+    print("  PARENT: fork() returned", pid, "my pid is", os.getpid())
+    os.wait()
+EOF
+before fork, pid = 54100
+  PARENT: fork() returned 54101 my pid is 54100
+  CHILD : fork() returned 0 my pid is 54101
+</pre>
+      <p>One <code>fork()</code> call, two returns, two different values — 0 in the child, the child's PID in
+         the parent. The line before the fork printed once; everything after printed twice.</p>
+      <p><strong>Now measure copy-on-write:</strong></p>
+<pre>
+$ python3 &lt;&lt;'EOF'
+import os, time
+
+def rss(pid):
+    for line in open('/proc/%d/status' % pid):
+        if line.startswith('VmRSS'): return line.split()[1] + ' kB'
+
+data = bytearray(400 * 1024 * 1024)          # 400 MB, touched
+print("parent RSS before fork:", rss(os.getpid()))
+
+pid = os.fork()
+if pid == 0:
+    time.sleep(2)
+    print("  child RSS (no writes):", rss(os.getpid()))
+    for i in range(0, len(data), 4096):       # now dirty every page
+        data[i] = 1
+    print("  child RSS (after writing):", rss(os.getpid()))
+    os._exit(0)
+time.sleep(4); os.wait()
+EOF
+parent RSS before fork: 410892 kB
+  child RSS (no writes): 8244 kB              ← shares the parent's pages
+  child RSS (after writing): 412108 kB        ← every page now copied
+</pre>
+      <p>The child started at 8 MB despite "inheriting" 400 MB, then grew to the full size once it wrote across
+         it. The copy was deferred, not avoided — which is exactly why a forking service can OOM later under
+         write pressure while the fork itself looked free.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Create a zombie and an orphan, and fix each correctly.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The zombie</strong> — a parent that does not reap:</p>
+<pre>
+$ cat &gt; /tmp/zparent.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+sleep 0.5 &amp;                 # child exits quickly
+echo "parent $$ ignoring child $!"
+sleep 60                    # never calls wait
+EOF
+$ bash /tmp/zparent.sh &amp; sleep 2
+parent 54300 ignoring child 54301
+
+$ ps -eo pid,ppid,stat,cmd | awk '$3 ~ /^Z/'
+  54301   54300 Z    [sleep] &lt;defunct&gt;
+</pre>
+      <p>Confirm it cannot be killed, because it is already dead:</p>
+<pre>
+$ kill -9 54301; sleep 1; ps -o pid,stat -p 54301
+    PID STAT
+  54301 Z                    # unchanged
+</pre>
+      <p><strong>Fix — remove the parent</strong>, so init reaps it:</p>
+<pre>
+$ kill 54300; sleep 1; ps -o pid= -p 54301 || echo "zombie gone"
+zombie gone
+</pre>
+      <p><strong>The real fix in code</strong> is for the parent to wait:</p>
+<pre>
+$ cat &gt; /tmp/good.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+sleep 0.5 &amp;
+wait                        # reap it
+sleep 5
+EOF
+$ bash /tmp/good.sh &amp; sleep 2; ps -eo stat,cmd | grep -c defunct
+0                           # no zombies
+</pre>
+      <p><strong>The orphan</strong> — the opposite case:</p>
+<pre>
+$ bash -c 'sleep 60 &amp; echo "child=$!"; echo "parent=$$"; exit'
+child=54500
+parent=54499
+$ ps -o pid,ppid,cmd -p 54500
+    PID    PPID CMD
+  54500       1 sleep 60     # re-parented to init
+</pre>
+      <p>The orphan is <em>not</em> a problem — it keeps running normally, and init will reap it when it
+         exits. The distinction is the point: a zombie is dead and un-reaped (parent's bug); an orphan is alive
+         with a dead parent (handled automatically by the kernel).</p>
+      <p><strong>Where it goes wrong at scale</strong> is a container whose PID 1 is an ordinary application:
+         it inherits every orphan but never calls <code>wait()</code>, so zombies accumulate until PIDs run
+         out. <code>docker run --init</code> inserts a minimal init that reaps them.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Use process groups to kill a whole job tree, and show
+       why killing the parent alone fails.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat &gt; /tmp/tree.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+sleep 300 &amp;
+sleep 300 &amp;
+sleep 300 &amp;
+echo "parent=$$ pgid=$(ps -o pgid= -p $$ | tr -d ' ')"
+wait
+EOF
+$ bash /tmp/tree.sh &amp; sleep 1
+parent=54700 pgid=54700
+
+$ ps -eo pid,ppid,pgid,cmd | grep -E 'tree.sh|sleep 300' | grep -v grep
+  54700   54600   54700 bash /tmp/tree.sh
+  54701   54700   54700 sleep 300
+  54702   54700   54700 sleep 300
+  54703   54700   54700 sleep 300
+</pre>
+      <p>All four share PGID 54700 — one job.</p>
+      <p><strong>Killing the parent alone leaves the children:</strong></p>
+<pre>
+$ kill 54700; sleep 1
+$ ps -eo pid,ppid,cmd | grep 'sleep 300' | grep -v grep
+  54701       1 sleep 300
+  54702       1 sleep 300
+  54703       1 sleep 300      # orphaned, re-parented to init, still running
+</pre>
+      <p>This is exactly the "I stopped the service but the port is still in use" situation.</p>
+      <p><strong>Killing the group gets everything:</strong></p>
+<pre>
+$ kill -TERM -54700 2>/dev/null      # already reaped above; restart to demo
+$ bash /tmp/tree.sh &amp; sleep 1
+parent=54800 pgid=54800
+$ kill -TERM -54800; sleep 1
+$ ps -eo pid,cmd | grep -c 'sleep 300'
+0                              # all gone
+</pre>
+      <p><strong>The negative PID is the whole trick</strong> — <code>kill -TERM -PGID</code>. Getting the PGID
+         reliably:</p>
+<pre>
+$ pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
+$ kill -TERM -"$pgid"
+</pre>
+      <p><strong>For a tree that spans process groups</strong>, use <code>pkill -P</code> recursively, or start
+         the job in its own session with <code>setsid</code> so the whole tree is isolated and killable as one
+         unit. systemd solves this properly with cgroups: <code>KillMode=control-group</code> signals every
+         process in the unit's cgroup regardless of PGID or re-parenting, which is why it is the default and
+         why it is more reliable than anything achievable with PIDs alone.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Investigate an unknown process entirely through
+       <code>/proc</code>, without <code>ps</code> or <code>lsof</code>.
+      <details class="solution"><summary>Solution</summary>
+      <p>Start a target with a distinctive setup:</p>
+<pre>
+$ (cd /var/tmp &amp;&amp; exec 7&lt; /etc/hostname; SECRET=hunter2 sleep 400) &amp;
+$ pid=$!
+</pre>
+      <p><strong>1. What is it, and what state?</strong></p>
+<pre>
+$ grep -E '^(Name|State|Pid|PPid|Threads|VmRSS)' /proc/$pid/status
+Name:   sleep
+State:  S (sleeping)
+Pid:    55010
+PPid:   55009
+Threads:        1
+VmRSS:       716 kB
+</pre>
+      <p><strong>2. The exact command line</strong> — NUL-separated, so translate:</p>
+<pre>
+$ tr '\0' ' ' &lt; /proc/$pid/cmdline; echo
+sleep 400
+</pre>
+      <p><strong>3. Where is it running, and what binary?</strong></p>
+<pre>
+$ ls -l /proc/$pid/cwd /proc/$pid/exe
+lrwxrwxrwx ... /proc/55010/cwd -&gt; /var/tmp
+lrwxrwxrwx ... /proc/55010/exe -&gt; /usr/bin/sleep
+</pre>
+      <p><strong>4. What does it have open?</strong> This replaces <code>lsof</code>:</p>
+<pre>
+$ ls -l /proc/$pid/fd
+lrwx------ ... 0 -&gt; /dev/pts/3
+lrwx------ ... 1 -&gt; /dev/pts/3
+lrwx------ ... 2 -&gt; /dev/pts/3
+lr-x------ ... 7 -&gt; /etc/hostname        ← the inherited descriptor
+</pre>
+      <p><strong>5. Its environment</strong> — note this is why env vars are poor secret storage:</p>
+<pre>
+$ tr '\0' '\n' &lt; /proc/$pid/environ | grep SECRET
+SECRET=hunter2
+</pre>
+      <p><strong>6. What is it blocked on, and what are its limits?</strong></p>
+<pre>
+$ cat /proc/$pid/wchan; echo
+hrtimer_nanosleep                        # sleeping on a timer, as expected
+$ grep -E 'open files|processes' /proc/$pid/limits
+Max processes             31404    31404    processes
+Max open files            1024     524288   files
+</pre>
+      <p><strong>7. Which signals are handled, blocked or ignored</strong> — the field people forget exists:</p>
+<pre>
+$ grep -E 'Sig(Blk|Ign|Cgt)' /proc/$pid/status
+SigBlk: 0000000000000000
+SigIgn: 0000000000000000
+SigCgt: 0000000000000000                 # handles nothing: default actions apply
+</pre>
+      <p><strong>8. Memory map, to see what libraries it loaded:</strong></p>
+<pre>
+$ awk '{print $NF}' /proc/$pid/maps | sort -u | grep -v '^\[' | head -3
+/usr/bin/sleep
+/usr/lib/x86_64-linux-gnu/libc.so.6
+/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+</pre>
+      <p><strong>Why this matters:</strong> every one of <code>ps</code>, <code>top</code>,
+         <code>lsof</code> and <code>htop</code> is a parser over these files. On a stripped container image or
+         a compromised host where you cannot trust the binaries, <code>/proc</code> is still there and still
+         tells the truth. The <code>SigIgn</code> field in particular answers "why is this ignoring SIGTERM?",
+         which no standard tool surfaces.</p>
+      <p>Cleanup: <code>kill $pid</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a correct graceful-shutdown handler and prove it
+       beats <code>kill -9</code>.
+      <details class="solution"><summary>Solution</summary>
+      <p>Write a worker that must flush state before exiting — the realistic case where an abrupt kill loses
+         data:</p>
+<pre>
+$ cat &gt; /tmp/worker.py &lt;&lt;'EOF'
+import signal, sys, time, os
+
+buffer, running = [], True
+
+def shutdown(signum, frame):
+    global running
+    print(f"[{os.getpid()}] got {signal.Signals(signum).name}, draining", flush=True)
+    running = False
+
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT,  shutdown)
+
+n = 0
+while running:
+    n += 1
+    buffer.append(f"record-{n}")
+    if len(buffer) &gt;= 5:                       # flush periodically
+        with open('/tmp/worker.out','a') as f:
+            f.write('\n'.join(buffer) + '\n')
+        buffer.clear()
+    time.sleep(0.1)
+
+with open('/tmp/worker.out','a') as f:          # FINAL flush on shutdown
+    if buffer: f.write('\n'.join(buffer) + '\n')
+    f.write(f"CLEAN-EXIT after {n} records\n")
+print("exited cleanly", flush=True)
+EOF
+</pre>
+      <p><strong>SIGTERM — the handler runs and nothing is lost:</strong></p>
+<pre>
+$ rm -f /tmp/worker.out; python3 /tmp/worker.py &amp; pid=$!
+$ sleep 2; kill -TERM $pid; wait $pid; echo "status=$?"
+[55200] got SIGTERM, draining
+exited cleanly
+status=0
+$ tail -2 /tmp/worker.out
+record-20
+CLEAN-EXIT after 20 records
+</pre>
+      <p><strong>SIGKILL — the same run, abruptly terminated:</strong></p>
+<pre>
+$ rm -f /tmp/worker.out; python3 /tmp/worker.py &amp; pid=$!
+$ sleep 2; kill -9 $pid; wait $pid 2&gt;/dev/null; echo "status=$?"
+status=137
+$ tail -2 /tmp/worker.out
+record-19
+record-20                     # no CLEAN-EXIT; unflushed buffer lost
+</pre>
+      <p>Status 137 = 128+9 confirms SIGKILL. The records held in the buffer at that instant are gone
+         permanently, and there is no marker indicating the file is incomplete.</p>
+      <p><strong>Prove the handler is registered</strong> via <code>/proc</code>:</p>
+<pre>
+$ python3 /tmp/worker.py &amp; pid=$!; sleep 1
+$ grep SigCgt /proc/$pid/status
+SigCgt: 0000000000004002      # bit 2 (SIGINT) and bit 15 (SIGTERM) caught
+$ kill -TERM $pid
+</pre>
+      <p><strong>The production-grade additions</strong> this simple version omits:</p>
+      <table class="tbl">
+        <tr><th>Concern</th><th>Handling</th></tr>
+        <tr><td>Shutdown could hang</td><td>The supervisor must escalate — systemd's <code>TimeoutStopSec</code>, then SIGKILL</td></tr>
+        <tr><td>Second signal while draining</td><td>Treat a repeated SIGTERM as "exit now"; users press Ctrl-C twice</td></tr>
+        <tr><td>Handler doing too much</td><td>Signal handlers should set a flag, not perform I/O — async-signal-safety</td></tr>
+        <tr><td>Children still running</td><td>Forward the signal to the process group, not just self</td></tr>
+        <tr><td>In-flight requests</td><td>Stop accepting new work first, then drain, then exit</td></tr>
+      </table>
+      <p>The systemd counterpart makes the escalation explicit rather than implicit:</p>
+<pre>
+[Service]
+KillSignal=SIGTERM
+TimeoutStopSec=30
+KillMode=mixed          # SIGTERM to main process, SIGKILL to stragglers
+</pre>
+      <p>The general principle: <strong><code>kill -9</code> is not a stronger version of <code>kill</code> —
+         it is a different operation that skips the program's own correctness logic.</strong> Reserve it for
+         processes that have demonstrably failed to respond, never as the first attempt.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>The <code>STAT</code> letter tells you what a process is waiting for; <code>WCHAN</code> names the exact kernel function and is far more specific.</li>
+        <li><code>D</code> state cannot receive any signal, including SIGKILL, because signals are only delivered on return to userspace — a pile of them is a storage problem, not an application one.</li>
+        <li><code>fork()</code> returns twice: 0 in the child, the child's PID in the parent.</li>
+        <li>Parent and child share open file <em>descriptions</em>, so they share read/write offsets — which is why concurrent appends to one log do not clobber each other.</li>
+        <li>Copy-on-write makes fork cheap but defers the cost; a child that writes widely materialises the full copy later, which is how forking services OOM under load.</li>
+        <li>A zombie is dead and un-reaped — always the parent's bug, unkillable, fixed by making the parent <code>wait()</code> or by killing the parent.</li>
+        <li>An orphan is alive with a dead parent; the kernel re-parents it to init or the nearest subreaper, and it is not a problem.</li>
+        <li>Running an app as PID 1 in a container breaks signals (no default handlers) and leaks zombies — use <code>--init</code> or <code>tini</code>.</li>
+        <li>PGID groups a pipeline into one job, which is why Ctrl-C stops every stage; <code>kill -TERM -PGID</code> is how you stop a process and its children.</li>
+        <li>SIGHUP on terminal disconnect is a session-level mechanism — <code>nohup</code>, <code>setsid</code>, <code>disown</code> and tmux each break that chain differently.</li>
+        <li><code>/proc/PID</code> answers nearly everything: <code>fd/</code> replaces lsof, <code>exe</code> reveals processes running deleted binaries after an upgrade, and <code>SigIgn</code>/<code>SigCgt</code> explain why a signal is being ignored.</li>
+        <li>Secrets in environment variables are readable from <code>/proc/PID/environ</code> by the same user and inherited by every child.</li>
+        <li>Always SIGTERM, wait, then SIGKILL — <code>kill -9</code> skips the program's own flush and cleanup, losing buffered data and leaving disk space unreleased.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="find-xargs.html">← Finding Files: find &amp; xargs</a>
+      <a href="signals-jobs.html">Signals &amp; Job Control →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
