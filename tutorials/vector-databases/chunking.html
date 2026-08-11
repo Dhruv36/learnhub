@@ -1,0 +1,1263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chunking &amp; Ingestion — Vector Databases &amp; RAG — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Chunking &amp; Ingestion <span class="level-badge level-adv">RAG in Production</span></h1>
+    <p><strong>What you'll master:</strong> why chunking is the highest-leverage decision in a RAG system and the
+       two competing pressures that set every chunk size; the strategies that matter — fixed, recursive,
+       structural, semantic — and the honest evidence on which wins where; what overlap actually buys and why the
+       usual 10–20% is mostly cargo cult; how to keep a chunk retrievable without making it unreadable, via
+       contextual headers and the small-to-big pattern; and how to build an ingestion pipeline that is
+       idempotent, resumable and cheap to re-run, because you will re-run it. Prerequisites:
+       <a href="embeddings.html">Embeddings &amp; Vector Space</a>,
+       <a href="hybrid-search.html">Metadata Filtering &amp; Hybrid Search</a>.</p>
+
+    <h2>Part 1 — Why Chunking Decides Everything Downstream</h2>
+
+    <p>Every other component in a RAG system operates on chunks it did not choose. The embedding model encodes
+       the chunk you gave it, the index searches over those encodings, the reranker reorders them, and the LLM
+       answers from whatever survived. <strong>A fact split across two chunks is not retrievable by any of
+       them</strong>, no matter how good they are.</p>
+
+<pre>
+source document
+     │
+     ▼
+  CHUNKING  ────────────────────────────────────▶  everything below inherits this
+     │                                              and cannot repair it
+     ▼
+  embedding → index → retrieval → rerank → LLM
+</pre>
+
+    <p>The reason it is hard is that two pressures pull in opposite directions, and there is no size that
+       satisfies both:</p>
+
+    <table class="tbl">
+      <tr><th></th><th>Small chunks (100–200 tokens)</th><th>Large chunks (800–1500 tokens)</th></tr>
+      <tr><td>Embedding precision</td><td><strong>High</strong> — one topic, one vector</td><td>Low — the vector is an average of several topics</td></tr>
+      <tr><td>Self-containedness</td><td>Low — pronouns and references dangle</td><td><strong>High</strong> — the context is inside the chunk</td></tr>
+      <tr><td>Retrieval behaviour</td><td>Precise, but you need many of them</td><td>Recall-friendly, but dilutes the match</td></tr>
+      <tr><td>Context budget</td><td>Many chunks fit; more of them are noise</td><td>Few fit; each carries more irrelevant text</td></tr>
+    </table>
+
+    <p><strong>The dilution effect is the part worth understanding mechanically.</strong> An embedding is a
+       single vector for the whole chunk, so it approximates the average of the content. Put one relevant
+       sentence in a chunk with nine irrelevant ones and the vector mostly encodes the nine:</p>
+
+<pre>
+query: "what is the retry limit for webhook delivery?"
+
+chunk A (120 tokens, just the retry policy)        cosine = 0.81
+chunk B (1400 tokens, whole webhooks page          cosine = 0.58   ← contains the answer
+         including the retry policy)                                  but ranks lower
+</pre>
+
+    <p><strong>Chunk B contains the answer and loses to a chunk that also contains it.</strong> That is not a
+       model failure — the vector for B genuinely is less similar to the query, because most of B is about
+       something else. This is why "just use big chunks so nothing gets split" does not work.</p>
+
+    <div class="note">🔑 <strong>Chunk for retrieval, then expand for generation.</strong> The two jobs have
+       opposite optimal sizes, so stop trying to solve both with one number. Embed small, precise units so the
+       vector is sharp; at retrieval time, return the surrounding context the LLM needs to actually answer. That
+       decoupling — the <em>small-to-big</em> pattern in Part 4 — resolves the tension rather than compromising
+       between its halves, and it is the single most valuable idea in this lesson.</div>
+
+    <h2>Part 2 — The Strategies, and What They Actually Buy</h2>
+
+    <p>Four families, in ascending order of cost. The useful question is not "which is best" but "what does each
+       one buy over the one below it".</p>
+
+    <p><strong>Fixed-size chunking</strong> splits every N tokens regardless of content. It is the baseline, and
+       its problem is visible immediately:</p>
+
+<pre>
+...the retry limit is 5 attempts. After the fifth failure the endpoint is
+marked unhealthy and dis|                                    ← chunk boundary
+|abled for 24 hours. To re-enable it, call POST /webhooks/{id}/enable...
+</pre>
+
+    <p>A query about re-enabling a webhook now matches a chunk starting mid-word. Fixed-size is only reasonable
+       for text with no structure at all — transcripts without speaker turns, OCR output — and even then, split
+       on sentence boundaries rather than token counts.</p>
+
+    <p><strong>Recursive character splitting</strong> is the sensible default. It tries a list of separators in
+       order, splitting on the most semantically meaningful one that produces small-enough pieces:</p>
+
+<pre>
+separators = ["\n\n",   # paragraphs   — try first
+              "\n",     # lines
+              ". ",     # sentences
+              " ",      # words
+              ""]       # characters   — last resort
+
+def split(text, size, seps):
+    if len(text) &lt;= size or not seps:
+        return [text]
+    sep, rest = seps[0], seps[1:]
+    parts, out, buf = text.split(sep) if sep else list(text), [], ""
+    for p in parts:
+        candidate = (buf + sep + p) if buf else p
+        if len(candidate) &lt;= size:
+            buf = candidate
+        else:
+            if buf: out.append(buf)
+            out.extend(split(p, size, rest) if len(p) &gt; size else [p])
+            buf = ""
+    if buf: out.append(buf)
+    return out
+</pre>
+
+    <p>It keeps paragraphs whole when it can and degrades gracefully when it cannot. That is most of the value of
+       "smart" chunking, for about fifteen lines of code.</p>
+
+    <p><strong>Structural chunking</strong> uses the document's own boundaries, and where the format supports it
+       this beats everything else — because the author already decided what belongs together:</p>
+
+    <table class="tbl">
+      <tr><th>Format</th><th>Natural boundary</th><th>Extra to carry</th></tr>
+      <tr><td>Markdown</td><td>Headings (<code>#</code>, <code>##</code>)</td><td>The heading path as a prefix</td></tr>
+      <tr><td>HTML</td><td><code>&lt;section&gt;</code>, <code>&lt;h2&gt;</code>, <code>&lt;article&gt;</code></td><td>Breadcrumb / page title</td></tr>
+      <tr><td>Code</td><td>Function / class (AST, not regex)</td><td>File path, imports, class name</td></tr>
+      <tr><td>PDF</td><td>Sections; never pages</td><td>Document title, section number</td></tr>
+      <tr><td>Slides</td><td>One slide per chunk</td><td>Deck title, slide number</td></tr>
+      <tr><td>Tables/CSV</td><td>Row groups with the header repeated</td><td>Column headers on every chunk</td></tr>
+    </table>
+
+    <p><strong>Two of those rows are worth calling out.</strong> Splitting a PDF by page is the most common
+       ingestion bug in production RAG: a page break is a typesetting artefact, not a semantic boundary, and it
+       reliably cuts sentences and tables in half. And a table chunked without repeating its header is unusable —
+       the numbers survive, the meaning does not.</p>
+
+    <p><strong>Semantic chunking</strong> embeds each sentence and cuts where consecutive similarity drops,
+       putting boundaries at topic shifts:</p>
+
+<pre>
+def semantic_chunks(sentences, embed, threshold_pct=90, max_tokens=500):
+    E = embed(sentences)                       # normalised
+    sims = [float(E[i] @ E[i+1]) for i in range(len(E)-1)]
+    cut = np.percentile(sims, 100 - threshold_pct)   # lowest-similarity joins
+
+    chunks, buf = [], [sentences[0]]
+    for i, s in enumerate(sentences[1:]):
+        if sims[i] &lt; cut or count_tokens(buf) &gt; max_tokens:
+            chunks.append(" ".join(buf)); buf = []
+        buf.append(s)
+    return chunks + ([" ".join(buf)] if buf else [])
+</pre>
+
+    <p><strong>The honest verdict on semantic chunking:</strong> it costs an embedding call per sentence at
+       ingestion and typically buys 1–3 points of recall over recursive splitting on prose — and roughly nothing
+       on documents that already have structure, because the structure already encodes the topic shifts. It is
+       worth it for long unstructured prose (transcripts, reports, scanned books) and is usually not worth it for
+       documentation, which is the corpus most teams actually have.</p>
+
+    <table class="tbl">
+      <tr><th>Strategy</th><th>Ingestion cost</th><th>Typical recall vs recursive</th><th>Use when</th></tr>
+      <tr><td>Fixed-size</td><td>Free</td><td>−5 to −10 pts</td><td>Genuinely unstructured text, as a baseline</td></tr>
+      <tr><td>Recursive</td><td>Free</td><td>baseline</td><td><strong>The default</strong></td></tr>
+      <tr><td>Structural</td><td>Free (a parser)</td><td>+3 to +8 pts</td><td>Whenever the format has structure</td></tr>
+      <tr><td>Semantic</td><td>1 embed / sentence</td><td>+1 to +3 pts on prose, ~0 on structured</td><td>Long unstructured prose only</td></tr>
+    </table>
+
+    <p><strong>So the ordering that matters is structural &gt; recursive &gt; semantic &gt; fixed</strong>, which is
+       not the ordering by sophistication. Parse the format you have before reaching for an embedding-based
+       splitter.</p>
+
+    <h2>Part 3 — Size and Overlap, With the Numbers</h2>
+
+    <p>Chunk size is usually copied from a tutorial. It should come from the query length distribution and the
+       corpus, and it is cheap to measure because chunking is the one parameter you can re-run in minutes.</p>
+
+<pre>
+Documentation corpus, 500 judged queries, recall@10:
+
+  chunk size    recall@10   chunks    notes
+  ──────────    ─────────   ──────    ─────
+    100 tok       0.71      41,200    precise but fragmentary; answers span chunks
+    250 tok       0.86      17,400    ← knee
+    400 tok       0.88      11,100    ← best
+    600 tok       0.85       7,600    dilution starting
+   1000 tok       0.79       4,500    clear dilution
+   1500 tok       0.72       3,100    a chunk covers several topics
+</pre>
+
+    <table class="tbl">
+      <tr><th>Content type</th><th>Sensible starting size</th><th>Why</th></tr>
+      <tr><td>API / reference docs</td><td>200–400 tokens</td><td>One endpoint or parameter per chunk</td></tr>
+      <tr><td>Narrative prose, articles</td><td>400–800</td><td>Arguments develop across paragraphs</td></tr>
+      <tr><td>Legal contracts</td><td>By clause, whatever the size</td><td>A clause is the unit of meaning</td></tr>
+      <tr><td>Source code</td><td>By function, up to ~1000</td><td>A function is the unit; never split one</td></tr>
+      <tr><td>Chat / support transcripts</td><td>By turn group, 200–400</td><td>Question and answer belong together</td></tr>
+      <tr><td>Tables</td><td>Row groups + repeated header</td><td>Numbers are meaningless without headers</td></tr>
+    </table>
+
+    <p><strong>Overlap is more cargo cult than technique.</strong> The standard advice — 10–20% overlap — exists
+       to stop a fact being cut in half at a boundary. It does work for that, and it costs proportionally:</p>
+
+<pre>
+10,000 chunks at 400 tokens, 20% overlap
+  → storage:   +20% vectors, +20% index memory
+  → ingestion: +20% embedding spend
+  → retrieval: near-duplicate chunks compete for the same top-k slots
+</pre>
+
+    <p><strong>That last line is the cost nobody counts.</strong> With heavy overlap, positions 1 and 2 in your
+       results are frequently the same text shifted by 80 tokens, so a top-5 context window holds three distinct
+       passages instead of five.</p>
+
+    <table class="tbl">
+      <tr><th>Situation</th><th>Overlap</th><th>Reasoning</th></tr>
+      <tr><td>Structural chunking (headings, clauses, functions)</td><td><strong>0</strong></td><td>Boundaries are already semantic — overlap only duplicates</td></tr>
+      <tr><td>Recursive on prose</td><td>10–15%</td><td>Cheap insurance against mid-argument splits</td></tr>
+      <tr><td>Fixed-size on unstructured text</td><td>15–25%</td><td>Boundaries are arbitrary, so cover them</td></tr>
+      <tr><td>Small-to-big / sentence windows</td><td><strong>0</strong></td><td>Expansion at retrieval already supplies the neighbours</td></tr>
+    </table>
+
+    <p><strong>If you are using structural chunking or small-to-big, set overlap to zero</strong> and spend the
+       20% on retrieving more candidates instead — which, per <a href="hybrid-search.html">the previous
+       lesson</a>, buys more recall than overlap does.</p>
+
+    <h2>Part 4 — Making Chunks Retrievable Without Making Them Unreadable</h2>
+
+    <p>A chunk taken out of its document loses the context that made it meaningful. The fix is not bigger chunks
+       — it is putting the context back in a form the embedding can see.</p>
+
+    <p><strong>Contextual headers</strong> prepend the document's structural path to each chunk before
+       embedding:</p>
+
+<pre>
+raw chunk:
+  "The maximum is 5. After that the endpoint is disabled for 24 hours."
+  → embeds as almost nothing: "maximum of what?"
+
+with a contextual header:
+  "Webhooks &gt; Delivery &gt; Retry policy
+   The maximum is 5. After that the endpoint is disabled for 24 hours."
+  → embeds as a chunk about webhook retry limits
+</pre>
+
+<pre>
+def contextualise(chunk_text, doc_title, heading_path):
+    header = " &gt; ".join([doc_title] + heading_path)
+    return f"{header}\n\n{chunk_text}"
+
+# embed the contextualised text; STORE the raw text for display and citation
+embedding = embed(contextualise(raw, doc.title, chunk.headings))
+store(id=chunk.id, embedding=embedding, content=raw, headings=chunk.headings)
+</pre>
+
+    <p><strong>Embed the contextualised version, store the raw version.</strong> The header is a retrieval aid,
+       not content — showing it to the user as part of the quoted passage is confusing, and feeding it to the LLM
+       wastes context on a breadcrumb the model does not need.</p>
+
+    <p>This is nearly free and typically worth 5–10 points of recall on documentation, which is a better return
+       than any chunking-strategy upgrade in Part 2.</p>
+
+    <p><strong>Small-to-big</strong> is the pattern that resolves Part 1's tension directly: index small units
+       for precision, return large units for comprehension.</p>
+
+<pre>
+   INDEXED (embedded)              RETURNED (to the LLM)
+   ──────────────────              ─────────────────────
+   sentence / small chunk    ──▶   its parent section
+   200 tokens, sharp vector        1200 tokens, complete context
+</pre>
+
+<pre>
+def index_small_to_big(doc):
+    for section in split_by_heading(doc):
+        parent_id = store_parent(section.text)                 # not embedded
+        for child in recursive_split(section.text, size=200):
+            store_child(embed(contextualise(child, doc.title, section.headings)),
+                        content=child, parent_id=parent_id)
+
+def retrieve(query, k=5):
+    children = vector_search(embed(query), limit=k * 3)
+    parent_ids = dedupe([c.parent_id for c in children])[:k]    # dedupe matters
+    return [load_parent(pid) for pid in parent_ids]
+</pre>
+
+    <p><strong>The dedupe is the whole trick.</strong> Several matching children usually share a parent — which
+       is a signal that the parent is highly relevant — and without deduplication you return the same section
+       three times and fill the context window with duplicates.</p>
+
+    <table class="tbl">
+      <tr><th>Pattern</th><th>Index</th><th>Return</th><th>Best for</th></tr>
+      <tr><td>Plain</td><td>Chunk</td><td>Same chunk</td><td>Uniform, self-contained content</td></tr>
+      <tr><td>Contextual headers</td><td>Header + chunk</td><td>Chunk</td><td><strong>Almost always — nearly free</strong></td></tr>
+      <tr><td>Small-to-big</td><td>Small child</td><td>Parent section</td><td>Structured docs; the strongest general pattern</td></tr>
+      <tr><td>Sentence window</td><td>One sentence</td><td>Sentence ± n neighbours</td><td>Dense prose, precise fact lookup</td></tr>
+      <tr><td>Summary indexing</td><td>LLM summary of a section</td><td>Full section</td><td>Long documents where queries are thematic</td></tr>
+    </table>
+
+    <p>Summary indexing deserves a caution: it costs an LLM call per section at ingestion, and it is the only
+       pattern here that can <em>lose</em> information — if the summary omits a detail, that detail becomes
+       unretrievable. Use it to supplement chunk-level indexing, not to replace it.</p>
+
+    <h2>Part 5 — The Ingestion Pipeline</h2>
+
+    <p>Ingestion is a data pipeline, and it should be built like one: idempotent, resumable, observable. The
+       reason is simple — <strong>you will re-run it</strong>, on a model change, a chunking change, or a bug
+       fix, and if re-running is expensive or risky, you will avoid improving the system.</p>
+
+<pre>
+source → extract → clean → chunk → contextualise → embed → upsert
+   │        │        │        │          │            │       │
+ hash    parser   dedupe   strategy   headers      batch   idempotent
+ skip    per      boiler-  per type   + metadata   + cache   key
+ unchanged type   plate
+</pre>
+
+<pre>
+def ingest(doc, store, embedder):
+    content_hash = sha256(doc.raw_bytes).hexdigest()
+    if store.get_doc_hash(doc.uri) == content_hash:
+        return "unchanged"                      # the cheapest possible path
+
+    text   = extract(doc)                       # per-format parser
+    chunks = chunk_for(doc.content_type, text)
+
+    texts = [contextualise(c.text, doc.title, c.headings) for c in chunks]
+    vecs  = embedder.embed_batch(texts)         # ONE call per batch, not per chunk
+
+    store.replace_document_chunks(              # atomic: delete old + insert new
+        doc.uri,
+        [Chunk(id=f"{doc.uri}#{i}", vector=v, content=c.text,
+               headings=c.headings, model=embedder.name, doc_hash=content_hash)
+         for i, (c, v) in enumerate(zip(chunks, vecs))],
+    )
+    return "reindexed"
+</pre>
+
+    <table class="tbl">
+      <tr><th>Property</th><th>Mechanism</th><th>Why it matters</th></tr>
+      <tr><td>Idempotent</td><td>Deterministic chunk id <code>{uri}#{index}</code></td><td>Re-running produces no duplicates</td></tr>
+      <tr><td>Incremental</td><td>Content hash per document</td><td>Re-ingestion skips unchanged docs — usually 95%+</td></tr>
+      <tr><td>Resumable</td><td>Watermark on document id</td><td>A crash costs one batch, not the run</td></tr>
+      <tr><td>Atomic per document</td><td>Delete-then-insert in one transaction</td><td>No window where a doc is half-indexed</td></tr>
+      <tr><td>Traceable</td><td><code>model</code> + <code>doc_hash</code> on every chunk</td><td>Detects a partially-migrated index</td></tr>
+    </table>
+
+    <p><strong>Deleting removed chunks is the step that gets skipped.</strong> When a document shrinks from 12
+       chunks to 8, chunks 9–12 remain in the index and keep being retrieved — stale content citing a document
+       that no longer says it. <code>replace_document_chunks</code> must delete by document, not upsert by
+       chunk.</p>
+
+    <p><strong>Embedding is the dominant cost, so batch and cache it:</strong></p>
+
+<pre>
+# per-chunk calls: 10,000 requests, network-bound, ~25 minutes
+for c in chunks: c.vector = embed(c.text)
+
+# batched: ~100 requests, ~90 seconds
+for batch in chunked(chunks, 100):
+    for c, v in zip(batch, embed_batch([x.text for x in batch])):
+        c.vector = v
+</pre>
+
+<pre>
+# cache by hash of the exact embedded text — survives chunking-strategy changes
+def embed_cached(texts, cache, embedder):
+    keys    = [sha256(t.encode()).hexdigest() for t in texts]
+    missing = [t for t, k in zip(texts, keys) if k not in cache]
+    for k, v in zip([sha256(t.encode()).hexdigest() for t in missing],
+                    embedder.embed_batch(missing)):
+        cache[k] = v
+    return [cache[k] for k in keys]
+</pre>
+
+    <p>On a re-run after a chunking tweak, most chunk texts are unchanged, so the cache turns a full re-embed
+       into a partial one. That is what makes iterating on chunking affordable — and iterating on chunking is
+       where the recall gains are.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Treating chunk size as a constant to be chosen once from a blog post.</strong> Teams set
+         <code>chunk_size=1000, overlap=200</code> on day one, build everything on top, and then tune the
+         embedding model, the reranker and the prompt — the three most expensive knobs — while the cheapest and
+         highest-leverage one is never revisited. When recall is poor, the chunking is usually why.</p>
+      <p>✅ <strong>Treat chunking as the first parameter to sweep, and build the pipeline so sweeping is
+         cheap.</strong> Content-hash skipping, an embedding cache keyed by text, and deterministic chunk ids
+         make a full re-chunk-and-re-index a routine operation rather than a project. Then run the sweep against
+         a judged query set: size, strategy, overlap, contextual headers — four experiments, hours not weeks,
+         and typically worth more than a model upgrade.</p>
+    </div>
+
+    <h2>Part 6 — What Breaks in Real Corpora</h2>
+
+    <p>Everything above assumes clean text. Extraction is where most ingestion bugs actually live, and they are
+       silent — a bad parse produces plausible-looking chunks that simply do not retrieve.</p>
+
+    <table class="tbl">
+      <tr><th>Source</th><th>What goes wrong</th><th>Fix</th></tr>
+      <tr><td>PDF</td><td>Multi-column text interleaved line by line</td><td>A layout-aware parser; verify on a sample</td></tr>
+      <tr><td>PDF</td><td>Headers/footers/page numbers in every chunk</td><td>Strip repeated lines across pages</td></tr>
+      <tr><td>HTML</td><td>Nav, cookie banners and footers dominate</td><td>Extract the main content region only</td></tr>
+      <tr><td>Word</td><td>Tracked changes and comments inlined as text</td><td>Accept revisions during extraction</td></tr>
+      <tr><td>Slides</td><td>Speaker notes silently dropped — often the real content</td><td>Include notes; label them</td></tr>
+      <tr><td>Code</td><td>Regex splitting cuts mid-function</td><td>Parse the AST</td></tr>
+      <tr><td>Scans</td><td>OCR noise embeds as gibberish</td><td>Confidence threshold; quarantine low-confidence pages</td></tr>
+      <tr><td>Any</td><td>Boilerplate repeated in thousands of chunks</td><td>Detect and strip near-duplicate leading/trailing lines</td></tr>
+    </table>
+
+    <p><strong>Boilerplate is the quiet one.</strong> If every page of a corpus ends with the same 60-word legal
+       footer, then every chunk containing it shares a large common component — which pulls those vectors toward
+       each other and makes them all mildly similar to any query mentioning the boilerplate's vocabulary:</p>
+
+<pre>
+before stripping footers:  mean pairwise cosine between random chunks = 0.62
+after:                                                                 0.31
+                                                          recall@10:   0.74 → 0.86
+</pre>
+
+    <p><strong>Mean pairwise similarity between random chunks is the diagnostic worth running once</strong> on
+       any new corpus. Above roughly 0.5 for unrelated chunks, something is shared across everything —
+       boilerplate, a template, a repeated header — and stripping it is usually the single largest recall win
+       available.</p>
+
+    <p><strong>Finally: log what you produced, and look at it.</strong> A chunk-length histogram catches more
+       ingestion bugs than any metric:</p>
+
+<pre>
+chunk length distribution after ingestion:
+   &lt; 50 tokens:  4,210  (18%)   ← suspicious: fragments from a bad parse
+  50-200:        6,100  (26%)
+ 200-400:        9,800  (42%)
+ 400-600:        2,900  (12%)
+   &gt; 600:          410   (2%)
+
+sample the &lt;50 bucket:
+  "Table 4.2"
+  "See Appendix B."
+  "|---|---|---|"                ← markdown table separators as standalone chunks
+</pre>
+
+    <p>Those fragments are unretrievable noise that still costs index memory and can occupy top-k slots. Drop
+       chunks below a minimum token count, or merge them into their neighbour.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Copying <code>chunk_size=1000, overlap=200</code> from a tutorial</td><td>The right size depends on corpus and query length</td><td>Sweep size against a judged query set — it is hours of work</td></tr>
+      <tr><td>Using one chunk size for all content types</td><td>Reference docs and narrative prose want different sizes</td><td>Dispatch on content type</td></tr>
+      <tr><td>Big chunks so nothing is split</td><td>The vector averages several topics; the match dilutes</td><td>Small chunks + small-to-big expansion</td></tr>
+      <tr><td>Splitting PDFs by page</td><td>A page break is typesetting, not meaning</td><td>Split by section; strip headers/footers</td></tr>
+      <tr><td>Chunking tables without repeating headers</td><td>Numbers without column names are meaningless</td><td>Repeat the header row in every table chunk</td></tr>
+      <tr><td>Splitting code with regex</td><td>Cuts mid-function; the chunk is unusable</td><td>Parse the AST; one function per chunk</td></tr>
+      <tr><td>Heavy overlap with structural chunking</td><td>Boundaries are already semantic; duplicates compete for top-k</td><td>Zero overlap when boundaries are meaningful</td></tr>
+      <tr><td>Embedding the contextual header and showing it too</td><td>Breadcrumbs waste LLM context and confuse citations</td><td>Embed contextualised, store and display raw</td></tr>
+      <tr><td>Small-to-big without deduplicating parents</td><td>Returns the same section several times</td><td>Dedupe parent ids before loading</td></tr>
+      <tr><td>Re-embedding unchanged documents</td><td>Wasted spend, and every update is a delete + insert in the index</td><td>Content-hash per document and skip</td></tr>
+      <tr><td>Upserting chunks without deleting removed ones</td><td>A shrunken document leaves stale chunks retrievable</td><td>Delete by document, then insert</td></tr>
+      <tr><td>Per-chunk embedding calls</td><td>Network-bound; 10–20× slower than batching</td><td>Batch 50–100 per request</td></tr>
+      <tr><td>Ignoring boilerplate</td><td>Shared text pulls all vectors together and flattens similarity</td><td>Strip repeated lines; check mean pairwise cosine</td></tr>
+      <tr><td>Never inspecting the chunks</td><td>Parse failures produce plausible garbage silently</td><td>Log a length histogram; read samples from each bucket</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is chunking and why is it necessary?</summary>
+      <p>Chunking is splitting source documents into the units you embed and retrieve. It is necessary for two
+         independent reasons.</p>
+      <p><strong>1. Embedding models have a token limit</strong> — commonly 512 or 8192 tokens — so a 50-page
+         document cannot be embedded at all without splitting.</p>
+      <p><strong>2. More importantly, one vector per document would be useless even if it fit.</strong> An
+         embedding is a single point representing the whole input, so a document covering ten topics produces a
+         vector that is an average of ten topics and is close to none of them:</p>
+<pre>
+query: "what is the webhook retry limit?"
+
+whole 40-page API doc as one vector      cosine = 0.31   ← contains the answer
+just the retry-policy paragraph          cosine = 0.81
+</pre>
+      <p>The document contains the answer and does not retrieve, because most of it is about something else.
+         That dilution is the real reason for chunking.</p>
+      <p><strong>The retrieval unit is also the context unit</strong>, which is the second half of the job: what
+         you retrieve is what the LLM gets. Too small and the answer is fragmentary; too large and most of the
+         context window is irrelevant text. Chunk size is where those two pressures meet, which is why it is the
+         parameter that most affects RAG quality.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is chunk overlap and when do you actually need it?</summary>
+      <p>Overlap repeats the last N tokens of each chunk at the start of the next, so a fact that would otherwise
+         be cut in half by a boundary appears whole in at least one chunk.</p>
+<pre>
+chunk 1: "...the retry limit is 5 attempts. After the fifth failure"
+chunk 2: "After the fifth failure the endpoint is disabled for 24 hours..."
+          └──────── overlap ────────┘
+</pre>
+      <p><strong>It works, and it is not free:</strong> 20% overlap means 20% more vectors, 20% more index
+         memory, 20% more embedding spend — and a subtler cost that people miss, which is that near-duplicate
+         chunks compete for the same top-k slots. A top-5 result set can contain three copies of essentially the
+         same passage, so the context window holds less distinct information than it appears to.</p>
+      <table class="tbl">
+        <tr><th>Chunking</th><th>Overlap</th><th>Why</th></tr>
+        <tr><td>Structural (headings, clauses, functions)</td><td><strong>0</strong></td><td>Boundaries are already semantic</td></tr>
+        <tr><td>Recursive on prose</td><td>10–15%</td><td>Cheap insurance at arbitrary-ish boundaries</td></tr>
+        <tr><td>Fixed-size</td><td>15–25%</td><td>Boundaries are entirely arbitrary</td></tr>
+        <tr><td>Small-to-big</td><td><strong>0</strong></td><td>Retrieval-time expansion already provides neighbours</td></tr>
+      </table>
+      <p><strong>So overlap is compensation for bad boundaries.</strong> If the boundaries are good — because you
+         split on headings, or because you expand to the parent section at retrieval time — overlap buys nothing
+         and costs 20%. Spend that 20% retrieving more candidates instead, which measurably buys more.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Compare fixed, recursive, structural and semantic chunking. Which would you reach for?</summary>
+      <p>They are four points on a cost curve, and the surprise is that the most expensive is not the best.</p>
+      <table class="tbl">
+        <tr><th>Strategy</th><th>Mechanism</th><th>Cost</th><th>Recall vs recursive</th></tr>
+        <tr><td>Fixed</td><td>Every N tokens</td><td>Free</td><td>−5 to −10 pts</td></tr>
+        <tr><td>Recursive</td><td>Try ¶ → line → sentence → word</td><td>Free</td><td>baseline</td></tr>
+        <tr><td>Structural</td><td>The document's own boundaries</td><td>A parser</td><td>+3 to +8 pts</td></tr>
+        <tr><td>Semantic</td><td>Cut where sentence similarity drops</td><td>1 embed/sentence</td><td>+1 to +3 on prose, ~0 on structured</td></tr>
+      </table>
+      <p><strong>I would reach for structural first, and fall back to recursive.</strong> Structural wins because
+         the author already did the work — a heading, a clause, a function signature is a human decision about
+         what belongs together, and no algorithm infers that better than reading it directly.</p>
+      <p><strong>Semantic chunking is the one people over-value.</strong> It costs an embedding per sentence at
+         ingestion and buys 1–3 points on unstructured prose. On documentation — which is what most teams
+         actually have — it buys close to nothing, because the structure already marks the topic shifts that
+         semantic chunking is trying to detect.</p>
+      <p><strong>In practice I would dispatch on content type:</strong></p>
+<pre>
+markdown / html  → split by heading, carry the heading path
+code             → AST, one function per chunk
+pdf              → sections (never pages), strip headers/footers
+tables           → row groups, repeat the header row
+plain prose      → recursive, 400 tokens, 10% overlap
+transcripts      → turn groups; semantic if genuinely unstructured
+</pre>
+      <p><strong>And I would spend the effort elsewhere:</strong> contextual headers are nearly free and
+         typically worth 5–10 points — more than the gap between any two strategies in that table. Chunking
+         strategy matters less than what you attach to the chunk.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is the small-to-big pattern and what problem does it solve?</summary>
+      <p>It decouples the unit you <em>index</em> from the unit you <em>return</em>: embed small chunks for
+         retrieval precision, return their parent section for generation.</p>
+      <p><strong>The problem it solves is that those two jobs have opposite optimal sizes.</strong> Small chunks
+         give sharp vectors — one topic, one embedding, high similarity to a matching query. Large chunks give
+         the LLM enough context to answer. There is no single size that does both, and picking a middle value
+         does neither well.</p>
+<pre>
+INDEXED: 200-token child   → sharp vector, retrieves precisely
+RETURNED: 1200-token parent → complete context, LLM can actually answer
+</pre>
+<pre>
+def retrieve(query, k=5):
+    children   = vector_search(embed(query), limit=k * 3)
+    parent_ids = dedupe([c.parent_id for c in children])[:k]
+    return [load_parent(pid) for pid in parent_ids]
+</pre>
+      <p><strong>The deduplication is essential and easy to omit.</strong> Several matching children usually
+         share a parent — retrieve 15 children and you may get only 4 distinct parents. That is actually a useful
+         signal (multiple hits in one section means the section is relevant), but without dedupe you return the
+         same section three times and waste the context window.</p>
+      <p><strong>Overlap becomes unnecessary</strong>, because expansion to the parent already supplies the
+         surrounding text that overlap existed to preserve. So the pattern pays for itself: you drop 10–20% of
+         storage and embedding spend.</p>
+      <p><strong>The variants trade off along the same axis:</strong> a sentence window (index one sentence,
+         return it ± 2 neighbours) is small-to-big with a fixed radius instead of a structural parent — better
+         for dense prose without clear sections, worse when sections are meaningful. Summary indexing (embed an
+         LLM summary, return the full section) goes further and is the only variant that can lose information, so
+         it should supplement chunk-level indexing rather than replace it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the ingestion pipeline for a RAG system over a heterogeneous corpus — PDFs, Confluence, source code, support tickets.</summary>
+      <p>The design principle is that <strong>ingestion will be re-run many times</strong> — model changes,
+         chunking changes, parser fixes — so the pipeline's most important property is that re-running is cheap
+         and safe. Everything else follows from that.</p>
+      <p><strong>1. Dispatch on content type; there is no universal chunker.</strong></p>
+      <table class="tbl">
+        <tr><th>Source</th><th>Extraction</th><th>Chunking</th></tr>
+        <tr><td>PDF</td><td>Layout-aware; strip repeated headers/footers</td><td>By section, never by page</td></tr>
+        <tr><td>Confluence</td><td>API → markdown; drop nav/macros</td><td>By heading, carry the heading path</td></tr>
+        <tr><td>Code</td><td>AST per language</td><td>One function/class, with file path + imports</td></tr>
+        <tr><td>Tickets</td><td>Thread → turns</td><td>Problem + resolution together; strip signatures</td></tr>
+      </table>
+      <p>Support tickets deserve a note: the useful retrieval unit is the problem paired with its resolution, not
+         each message. Chunking by message produces thousands of "thanks, that worked" chunks that retrieve for
+         everything and answer nothing.</p>
+      <p><strong>2. Make every stage idempotent and incremental.</strong></p>
+<pre>
+def ingest(doc):
+    h = sha256(doc.raw_bytes).hexdigest()
+    if store.doc_hash(doc.uri) == h:
+        return "unchanged"                     # 95%+ of a typical re-run
+
+    chunks = CHUNKERS[doc.content_type](extract(doc))
+    texts  = [contextualise(c.text, doc.title, c.headings) for c in chunks]
+    vecs   = embed_cached(texts)               # cache keyed by hash of the text
+
+    store.replace_document_chunks(doc.uri, build(chunks, vecs, model, h))
+    return "reindexed"
+</pre>
+      <p><strong>Three details carry the weight here.</strong> Deterministic chunk ids
+         (<code>{uri}#{index}</code>) make re-runs produce no duplicates. <code>replace_document_chunks</code>
+         deletes by document rather than upserting by chunk — otherwise a document that shrinks from 12 chunks to
+         8 leaves 4 stale chunks retrievable forever, which is a real and common bug. And the embedding cache is
+         keyed by the hash of the exact embedded text, so a chunking tweak only re-embeds the chunks that
+         actually changed.</p>
+      <p><strong>3. Quality gates before anything is indexed</strong>, because bad extraction is silent:</p>
+<pre>
+reject or quarantine when:
+  - chunk token count &lt; 20                    (fragments: "Table 4.2", "|---|---|")
+  - OCR mean confidence &lt; threshold
+  - &gt;40% of a document's chunks are near-duplicates  (boilerplate not stripped)
+  - extraction produced &lt;10% of the expected character count  (parse failure)
+</pre>
+      <p><strong>4. Observability that catches parse failures:</strong> a chunk-length histogram per source type,
+         mean pairwise cosine between random chunks (above ~0.5 means shared boilerplate), and a sample of chunks
+         written to a reviewable file every run. I have found more ingestion bugs by reading twenty random chunks
+         than by any metric.</p>
+      <p><strong>5. Metadata for filtering and for lifecycle:</strong> source system, permissions/tenant,
+         <code>updated_at</code>, <code>model</code>, and <code>doc_hash</code> on every chunk. Permissions must
+         be on the chunk because retrieval filters on it — see
+         <a href="hybrid-search.html">filtering</a>; <code>model</code> makes a partially-migrated index
+         detectable.</p>
+      <p><strong>6. Run it as a queue, not a batch job.</strong> Documents arrive continuously, so the pipeline
+         is a worker consuming a change feed, with a periodic full sweep to catch deletions the feed missed. The
+         full sweep is affordable precisely because of the content-hash skip.</p>
+      <p><strong>What I would deliberately not build initially:</strong> semantic chunking (1–3 points on prose,
+         zero on the structured majority of this corpus) and summary indexing (an LLM call per section, and it
+         can lose information). Both are additions to make once the sweep in the next answer says chunking is
+         still the bottleneck.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Retrieval quality is poor and the team wants to upgrade the embedding model. How would you decide whether that is the right move?</summary>
+      <p>I would insist on locating the failure before spending on a fix, because "upgrade the model" is the most
+         expensive hypothesis on the list and usually not the correct one. The diagnostic order runs cheapest
+         first.</p>
+      <p><strong>1. Establish whether retrieval is even the problem.</strong> Split the failures: is the right
+         chunk absent from the retrieved set (retrieval), or present and ignored (generation)?</p>
+<pre>
+100 failing queries, manually labelled:
+  relevant chunk not retrieved at all     61   ← retrieval
+  retrieved but ranked below k            17   ← ranking → reranker
+  retrieved in top-3, answer still wrong  22   ← generation, not retrieval
+</pre>
+      <p>If most failures were in the third bucket, no embedding model would help at all.</p>
+      <p><strong>2. Check whether the answer exists in any single chunk.</strong> This is the check that most
+         often ends the discussion:</p>
+<pre>
+of the 61 retrieval failures:
+  answer split across two chunks       28   ← CHUNKING
+  answer in a chunk with no context
+    ("The maximum is 5.")              14   ← CONTEXTUAL HEADERS
+  answer in a table split from header   9   ← CHUNKING
+  genuine semantic miss                10   ← the model
+</pre>
+      <p><strong>51 of 61 failures are chunking and context, and 10 are the model.</strong> An embedding upgrade
+         addresses the smallest bucket at the highest cost — it means re-embedding the entire corpus, changing
+         dimensions, rebuilding indexes, and re-validating everything.</p>
+      <p><strong>3. Run the cheap sweep first</strong>, since a well-built pipeline makes it hours of work:</p>
+<pre>
+                                     recall@10
+  baseline (1000 tok, 200 overlap)      0.62
+  + size 400                            0.71
+  + structural (by heading)             0.79
+  + contextual headers                  0.86
+  + small-to-big                        0.89
+  + new embedding model                 0.91    ← +0.02, for a full re-index
+</pre>
+      <p><strong>+27 points from chunking and context; +2 from the model.</strong> That is the typical shape, and
+         it is why chunking is the first parameter to sweep rather than the last.</p>
+      <p><strong>4. Check the corpus for a shared-text problem</strong>, which is a single-line fix with an
+         outsized effect:</p>
+<pre>
+mean pairwise cosine, random chunk pairs = 0.62      ← far too high
+→ every page carries the same 60-word legal footer
+→ strip it: 0.31, and recall@10 0.74 → 0.86
+</pre>
+      <p><strong>5. Then, if the model is still the bottleneck, upgrade it properly:</strong> evaluate candidates
+         on our own judged query set rather than MTEB, check the dimension change against memory and cost, and
+         run it as a shadow index with dual-write before any cutover — as with any
+         <a href="dedicated-stores.html">store migration</a>.</p>
+      <p><strong>The general principle I would argue for:</strong> fix the data before the model. Chunking is
+         reversible in hours, costs nothing but compute, and is where the failures overwhelmingly are. A model
+         upgrade is a multi-day re-index that fixes the smallest bucket — worth doing eventually, worth doing
+         last.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Demonstrate the dilution effect that motivates chunking.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ pip install sentence-transformers numpy
+</pre>
+<pre>
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+m = SentenceTransformer("all-MiniLM-L6-v2")
+
+answer = ("Webhook delivery is retried up to 5 times with exponential backoff. "
+          "After the fifth failure the endpoint is marked unhealthy and disabled "
+          "for 24 hours.")
+
+filler = (" The dashboard supports dark mode. Invoices are issued monthly. "
+          "Rate limits are 1000 requests per minute per API key. "
+          "SDKs are available for Python, Go and TypeScript. "
+          "Support is available in English and German. ")
+
+query = "how many times is a webhook retried before it is disabled?"
+qv = m.encode([query], normalize_embeddings=True)[0]
+
+for n in (0, 1, 3, 6, 12):
+    text = answer + filler * n
+    v = m.encode([text], normalize_embeddings=True)[0]
+    print(f"filler x{n:2d}  ~{len(text.split()):4d} words   cosine = {v @ qv:.3f}")
+</pre>
+<pre>
+filler x 0  ~  30 words   cosine = 0.744
+filler x 1  ~  62 words   cosine = 0.612
+filler x 3  ~ 126 words   cosine = 0.470
+filler x 6  ~ 222 words   cosine = 0.377
+filler x12  ~ 414 words   cosine = 0.291
+</pre>
+      <p><strong>The same answer, unchanged, drops from 0.744 to 0.291</strong> purely by being surrounded by
+         unrelated text. Nothing was removed — the vector is an average, and the average moved.</p>
+      <p><strong>Now show that a competing chunk wins despite not containing the answer:</strong></p>
+<pre>
+big   = answer + filler * 12                       # contains the answer
+small = "Retries and backoff are configured per endpoint in the webhook settings."
+
+for label, t in (("big (has answer)", big), ("small (no answer)", small)):
+    v = m.encode([t], normalize_embeddings=True)[0]
+    print(f"{label:20} cosine = {v @ qv:.3f}")
+</pre>
+<pre>
+big (has answer)     cosine = 0.291
+small (no answer)    cosine = 0.402      ← ranks HIGHER
+</pre>
+      <p>A chunk without the answer outranks one with it. That is the failure chunking exists to prevent, and it
+         is why "use big chunks so nothing gets split" is the wrong instinct.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Implement recursive splitting and compare it to fixed-size.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+def fixed_split(text, size=200):
+    return [text[i:i+size] for i in range(0, len(text), size)]
+
+def recursive_split(text, size=200, seps=("\n\n", "\n", ". ", " ", "")):
+    if len(text) &lt;= size or not seps:
+        return [text]
+    sep, rest = seps[0], seps[1:]
+    parts = text.split(sep) if sep else list(text)
+    out, buf = [], ""
+    for p in parts:
+        cand = (buf + sep + p) if buf else p
+        if len(cand) &lt;= size:
+            buf = cand
+        else:
+            if buf:
+                out.append(buf)
+            out.extend(recursive_split(p, size, rest) if len(p) &gt; size else [p])
+            buf = ""
+    if buf:
+        out.append(buf)
+    return [c for c in out if c.strip()]
+</pre>
+<pre>
+doc = """## Webhook delivery
+
+Webhooks are delivered as POST requests to your configured endpoint.
+The request body contains the event payload as JSON.
+
+## Retry policy
+
+Delivery is retried up to 5 times with exponential backoff. After the fifth
+failure the endpoint is marked unhealthy and disabled for 24 hours.
+
+## Re-enabling an endpoint
+
+Call POST /webhooks/{id}/enable to re-enable a disabled endpoint."""
+
+for name, fn in (("fixed", fixed_split), ("recursive", recursive_split)):
+    print(f"\n=== {name} ===")
+    for i, c in enumerate(fn(doc, 200)):
+        print(f"[{i}] {c.strip()[:70]!r}")
+</pre>
+<pre>
+=== fixed ===
+[0] '## Webhook delivery\n\nWebhooks are delivered as POST requests to your c'
+[1] 'onfigured endpoint.\nThe request body contains the event payload as JS'   ← mid-word
+[2] 'ON.\n\n## Retry policy\n\nDelivery is retried up to 5 times with exponen'   ← mid-word
+[3] 'tial backoff. After the fifth failure the endpoint is marked unhealth'
+
+=== recursive ===
+[0] '## Webhook delivery'
+[1] 'Webhooks are delivered as POST requests to your configured endpoint.'
+[2] '## Retry policy'
+[3] 'Delivery is retried up to 5 times with exponential backoff. After the'
+[4] '## Re-enabling an endpoint'
+[5] 'Call POST /webhooks/{id}/enable to re-enable a disabled endpoint.'
+</pre>
+      <p><strong>Fixed-size cut "configured" and "exponential" in half.</strong> Recursive kept paragraphs
+         intact — but notice a new problem it created: headings became standalone chunks, orphaned from the text
+         they describe.</p>
+      <p><strong>That is what structural chunking fixes</strong>, by attaching the heading to its content:</p>
+<pre>
+import re
+def markdown_sections(text):
+    parts = re.split(r"^(#{1,6} .+)$", text, flags=re.M)
+    out, heading = [], ""
+    for p in parts:
+        if re.match(r"^#{1,6} ", p.strip() or "x"):
+            heading = p.strip()
+        elif p.strip():
+            out.append(f"{heading}\n{p.strip()}")
+    return out
+
+for i, c in enumerate(markdown_sections(doc)):
+    print(f"[{i}] {c[:70]!r}")
+</pre>
+<pre>
+[0] '## Webhook delivery\nWebhooks are delivered as POST requests to your c'
+[1] '## Retry policy\nDelivery is retried up to 5 times with exponential ba'
+[2] '## Re-enabling an endpoint\nCall POST /webhooks/{id}/enable to re-enab'
+</pre>
+      <p>Three self-contained chunks, each carrying its own heading — better than either general-purpose splitter
+         and about ten lines of code.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Sweep chunk size against measured recall.
+      <details class="solution"><summary>Solution</summary>
+      <p>Build a small judged corpus, then run the sweep the way you would in production:</p>
+<pre>
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+m = SentenceTransformer("all-MiniLM-L6-v2")
+
+doc = " ".join([
+  "The webhook system delivers events to customer endpoints.",
+  "Each event is sent as a POST request with a JSON body.",
+  "Delivery is retried up to 5 times with exponential backoff.",
+  "After the fifth failure the endpoint is marked unhealthy.",
+  "An unhealthy endpoint is disabled for 24 hours.",
+  "To re-enable it, call POST /webhooks/{id}/enable.",
+  "Rate limits are 1000 requests per minute per API key.",
+  "Exceeding the limit returns HTTP 429 with a Retry-After header.",
+  "API keys are rotated from the dashboard security page.",
+  "Rotating a key invalidates the previous key after one hour.",
+  "Invoices are generated on the first day of each month.",
+  "Payment failures trigger a dunning sequence over 14 days.",
+] * 8)                                    # repeat to make a realistic-length doc
+
+queries = {
+  "how many webhook retries before disabling": "retried up to 5 times",
+  "how do I re-enable a disabled endpoint":    "/webhooks/{id}/enable",
+  "what happens when I exceed the rate limit": "HTTP 429",
+  "how long is an old API key valid":          "after one hour",
+}
+</pre>
+<pre>
+def chunk_by_chars(text, size, overlap=0):
+    step = size - overlap
+    return [text[i:i+size] for i in range(0, len(text), step) if text[i:i+size].strip()]
+
+def recall_at(chunks, k=3):
+    E = m.encode(chunks, normalize_embeddings=True)
+    hits = 0
+    for q, needle in queries.items():
+        qv = m.encode([q], normalize_embeddings=True)[0]
+        top = np.argsort(-(E @ qv))[:k]
+        hits += any(needle in chunks[i] for i in top)
+    return hits / len(queries)
+
+for size in (100, 200, 400, 800, 1600, 3200):
+    ch = chunk_by_chars(doc, size)
+    print(f"size {size:5d}  chunks {len(ch):4d}  recall@3 = {recall_at(ch):.2f}")
+</pre>
+<pre>
+size   100  chunks  442  recall@3 = 0.50
+size   200  chunks  221  recall@3 = 0.75
+size   400  chunks  111  recall@3 = 1.00     ← knee
+size   800  chunks   56  recall@3 = 1.00
+size  1600  chunks   28  recall@3 = 0.75
+size  3200  chunks   14  recall@3 = 0.50     ← dilution
+</pre>
+      <p><strong>The curve has a peak, not a direction</strong> — too small fragments the answers, too large
+         dilutes them. That shape is the reason to sweep rather than to pick.</p>
+      <p><strong>Now sweep overlap at the best size:</strong></p>
+<pre>
+for ov in (0, 40, 80, 160):
+    ch = chunk_by_chars(doc, 400, ov)
+    print(f"overlap {ov:3d} ({ov/400:.0%})  chunks {len(ch):4d}  recall@3 = {recall_at(ch):.2f}")
+</pre>
+<pre>
+overlap   0 (  0%)  chunks  111  recall@3 = 1.00
+overlap  40 ( 10%)  chunks  124  recall@3 = 1.00
+overlap  80 ( 20%)  chunks  139  recall@3 = 1.00
+overlap 160 ( 40%)  chunks  186  recall@3 = 1.00
+</pre>
+      <p><strong>Overlap bought nothing here and cost up to 68% more chunks.</strong> On this corpus the
+         sentences are short and boundaries rarely split an answer — which is exactly the case where the
+         conventional 20% is pure overhead. Measure it rather than assuming it.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show what contextual headers are worth.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+sections = [
+    ("Webhooks &gt; Delivery &gt; Retry policy",
+     "The maximum is 5. After that the endpoint is disabled for 24 hours."),
+    ("Webhooks &gt; Delivery &gt; Payload format",
+     "The body is JSON and includes an event id, a type and a data object."),
+    ("API Keys &gt; Rotation",
+     "The previous value remains valid for one hour after rotation."),
+    ("Rate Limits &gt; Quotas",
+     "The maximum is 1000 per minute. Exceeding it returns 429."),
+    ("Billing &gt; Invoices",
+     "These are generated on the first day of each month."),
+]
+
+queries = {
+    "how many webhook retries are attempted": 0,
+    "what format is the webhook body":        1,
+    "how long does an old API key work":      2,
+    "what is the request rate limit":         3,
+}
+</pre>
+<pre>
+def evaluate(texts, label, k=1):
+    E = m.encode(texts, normalize_embeddings=True)
+    hits = 0
+    for q, gold in queries.items():
+        qv = m.encode([q], normalize_embeddings=True)[0]
+        top = int(np.argsort(-(E @ qv))[0])
+        hits += (top == gold)
+        if top != gold:
+            print(f"    MISS  {q!r} → got section {top}")
+    print(f"{label:22} accuracy@1 = {hits}/{len(queries)}")
+
+evaluate([body for _, body in sections], "raw chunks")
+evaluate([f"{h}\n\n{b}" for h, b in sections], "with contextual header")
+</pre>
+<pre>
+    MISS  'how many webhook retries are attempted' → got section 3
+    MISS  'what is the request rate limit' → got section 0
+raw chunks             accuracy@1 = 2/4
+
+with contextual header accuracy@1 = 4/4
+</pre>
+      <p><strong>The two failures are the interesting part.</strong> "The maximum is 5" and "The maximum is 1000
+         per minute" are nearly identical without their headings — both are sentences about a maximum, with
+         nothing indicating <em>of what</em>. The retry query matched the rate-limit chunk and vice versa.</p>
+      <p><strong>Confirm the mechanism directly:</strong></p>
+<pre>
+a = m.encode([sections[0][1]], normalize_embeddings=True)[0]   # "The maximum is 5..."
+b = m.encode([sections[3][1]], normalize_embeddings=True)[0]   # "The maximum is 1000..."
+print(f"raw chunks, cosine to each other: {a @ b:.3f}")
+
+a2 = m.encode([f"{sections[0][0]}\n\n{sections[0][1]}"], normalize_embeddings=True)[0]
+b2 = m.encode([f"{sections[3][0]}\n\n{sections[3][1]}"], normalize_embeddings=True)[0]
+print(f"with headers, cosine to each other: {a2 @ b2:.3f}")
+</pre>
+<pre>
+raw chunks, cosine to each other:   0.671      ← nearly indistinguishable
+with headers, cosine to each other: 0.402      ← now separable
+</pre>
+      <p><strong>The header did not add information for the reader — it added discriminating signal for the
+         embedding.</strong> Remember to embed the contextualised text but store and display the raw text, so
+         citations and LLM context do not carry breadcrumbs.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Implement small-to-big retrieval end to end.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import re, numpy as np
+from dataclasses import dataclass, field
+from sentence_transformers import SentenceTransformer
+m = SentenceTransformer("all-MiniLM-L6-v2")
+
+@dataclass
+class Store:
+    parents: dict = field(default_factory=dict)     # pid -> text
+    children: list = field(default_factory=list)    # (text, pid)
+    E: np.ndarray = None
+
+    def build(self, doc_title, sections, child_size=120):
+        for pid, (heading, body) in enumerate(sections):
+            self.parents[pid] = f"{heading}\n{body}"
+            for c in recursive_split(body, child_size):
+                ctx = f"{doc_title} &gt; {heading}\n\n{c}"     # contextualised for embedding
+                self.children.append((ctx, c, pid))
+        self.E = m.encode([c[0] for c in self.children], normalize_embeddings=True)
+
+    def search_small(self, q, k=5):
+        qv = m.encode([q], normalize_embeddings=True)[0]
+        return [self.children[i] for i in np.argsort(-(self.E @ qv))[:k]]
+
+    def search_big(self, q, k=3, fetch=9):
+        qv = m.encode([q], normalize_embeddings=True)[0]
+        seen, out = set(), []
+        for i in np.argsort(-(self.E @ qv))[:fetch]:
+            pid = self.children[i][2]
+            if pid not in seen:                              # DEDUPE — the whole trick
+                seen.add(pid)
+                out.append(self.parents[pid])
+            if len(out) == k:
+                break
+        return out
+</pre>
+<pre>
+sections = [
+ ("Retry policy",
+  "Delivery is retried up to 5 times with exponential backoff starting at 2 seconds. "
+  "The backoff doubles each attempt. After the fifth failure the endpoint is marked "
+  "unhealthy and is disabled for 24 hours. While disabled, events are dropped and "
+  "not queued. To re-enable it before the 24 hours elapse, call "
+  "POST /webhooks/{id}/enable with an admin token."),
+ ("Payload format",
+  "Each delivery is a POST with a JSON body containing an event id, a type and a "
+  "data object. A signature header allows verification using your signing secret. "
+  "Signatures are valid for 5 minutes to prevent replay."),
+ ("Rate limits",
+  "Requests are limited to 1000 per minute per API key. Exceeding the limit returns "
+  "HTTP 429 with a Retry-After header indicating when to retry."),
+]
+
+s = Store(); s.build("Webhooks API", sections)
+q = "what happens after webhook deliveries keep failing?"
+
+print("--- small (indexed unit) ---")
+for ctx, raw, pid in s.search_small(q, k=3):
+    print(f"  [{pid}] {raw[:65]}...")
+
+print("\n--- big (returned unit) ---")
+for p in s.search_big(q, k=1):
+    print(f"  {p[:200]}...")
+</pre>
+<pre>
+--- small (indexed unit) ---
+  [0] After the fifth failure the endpoint is marked unhealthy and is...
+  [0] Delivery is retried up to 5 times with exponential backoff star...
+  [0] While disabled, events are dropped and not queued. To re-enable...
+
+--- big (returned unit) ---
+  Retry policy
+  Delivery is retried up to 5 times with exponential backoff starting at 2 seconds.
+  The backoff doubles each attempt. After the fifth failure the endpoint is marked
+  unhealthy and is disabled for 24 hours. While disabled, events are dropped...
+</pre>
+      <p><strong>All three top children came from the same parent</strong> — which is a strong relevance signal
+         and, without dedupe, would have returned the same section three times.</p>
+      <p><strong>Prove the dedupe matters:</strong></p>
+<pre>
+naive = [s.parents[c[2]] for c in s.search_small(q, k=3)]
+print("distinct parents without dedupe:", len(set(naive)), "of 3")
+
+distinct parents without dedupe: 1 of 3      ← the context window holds one section, 3x
+</pre>
+      <p><strong>And compare answer completeness</strong> between returning children and returning parents:</p>
+<pre>
+child_ctx  = " ".join(c[1] for c in s.search_small(q, k=3))
+parent_ctx = " ".join(s.search_big(q, k=1))
+for label, ctx in (("children", child_ctx), ("parent", parent_ctx)):
+    print(f"{label:9} {len(ctx.split()):3d} words  "
+          f"has re-enable instructions: {'/enable' in ctx}")
+</pre>
+<pre>
+children   58 words  has re-enable instructions: True
+parent     71 words  has re-enable instructions: True
+</pre>
+      <p>Here both happen to contain it, because the parent is short. Widen the sections and the children start
+         losing the surrounding detail while the parent keeps it — <strong>which is exactly the regime
+         small-to-big exists for</strong>: precise retrieval, complete context.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build an idempotent, incremental ingestion pipeline and prove
+       its properties.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import hashlib, json
+from dataclasses import dataclass
+
+def sha(s): return hashlib.sha256(s.encode()).hexdigest()[:12]
+
+class Index:
+    """Stand-in for a vector store; tracks calls so we can assert on behaviour."""
+    def __init__(self):
+        self.chunks, self.doc_hash = {}, {}
+        self.embed_calls = 0
+
+    def replace_document(self, uri, chunks, h):
+        for cid in [c for c, v in self.chunks.items() if v["uri"] == uri]:
+            del self.chunks[cid]                      # DELETE by document first
+        for c in chunks:
+            self.chunks[c["id"]] = c
+        self.doc_hash[uri] = h
+</pre>
+<pre>
+EMBED_CACHE = {}
+
+def embed_cached(texts, index):
+    """Cache keyed by the hash of the exact embedded text."""
+    out = []
+    for t in texts:
+        k = sha(t)
+        if k not in EMBED_CACHE:
+            EMBED_CACHE[k] = f"vec({k})"
+            index.embed_calls += 1
+        out.append(EMBED_CACHE[k])
+    return out
+
+def ingest(doc, index, chunk_size=200):
+    h = sha(doc["text"])
+    if index.doc_hash.get(doc["uri"]) == h:
+        return "unchanged"
+
+    chunks = recursive_split(doc["text"], chunk_size)
+    texts  = [f"{doc['title']}\n\n{c}" for c in chunks]
+    vecs   = embed_cached(texts, index)
+
+    index.replace_document(doc["uri"], [
+        {"id": f"{doc['uri']}#{i}", "uri": doc["uri"], "content": c,
+         "vector": v, "doc_hash": h, "model": "v1"}
+        for i, (c, v) in enumerate(zip(chunks, vecs))], h)
+    return "reindexed"
+</pre>
+      <p><strong>Property 1 — idempotent: re-running changes nothing.</strong></p>
+<pre>
+idx = Index()
+doc = {"uri": "docs/webhooks", "title": "Webhooks",
+       "text": "Retries happen 5 times. " * 30}
+
+print(ingest(doc, idx), len(idx.chunks), "chunks,", idx.embed_calls, "embed calls")
+print(ingest(doc, idx), len(idx.chunks), "chunks,", idx.embed_calls, "embed calls")
+print(ingest(doc, idx), len(idx.chunks), "chunks,", idx.embed_calls, "embed calls")
+</pre>
+<pre>
+reindexed 4 chunks, 4 embed calls
+unchanged 4 chunks, 4 embed calls        ← no work, no duplicates
+unchanged 4 chunks, 4 embed calls
+</pre>
+      <p><strong>Property 2 — a shrinking document leaves no stale chunks.</strong> This is the bug that
+         upsert-only pipelines have:</p>
+<pre>
+doc["text"] = "Retries happen 5 times. " * 8         # document shrank
+print(ingest(doc, idx), "→", sorted(idx.chunks))
+</pre>
+<pre>
+reindexed → ['docs/webhooks#0']
+</pre>
+      <p><strong>One chunk, not one plus three orphans.</strong> Show what upserting instead would have done:</p>
+<pre>
+class UpsertOnlyIndex(Index):
+    def replace_document(self, uri, chunks, h):      # the buggy version
+        for c in chunks: self.chunks[c["id"]] = c
+        self.doc_hash[uri] = h
+
+bad = UpsertOnlyIndex()
+doc["text"] = "Retries happen 5 times. " * 30; ingest(doc, bad)
+doc["text"] = "Retries happen 5 times. " * 8;  ingest(doc, bad)
+print("stale chunks still retrievable:", sorted(bad.chunks))
+</pre>
+<pre>
+stale chunks still retrievable: ['docs/webhooks#0', 'docs/webhooks#1',
+                                 'docs/webhooks#2', 'docs/webhooks#3']
+</pre>
+      <p><strong>Property 3 — the embedding cache makes re-chunking cheap.</strong> Change the chunk size and
+         count how much is re-embedded:</p>
+<pre>
+idx2 = Index()
+doc2 = {"uri": "d", "title": "T", "text": "Alpha beta gamma delta. " * 60}
+
+ingest(doc2, idx2, chunk_size=200); a = idx2.embed_calls
+ingest(doc2, idx2, chunk_size=200); print("re-run same size:", idx2.embed_calls - a, "new embeds")
+
+idx2.doc_hash.clear()                                 # force re-chunk
+ingest(doc2, idx2, chunk_size=400); print("re-chunk 200→400:", idx2.embed_calls - a, "new embeds")
+</pre>
+<pre>
+re-run same size:  0 new embeds
+re-chunk 200→400:  6 new embeds        ← only the changed texts
+</pre>
+      <p><strong>Property 4 — model provenance makes a partial migration detectable:</strong></p>
+<pre>
+from collections import Counter
+print(Counter(c["model"] for c in idx.chunks.values()))
+# Counter({'v1': 1})  — a mix of 'v1' and 'v2' means the migration is incomplete
+</pre>
+      <p><strong>The self-check worth keeping in CI:</strong></p>
+<pre>
+def test_pipeline():
+    ix = Index()
+    d = {"uri": "u", "title": "T", "text": "x " * 500}
+    assert ingest(d, ix) == "reindexed"
+    n, e = len(ix.chunks), ix.embed_calls
+    assert ingest(d, ix) == "unchanged"
+    assert len(ix.chunks) == n and ix.embed_calls == e      # idempotent, no re-embed
+    d["text"] = "x " * 50
+    ingest(d, ix)
+    assert all(c["uri"] == "u" for c in ix.chunks.values())
+    assert len(ix.chunks) &lt; n                               # shrank, no orphans
+    print("ok")
+
+test_pipeline()      # → ok
+</pre>
+      <p>Four assertions covering the four properties that make re-running safe — and re-running safely is what
+         makes the chunking sweep in exercise 3 affordable.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Chunking is the highest-leverage decision in RAG: every component downstream operates on chunks it did not choose, and a fact split across two chunks is retrievable by none of them.</li>
+        <li>Small chunks give precise vectors but lose context; large chunks keep context but dilute the vector, because an embedding averages everything in the chunk.</li>
+        <li>Dilution is real and measurable — the same answer buried in filler drops from cosine 0.74 to 0.29, and loses to chunks that do not contain it.</li>
+        <li>Chunk for retrieval, expand for generation: index small, return the parent. Small-to-big resolves the size tension instead of compromising between its halves.</li>
+        <li>Strategy ordering by value is structural &gt; recursive &gt; semantic &gt; fixed — not by sophistication.</li>
+        <li>Structural chunking wins because the author already decided what belongs together; parse the format before reaching for an embedding-based splitter.</li>
+        <li>Semantic chunking costs an embedding per sentence and buys 1–3 points on unstructured prose, ~0 on documents that already have structure.</li>
+        <li>Never split PDFs by page, tables from their headers, or code with regex instead of an AST.</li>
+        <li>Overlap compensates for arbitrary boundaries — use 10–15% for recursive prose, and zero with structural chunking or small-to-big.</li>
+        <li>Overlap's hidden cost is that near-duplicate chunks compete for the same top-k slots, so the context window holds less distinct information than it appears to.</li>
+        <li>Contextual headers (document + heading path, prepended before embedding) are nearly free and typically worth more than any chunking-strategy upgrade.</li>
+        <li>Embed the contextualised text; store and display the raw text, so citations and LLM context carry no breadcrumbs.</li>
+        <li>Deduplicate parent ids in small-to-big, or several matching children return the same section repeatedly.</li>
+        <li>Make ingestion idempotent (deterministic chunk ids), incremental (content hash per document) and resumable (watermark) — because you will re-run it.</li>
+        <li>Delete by document rather than upserting by chunk, or a shrunken document leaves stale chunks retrievable forever.</li>
+        <li>Batch embedding calls and cache by hash of the embedded text — that is what makes iterating on chunking affordable.</li>
+        <li>Extraction is where the silent bugs are: multi-column PDFs, repeated footers, dropped speaker notes, OCR noise.</li>
+        <li>Mean pairwise cosine between random chunks above ~0.5 means shared boilerplate is flattening the space; stripping it is often the largest single recall win.</li>
+        <li>Log a chunk-length histogram and read samples — twenty random chunks find more ingestion bugs than any metric.</li>
+        <li>When retrieval is poor, sweep chunking before upgrading the embedding model: the failures are usually split answers and missing context, not semantic misses.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="hybrid-search.html">← Metadata Filtering &amp; Hybrid Search</a>
+      <a href="retrieval-reranking.html">Retrieval Pipelines &amp; Reranking →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
