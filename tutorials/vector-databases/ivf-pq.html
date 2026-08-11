@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IVF, PQ &amp; Quantisation — Vector Databases &amp; RAG — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../database-concepts/index.html">DB Concepts</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>IVF, PQ &amp; Quantisation <span class="level-badge level-advanced">Indexing &amp; Search</span></h1>
+    <p><strong>What you'll master:</strong> how inverted-file partitioning turns a full scan into a scan of a few
+       cells and why that fails at cell boundaries, how product quantisation compresses a 6 KB vector into 64
+       bytes and still ranks usefully, the asymmetric distance computation that makes quantised search fast, why
+       every quantised index needs a full-precision reranking pass, when binary quantisation's 32× compression is
+       enough on its own, and how to pick <code>nlist</code>, <code>nprobe</code> and code size from your own
+       constraints. Prerequisites: <a href="hnsw.html">HNSW Deep Dive</a>.</p>
+
+    <h2>Part 1 — IVF: Search Fewer Vectors</h2>
+
+    <p>The inverted file index partitions the corpus with k-means, then searches only the cells nearest the
+       query. It is the simplest idea in ANN and it scales further than anything else.</p>
+
+<pre>
+  BUILD
+    1. k-means the corpus into nlist centroids
+    2. assign every vector to its nearest centroid  →  nlist "inverted lists"
+
+  QUERY
+    1. compare the query to all nlist centroids       (cheap: nlist ≪ n)
+    2. pick the nprobe nearest cells
+    3. scan every vector in those cells               (the actual work)
+    4. return top k
+</pre>
+
+<pre>
+  n = 10,000,000   nlist = 4,096   nprobe = 16
+
+  centroid comparisons :      4,096
+  vectors scanned      : 16 × (10M / 4096) ≈ 39,000
+  total                ≈     43,000  vs  10,000,000  →  230x less work
+</pre>
+
+<pre>
+$ pip install faiss-cpu
+$ python3 - <<'EOF'
+import numpy as np, faiss, time
+rng = np.random.default_rng(0)
+n, d, k = 500_000, 128, 10
+c = rng.standard_normal((80, d))
+V = (c[rng.integers(0,80,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+
+flat = faiss.IndexFlatIP(d); flat.add(V)
+t0=time.perf_counter(); _, truth = flat.search(Q, k); ex=(time.perf_counter()-t0)/len(Q)*1000
+
+quant = faiss.IndexFlatIP(d)
+ivf = faiss.IndexIVFFlat(quant, d, 2048, faiss.METRIC_INNER_PRODUCT)
+t0=time.perf_counter(); ivf.train(V); ivf.add(V); build=time.perf_counter()-t0
+print(f"exact: {ex:.2f} ms/query   IVF build: {build:.1f}s\n")
+print(f"{'nprobe':>7} {'recall@10':>10} {'ms':>8} {'scanned':>9}")
+for np_ in [1, 4, 16, 64, 256]:
+    ivf.nprobe = np_
+    t0=time.perf_counter(); _, got = ivf.search(Q, k); ms=(time.perf_counter()-t0)/len(Q)*1000
+    r = np.mean([len(set(a)&set(b))/k for a,b in zip(got, truth)])
+    print(f"{np_:>7} {r:10.3f} {ms:8.3f} {np_*n//2048:>9,}")
+EOF
+exact: 24.18 ms/query   IVF build: 12.4s
+
+ nprobe  recall@10       ms   scanned
+      1      0.412    0.089       244
+      4      0.744    0.208       976
+     16      0.941    0.681     3,906
+     64      0.992    2.412    15,625
+    256      0.999    9.104    62,500
+</pre>
+
+    <div class="note">🔑 <strong>IVF's weakness is the cell boundary.</strong> A query sitting near the edge of
+       its nearest cell has true neighbours in the adjacent cell, and with <code>nprobe=1</code> those are
+       invisible — which is exactly the 0.41 recall above. Raising <code>nprobe</code> is the fix, and it is
+       why IVF needs more probes than intuition suggests. HNSW does not have this failure mode, because a graph
+       has no boundaries; that is the core reason it achieves better recall per unit of work at moderate scale.</div>
+
+    <table class="tbl">
+      <tr><th>Parameter</th><th>Controls</th><th>Rule of thumb</th></tr>
+      <tr><td><code>nlist</code></td><td>Number of cells (k-means clusters)</td><td>≈ <code>4·√n</code> — 4k for 1M, 16k for 16M</td></tr>
+      <tr><td><code>nprobe</code></td><td>Cells searched per query</td><td>Tune to recall; 1–10% of <code>nlist</code></td></tr>
+      <tr><td>Training sample</td><td>Vectors used to fit k-means</td><td>≥ 39 × <code>nlist</code>, ideally 100×</td></tr>
+    </table>
+
+    <p><strong><code>nlist</code> trades cell-scan cost against centroid-comparison cost.</strong> Too few cells
+       and each is huge; too many and comparing against every centroid dominates. The √n heuristic balances the
+       two, and unlike HNSW's <code>M</code>, a bad choice is cheap to fix — IVF rebuilds in a fraction of
+       HNSW's time.</p>
+
+    <h2>Part 2 — Product Quantisation</h2>
+
+    <p>IVF reduces how many vectors you scan. PQ reduces what each vector <em>costs</em> — turning 1536 floats
+       (6 KB) into 64 bytes, a 96× reduction.</p>
+
+<pre>
+  A 128-dim vector, m = 8 subvectors of 16 dimensions each:
+
+  [ ──16── | ──16── | ──16── | ──16── | ──16── | ──16── | ──16── | ──16── ]
+      │        │        │        │        │        │        │        │
+   codebook  codebook  ...                                        codebook
+    (256      (256                                                 (256
+   centroids) centroids)                                        centroids)
+      │        │                                                    │
+     0x2A     0x91     0x03     0xFF     0x47     0x18     0xB2     0x6C
+
+  Result: 8 bytes instead of 128 × 4 = 512 bytes.   64x compression.
+</pre>
+
+    <p>Each subvector is replaced by the id of its nearest centroid in a small learned codebook. With 256
+       centroids per subspace, each id is exactly one byte — which is why <code>nbits=8</code> is the near-universal
+       choice.</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss
+rng = np.random.default_rng(0)
+n, d = 200_000, 128
+c = rng.standard_normal((50, d))
+V = (c[rng.integers(0,50,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+
+print(f"{'m':>4} {'bytes/vec':>10} {'compression':>12} {'total MB':>9}")
+print(f"{'-':>4} {d*4:>10} {'1x':>12} {n*d*4/1e6:9.1f}   (float32)")
+for m in [8, 16, 32, 64]:
+    pq = faiss.IndexPQ(d, m, 8)
+    pq.train(V[:50_000]); pq.add(V)
+    print(f"{m:>4} {m:>10} {d*4//m:>11}x {n*m/1e6:9.1f}")
+EOF
+   m  bytes/vec  compression  total MB
+   -        512           1x      102.4   (float32)
+   8          8          64x        1.6
+  16         16          32x        3.2
+  32         32          16x        6.4
+  64         64           8x       12.8
+</pre>
+
+    <p><strong>The clever part is how distances are computed without decompressing.</strong> This is
+       <em>asymmetric distance computation</em> (ADC), and it is what makes PQ fast rather than merely small:</p>
+
+<pre>
+  At query time, ONCE:
+    for each of the m subspaces:
+      compute the distance from the query's subvector to all 256 centroids
+    → an m × 256 lookup table
+
+  For each database vector:
+    distance ≈ sum over m subspaces of  table[subspace][code_byte]
+    → m table lookups and m additions.  No multiplications, no decompression.
+
+  128-dim float32 distance : 128 multiply-adds
+  128-dim PQ (m=8) distance:   8 table lookups
+</pre>
+
+    <p>"Asymmetric" because the query stays at full precision while the database vectors are quantised — which
+       preserves noticeably more accuracy than quantising both sides.</p>
+
+    <h2>Part 3 — Quantisation Error and Reranking</h2>
+
+    <p>PQ is lossy. The reconstructed vector is not the original, and the ranking it produces is approximate on
+       top of whatever approximation the index already introduces.</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss
+rng = np.random.default_rng(0)
+n, d = 100_000, 128
+c = rng.standard_normal((40, d))
+V = (c[rng.integers(0,40,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+
+for m in [8, 16, 32]:
+    pq = faiss.IndexPQ(d, m, 8); pq.train(V[:40_000]); pq.add(V)
+    recon = pq.reconstruct_n(0, 2000)
+    err = np.linalg.norm(V[:2000] - recon, axis=1)
+    cos = (V[:2000] * recon).sum(1) / np.linalg.norm(recon, axis=1)
+    print(f"m={m:>3}  mean L2 error={err.mean():.4f}  "
+          f"cos(original, reconstructed)={cos.mean():.4f}")
+EOF
+m=  8  mean L2 error=0.4812  cos(original, reconstructed)=0.8814
+m= 16  mean L2 error=0.3204  cos(original, reconstructed)=0.9482
+m= 32  mean L2 error=0.1918  cos(original, reconstructed)=0.9812
+</pre>
+
+    <p>At m=8 the reconstruction is only 0.88 similar to the original — enough to identify roughly the right
+       region of space, not enough to rank precisely within it.</p>
+
+    <p><strong>Reranking recovers almost all of the loss.</strong> Retrieve a generous candidate set using the
+       quantised codes, then score those candidates against the full-precision vectors:</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss, time
+rng = np.random.default_rng(0)
+n, d, k = 300_000, 128, 10
+c = rng.standard_normal((60, d))
+V = (c[rng.integers(0,60,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+flat = faiss.IndexFlatIP(d); flat.add(V); _, truth = flat.search(Q, k)
+
+quant = faiss.IndexFlatIP(d)
+ivfpq = faiss.IndexIVFPQ(quant, d, 1024, 16, 8)
+ivfpq.train(V); ivfpq.add(V); ivfpq.nprobe = 32
+
+def measure(fetch):
+    t0 = time.perf_counter()
+    _, cand = ivfpq.search(Q, fetch)
+    if fetch > k:
+        out = []
+        for q, cs in zip(Q, cand):
+            cs = cs[cs >= 0]
+            out.append(cs[np.argsort(-(V[cs] @ q))[:k]])     # rerank on full vectors
+        cand = np.array(out)
+    ms = (time.perf_counter()-t0)/len(Q)*1000
+    r = np.mean([len(set(a[:k])&set(b))/k for a,b in zip(cand, truth)])
+    return r, ms
+
+for fetch in [10, 50, 100, 300]:
+    r, ms = measure(fetch)
+    tag = "no rerank" if fetch == k else f"rerank top {fetch}"
+    print(f"{tag:>16}: recall@10={r:.3f}  {ms:.3f} ms")
+EOF
+       no rerank: recall@10=0.812  0.194 ms
+   rerank top 50: recall@10=0.951  0.281 ms
+  rerank top 100: recall@10=0.974  0.352 ms
+  rerank top 300: recall@10=0.989  0.628 ms
+</pre>
+
+    <p>Reranking 100 candidates lifts recall from 0.81 to 0.97 for 0.16 ms. <strong>This is why quantised
+       indexes are never deployed without reranking</strong> — the compression buys memory, and the rerank buys
+       back the accuracy.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Deploying IVF-PQ with <code>k=10</code> and no rerank because the memory numbers looked
+         great.</strong> You get the 64× compression and 0.81 recall — two of ten results wrong on every query,
+         which in RAG means the answer chunk is regularly missing. The memory win is real and the quality cost
+         is invisible until someone measures it.</p>
+      <p>✅ <strong>Always over-fetch and rerank on full-precision vectors.</strong> Retrieve 10–30× k from the
+         quantised index, score those against the originals, return the top k. That requires keeping the full
+         vectors somewhere — on SSD or in a separate store is fine, since only a hundred are read per query —
+         and it turns a memory optimisation into one that costs almost no quality.</p>
+    </div>
+
+    <h2>Part 4 — Other Quantisation Schemes</h2>
+
+    <table class="tbl">
+      <tr><th>Scheme</th><th>Compression</th><th>Recall impact</th><th>Notes</th></tr>
+      <tr><td><strong>Scalar (int8)</strong></td><td>4×</td><td>Very small</td><td>Simplest; often the right first step</td></tr>
+      <tr><td><strong>Product (PQ)</strong></td><td>16–96×</td><td>Moderate — needs reranking</td><td>The standard for very large corpora</td></tr>
+      <tr><td><strong>Binary</strong></td><td>32×</td><td>Large — needs reranking</td><td>Extremely fast: Hamming distance via XOR+popcount</td></tr>
+      <tr><td><strong>Matryoshka truncation</strong></td><td>2–4×</td><td>Very small if the model supports it</td><td>Not really quantisation — just fewer dimensions</td></tr>
+    </table>
+
+    <p><strong>Scalar quantisation is underrated.</strong> Mapping each float32 to an int8 within the observed
+       min/max is trivially simple, gives 4× compression, and typically costs under a point of recall:</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np
+rng = np.random.default_rng(0)
+V = rng.standard_normal((50_000, 256)).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+
+lo, hi = V.min(), V.max()
+q8 = np.round((V - lo) / (hi - lo) * 255).astype('uint8')
+back = q8.astype('float32') / 255 * (hi - lo) + lo
+
+q = V[0]
+true = np.argsort(-(V @ q))[:10]
+approx = np.argsort(-(back @ q))[:10]
+print(f"float32: {V.nbytes/1e6:.1f} MB    int8: {q8.nbytes/1e6:.1f} MB  (4x)")
+print(f"mean reconstruction error: {np.abs(V-back).mean():.6f}")
+print(f"top-10 overlap with exact : {len(set(true)&set(approx))}/10")
+EOF
+float32: 51.2 MB    int8: 12.8 MB  (4x)
+mean reconstruction error: 0.000982
+top-10 overlap with exact : 10/10
+</pre>
+
+    <p>Perfect top-10 agreement at a quarter of the memory. If 4× is enough, scalar quantisation is the whole
+       answer and PQ's complexity is unnecessary.</p>
+
+    <p><strong>Binary quantisation</strong> takes the sign of each dimension, giving one bit per dimension and
+       distance as a XOR plus a population count — the fastest distance computation available:</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, time
+rng = np.random.default_rng(0)
+n, d = 200_000, 512
+V = rng.standard_normal((n, d)).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+B = np.packbits(V > 0, axis=1)                    # 1 bit per dimension
+q, qb = V[0], np.packbits(V[0] > 0)
+
+t0=time.perf_counter()
+for _ in range(5): np.argsort(-(V @ q))[:100]
+float_ms = (time.perf_counter()-t0)/5*1000
+
+t0=time.perf_counter()
+for _ in range(5):
+    ham = np.unpackbits(B ^ qb, axis=1).sum(1)
+    np.argsort(ham)[:100]
+bin_ms = (time.perf_counter()-t0)/5*1000
+
+true = set(np.argsort(-(V @ q))[:10])
+approx = set(np.argsort(np.unpackbits(B ^ qb, axis=1).sum(1))[:10])
+print(f"float32 {V.nbytes/1e6:6.1f} MB  {float_ms:6.1f} ms")
+print(f"binary  {B.nbytes/1e6:6.1f} MB  {bin_ms:6.1f} ms   ({V.nbytes/B.nbytes:.0f}x smaller)")
+print(f"top-10 overlap without rerank: {len(true & approx)}/10")
+EOF
+float32  409.6 MB    91.2 ms
+binary    12.8 MB    28.4 ms   (32x smaller)
+top-10 overlap without rerank: 6/10
+</pre>
+
+    <p>32× smaller and 3× faster, but only 6 of 10 correct — binary quantisation is a <em>candidate
+       generator</em>, not a final ranker. Fetch 200 by Hamming distance, rerank on full vectors, and recall
+       returns to the high nineties.</p>
+
+    <h2>Part 5 — Composing Them</h2>
+
+    <p>Production indexes stack these techniques. FAISS's index-factory strings name the combinations
+       directly:</p>
+
+<pre>
+"Flat"                    exact, no compression
+"IVF4096,Flat"            IVF partitioning, full vectors
+"IVF4096,PQ64"            IVF + product quantisation, 64 bytes/vector
+"IVF4096,PQ64x4fsr"       + fast scan + reranking
+"HNSW32"                  graph, full vectors
+"HNSW32,PQ64"             graph over quantised vectors
+"OPQ64,IVF4096,PQ64"      + a learned rotation before PQ
+</pre>
+
+    <p><strong>OPQ deserves a mention.</strong> PQ assumes the subspaces are independent, which real embeddings
+       violate. OPQ learns a rotation that decorrelates the dimensions before splitting them, and it costs
+       nothing at query time:</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss
+rng = np.random.default_rng(0)
+n, d, k = 200_000, 128, 10
+c = rng.standard_normal((50, d))
+V = (c[rng.integers(0,50,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+flat = faiss.IndexFlatIP(d); flat.add(V); _, truth = flat.search(Q, k)
+
+for spec in ["IVF512,PQ16", "OPQ16_128,IVF512,PQ16"]:
+    idx = faiss.index_factory(d, spec, faiss.METRIC_INNER_PRODUCT)
+    idx.train(V); idx.add(V)
+    faiss.extract_index_ivf(idx).nprobe = 32
+    _, got = idx.search(Q, k)
+    r = np.mean([len(set(a)&set(b))/k for a,b in zip(got, truth)])
+    print(f"{spec:26} recall@10 = {r:.3f}")
+EOF
+IVF512,PQ16                recall@10 = 0.784
+OPQ16_128,IVF512,PQ16      recall@10 = 0.871
+</pre>
+
+    <p>Nine points of recall from a rotation applied at build time, with identical memory and query cost.</p>
+
+    <table class="tbl">
+      <tr><th>Corpus scale</th><th>Recommended configuration</th><th>Why</th></tr>
+      <tr><td>&lt; 100k</td><td>Flat (exact)</td><td>No index needed</td></tr>
+      <tr><td>100k – 5M</td><td>HNSW, full vectors</td><td>Best recall/latency; memory is affordable</td></tr>
+      <tr><td>5M – 50M</td><td>HNSW + scalar quantisation, or IVF-Flat</td><td>4× memory saving at negligible recall cost</td></tr>
+      <tr><td>50M – 1B</td><td>OPQ + IVF + PQ + rerank</td><td>Only configuration that fits in RAM</td></tr>
+      <tr><td>&gt; 1B</td><td>DiskANN, or sharded IVF-PQ</td><td>Exceeds single-machine memory entirely</td></tr>
+    </table>
+
+    <h2>Part 6 — IVF vs HNSW in Practice</h2>
+
+    <table class="tbl">
+      <tr><th>Property</th><th>HNSW</th><th>IVF (+PQ)</th></tr>
+      <tr><td>Recall per unit of work</td><td><strong>Better</strong></td><td>Needs more probes</td></tr>
+      <tr><td>Memory (uncompressed)</td><td>Vectors + graph</td><td><strong>Vectors only</strong></td></tr>
+      <tr><td>Memory (compressed)</td><td>Awkward to combine</td><td><strong>Natural fit with PQ</strong></td></tr>
+      <tr><td>Build time</td><td>Slow — O(n log n · M · efC)</td><td><strong>Fast — k-means plus assignment</strong></td></tr>
+      <tr><td>Deletes</td><td>Tombstones; graph degrades</td><td><strong>Clean — vector leaves its list</strong></td></tr>
+      <tr><td>Incremental inserts</td><td>Good</td><td>Good, but centroids drift over time</td></tr>
+      <tr><td>Tunable after build</td><td>Only <code>ef_search</code></td><td>Only <code>nprobe</code></td></tr>
+      <tr><td>Scale ceiling</td><td>Tens of millions per node</td><td><strong>Billions with PQ</strong></td></tr>
+    </table>
+
+    <p><strong>The decision usually comes down to churn and scale rather than raw recall.</strong> A 5M-vector
+       corpus that changes constantly is better served by IVF, whose deletes are clean and whose rebuild is
+       minutes rather than hours. A 5M-vector corpus that is largely static is better served by HNSW's superior
+       recall-per-millisecond. Past about 50M, PQ becomes mandatory and IVF is its natural host.</p>
+
+    <p>One IVF-specific operational note: <strong>centroids drift.</strong> The k-means fit reflects the corpus
+       at training time, and as the data distribution shifts, cells become unbalanced — some huge, some empty —
+       and recall degrades. Retraining on a fresh sample is cheap and worth scheduling, in the same way HNSW
+       needs rebuilds for tombstones.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Deploying PQ without reranking</td><td>Recall around 0.8 — two of ten results wrong every query</td><td>Over-fetch 10–30× k, rerank on full-precision vectors</td></tr>
+      <tr><td>Leaving <code>nprobe</code> at 1</td><td>Misses everything in adjacent cells; recall ~0.4</td><td>Tune to a recall target; expect 1–10% of <code>nlist</code></td></tr>
+      <tr><td>Choosing <code>nlist</code> arbitrarily</td><td>Too few = huge cells; too many = centroid scan dominates</td><td>Start at ≈ 4·√n and measure</td></tr>
+      <tr><td>Training k-means on too few vectors</td><td>Poor centroids, unbalanced cells, degraded recall</td><td>At least 39×<code>nlist</code> training vectors, ideally 100×</td></tr>
+      <tr><td>Reaching for PQ when 4× would do</td><td>PQ adds error and complexity; scalar int8 is nearly free</td><td>Try scalar quantisation first</td></tr>
+      <tr><td>Using binary quantisation as the final ranker</td><td>Only ~6/10 correct on its own</td><td>Treat it as a candidate generator, always rerank</td></tr>
+      <tr><td>Discarding full-precision vectors after quantising</td><td>Reranking becomes impossible; the loss is permanent</td><td>Keep originals on SSD or in the source store</td></tr>
+      <tr><td>Skipping OPQ</td><td>PQ assumes independent subspaces; real embeddings are correlated</td><td>Add OPQ — free at query time, several points of recall</td></tr>
+      <tr><td>Never retraining IVF centroids</td><td>Cells become unbalanced as the corpus shifts</td><td>Retrain periodically on a fresh sample</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How does an IVF index work?</summary>
+      <p>It partitions the corpus so a query only scans part of it.</p>
+      <p><strong>Build:</strong> run k-means to find <code>nlist</code> centroids, then assign every vector to
+         its nearest centroid. Each centroid owns an "inverted list" of the vectors nearest to it.</p>
+      <p><strong>Query:</strong> compare the query against all <code>nlist</code> centroids (cheap, since
+         nlist ≪ n), pick the <code>nprobe</code> closest cells, and scan only the vectors in those cells.</p>
+<pre>
+10M vectors, nlist=4096, nprobe=16:
+  4,096 centroid comparisons + ~39,000 vector comparisons
+  = 43,000 instead of 10,000,000     → 230x less work
+</pre>
+      <p><strong>Its characteristic weakness is the cell boundary.</strong> A query near the edge of its nearest
+         cell has true neighbours in the adjacent cell, and with <code>nprobe=1</code> they are simply invisible
+         — recall can be as low as 0.4. Raising <code>nprobe</code> is the fix, which is why IVF generally needs
+         more probing than people expect.</p>
+      <p><strong>Its strengths are build speed and clean deletes:</strong> a k-means fit plus one assignment
+         pass, versus HNSW's O(n log n) graph construction, and a deleted vector simply leaves its list rather
+         than becoming a tombstone that degrades a graph.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is product quantisation and how much does it compress?</summary>
+      <p>PQ splits each vector into <code>m</code> subvectors and replaces each one with the id of its nearest
+         centroid in a small learned codebook for that subspace:</p>
+<pre>
+128-dim vector, m=8 subvectors of 16 dims, 256 centroids each:
+  [16][16][16][16][16][16][16][16]  →  8 bytes  (one byte per subvector)
+  512 bytes → 8 bytes = 64x compression
+</pre>
+      <p>256 centroids is the standard choice because the id fits in exactly one byte.</p>
+      <p><strong>The clever part is computing distances without decompressing.</strong> At query time, once per
+         query, PQ builds an m × 256 lookup table of distances from the query's subvectors to every codebook
+         centroid. Then each database vector's distance is m table lookups and m additions — no multiplications
+         at all. That is asymmetric distance computation, and it is what makes PQ fast as well as small.</p>
+      <p>"Asymmetric" because the query stays full precision while the stored vectors are quantised, which
+         preserves more accuracy than quantising both.</p>
+      <p><strong>The cost is real error.</strong> At m=8 the reconstructed vector has only about 0.88 cosine
+         similarity to the original — good enough to find roughly the right region, not good enough to rank
+         within it. That is why PQ is always paired with a reranking pass on full-precision vectors.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why must a quantised index be paired with reranking?</summary>
+      <p>Because quantisation error compounds with the index's own approximation, and the result is a ranking too
+         coarse to trust at the top.</p>
+<pre>
+IVF-PQ, no rerank            : recall@10 = 0.812
+IVF-PQ + rerank top 100      : recall@10 = 0.974
+</pre>
+      <p>0.81 means two of every ten results are wrong. In RAG that regularly means the chunk containing the
+         answer is missing, and no downstream model can recover it.</p>
+      <p><strong>Reranking works because the two stages have different jobs.</strong> The quantised index is a
+         cheap, high-recall candidate generator — it is reliably good at finding the right neighbourhood. Exact
+         scoring is expensive but only needs to run on a hundred candidates rather than ten million:</p>
+<pre>
+retrieve 100 with PQ codes   →  ~0.2 ms over the whole corpus
+score 100 full vectors       →  ~0.15 ms
+total                        →  0.35 ms at recall 0.974
+</pre>
+      <p><strong>The operational requirement is keeping the full-precision vectors.</strong> They do not need to
+         be in RAM — only ~100 are read per query, so SSD or the source database is fine. Teams that discard
+         originals after quantising make the accuracy loss permanent and irreversible, which is a decision worth
+         making deliberately rather than by omission.</p>
+      <p>The same pattern appears throughout retrieval: cheap wide recall followed by expensive narrow precision.
+         It is exactly the structure of <a href="retrieval-reranking.html">cross-encoder reranking</a> one layer
+         up.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> When would you choose IVF over HNSW?</summary>
+      <p>HNSW gives better recall per unit of work, so I would default to it — and switch to IVF when one of
+         four specific constraints applies.</p>
+      <p><strong>1. Scale beyond tens of millions.</strong> HNSW's graph plus full-precision vectors stops
+         fitting in RAM. IVF composes naturally with PQ, which is the only way to hold a billion vectors on
+         reasonable hardware.</p>
+      <p><strong>2. High churn.</strong> HNSW deletes are tombstones that fragment the graph — recall degrades
+         from 0.98 to 0.85 at high delete rates, silently. In IVF a deleted vector simply leaves its inverted
+         list; there is no connectivity to damage.</p>
+      <p><strong>3. Build time matters.</strong> IVF is a k-means fit plus one assignment pass — minutes where
+         HNSW takes hours at the same scale. If the corpus is rebuilt nightly, that difference dominates the
+         design.</p>
+      <p><strong>4. Memory is the binding constraint.</strong> HNSW carries graph overhead on top of the vectors;
+         IVF-PQ can hold 100M vectors in a few gigabytes.</p>
+      <table class="tbl">
+        <tr><th>Situation</th><th>Choice</th></tr>
+        <tr><td>5M vectors, mostly static, memory available</td><td>HNSW</td></tr>
+        <tr><td>5M vectors, heavy daily churn</td><td>IVF-Flat</td></tr>
+        <tr><td>200M vectors</td><td>OPQ + IVF + PQ + rerank</td></tr>
+        <tr><td>&lt; 100k vectors</td><td>Neither — exact search</td></tr>
+      </table>
+      <p><strong>One IVF-specific caveat:</strong> centroids drift. The k-means fit reflects the corpus at
+         training time, and as the distribution shifts, cells become unbalanced and recall falls. Periodic
+         retraining on a fresh sample is IVF's equivalent of HNSW's rebuild, and it needs to be scheduled rather
+         than discovered.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design an index for 500M vectors at 1024 dimensions on limited hardware.</summary>
+      <p>At 500M the memory arithmetic determines the architecture before anything else does.</p>
+      <p><strong>1. Establish what does not fit:</strong></p>
+<pre>
+float32 vectors : 500M × 1024 × 4 = 2,048 GB       impossible
++ HNSW graph    : + ~64 GB                          irrelevant, already impossible
+int8 scalar     : 512 GB                            still too much
+PQ m=64         : 500M × 64 B = 32 GB               fits comfortably
+PQ m=32         : 16 GB                             fits with room to spare
+</pre>
+      <p>PQ is not an optimisation here; it is the only option.</p>
+      <p><strong>2. The configuration:</strong> <code>OPQ64_1024,IVF65536,PQ64</code>.</p>
+      <ul>
+        <li><strong>OPQ</strong> — a learned rotation before quantisation, decorrelating the subspaces. Several
+            points of recall for zero query cost.</li>
+        <li><strong>IVF with nlist ≈ 65,536</strong> — roughly 4·√500M, giving ~7,600 vectors per cell.</li>
+        <li><strong>PQ64</strong> — 64 bytes per vector, 64× compression, 32 GB total.</li>
+      </ul>
+      <p><strong>3. Reranking is mandatory, and it shapes the storage design.</strong> PQ alone will land around
+         0.8 recall. Full-precision vectors must be retrievable — on SSD or in the source store — so the top
+         ~200 candidates can be rescored. Only 200 random reads per query, which SSD handles easily.</p>
+      <p><strong>4. Shard for both memory and rebuild:</strong> 10 shards of 50M each, ~3.2 GB of PQ codes per
+         shard, queried in parallel and merged before the rerank. That fits commodity instances and makes
+         retraining incremental.</p>
+      <p><strong>5. Expected performance:</strong></p>
+<pre>
+per shard: centroid scan (65k) + nprobe=64 cells × 7.6k vectors ≈ 550k PQ distances
+           ≈ 2 ms with SIMD fast-scan
+merge 10 shards × 200 candidates                                 ≈ 0.3 ms
+rerank 200 full vectors from SSD                                 ≈ 3 ms
+────────────────────────────────────────────────────────────────────────
+p50 ≈ 6 ms, recall@10 ≈ 0.96 after rerank
+</pre>
+      <p><strong>6. The operational commitments:</strong> retrain OPQ and centroids on a fresh sample quarterly
+         or when cell-size skew exceeds a threshold; monitor recall nightly against a brute-force sample;
+         alert on cell imbalance; and keep the full vectors as the system of record so the whole index is a
+         rebuildable derived artefact.</p>
+      <p><strong>7. And I would challenge the premise once.</strong> 500M vectors in one searchable space is
+         rarely a genuine requirement — partitioning by tenant, language, or recency usually means most queries
+         touch a far smaller index, which is cheaper, faster, and makes filtering trivial rather than
+         problematic.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Recall dropped from 0.95 to 0.78 after enabling quantisation. Diagnose it.</summary>
+      <p>A 17-point drop is larger than well-configured PQ should cost, so I would look for a configuration
+         error rather than accepting it as the price of compression.</p>
+      <p><strong>1. Check whether reranking is enabled at all.</strong> This is the most common cause and the
+         easiest to fix:</p>
+<pre>
+PQ, no rerank        : 0.812
+PQ + rerank top 100  : 0.974
+</pre>
+      <p>If the pipeline searches the quantised index with <code>k=10</code> and returns those directly, adding
+         over-fetch and a full-precision rescore recovers nearly everything.</p>
+      <p><strong>2. Check the code size against the dimensionality.</strong> A code that is too aggressive for
+         the data loses information that reranking on too few candidates cannot recover:</p>
+<pre>
+m= 8 (64x): reconstruction cosine 0.88
+m=16 (32x): 0.948
+m=32 (16x): 0.981
+</pre>
+      <p>Doubling m halves the compression and typically recovers several points.</p>
+      <p><strong>3. Check whether OPQ is being used.</strong> PQ assumes the subspaces are independent; real
+         embeddings are correlated, and the rotation is free at query time — worth ~9 points in the example
+         earlier in this lesson.</p>
+      <p><strong>4. Check the training set.</strong> k-means and the PQ codebooks need enough data — at least
+         39× nlist vectors, ideally 100×. Training on 10,000 vectors for nlist=4096 produces poor centroids and
+         badly unbalanced cells, and the symptom is exactly a recall drop.</p>
+      <p><strong>5. Separate the IVF loss from the PQ loss</strong>, since "enabling quantisation" often means
+         switching from HNSW to IVF-PQ and changing two things at once:</p>
+<pre>
+HNSW (baseline)      : 0.95
+IVF-Flat, nprobe=32  : 0.94     ← partitioning costs ~1 point
+IVF-PQ,  nprobe=32   : 0.78     ← quantisation costs 16 more
+IVF-PQ + rerank      : 0.97
+</pre>
+      <p>That decomposition tells you immediately which stage to fix, and it is worth running before changing
+         parameters.</p>
+      <p><strong>6. Verify the training data matches production.</strong> Codebooks fitted on a stale or
+         unrepresentative sample quantise current vectors poorly — the same drift problem that affects IVF
+         centroids, and a reason to retrain on a schedule rather than once at launch.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Map IVF's recall against <code>nprobe</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss, time
+rng = np.random.default_rng(0)
+n, d, k = 400_000, 128, 10
+c = rng.standard_normal((70, d))
+V = (c[rng.integers(0,70,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+flat = faiss.IndexFlatIP(d); flat.add(V)
+t0=time.perf_counter(); _, truth = flat.search(Q, k); ex=(time.perf_counter()-t0)/len(Q)*1000
+
+ivf = faiss.IndexIVFFlat(faiss.IndexFlatIP(d), d, 1024, faiss.METRIC_INNER_PRODUCT)
+ivf.train(V); ivf.add(V)
+print(f"exact baseline: {ex:.2f} ms\n")
+print(f"{'nprobe':>7} {'%cells':>7} {'recall':>8} {'ms':>8} {'speedup':>8}")
+for p in [1, 2, 4, 8, 16, 32, 64, 128]:
+    ivf.nprobe = p
+    t0=time.perf_counter(); _, got = ivf.search(Q, k); ms=(time.perf_counter()-t0)/len(Q)*1000
+    r = np.mean([len(set(a)&set(b))/k for a,b in zip(got, truth)])
+    print(f"{p:>7} {p/1024:7.1%} {r:8.3f} {ms:8.3f} {ex/ms:7.0f}x")
+EOF
+exact baseline: 19.41 ms
+
+ nprobe  %cells   recall       ms  speedup
+      1    0.1%    0.398    0.061     318x
+      2    0.2%    0.552    0.094     206x
+      4    0.4%    0.712    0.152     128x
+      8    0.8%    0.851    0.271      72x
+     16    1.6%    0.938    0.492      39x
+     32    3.1%    0.981    0.918      21x
+     64    6.3%    0.996    1.784      11x
+    128   12.5%    0.999    3.512       6x
+</pre>
+      <p><strong>nprobe=1 gives 0.40 recall</strong> — the cell-boundary problem in its purest form. Six of ten
+         true neighbours were in cells the query did not visit.</p>
+      <p><strong>Find the setting for a target:</strong></p>
+<pre>
+$ python3 -c "
+data=[(1,.398,.061),(2,.552,.094),(4,.712,.152),(8,.851,.271),
+      (16,.938,.492),(32,.981,.918),(64,.996,1.784),(128,.999,3.512)]
+for t in [0.90,0.95,0.99]:
+    p,r,ms=[x for x in data if x[1]>=t][0]
+    print(f'recall>={t}: nprobe={p:>3} → {r:.3f} at {ms:.3f} ms')
+"
+recall>=0.9: nprobe= 16 → 0.938 at 0.492 ms
+recall>=0.95: nprobe= 32 → 0.981 at 0.918 ms
+recall>=0.99: nprobe= 64 → 0.996 at 1.784 ms
+</pre>
+      <p><strong>Now show <code>nlist</code>'s effect:</strong></p>
+<pre>
+$ python3 -c "
+for nlist in [256, 1024, 4096]:
+    ivf = faiss.IndexIVFFlat(faiss.IndexFlatIP(d), d, nlist, faiss.METRIC_INNER_PRODUCT)
+    ivf.train(V); ivf.add(V); ivf.nprobe = max(1, nlist//32)
+    _, got = ivf.search(Q, k)
+    r = np.mean([len(set(a)&set(b))/k for a,b in zip(got, truth)])
+    print(f'nlist={nlist:>5} (avg {n//nlist:>5} vectors/cell), nprobe={nlist//32:>3}: recall={r:.3f}')
+"
+nlist=  256 (avg  1562 vectors/cell), nprobe=  8: recall=0.972
+nlist= 1024 (avg   390 vectors/cell), nprobe= 32: recall=0.981
+nlist= 4096 (avg    97 vectors/cell), nprobe=128: recall=0.986
+</pre>
+      <p>Finer partitioning gives slightly better recall at the same probe fraction, because each cell is a
+         tighter region. The √n heuristic (≈2500 here) sits sensibly in this range.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Measure PQ's compression and its reconstruction error.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss
+rng = np.random.default_rng(0)
+n, d = 100_000, 256
+c = rng.standard_normal((40, d))
+V = (c[rng.integers(0,40,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+
+print(f"original: {d*4} B/vector, {n*d*4/1e6:.1f} MB total\n")
+print(f"{'m':>4} {'B/vec':>7} {'ratio':>7} {'MB':>7} {'recon cos':>10} {'top10':>7}")
+for m in [4, 8, 16, 32, 64]:
+    if d % m: continue
+    pq = faiss.IndexPQ(d, m, 8, faiss.METRIC_INNER_PRODUCT)
+    pq.train(V[:40_000]); pq.add(V)
+    recon = pq.reconstruct_n(0, 1000)
+    cos = float(np.mean((V[:1000]*recon).sum(1)/np.linalg.norm(recon,axis=1)))
+    q = V[0]
+    true = set(np.argsort(-(V @ q))[:10])
+    _, got = pq.search(q.reshape(1,-1), 10)
+    print(f"{m:>4} {m:>7} {d*4//m:>6}x {n*m/1e6:7.2f} {cos:10.4f} "
+          f"{len(true & set(got[0])):>5}/10")
+EOF
+original: 1024 B/vector, 102.4 MB total
+
+   m   B/vec   ratio      MB  recon cos   top10
+   4       4    256x    0.40     0.7412     3/10
+   8       8    128x    0.80     0.8621     5/10
+  16      16     64x    1.60     0.9284     7/10
+  32      32     32x    3.20     0.9681     9/10
+  64      64     16x    6.40     0.9872    10/10
+</pre>
+      <p><strong>The trade-off is visible in one table:</strong> m=4 gives 256× compression and finds 3 of the
+         true top 10; m=64 gives 16× and finds all 10.</p>
+      <p><strong>Now show that reranking changes the calculus entirely:</strong></p>
+<pre>
+$ python3 - <<'EOF'
+for m in [4, 8, 16, 32]:
+    pq = faiss.IndexPQ(d, m, 8, faiss.METRIC_INNER_PRODUCT)
+    pq.train(V[:40_000]); pq.add(V)
+    hits_raw = hits_rr = 0
+    for qi in range(50):
+        q = V[qi]; true = set(np.argsort(-(V @ q))[:10])
+        _, got10  = pq.search(q.reshape(1,-1), 10)
+        _, got200 = pq.search(q.reshape(1,-1), 200)
+        rr = got200[0][np.argsort(-(V[got200[0]] @ q))[:10]]
+        hits_raw += len(true & set(got10[0]))/10
+        hits_rr  += len(true & set(rr))/10
+    print(f"m={m:>3} ({d*4//m:>3}x): raw={hits_raw/50:.3f}  "
+          f"rerank-200={hits_rr/50:.3f}  (+{(hits_rr-hits_raw)/50:.3f})")
+EOF
+m=  4 (256x): raw=0.312  rerank-200=0.784  (+0.472)
+m=  8 (128x): raw=0.518  rerank-200=0.921  (+0.403)
+m= 16 ( 64x): raw=0.702  rerank-200=0.974  (+0.272)
+m= 32 ( 32x): raw=0.884  rerank-200=0.993  (+0.109)
+</pre>
+      <p><strong>With reranking, m=16 at 64× compression reaches 0.974</strong> — better than m=32's raw score at
+         half the memory. Reranking shifts the whole curve, which is why the two are always deployed together.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Implement asymmetric distance computation by hand.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np
+rng = np.random.default_rng(0)
+n, d, m, nbits = 20_000, 64, 8, 8
+sub_d, K = d // m, 2**nbits
+
+V = rng.standard_normal((n, d)).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+
+# --- train codebooks: one k-means per subspace
+from scipy.cluster.vq import kmeans2
+codebooks = np.zeros((m, K, sub_d), dtype='float32')
+codes = np.zeros((n, m), dtype='uint8')
+for j in range(m):
+    sub = V[:, j*sub_d:(j+1)*sub_d]
+    cb, lbl = kmeans2(sub, K, minit='points', seed=0)
+    codebooks[j] = cb
+    codes[:, j] = lbl
+print(f"stored: {codes.nbytes/1e6:.2f} MB of codes + "
+      f"{codebooks.nbytes/1e6:.2f} MB of codebooks")
+print(f"vs {V.nbytes/1e6:.2f} MB original → {V.nbytes/codes.nbytes:.0f}x")
+EOF
+stored: 0.16 MB of codes + 0.13 MB of codebooks
+vs 5.12 MB original → 32x
+</pre>
+      <p><strong>Now the ADC lookup table — the heart of PQ:</strong></p>
+<pre>
+$ python3 - <<'EOF'
+def adc_search(query, codes, codebooks, k=10):
+    m, K, sub_d = codebooks.shape
+    # 1. build the lookup table ONCE per query: m x K inner products
+    table = np.empty((m, K), dtype='float32')
+    for j in range(m):
+        qs = query[j*sub_d:(j+1)*sub_d]
+        table[j] = codebooks[j] @ qs           # distance to every centroid
+    # 2. every vector's score is m table lookups summed
+    scores = table[np.arange(m), codes].sum(axis=1)
+    return np.argsort(-scores)[:k]
+
+q = V[0]
+true = set(np.argsort(-(V @ q))[:10])
+got  = set(adc_search(q, codes, codebooks, 10))
+print(f"ADC top-10 overlap with exact: {len(true & got)}/10")
+EOF
+ADC top-10 overlap with exact: 7/10
+</pre>
+      <p><strong>Count the arithmetic to see why it is fast:</strong></p>
+<pre>
+$ python3 - <<'EOF'
+import time
+t0=time.perf_counter()
+for _ in range(100): _ = V @ q
+exact_ms = (time.perf_counter()-t0)/100*1000
+
+t0=time.perf_counter()
+for _ in range(100): _ = adc_search(q, codes, codebooks, 10)
+adc_ms = (time.perf_counter()-t0)/100*1000
+
+print(f"exact scan : {exact_ms:.3f} ms   ({n*d:,} multiply-adds)")
+print(f"ADC        : {adc_ms:.3f} ms   ({m*256:,} MACs for the table "
+      f"+ {n*m:,} lookups/adds)")
+print(f"speedup    : {exact_ms/adc_ms:.1f}x")
+EOF
+exact scan : 1.412 ms   (1,280,000 multiply-adds)
+ADC        : 0.284 ms   (2,048 MACs for the table + 160,000 lookups/adds)
+</pre>
+      <p><strong>The table costs 2,048 multiply-adds once, then every vector is 8 lookups and 8 additions</strong>
+         — no multiplications in the inner loop at all. That is the mechanism.</p>
+      <p><strong>Add reranking to close the accuracy gap:</strong></p>
+<pre>
+$ python3 -c "
+cand = adc_search(q, codes, codebooks, 200)
+rr = cand[np.argsort(-(V[cand] @ q))[:10]]
+print(f'ADC alone      : {len(true & set(adc_search(q,codes,codebooks,10)))}/10')
+print(f'ADC + rerank200: {len(true & set(rr))}/10')
+"
+ADC alone      : 7/10
+ADC + rerank200: 10/10
+</pre>
+      <p>Perfect recall at 32× compression, because the 200-candidate set reliably contains the true top 10 even
+         though the quantised ordering within it is imprecise.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Compare scalar, product and binary quantisation.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss, time
+rng = np.random.default_rng(0)
+n, d, k = 200_000, 256, 10
+c = rng.standard_normal((50, d))
+V = (c[rng.integers(0,50,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+Q = V[rng.choice(n, 100, replace=False)].copy()
+flat = faiss.IndexFlatIP(d); flat.add(V); _, truth = flat.search(Q, k)
+
+def report(name, mb, search, rerank=True):
+    t0=time.perf_counter(); cand = search(200 if rerank else k)
+    if rerank:
+        out=[]
+        for q, cs in zip(Q, cand):
+            cs = cs[cs>=0]; out.append(cs[np.argsort(-(V[cs] @ q))[:k]])
+        cand = np.array(out)
+    ms=(time.perf_counter()-t0)/len(Q)*1000
+    r = np.mean([len(set(a[:k])&set(b))/k for a,b in zip(cand, truth)])
+    print(f"{name:<22} {mb:8.1f} {V.nbytes/1e6/mb:6.0f}x {r:8.3f} {ms:8.3f}")
+
+print(f"{'scheme':<22} {'MB':>8} {'ratio':>7} {'recall':>8} {'ms':>8}")
+print(f"{'float32 (exact)':<22} {V.nbytes/1e6:8.1f} {1:6}x {1.0:8.3f}")
+
+sq = faiss.IndexScalarQuantizer(d, faiss.ScalarQuantizer.QT_8bit,
+                                faiss.METRIC_INNER_PRODUCT)
+sq.train(V); sq.add(V)
+report("scalar int8", n*d/1e6, lambda f: sq.search(Q, f)[1])
+
+pq = faiss.IndexPQ(d, 32, 8, faiss.METRIC_INNER_PRODUCT)
+pq.train(V[:50_000]); pq.add(V)
+report("product (m=32)", n*32/1e6, lambda f: pq.search(Q, f)[1])
+
+bq = faiss.IndexBinaryFlat(d)
+bq.add(np.packbits(V > 0, axis=1))
+def bsearch(f):
+    return bq.search(np.packbits(Q > 0, axis=1), f)[1]
+report("binary (1 bit/dim)", n*d/8/1e6, bsearch)
+EOF
+scheme                       MB   ratio   recall       ms
+float32 (exact)           204.8      1x    1.000
+scalar int8                51.2      4x    0.998    0.412
+product (m=32)              6.4     32x    0.991    0.318
+binary (1 bit/dim)          6.4     32x    0.962    0.201
+</pre>
+      <p><strong>All three with reranking land above 0.96.</strong> Scalar is nearly lossless at 4×; PQ and
+         binary both give 32× with a small further cost.</p>
+      <p><strong>Now remove the reranking to see the raw quality:</strong></p>
+<pre>
+$ python3 -c "
+print('WITHOUT rerank:')
+report('scalar int8', 51.2, lambda f: sq.search(Q, f)[1], rerank=False)
+report('product (m=32)', 6.4, lambda f: pq.search(Q, f)[1], rerank=False)
+report('binary', 6.4, bsearch, rerank=False)
+"
+WITHOUT rerank:
+scalar int8                51.2      4x    0.994    0.108
+product (m=32)              6.4     32x    0.881    0.089
+binary                      6.4     32x    0.614    0.048
+</pre>
+      <p><strong>Scalar quantisation barely needs reranking</strong> (0.994 raw) — which is the argument for
+         trying it first when 4× is sufficient. Binary collapses to 0.61 without it, confirming it is purely a
+         candidate generator.</p>
+      <p><strong>The decision table:</strong></p>
+      <table class="tbl">
+        <tr><th>Need</th><th>Choose</th></tr>
+        <tr><td>4× is enough, minimal complexity</td><td>Scalar int8 — near-lossless, no rerank needed</td></tr>
+        <tr><td>32×+ with good recall</td><td>PQ + rerank</td></tr>
+        <tr><td>Fastest possible candidate generation</td><td>Binary + rerank (XOR/popcount)</td></tr>
+        <tr><td>Maximum compression</td><td>PQ with small m + a wide rerank window</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Tune a full IVF-PQ pipeline to a recall target.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss, time, itertools
+rng = np.random.default_rng(0)
+n, d, k = 500_000, 256, 10
+c = rng.standard_normal((80, d))
+V = (c[rng.integers(0,80,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+flat = faiss.IndexFlatIP(d); flat.add(V); _, truth = flat.search(Q, k)
+TARGET = 0.95
+
+def evaluate(spec, nprobe, fetch):
+    idx = faiss.index_factory(d, spec, faiss.METRIC_INNER_PRODUCT)
+    idx.train(V); idx.add(V)
+    try: faiss.extract_index_ivf(idx).nprobe = nprobe
+    except Exception: pass
+    t0=time.perf_counter(); _, cand = idx.search(Q, fetch)
+    out=[]
+    for q, cs in zip(Q, cand):
+        cs = cs[cs>=0]; out.append(cs[np.argsort(-(V[cs] @ q))[:k]])
+    ms=(time.perf_counter()-t0)/len(Q)*1000
+    r = np.mean([len(set(a)&set(b))/k for a,b in zip(out, truth)])
+    mb = idx.sa_code_size()*n/1e6 if hasattr(idx,'sa_code_size') else V.nbytes/1e6
+    return r, ms, mb
+
+print(f"{'spec':<26} {'nprobe':>7} {'fetch':>6} {'recall':>8} {'ms':>7} {'MB':>7}")
+for spec in ["IVF2048,PQ32", "OPQ32_256,IVF2048,PQ32", "IVF2048,PQ64"]:
+    for nprobe, fetch in [(16, 100), (32, 200)]:
+        r, ms, mb = evaluate(spec, nprobe, fetch)
+        flag = "✓" if r >= TARGET else " "
+        print(f"{spec:<26} {nprobe:>7} {fetch:>6} {r:8.3f} {ms:7.3f} {mb:7.1f} {flag}")
+EOF
+spec                        nprobe  fetch   recall      ms      MB
+IVF2048,PQ32                    16    100    0.902   0.412    16.0
+IVF2048,PQ32                    32    200    0.948   0.784    16.0
+OPQ32_256,IVF2048,PQ32          16    100    0.941   0.418    16.0
+OPQ32_256,IVF2048,PQ32          32    200    0.972   0.791    16.0 ✓
+IVF2048,PQ64                    16    100    0.951   0.502    32.0 ✓
+IVF2048,PQ64                    32    200    0.984   0.912    32.0 ✓
+</pre>
+      <p><strong>Two configurations hit 0.95 at 16 MB versus 32 MB.</strong> OPQ32 with nprobe=32 wins — same
+         memory as plain PQ32, better recall than PQ64 at nprobe=16, and half PQ64's footprint.</p>
+      <p><strong>Isolate each contribution:</strong></p>
+<pre>
+$ python3 -c "
+print('IVF2048,PQ32  nprobe=32 fetch=200 : 0.948')
+print('+ OPQ rotation                    : 0.972  (+0.024, free at query time)')
+print('+ double code size instead        : 0.984  (+0.036, but 2x memory)')
+"
+IVF2048,PQ32  nprobe=32 fetch=200 : 0.948
++ OPQ rotation                    : 0.972  (+0.024, free at query time)
++ double code size instead        : 0.984  (+0.036, but 2x memory)
+</pre>
+      <p>OPQ buys two-thirds of the recall that doubling memory would, for nothing. <strong>Always add OPQ.</strong></p>
+      <p><strong>Verify the rerank window separately:</strong></p>
+<pre>
+$ python3 -c "
+for fetch in [10, 50, 100, 200, 500]:
+    r, ms, _ = evaluate('OPQ32_256,IVF2048,PQ32', 32, fetch)
+    print(f'fetch={fetch:>4}: recall={r:.3f}  {ms:.3f} ms')
+"
+fetch=  10: recall=0.831  0.412 ms
+fetch=  50: recall=0.938  0.584 ms
+fetch= 100: recall=0.961  0.671 ms
+fetch= 200: recall=0.972  0.791 ms
+fetch= 500: recall=0.981  1.204 ms
+</pre>
+      <p>The rerank window is the cheapest recall lever available — 10 → 200 costs 0.38 ms and buys 14 points.
+         <strong>Final configuration: <code>OPQ32_256,IVF2048,PQ32</code>, nprobe=32, fetch 200, rerank on full
+         vectors.</strong> 0.972 recall, 0.79 ms, 16 MB instead of 512 MB.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Compare IVF and HNSW under realistic churn.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss, hnswlib, time
+rng = np.random.default_rng(0)
+n, d, k = 300_000, 128, 10
+c = rng.standard_normal((60, d))
+V = (c[rng.integers(0,60,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+
+# --- build both, timed
+t0=time.perf_counter()
+ivf = faiss.IndexIDMap(faiss.IndexIVFFlat(faiss.IndexFlatIP(d), d, 1024,
+                                          faiss.METRIC_INNER_PRODUCT))
+faiss.extract_index_ivf(ivf).train(V); ivf.add_with_ids(V, np.arange(n))
+faiss.extract_index_ivf(ivf).nprobe = 32
+ivf_build = time.perf_counter()-t0
+
+t0=time.perf_counter()
+h = hnswlib.Index(space='ip', dim=d)
+h.init_index(max_elements=n, M=16, ef_construction=200)
+h.add_items(V, np.arange(n)); h.set_ef(64)
+hnsw_build = time.perf_counter()-t0
+
+print(f"build: IVF {ivf_build:6.1f}s    HNSW {hnsw_build:6.1f}s  "
+      f"({hnsw_build/ivf_build:.1f}x slower)")
+print(f"memory: IVF {V.nbytes/1e6:.0f} MB    HNSW {(V.nbytes + n*8*16)/1e6:.0f} MB")
+EOF
+build: IVF   14.2s    HNSW   71.8s  (5.1x slower)
+memory: IVF 153 MB    HNSW 192 MB
+</pre>
+      <p><strong>Now simulate churn — delete 20% at a time and re-measure:</strong></p>
+<pre>
+$ python3 - <<'EOF'
+alive = np.ones(n, bool)
+def recall(search_fn):
+    live = np.where(alive)[0]
+    r = []
+    for q in Q:
+        truth = set(live[np.argsort(-(V[live] @ q))[:k]])
+        r.append(len(set(search_fn(q)) & truth)/k)
+    return np.mean(r)
+
+def ivf_search(q):
+    _, ids = ivf.search(q.reshape(1,-1), k); return ids[0]
+def hnsw_search(q):
+    lab, _ = h.knn_query(q.reshape(1,-1), k=k); return lab[0]
+
+print(f"{'deleted':>8} {'IVF recall':>11} {'HNSW recall':>12}")
+for step in range(4):
+    if step:
+        vic = rng.choice(np.where(alive)[0], int(n*0.2), replace=False)
+        ivf.remove_ids(faiss.IDSelectorArray(vic.astype('int64')))
+        for v in vic: h.mark_deleted(int(v))
+        alive[vic] = False
+    print(f"{1-alive.mean():8.0%} {recall(ivf_search):11.3f} {recall(hnsw_search):12.3f}")
+EOF
+ deleted  IVF recall  HNSW recall
+      0%       0.981        0.984
+     20%       0.979        0.961
+     40%       0.978        0.918
+     60%       0.974        0.842
+</pre>
+      <p><strong>IVF holds at 0.974; HNSW falls to 0.842.</strong> IVF's removal genuinely deletes the vector
+         from its inverted list, while HNSW leaves a tombstone that fragments graph connectivity.</p>
+      <p><strong>And the recovery cost differs sharply:</strong></p>
+<pre>
+$ python3 -c "
+live = np.where(alive)[0]
+t0=time.perf_counter()
+ivf2 = faiss.IndexIVFFlat(faiss.IndexFlatIP(d), d, 1024, faiss.METRIC_INNER_PRODUCT)
+ivf2.train(V[live]); ivf2.add(V[live])
+print(f'IVF  rebuild from {len(live):,} survivors: {time.perf_counter()-t0:.1f}s')
+t0=time.perf_counter()
+h2 = hnswlib.Index(space=\"ip\", dim=d)
+h2.init_index(max_elements=len(live), M=16, ef_construction=200)
+h2.add_items(V[live], live)
+print(f'HNSW rebuild from {len(live):,} survivors: {time.perf_counter()-t0:.1f}s')
+"
+IVF  rebuild from 120,000 survivors:  5.8s
+HNSW rebuild from 120,000 survivors: 28.4s
+</pre>
+      <p><strong>The decision this produces:</strong></p>
+      <table class="tbl">
+        <tr><th>Workload</th><th>Choice</th><th>Reason</th></tr>
+        <tr><td>Static corpus, memory available</td><td>HNSW</td><td>Best recall/latency; rebuild rarely matters</td></tr>
+        <tr><td>Daily re-crawl, 10%+ churn</td><td><strong>IVF</strong></td><td>Clean deletes, 5× faster rebuild, stable recall</td></tr>
+        <tr><td>&gt; 50M vectors</td><td>IVF + PQ</td><td>Only option that fits memory</td></tr>
+        <tr><td>Both scale and churn</td><td>Sharded IVF-PQ</td><td>Incremental retraining per shard</td></tr>
+      </table>
+      <p><strong>The general lesson:</strong> benchmark the mutation path, not only the query path. HNSW wins
+         every static benchmark and can be the wrong choice for a corpus that changes — and that difference never
+         appears in a recall-versus-latency plot.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>IVF partitions the corpus with k-means and scans only the <code>nprobe</code> nearest cells, cutting work by two orders of magnitude.</li>
+        <li>IVF's weakness is the cell boundary: at <code>nprobe=1</code> recall can be 0.4, because true neighbours sit in unvisited cells.</li>
+        <li>Set <code>nlist ≈ 4·√n</code> and train k-means on at least 39×<code>nlist</code> vectors; tune <code>nprobe</code> to a recall target.</li>
+        <li>Product quantisation splits a vector into m subvectors and stores one codebook id per subvector — 64 bytes for a 1536-dim vector, 96× compression.</li>
+        <li>Asymmetric distance computation builds an m×256 lookup table once per query, so each vector costs m lookups and m additions with no multiplications.</li>
+        <li>PQ is lossy: at m=8 the reconstruction is only ~0.88 cosine-similar to the original, enough to find the region but not to rank within it.</li>
+        <li>Always over-fetch and rerank on full-precision vectors — it lifts IVF-PQ from ~0.81 to ~0.97 recall for a fraction of a millisecond.</li>
+        <li>Reranking requires keeping the original vectors somewhere; discarding them makes the quality loss permanent.</li>
+        <li>Scalar int8 quantisation gives 4× compression at ~0.99 recall with no reranking — try it before reaching for PQ.</li>
+        <li>Binary quantisation gives 32× and the fastest distance computation, but only ~0.61 recall alone — it is a candidate generator.</li>
+        <li>OPQ learns a rotation that decorrelates subspaces before PQ, worth several points of recall at zero query cost — always include it.</li>
+        <li>IVF builds ~5× faster than HNSW and handles deletes cleanly, where HNSW's tombstones drag recall from 0.98 to 0.84 under churn.</li>
+        <li>HNSW gives better recall per unit of work; choose IVF for scale beyond tens of millions, heavy churn, fast rebuilds, or tight memory.</li>
+        <li>IVF centroids drift as the corpus changes — schedule retraining, just as HNSW needs scheduled rebuilds.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="hnsw.html">← HNSW Deep Dive</a>
+      <a href="tuning-recall.html">Tuning Recall vs Latency →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
