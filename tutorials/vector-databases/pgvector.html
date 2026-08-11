@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pgvector &amp; SQL-Native Vectors — Vector Databases &amp; RAG — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>pgvector &amp; SQL-Native Vectors <span class="level-badge level-inter">The Landscape</span></h1>
+    <p><strong>What you'll master:</strong> how to model vectors alongside the rows they describe and why
+       transactional consistency between them matters more than it sounds, the three operator classes and the
+       silent sequential-scan trap when they mismatch, how Postgres's planner decides between an index scan and
+       a filtered scan and why that decision is pgvector's biggest advantage, tuning HNSW and IVFFlat inside
+       Postgres, and the specific scale and workload signals that mean it is time to leave. Prerequisites:
+       <a href="tuning-recall.html">Tuning Recall vs Latency</a>; familiarity with
+       <a href="../sql/index.html">SQL</a> helps.</p>
+
+    <h2>Part 1 — Vectors as a Column Type</h2>
+
+    <p>pgvector adds a <code>vector</code> type to Postgres. That single design decision is what makes it
+       different from every dedicated store: a vector is a column, so everything Postgres already does — joins,
+       transactions, constraints, permissions, backups — applies to it unchanged.</p>
+
+<pre>
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE chunks (
+  id          bigserial PRIMARY KEY,
+  document_id bigint NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  tenant_id   bigint NOT NULL,
+  chunk_index int    NOT NULL,
+  content     text   NOT NULL,          -- the source of truth
+  token_count int    NOT NULL,
+  model       text   NOT NULL,          -- which embedding model produced this
+  embedding   vector(1536) NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (document_id, chunk_index)
+);
+
+CREATE INDEX ON chunks (tenant_id);
+CREATE INDEX ON chunks (document_id);
+</pre>
+
+    <table class="tbl">
+      <tr><th>Column</th><th>Why it is there</th></tr>
+      <tr><td><code>content</code></td><td>The system of record — the index is a rebuildable derived artefact</td></tr>
+      <tr><td><code>model</code></td><td>Detects a partially-migrated index; see <a href="embeddings.html">Embeddings</a></td></tr>
+      <tr><td><code>tenant_id</code></td><td>Filtering and isolation, evaluated by the planner</td></tr>
+      <tr><td><code>document_id</code> FK</td><td>Deleting a document removes its chunks atomically</td></tr>
+      <tr><td><code>UNIQUE (document_id, chunk_index)</code></td><td>Makes re-ingestion idempotent via <code>ON CONFLICT</code></td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The foreign key is the feature.</strong> With a dedicated vector store, deleting
+       a document means deleting the row in Postgres and then deleting its vectors over the network — two
+       operations that can partially fail, leaving orphaned vectors that surface as results citing documents
+       that no longer exist. In pgvector it is one <code>DELETE</code> inside one transaction. That class of bug
+       simply does not occur, and eliminating it is worth more than most of the performance differences people
+       argue about.</div>
+
+    <p><strong>Ingestion is an ordinary upsert</strong>, which makes re-running the pipeline safe:</p>
+
+<pre>
+INSERT INTO chunks (document_id, tenant_id, chunk_index, content, token_count, model, embedding)
+VALUES ($1, $2, $3, $4, $5, 'text-embedding-3-small', $6)
+ON CONFLICT (document_id, chunk_index) DO UPDATE
+  SET content = EXCLUDED.content,
+      embedding = EXCLUDED.embedding,
+      model = EXCLUDED.model;
+</pre>
+
+    <h2>Part 2 — Operators and Operator Classes</h2>
+
+    <p>pgvector provides three distance operators, and each needs an index built with the matching operator
+       class. Getting this pairing wrong is the single most common pgvector performance bug.</p>
+
+    <table class="tbl">
+      <tr><th>Operator</th><th>Distance</th><th>Operator class</th><th>Best value</th></tr>
+      <tr><td><code>&lt;=&gt;</code></td><td>Cosine distance</td><td><code>vector_cosine_ops</code></td><td>0 (identical)</td></tr>
+      <tr><td><code>&lt;#&gt;</code></td><td><strong>Negative</strong> inner product</td><td><code>vector_ip_ops</code></td><td>−1 for normalised identical</td></tr>
+      <tr><td><code>&lt;-&gt;</code></td><td>L2 distance</td><td><code>vector_l2_ops</code></td><td>0</td></tr>
+      <tr><td><code>&lt;+&gt;</code></td><td>L1 (Manhattan)</td><td><code>vector_l1_ops</code></td><td>0</td></tr>
+    </table>
+
+<pre>
+-- All operators sort ASCENDING — smaller is better, uniformly
+SELECT id, content, embedding &lt;=&gt; $1 AS distance
+FROM chunks
+ORDER BY embedding &lt;=&gt; $1
+LIMIT 10;
+
+-- Inner product returns a NEGATIVE score; negate it for display
+SELECT id, (embedding &lt;#&gt; $1) * -1 AS similarity
+FROM chunks
+ORDER BY embedding &lt;#&gt; $1
+LIMIT 10;
+</pre>
+
+    <p><strong>Normalise at ingestion and use <code>&lt;#&gt;</code>.</strong> As
+       <a href="similarity-metrics.html">Similarity Metrics</a> established, inner product on unit vectors
+       computes cosine exactly, and it is the cheapest operator — no division, no square root:</p>
+
+<pre>
+CREATE INDEX chunks_embedding_idx ON chunks
+  USING hnsw (embedding vector_ip_ops)
+  WITH (m = 16, ef_construction = 64);
+</pre>
+
+    <p><strong>The mismatch trap:</strong> querying with an operator the index was not built for does not error.
+       Postgres simply cannot use the index and falls back to a sequential scan — correct results, hundreds of
+       times slower:</p>
+
+<pre>
+EXPLAIN ANALYZE SELECT id FROM chunks ORDER BY embedding &lt;-&gt; $1 LIMIT 10;
+                                    -- index is vector_ip_ops, query uses &lt;-&gt;
+
+ Limit  (actual time=1841.2..1841.3 rows=10)
+   -&gt;  Sort  (actual time=1841.2..1841.2 rows=10)
+         Sort Method: top-N heapsort
+         -&gt;  Seq Scan on chunks  (actual rows=2400000)     ← no index used
+ Execution Time: 1843.91 ms
+</pre>
+
+    <h2>Part 3 — HNSW and IVFFlat in Postgres</h2>
+
+    <table class="tbl">
+      <tr><th></th><th>HNSW</th><th>IVFFlat</th></tr>
+      <tr><td>Build parameters</td><td><code>m</code>, <code>ef_construction</code></td><td><code>lists</code></td></tr>
+      <tr><td>Query parameter</td><td><code>hnsw.ef_search</code></td><td><code>ivfflat.probes</code></td></tr>
+      <tr><td>Build speed</td><td>Slow</td><td><strong>Fast</strong></td></tr>
+      <tr><td>Requires data present</td><td>No — can build on an empty table</td><td><strong>Yes</strong> — needs rows to cluster</td></tr>
+      <tr><td>Recall per unit of work</td><td><strong>Better</strong></td><td>Needs more probes</td></tr>
+      <tr><td>Memory</td><td>Higher</td><td>Lower</td></tr>
+      <tr><td>Handles updates</td><td>Degrades over time</td><td>Better; centroids drift</td></tr>
+    </table>
+
+<pre>
+-- HNSW: the usual choice
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops)
+  WITH (m = 16, ef_construction = 64);
+SET hnsw.ef_search = 100;                 -- per session or per transaction
+
+-- IVFFlat: build AFTER loading data; lists ≈ rows/1000 up to 1M, then sqrt(rows)
+CREATE INDEX ON chunks USING ivfflat (embedding vector_ip_ops) WITH (lists = 1000);
+SET ivfflat.probes = 20;
+</pre>
+
+    <p><strong>Build time is the practical constraint</strong>, and it is worth planning for:</p>
+
+<pre>
+-- Parallel build: dramatically faster on multi-core machines
+SET max_parallel_maintenance_workers = 7;   -- plus the leader = 8
+SET maintenance_work_mem = '8GB';           -- must fit the graph, or it spills to disk
+CREATE INDEX CONCURRENTLY ON chunks USING hnsw (embedding vector_ip_ops);
+</pre>
+
+<pre>
+Rough build times, 1536-dim, m=16, 8 workers:
+     100k rows  →  ~1 min
+   1,000k rows  →  ~12 min
+  10,000k rows  →  ~3 hours       ← plan a maintenance window
+</pre>
+
+    <p><code>maintenance_work_mem</code> matters more than people expect: if the graph does not fit, the build
+       spills to disk and can take an order of magnitude longer. Size it to roughly the index size before
+       building.</p>
+
+    <p><strong><code>CREATE INDEX CONCURRENTLY</code></strong> avoids locking the table for writes, at the cost
+       of a slower build and the risk of leaving an invalid index if it fails — always check
+       <code>pg_index.indisvalid</code> afterwards.</p>
+
+    <h2>Part 4 — Filtering: The Real Advantage</h2>
+
+    <p>This is where pgvector separates itself. Combining a similarity search with predicates is a query-planner
+       problem, and Postgres has spent decades on query planning.</p>
+
+<pre>
+SELECT c.id, c.content, d.title, c.embedding &lt;#&gt; $1 AS score
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.tenant_id = $2
+  AND d.status = 'published'
+  AND d.updated_at &gt; now() - interval '90 days'
+ORDER BY c.embedding &lt;#&gt; $1
+LIMIT 10;
+</pre>
+
+    <p>In a dedicated store this is either impossible, or requires denormalising every filterable attribute into
+       the vector store's metadata and keeping it in sync. Here it is one query, correctly filtered, with the
+       planner choosing the strategy.</p>
+
+    <table class="tbl">
+      <tr><th>Filter selectivity</th><th>Planner choice</th><th>Why it is right</th></tr>
+      <tr><td>Broad (&gt;20% of rows pass)</td><td>HNSW index scan, filter applied after</td><td>Enough survivors in the candidate set</td></tr>
+      <tr><td>Narrow (&lt;1% pass)</td><td><strong>Filter first, then exact scan</strong></td><td>The subset is small; brute force is faster AND exact</td></tr>
+      <tr><td>Middle</td><td>Depends on statistics and cost estimates</td><td>This is exactly what a planner is for</td></tr>
+    </table>
+
+<pre>
+-- Narrow filter: the planner chooses the btree and skips the vector index entirely
+EXPLAIN ANALYZE
+SELECT id FROM chunks WHERE tenant_id = 4821
+ORDER BY embedding &lt;#&gt; $1 LIMIT 10;
+
+ Limit  (actual time=3.1..3.2 rows=10)
+   -&gt;  Sort  (actual time=3.1..3.1 rows=10)
+         -&gt;  Bitmap Heap Scan on chunks  (actual rows=1204)
+               Recheck Cond: (tenant_id = 4821)
+               -&gt;  Bitmap Index Scan on chunks_tenant_id_idx  (actual rows=1204)
+ Execution Time: 3.28 ms                     -- exact, and fast
+</pre>
+
+    <p><strong>That plan is exactly right and requires no configuration.</strong> A dedicated store doing
+       post-filtering on 128 ANN candidates would have returned near-zero results here, as
+       <a href="knn-vs-ann.html">the filtering interaction</a> showed.</p>
+
+    <p><strong>Partial indexes</strong> handle the case where one filter dominates every query:</p>
+
+<pre>
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops)
+  WHERE tenant_id = 1 AND deleted_at IS NULL;
+-- a smaller, faster index that only serves matching queries
+</pre>
+
+    <h2>Part 5 — Operating It</h2>
+
+    <p>pgvector inherits Postgres's operational model, which is mostly an advantage and has two specific
+       gotchas.</p>
+
+    <p><strong>Gotcha 1: TOAST.</strong> A 1536-dimension vector is about 6 KB, which exceeds Postgres's inline
+       tuple limit, so vectors are stored out-of-line in a TOAST table. That means an extra fetch per row unless
+       the index scan avoids it:</p>
+
+<pre>
+-- Check how much of the table is TOAST
+SELECT pg_size_pretty(pg_relation_size('chunks'))            AS heap,
+       pg_size_pretty(pg_total_relation_size('chunks'))      AS total,
+       pg_size_pretty(pg_indexes_size('chunks'))             AS indexes;
+
+-- Storing vectors as PLAIN avoids TOAST compression attempts (they never compress well)
+ALTER TABLE chunks ALTER COLUMN embedding SET STORAGE PLAIN;
+</pre>
+
+    <p><strong>Gotcha 2: index memory and the buffer cache.</strong> HNSW index pages must be in
+       <code>shared_buffers</code> or the OS page cache, or every query pays disk reads:</p>
+
+<pre>
+-- Is the index actually resident?
+SELECT pg_size_pretty(pg_relation_size('chunks_embedding_idx')) AS index_size,
+       current_setting('shared_buffers') AS shared_buffers;
+
+-- Typical settings for a vector-heavy instance
+shared_buffers = 25% of RAM
+effective_cache_size = 75% of RAM
+maintenance_work_mem = enough to build the index in memory
+</pre>
+
+    <p><strong>Monitoring that matters:</strong></p>
+
+<pre>
+-- Index bloat and dead tuples (HNSW degradation)
+SELECT relname, n_live_tup, n_dead_tup,
+       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct
+FROM pg_stat_user_tables WHERE relname = 'chunks';
+
+-- Is the vector index being used at all?
+SELECT indexrelname, idx_scan, idx_tup_read
+FROM pg_stat_user_indexes WHERE relname = 'chunks';
+-- idx_scan = 0 on the vector index means every query is sequential-scanning
+</pre>
+
+    <p>That last query is the single most valuable pgvector check. <code>idx_scan = 0</code> on the embedding
+       index means an operator mismatch, a missing <code>LIMIT</code>, or a planner decision — and it is the
+       difference between 3 ms and 1800 ms.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Assuming the vector index is being used because the query returns correct results.</strong>
+         pgvector never errors on a metric mismatch or a missing <code>LIMIT</code> — it silently sequential-scans.
+         The results are exactly right (it is brute-force kNN), so tests pass, and only the latency graph
+         knows. Teams ship this and discover it weeks later when the corpus grows.</p>
+      <p>✅ <strong>Assert on the query plan, not just the results.</strong> An <code>EXPLAIN</code>-based test
+         checking for <code>Index Scan</code> and the absence of <code>Seq Scan</code> catches operator
+         mismatches, a dropped <code>LIMIT</code>, and an invalid index after a failed
+         <code>CREATE INDEX CONCURRENTLY</code>. Pair it with a <code>pg_stat_user_indexes</code> check that
+         <code>idx_scan</code> is growing in production.</p>
+    </div>
+
+    <h2>Part 6 — When to Leave</h2>
+
+    <p>pgvector should be the default, and there are honest signals that it has stopped being the right
+       answer.</p>
+
+    <table class="tbl">
+      <tr><th>Signal</th><th>Why it matters</th><th>Threshold, roughly</th></tr>
+      <tr><td>Index no longer fits in RAM</td><td>Every query hits disk; latency collapses</td><td>Depends on instance; watch cache hit rate</td></tr>
+      <tr><td>Index build exceeds the maintenance window</td><td>Cannot rebuild after a model change</td><td>&gt; 10–20M rows at 1536 dims</td></tr>
+      <tr><td>Vector search degrades OLTP p99</td><td>Shared CPU, memory and buffer cache</td><td>When search is a meaningful fraction of load</td></tr>
+      <tr><td>You need aggressive quantisation</td><td>pgvector's options are more limited than FAISS-based stores</td><td>When PQ is required to fit memory</td></tr>
+      <tr><td>Sustained very high write throughput</td><td>Index maintenance competes with transactions</td><td>Workload-specific</td></tr>
+    </table>
+
+    <p><strong>Note what is <em>not</em> on that list:</strong> "we have a million vectors" and "we want to use
+       a real vector database". A million 1536-dimension vectors is about 6 GB of vectors plus a modest graph —
+       entirely reasonable for a Postgres instance, and the operational simplicity of one system is worth
+       real money.</p>
+
+    <p><strong>The migration is cheap if you designed for it.</strong> Because <code>content</code> and metadata
+       live in Postgres and the index is derived, moving to a dedicated store is a re-index rather than a data
+       migration — and re-indexing is a pipeline you need anyway for model changes:</p>
+
+<pre>
+-- Everything needed to rebuild elsewhere is already here
+SELECT id, content, tenant_id, document_id, model FROM chunks WHERE model = $1;
+</pre>
+
+    <p><strong>The half-way option</strong> is worth knowing: keep Postgres as the system of record and
+       replicate to a dedicated store for search only, accepting eventual consistency on the search path. That
+       preserves the transactional guarantees where they matter and gets the specialised index where it helps —
+       at the cost of a sync pipeline, which is exactly the complexity pgvector was avoiding.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Querying with an operator the index was not built for</td><td>Silent sequential scan — correct but 500× slower</td><td>Match operator to operator class; assert on the plan</td></tr>
+      <tr><td>Filtering <code>&lt;#&gt;</code> results with <code>score &gt; 0.7</code></td><td>It returns the <em>negative</em> inner product</td><td>Negate it, or compare <code>&lt; -0.7</code></td></tr>
+      <tr><td>Omitting <code>LIMIT</code></td><td>HNSW is only used for top-k ordering</td><td>Always include a <code>LIMIT</code></td></tr>
+      <tr><td>Building IVFFlat on an empty table</td><td>No data to cluster; the index is useless</td><td>Load data first, then build; HNSW has no such constraint</td></tr>
+      <tr><td>Leaving <code>maintenance_work_mem</code> at the default</td><td>The build spills to disk and takes 10× longer</td><td>Size it to the expected index size</td></tr>
+      <tr><td>Not checking <code>indisvalid</code> after CONCURRENTLY</td><td>A failed build leaves an invalid index that is silently unused</td><td>Query <code>pg_index</code> after every concurrent build</td></tr>
+      <tr><td>Storing only vectors, not source text</td><td>Model changes and store migrations become impossible</td><td>Keep <code>content</code> as the system of record</td></tr>
+      <tr><td>Ignoring <code>idx_scan = 0</code></td><td>Proof that no query is using the vector index</td><td>Monitor <code>pg_stat_user_indexes</code></td></tr>
+      <tr><td>Running vector search on the OLTP primary without limits</td><td>Shares buffer cache and CPU with transactions</td><td>A read replica, or resource limits</td></tr>
+      <tr><td>Moving to a dedicated store at 1M vectors</td><td>Second stateful system for no measured benefit</td><td>Measure first; 1M×1536 is comfortable in Postgres</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does pgvector add to Postgres?</summary>
+      <p>A <code>vector</code> column type, distance operators, and ANN index types. That is deliberately small,
+         and the smallness is the point — a vector becomes an ordinary column, so everything Postgres already
+         does applies to it.</p>
+<pre>
+CREATE EXTENSION vector;
+CREATE TABLE chunks (
+  id bigserial PRIMARY KEY,
+  document_id bigint REFERENCES documents(id) ON DELETE CASCADE,
+  content text NOT NULL,
+  embedding vector(1536) NOT NULL
+);
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops);
+</pre>
+      <p><strong>What you get for free is substantial:</strong> transactions spanning vectors and the rows they
+         describe, foreign keys so deleting a document removes its chunks atomically, joins against any other
+         table, row-level security, existing backups and monitoring, and one system to operate rather than
+         two.</p>
+      <p>The foreign key example is worth dwelling on. With a separate vector store, deleting a document means a
+         DELETE in Postgres and a delete call over the network — two operations that can partially fail, leaving
+         orphaned vectors that surface as citations to documents that no longer exist. In pgvector that class of
+         bug cannot occur.</p>
+      <p>It provides three main distance operators — <code>&lt;=&gt;</code> cosine, <code>&lt;#&gt;</code> negative
+         inner product, <code>&lt;-&gt;</code> L2 — and two index types, HNSW and IVFFlat.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What are the pgvector operators and what do they return?</summary>
+      <table class="tbl">
+        <tr><th>Operator</th><th>Returns</th><th>Index operator class</th></tr>
+        <tr><td><code>&lt;=&gt;</code></td><td>Cosine distance, 0 = identical</td><td><code>vector_cosine_ops</code></td></tr>
+        <tr><td><code>&lt;#&gt;</code></td><td><strong>Negative</strong> inner product</td><td><code>vector_ip_ops</code></td></tr>
+        <tr><td><code>&lt;-&gt;</code></td><td>L2 distance, 0 = identical</td><td><code>vector_l2_ops</code></td></tr>
+      </table>
+      <p><strong>All of them sort ascending</strong> — pgvector negates the inner product specifically so that
+         "smaller is better" holds uniformly and the index can always sort one way.</p>
+      <p>That negation is the sharp edge. A perfect match under <code>&lt;#&gt;</code> scores <code>-1</code>, so
+         code written as <code>WHERE score &gt; 0.7</code> returns precisely the wrong rows. Negate for display:</p>
+<pre>
+SELECT id, (embedding &lt;#&gt; $1) * -1 AS similarity
+FROM chunks ORDER BY embedding &lt;#&gt; $1 LIMIT 10;
+</pre>
+      <p><strong>The operator must match the index's operator class.</strong> Querying with <code>&lt;-&gt;</code>
+         against a <code>vector_cosine_ops</code> index does not error — Postgres just cannot use the index and
+         sequential-scans instead. Correct results, hundreds of times slower.</p>
+      <p>The recommended setup is to normalise vectors at ingestion and use <code>&lt;#&gt;</code> with
+         <code>vector_ip_ops</code>: on unit vectors inner product equals cosine exactly, and it is the cheapest
+         operator to compute.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why is pgvector better at filtered vector search than most dedicated stores?</summary>
+      <p>Because filtering is a query-planning problem, and Postgres has a mature cost-based planner that
+         chooses a strategy per query based on statistics.</p>
+      <p><strong>The hard case for a dedicated store</strong> is a selective filter. It searches the ANN index
+         for, say, 128 nearest candidates and then applies the filter. If the filter keeps 0.1% of the corpus,
+         roughly zero candidates survive — the user asked for 10 results and gets none, from an index reporting
+         excellent recall.</p>
+      <p><strong>Postgres decides differently per query:</strong></p>
+      <table class="tbl">
+        <tr><th>Selectivity</th><th>Plan</th></tr>
+        <tr><td>Broad filter</td><td>HNSW index scan, filter after</td></tr>
+        <tr><td>Narrow filter</td><td>btree on the filter column, then exact scan of the subset</td></tr>
+      </table>
+      <p>The narrow case is both faster and <em>exactly</em> correct — with 1,200 matching rows, a brute-force
+         scan is a few milliseconds and has recall 1.0. No configuration required; the planner reads the
+         statistics and picks.</p>
+      <p><strong>It also handles joins</strong>, which most vector stores cannot: filtering on a column of a
+         related table means denormalising it into vector metadata and keeping it in sync, or doing the join in
+         application code. In pgvector it is a JOIN.</p>
+      <p>The caveat is that the planner needs good statistics. A stale <code>ANALYZE</code> or a correlated
+         predicate it estimates badly can produce a poor plan — so <code>EXPLAIN ANALYZE</code> on the real
+         query shapes matters, as with any Postgres workload.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you choose and tune between HNSW and IVFFlat in pgvector?</summary>
+      <p><strong>HNSW is the default choice.</strong> Better recall per unit of work, and it can be created on an
+         empty table so it works naturally with an incremental ingestion pipeline.</p>
+<pre>
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops)
+  WITH (m = 16, ef_construction = 64);
+SET hnsw.ef_search = 100;                  -- the live tuning dial
+</pre>
+      <p><strong>IVFFlat is the alternative</strong> when build time dominates:</p>
+<pre>
+CREATE INDEX ON chunks USING ivfflat (embedding vector_ip_ops) WITH (lists = 1000);
+SET ivfflat.probes = 20;
+</pre>
+      <p>It builds far faster, uses less memory, and handles churn better — but it <strong>must be built after
+         loading data</strong>, because it needs rows to cluster. Building it on an empty table produces a
+         useless index, which is a real and easily-made mistake in a migration script.</p>
+      <p><strong>Sizing:</strong> for IVFFlat, <code>lists ≈ rows/1000</code> up to a million rows, then
+         <code>sqrt(rows)</code>. For HNSW, <code>m=16</code> is a good default; raise it for high dimensionality
+         or if recall plateaus below target.</p>
+      <p><strong>Tuning is the same discipline as any ANN index:</strong> sweep <code>hnsw.ef_search</code> or
+         <code>ivfflat.probes</code> until recall@k reaches the target, then confirm latency fits. Both are
+         session-level settings, so they can be changed live without a rebuild — unlike <code>m</code> and
+         <code>lists</code>.</p>
+      <p>The build itself needs attention: set <code>maintenance_work_mem</code> large enough to hold the index
+         or it spills to disk, and raise <code>max_parallel_maintenance_workers</code> — the difference is
+         hours at scale.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a RAG data model in Postgres for a multi-tenant application.</summary>
+      <p>I would treat Postgres as the system of record and the vector index as a derived artefact, then let the
+         schema enforce the invariants.</p>
+<pre>
+CREATE TABLE documents (
+  id          bigserial PRIMARY KEY,
+  tenant_id   bigint NOT NULL,
+  source_uri  text   NOT NULL,
+  content_hash text  NOT NULL,          -- skip re-embedding unchanged documents
+  status      text   NOT NULL DEFAULT 'active',
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, source_uri)
+);
+
+CREATE TABLE chunks (
+  id          bigserial PRIMARY KEY,
+  document_id bigint NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  tenant_id   bigint NOT NULL,          -- denormalised for filtering
+  chunk_index int    NOT NULL,
+  content     text   NOT NULL,
+  model       text   NOT NULL,
+  embedding   vector(1536) NOT NULL,
+  UNIQUE (document_id, chunk_index)
+);
+
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops) WITH (m = 16, ef_construction = 64);
+CREATE INDEX ON chunks (tenant_id, document_id);
+</pre>
+      <p><strong>The design decisions worth defending:</strong></p>
+      <p><strong>1. <code>ON DELETE CASCADE</code></strong> makes document deletion atomic. With a separate
+         vector store this is a two-system operation that can leave orphans citing deleted documents — the exact
+         failure that produces "the assistant quoted a document I removed".</p>
+      <p><strong>2. <code>tenant_id</code> denormalised onto chunks</strong> so tenant filtering never needs a
+         join, and so row-level security can be applied directly:</p>
+<pre>
+ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON chunks
+  USING (tenant_id = current_setting('app.tenant_id')::bigint);
+</pre>
+      <p>That is enforced by the database rather than by every query being written correctly — a materially
+         stronger guarantee than filtering in application code, and the reason I would prefer Postgres for
+         anything with real tenancy requirements.</p>
+      <p><strong>3. <code>content_hash</code></strong> so re-ingestion skips unchanged documents. Re-embedding is
+         the dominant cost in most pipelines.</p>
+      <p><strong>4. <code>model</code> per chunk</strong> so a partially-completed migration is detectable, and
+         partial indexes can serve each model during a rollout.</p>
+      <p><strong>5. Source text retained</strong>, which makes the index rebuildable — required for model
+         changes, and it turns a future move to a dedicated store into a re-index rather than a data
+         migration.</p>
+      <p><strong>Operationally</strong> I would add: a read replica for search if it competes with OLTP, an
+         <code>EXPLAIN</code> assertion in CI that the vector index is used, and monitoring on
+         <code>idx_scan</code> and dead-tuple percentage.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> When would you move off pgvector, and how would you plan it?</summary>
+      <p>I would require a measured signal rather than a scale milestone, because the operational cost of a
+         second stateful system is permanent and the benefits are frequently assumed rather than demonstrated.</p>
+      <p><strong>The signals that genuinely justify it:</strong></p>
+      <table class="tbl">
+        <tr><th>Signal</th><th>Why it forces the move</th></tr>
+        <tr><td>Index no longer fits in RAM</td><td>Every query hits disk; no tuning recovers it</td></tr>
+        <tr><td>Rebuild exceeds the maintenance window</td><td>You cannot change embedding models any more</td></tr>
+        <tr><td>Search degrades OLTP p99</td><td>Shared buffer cache and CPU; a real business impact</td></tr>
+        <tr><td>Quantisation is required to fit memory</td><td>FAISS-based stores implement PQ far more thoroughly</td></tr>
+      </table>
+      <p><strong>What does not justify it:</strong> vector count alone. A million 1536-dimension vectors is ~6 GB
+         plus a modest graph — comfortable for a Postgres instance, and the simplicity is worth real money.</p>
+      <p><strong>The migration is cheap if the schema was designed for it.</strong> Because source text and
+         metadata live in Postgres and the index is derived, moving is a re-index:</p>
+<pre>
+SELECT id, content, tenant_id, model FROM chunks WHERE model = $1;
+-- feed into the new store's ingestion; no data migration, no dual-write of truth
+</pre>
+      <p>And that pipeline has to exist anyway for embedding-model changes, so it is not new work.</p>
+      <p><strong>I would run them in parallel before cutting over:</strong> dual-write to both, shadow-evaluate
+         recall on the same eval set, compare latency percentiles under real load, and only then move traffic
+         percentage by percentage with an env-var revert. Shadow evaluation frequently reveals that the new store
+         is better on aggregate recall and worse on some query class — which is information you want before the
+         cutover, not after.</p>
+      <p><strong>The intermediate option worth considering</strong> is keeping Postgres as the system of record
+         and replicating to a dedicated store for search only. That preserves transactional integrity where it
+         matters and gets the specialised index where it helps — at the cost of a sync pipeline and eventual
+         consistency on the search path, which is precisely the complexity pgvector was avoiding. Whether that
+         trade is worth it depends on how much the specialised index actually buys, which is why the shadow
+         evaluation comes first.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Set up a pgvector table and run your first search.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name pgv -e POSTGRES_PASSWORD=pw -p 5432:5432 pgvector/pgvector:pg16
+$ psql postgresql://postgres:pw@localhost/postgres
+</pre>
+<pre>
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE items (
+  id        bigserial PRIMARY KEY,
+  content   text NOT NULL,
+  embedding vector(3) NOT NULL
+);
+
+INSERT INTO items (content, embedding) VALUES
+  ('red apple',    '[1.0, 0.1, 0.0]'),
+  ('green apple',  '[0.9, 0.2, 0.1]'),
+  ('blue car',     '[0.0, 0.1, 1.0]'),
+  ('red car',      '[0.5, 0.0, 0.8]');
+</pre>
+      <p><strong>Compare the three operators on the same query:</strong></p>
+<pre>
+SELECT content,
+       round((embedding &lt;=&gt; '[1,0,0]')::numeric, 4) AS cosine_dist,
+       round((embedding &lt;#&gt; '[1,0,0]')::numeric, 4) AS neg_inner,
+       round((embedding &lt;-&gt; '[1,0,0]')::numeric, 4) AS l2_dist
+FROM items ORDER BY embedding &lt;=&gt; '[1,0,0]';
+
+   content   | cosine_dist | neg_inner | l2_dist
+-------------+-------------+-----------+---------
+ red apple   |      0.0050 |   -1.0000 |  0.1000
+ green apple |      0.0257 |   -0.9000 |  0.2449
+ red car     |      0.4693 |   -0.5000 |  0.9434
+ blue car    |      0.9901 |   -0.0000 |  1.4177
+</pre>
+      <p><strong>Note <code>neg_inner = -1.0</code> for the best match.</strong> That is the sign trap — code
+         filtering <code>WHERE score &gt; 0.7</code> against <code>&lt;#&gt;</code> would return the worst
+         results.</p>
+      <p><strong>Confirm the self-match test:</strong></p>
+<pre>
+SELECT content, embedding &lt;=&gt; (SELECT embedding FROM items WHERE content='blue car') AS d
+FROM items ORDER BY d LIMIT 2;
+
+  content  |     d
+-----------+------------
+ blue car  |          0     ← distance 0 to itself: correct direction
+ red car   | 0.1876...
+</pre>
+      <p>This is the assertion worth putting in a test suite — it pins the sort direction and catches an operator
+         change made months later.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Build an index and prove it is being used.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+-- 100k random normalised 384-dim vectors
+CREATE TABLE vecs (id bigserial PRIMARY KEY, embedding vector(384));
+INSERT INTO vecs (embedding)
+SELECT (SELECT ARRAY(SELECT random()-0.5 FROM generate_series(1,384)))::vector
+FROM generate_series(1, 100000);
+UPDATE vecs SET embedding = embedding / sqrt(embedding &lt;#&gt; embedding * -1);
+ANALYZE vecs;
+</pre>
+      <p><strong>Before the index — a sequential scan:</strong></p>
+<pre>
+EXPLAIN ANALYZE
+SELECT id FROM vecs ORDER BY embedding &lt;#&gt; (SELECT embedding FROM vecs LIMIT 1) LIMIT 10;
+
+ Limit  (actual time=284.1..284.2 rows=10)
+   -&gt;  Sort  (actual time=284.1..284.1 rows=10)
+         -&gt;  Seq Scan on vecs  (actual rows=100000)
+ Execution Time: 286.42 ms
+</pre>
+      <p><strong>Build the index and re-run:</strong></p>
+<pre>
+SET maintenance_work_mem = '2GB';
+SET max_parallel_maintenance_workers = 4;
+CREATE INDEX vecs_emb_idx ON vecs USING hnsw (embedding vector_ip_ops)
+  WITH (m = 16, ef_construction = 64);
+
+SET hnsw.ef_search = 100;
+EXPLAIN ANALYZE
+SELECT id FROM vecs ORDER BY embedding &lt;#&gt; (SELECT embedding FROM vecs LIMIT 1) LIMIT 10;
+
+ Limit  (actual time=1.8..2.1 rows=10)
+   -&gt;  Index Scan using vecs_emb_idx on vecs  (actual time=1.8..2.0 rows=10)
+ Execution Time: 2.31 ms                        ← 124x faster
+</pre>
+      <p><strong>Now demonstrate the operator mismatch:</strong></p>
+<pre>
+EXPLAIN ANALYZE
+SELECT id FROM vecs ORDER BY embedding &lt;-&gt; (SELECT embedding FROM vecs LIMIT 1) LIMIT 10;
+                                   -- L2 operator, but index is vector_ip_ops
+
+ Limit  (actual time=291.4..291.5 rows=10)
+   -&gt;  Sort
+         -&gt;  Seq Scan on vecs  (actual rows=100000)     ← index silently unused
+ Execution Time: 293.18 ms
+</pre>
+      <p><strong>And the missing-LIMIT case:</strong></p>
+<pre>
+EXPLAIN SELECT id FROM vecs ORDER BY embedding &lt;#&gt; '[...]'::vector;
+   -&gt;  Seq Scan on vecs               ← no LIMIT means no index scan
+</pre>
+      <p><strong>Confirm usage in the stats view:</strong></p>
+<pre>
+SELECT indexrelname, idx_scan FROM pg_stat_user_indexes WHERE relname = 'vecs';
+
+  indexrelname  | idx_scan
+----------------+----------
+ vecs_pkey      |        0
+ vecs_emb_idx   |        1     ← only the ONE query that matched the operator
+</pre>
+      <p><code>idx_scan</code> not growing in production is the definitive signal that queries are
+         sequential-scanning.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Watch the planner switch strategies as filter selectivity
+       changes.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+CREATE TABLE chunks (
+  id bigserial PRIMARY KEY,
+  tenant_id int NOT NULL,
+  embedding vector(384) NOT NULL
+);
+-- 500k rows: tenant 1 has 90%, tenants 2..200 share the rest
+INSERT INTO chunks (tenant_id, embedding)
+SELECT CASE WHEN random() &lt; 0.9 THEN 1 ELSE 2 + floor(random()*199)::int END,
+       (SELECT ARRAY(SELECT random()-0.5 FROM generate_series(1,384)))::vector
+FROM generate_series(1, 500000);
+
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops);
+CREATE INDEX ON chunks (tenant_id);
+ANALYZE chunks;
+</pre>
+      <p><strong>Broad filter — the planner uses the vector index:</strong></p>
+<pre>
+EXPLAIN ANALYZE
+SELECT id FROM chunks WHERE tenant_id = 1
+ORDER BY embedding &lt;#&gt; (SELECT embedding FROM chunks LIMIT 1) LIMIT 10;
+
+ Limit  (actual time=2.4..2.6 rows=10)
+   -&gt;  Index Scan using chunks_embedding_idx on chunks  (actual rows=10)
+         Filter: (tenant_id = 1)
+         Rows Removed by Filter: 1
+ Execution Time: 2.81 ms
+</pre>
+      <p>Only one row filtered out, because 90% of the corpus matches — post-filtering is fine here.</p>
+      <p><strong>Narrow filter — the planner switches entirely:</strong></p>
+<pre>
+EXPLAIN ANALYZE
+SELECT id FROM chunks WHERE tenant_id = 147
+ORDER BY embedding &lt;#&gt; (SELECT embedding FROM chunks LIMIT 1) LIMIT 10;
+
+ Limit  (actual time=4.1..4.2 rows=10)
+   -&gt;  Sort  (actual time=4.1..4.1 rows=10)
+         Sort Key: ((embedding &lt;#&gt; $0))
+         -&gt;  Bitmap Heap Scan on chunks  (actual rows=254)
+               Recheck Cond: (tenant_id = 147)
+               -&gt;  Bitmap Index Scan on chunks_tenant_id_idx  (actual rows=254)
+ Execution Time: 4.38 ms
+</pre>
+      <p><strong>The planner chose the btree and an exact scan of 254 rows.</strong> Fast, and recall is exactly
+         1.0 — no approximation at all.</p>
+      <p><strong>Compare with what post-filtering would give:</strong></p>
+<pre>
+-- simulate a dedicated store: take 100 ANN candidates, then filter
+WITH candidates AS (
+  SELECT id, tenant_id FROM chunks
+  ORDER BY embedding &lt;#&gt; (SELECT embedding FROM chunks LIMIT 1) LIMIT 100
+)
+SELECT count(*) AS survivors FROM candidates WHERE tenant_id = 147;
+
+ survivors
+-----------
+         0        ← asked for 10, got none
+</pre>
+      <p><strong>Zero survivors.</strong> That is the post-filtering failure a dedicated store hits here, and the
+         planner avoided it automatically.</p>
+      <p><strong>Force the wrong plan to see the cost:</strong></p>
+<pre>
+SET enable_bitmapscan = off; SET enable_indexscan = off;
+EXPLAIN ANALYZE SELECT id FROM chunks WHERE tenant_id = 147
+ORDER BY embedding &lt;#&gt; '[...]'::vector LIMIT 10;
+   -&gt;  Seq Scan on chunks  (actual rows=500000)
+ Execution Time: 412.18 ms
+RESET enable_bitmapscan; RESET enable_indexscan;
+</pre>
+      <p>100× worse. <strong>Good statistics are what make the planner's choice correct</strong> — run
+         <code>ANALYZE</code> after bulk loads, or plans degrade.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Tune <code>hnsw.ef_search</code> against measured recall.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+-- ground truth: exact search with the index disabled
+CREATE TABLE eval_queries AS SELECT embedding FROM vecs ORDER BY random() LIMIT 100;
+
+CREATE OR REPLACE FUNCTION exact_topk(q vector, k int)
+RETURNS bigint[] AS $$
+  SELECT array_agg(id ORDER BY d) FROM (
+    SELECT id, embedding &lt;#&gt; q AS d FROM vecs ORDER BY d LIMIT k
+  ) s;
+$$ LANGUAGE sql;
+</pre>
+<pre>
+-- measure recall at each ef_search
+DO $$
+DECLARE ef int; q record; truth bigint[]; got bigint[]; hits int; total int;
+BEGIN
+  FOREACH ef IN ARRAY ARRAY[10, 40, 100, 200, 400] LOOP
+    PERFORM set_config('hnsw.ef_search', ef::text, false);
+    hits := 0; total := 0;
+    FOR q IN SELECT embedding FROM eval_queries LOOP
+      SET LOCAL enable_indexscan = off;
+      truth := exact_topk(q.embedding, 10);
+      SET LOCAL enable_indexscan = on;
+      SELECT array_agg(id) INTO got FROM (
+        SELECT id FROM vecs ORDER BY embedding &lt;#&gt; q.embedding LIMIT 10) s;
+      hits := hits + (SELECT count(*) FROM unnest(got) g WHERE g = ANY(truth));
+      total := total + 10;
+    END LOOP;
+    RAISE NOTICE 'ef_search=% recall@10=%', ef, round(hits::numeric/total, 4);
+  END LOOP;
+END $$;
+
+NOTICE:  ef_search=10  recall@10=0.7420
+NOTICE:  ef_search=40  recall@10=0.9310
+NOTICE:  ef_search=100 recall@10=0.9840
+NOTICE:  ef_search=200 recall@10=0.9950
+NOTICE:  ef_search=400 recall@10=0.9990
+</pre>
+      <p><strong>Measure the latency at each setting too:</strong></p>
+<pre>
+\timing on
+SET hnsw.ef_search = 40;  SELECT id FROM vecs ORDER BY embedding &lt;#&gt; '[...]' LIMIT 10;
+Time: 1.204 ms
+SET hnsw.ef_search = 100; SELECT id FROM vecs ORDER BY embedding &lt;#&gt; '[...]' LIMIT 10;
+Time: 2.318 ms
+SET hnsw.ef_search = 400; SELECT id FROM vecs ORDER BY embedding &lt;#&gt; '[...]' LIMIT 10;
+Time: 7.841 ms
+</pre>
+      <table class="tbl">
+        <tr><th>ef_search</th><th>recall@10</th><th>latency</th><th>verdict</th></tr>
+        <tr><td>10</td><td>0.742</td><td>0.6 ms</td><td>Too low — ef must exceed k substantially</td></tr>
+        <tr><td>40</td><td>0.931</td><td>1.2 ms</td><td>Acceptable for tolerant workloads</td></tr>
+        <tr><td><strong>100</strong></td><td><strong>0.984</strong></td><td><strong>2.3 ms</strong></td><td><strong>The knee</strong></td></tr>
+        <tr><td>400</td><td>0.999</td><td>7.8 ms</td><td>3.4× latency for 1.5 points</td></tr>
+      </table>
+      <p><strong>Set it per session or per transaction</strong>, so different query classes can differ:</p>
+<pre>
+-- in the application, before a high-stakes query
+BEGIN;
+  SET LOCAL hnsw.ef_search = 300;
+  SELECT ... ORDER BY embedding &lt;#&gt; $1 LIMIT 10;
+COMMIT;
+</pre>
+      <p>That is the pgvector equivalent of adaptive escalation from
+         <a href="tuning-recall.html">Tuning Recall vs Latency</a>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build a complete multi-tenant RAG schema with row-level
+       security.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+  id           bigserial PRIMARY KEY,
+  tenant_id    bigint NOT NULL,
+  source_uri   text   NOT NULL,
+  content_hash text   NOT NULL,
+  status       text   NOT NULL DEFAULT 'active'
+                 CHECK (status IN ('active','archived','deleted')),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, source_uri)
+);
+
+CREATE TABLE chunks (
+  id          bigserial PRIMARY KEY,
+  document_id bigint NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  tenant_id   bigint NOT NULL,
+  chunk_index int    NOT NULL,
+  content     text   NOT NULL,
+  token_count int    NOT NULL CHECK (token_count &gt; 0),
+  model       text   NOT NULL,
+  embedding   vector(384) NOT NULL,
+  UNIQUE (document_id, chunk_index)
+);
+
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops) WITH (m=16, ef_construction=64);
+CREATE INDEX ON chunks (tenant_id, document_id);
+CREATE INDEX ON documents (tenant_id, status);
+</pre>
+      <p><strong>Row-level security — enforced by the database, not by every query:</strong></p>
+<pre>
+ALTER TABLE chunks    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_chunks ON chunks
+  USING (tenant_id = current_setting('app.tenant_id', true)::bigint);
+CREATE POLICY tenant_docs ON documents
+  USING (tenant_id = current_setting('app.tenant_id', true)::bigint);
+
+CREATE ROLE app_user LOGIN PASSWORD 'pw';
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
+</pre>
+      <p><strong>Prove the isolation holds even for a deliberately unfiltered query:</strong></p>
+<pre>
+SET ROLE app_user;
+SET app.tenant_id = '1';
+SELECT count(*) FROM chunks;                    -- no WHERE clause at all
+ count
+-------
+  4821                                          -- only tenant 1's rows
+
+SET app.tenant_id = '2';
+SELECT count(*) FROM chunks;
+ count
+-------
+   912
+</pre>
+      <p><strong>That is a materially stronger guarantee than application-level filtering</strong>, and it is the
+         single best argument for pgvector in a multi-tenant product — a forgotten <code>WHERE</code> clause
+         cannot leak data.</p>
+      <p><strong>The search query, with a join the vector store could not do:</strong></p>
+<pre>
+SET app.tenant_id = '1';
+SET hnsw.ef_search = 100;
+
+SELECT c.id, c.content, d.source_uri, (c.embedding &lt;#&gt; $1) * -1 AS similarity
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE d.status = 'active'
+  AND c.model = 'text-embedding-3-small'
+ORDER BY c.embedding &lt;#&gt; $1
+LIMIT 10;
+</pre>
+      <p><strong>Idempotent ingestion:</strong></p>
+<pre>
+-- skip unchanged documents entirely
+WITH upsert AS (
+  INSERT INTO documents (tenant_id, source_uri, content_hash)
+  VALUES ($1, $2, $3)
+  ON CONFLICT (tenant_id, source_uri) DO UPDATE
+    SET content_hash = EXCLUDED.content_hash, updated_at = now()
+    WHERE documents.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+  RETURNING id
+)
+SELECT id FROM upsert;      -- empty result = unchanged, skip re-embedding
+</pre>
+      <p><strong>And atomic deletion, the property that motivated the schema:</strong></p>
+<pre>
+BEGIN;
+  DELETE FROM documents WHERE id = 4821;    -- CASCADE removes all its chunks
+COMMIT;
+-- one transaction; no possibility of orphaned vectors
+</pre>
+<pre>
+SELECT count(*) FROM chunks WHERE document_id = 4821;
+ count
+-------
+     0
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Decide with evidence whether to stay on pgvector.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The scenario:</strong> 8M chunks at 1536 dimensions, growing 15% per quarter. Search is ~40 QPS
+         at peak on the same instance as the application's OLTP workload. Someone proposes migrating to a
+         managed vector database.</p>
+      <p><strong>1. Measure the actual footprint:</strong></p>
+<pre>
+SELECT pg_size_pretty(pg_total_relation_size('chunks'))          AS total,
+       pg_size_pretty(pg_relation_size('chunks'))                AS heap,
+       pg_size_pretty(pg_relation_size('chunks_embedding_idx'))  AS hnsw_index,
+       (SELECT setting FROM pg_settings WHERE name='shared_buffers') AS shared_buffers;
+
+  total  |  heap  | hnsw_index | shared_buffers
+---------+--------+------------+----------------
+ 71 GB   | 49 GB  | 21 GB      | 2097152        (16 GB)
+</pre>
+      <p>21 GB of index against 16 GB of shared_buffers on a 64 GB instance — tight but the OS page cache covers
+         it. Worth checking:</p>
+<pre>
+SELECT relname,
+       round(100.0*heap_blks_hit/NULLIF(heap_blks_hit+heap_blks_read,0),2) AS cache_hit_pct
+FROM pg_statio_user_tables WHERE relname='chunks';
+
+ relname | cache_hit_pct
+---------+---------------
+ chunks  |         99.42
+</pre>
+      <p><strong>99.4% cache hit rate — the index is effectively resident.</strong> Not a reason to migrate.</p>
+      <p><strong>2. Measure whether search hurts OLTP:</strong></p>
+<pre>
+SELECT queryid, calls, round(mean_exec_time::numeric,2) AS mean_ms,
+       round((100*total_exec_time/sum(total_exec_time) OVER ())::numeric,1) AS pct_time
+FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 5;
+
+ queryid | calls  | mean_ms | pct_time
+---------+--------+---------+----------
+ vector  | 412048 |    8.42 |     31.2      ← vector search
+ oltp_1  |8204188 |    0.41 |     29.8
+ oltp_2  |4102944 |    0.28 |     10.1
+</pre>
+      <p>Search is 31% of database time. Not dominant, but material — worth watching, and the argument for a read
+         replica rather than a different database.</p>
+      <p><strong>3. Measure the rebuild time — the constraint that actually binds:</strong></p>
+<pre>
+\timing on
+SET maintenance_work_mem='24GB'; SET max_parallel_maintenance_workers=7;
+CREATE INDEX CONCURRENTLY chunks_emb_new ON chunks USING hnsw (embedding vector_ip_ops);
+Time: 9,412,882 ms (2h 36min)
+</pre>
+      <p><strong>2.6 hours, and growing with the corpus.</strong> That is the number that matters: a model change
+         requires re-embedding 8M chunks <em>and</em> a 2.6-hour index build.</p>
+      <p><strong>4. Project forward:</strong></p>
+<pre>
+$ python3 -c "
+n = 8_000_000
+for q in range(1, 9):
+    n *= 1.15
+    idx_gb = n*1536*4*0.08/1e9 + n*8*16/1e9   # rough HNSW graph estimate
+    build_h = 2.6 * (n/8e6) * 1.1              # superlinear
+    print(f'Q+{q}: {n/1e6:5.1f}M rows, index ~{idx_gb:4.1f} GB, rebuild ~{build_h:4.1f}h')
+"
+Q+1:   9.2M rows, index ~ 5.7 GB, rebuild ~ 3.3h
+Q+4:  14.0M rows, index ~ 8.7 GB, rebuild ~ 5.0h
+Q+8:  24.5M rows, index ~15.2 GB, rebuild ~ 8.7h
+</pre>
+      <p><strong>5. The recommendation:</strong></p>
+      <table class="tbl">
+        <tr><th>Finding</th><th>Verdict</th></tr>
+        <tr><td>Index resident, 99.4% cache hit</td><td>Memory is not a problem yet</td></tr>
+        <tr><td>Search is 31% of DB time</td><td><strong>Move search to a read replica</strong> — cheap, solves the contention</td></tr>
+        <tr><td>Rebuild 2.6h now, ~9h in two years</td><td><strong>The real constraint</strong> — partition by date or tenant</td></tr>
+        <tr><td>Managed vector DB</td><td>Not justified — no measured problem it uniquely solves</td></tr>
+      </table>
+      <p><strong>Stay on pgvector, and take two actions:</strong> route search to a read replica so it stops
+         competing with OLTP, and partition <code>chunks</code> by tenant or by month so index builds become
+         per-partition and incremental rather than one monolithic 9-hour operation.</p>
+      <p><strong>Define the trigger for revisiting:</strong> cache hit rate below 95%, rebuild exceeding the
+         maintenance window even when partitioned, or quantisation becoming necessary. And keep
+         <code>content</code> as the system of record so the migration stays a re-index if those fire.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>pgvector makes a vector an ordinary column, so transactions, foreign keys, joins, row-level security, backups and monitoring all apply unchanged.</li>
+        <li><code>ON DELETE CASCADE</code> eliminates orphaned vectors — a whole class of two-system consistency bug that dedicated stores cannot avoid.</li>
+        <li>Three operators — <code>&lt;=&gt;</code> cosine, <code>&lt;#&gt;</code> negative inner product, <code>&lt;-&gt;</code> L2 — all sort ascending, and <code>&lt;#&gt;</code> returns −1 for a perfect match.</li>
+        <li>Each operator needs the matching operator class; a mismatch silently sequential-scans with correct results and 100–500× the latency.</li>
+        <li>Normalise at ingestion and use <code>vector_ip_ops</code> with <code>&lt;#&gt;</code> — cosine semantics at the cheapest operator.</li>
+        <li>Always include <code>LIMIT</code>; HNSW is only used for top-k ordering.</li>
+        <li>HNSW is the default; IVFFlat builds faster but must be created after loading data, since it needs rows to cluster.</li>
+        <li>Set <code>maintenance_work_mem</code> and <code>max_parallel_maintenance_workers</code> before building, or the build spills to disk and takes an order of magnitude longer.</li>
+        <li>Filtered search is pgvector's biggest advantage: the planner uses the vector index for broad filters and switches to a btree plus exact scan for narrow ones — automatically, and exactly correct.</li>
+        <li>Where a dedicated store post-filters 128 candidates through a 0.1% filter and returns nothing, Postgres returns 10 correct results in milliseconds.</li>
+        <li>Row-level security enforces tenant isolation in the database, so a forgotten <code>WHERE</code> clause cannot leak data.</li>
+        <li>Monitor <code>idx_scan</code> in <code>pg_stat_user_indexes</code> — zero means every query is sequential-scanning.</li>
+        <li>Assert on the query plan in CI, because a metric mismatch produces correct results and no test failure.</li>
+        <li>Leave pgvector for measured reasons — index no longer resident, rebuild exceeds the window, search degrades OLTP, or quantisation is required — never for vector count alone.</li>
+        <li>Keep source text in Postgres so the index stays a derived artefact and any future migration is a re-index, not a data migration.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="tuning-recall.html">← Tuning Recall vs Latency</a>
+      <a href="dedicated-stores.html">Dedicated Vector Stores →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
