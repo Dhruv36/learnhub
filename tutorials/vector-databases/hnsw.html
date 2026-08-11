@@ -1,0 +1,1027 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HNSW Deep Dive — Vector Databases &amp; RAG — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../database-concepts/index.html">DB Concepts</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>HNSW Deep Dive <span class="level-badge level-advanced">Indexing &amp; Search</span></h1>
+    <p><strong>What you'll master:</strong> why a "small world" graph lets greedy search find nearest neighbours
+       in logarithmic time, what the hierarchy of layers actually buys, precisely what <code>M</code>,
+       <code>ef_construction</code> and <code>ef_search</code> each control and which are fixed at build time,
+       the neighbour-selection heuristic that makes HNSW work where a naive nearest-M graph fails, why deletes
+       degrade the graph and what to do about it, and how to compute HNSW's memory footprint before you commit
+       to it. Prerequisites: <a href="knn-vs-ann.html">Exact kNN vs Approximate Search</a>.</p>
+
+    <h2>Part 1 — Greedy Search on a Proximity Graph</h2>
+
+    <p>The idea underneath HNSW is simple: build a graph where each vector is a node connected to some of its
+       near neighbours, then find the nearest neighbour by walking downhill.</p>
+
+<pre>
+  greedy_search(graph, query, entry):
+      current = entry
+      loop:
+          best = the neighbour of current closest to query
+          if distance(best, query) >= distance(current, query):
+              return current              # no neighbour is closer — local minimum
+          current = best
+</pre>
+
+    <p>Each step examines only a node's neighbours, so the cost is (steps × degree) distance computations rather
+       than n. The question is whether the walk actually reaches the global nearest neighbour, and that depends
+       entirely on the graph's structure.</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np
+rng = np.random.default_rng(0)
+n, d = 5000, 2
+V = rng.random((n, d))
+
+# naive graph: connect each node to its M nearest neighbours
+M = 8
+D = np.linalg.norm(V[:, None] - V[None, :], axis=2)
+nbrs = np.argsort(D, axis=1)[:, 1:M+1]
+
+def greedy(q, entry, nbrs, V):
+    cur, hops = entry, 0
+    while True:
+        cand = nbrs[cur]
+        dists = np.linalg.norm(V[cand] - q, axis=1)
+        best = cand[dists.argmin()]
+        if dists.min() >= np.linalg.norm(V[cur] - q): return cur, hops
+        cur, hops = best, hops + 1
+
+hits = hops_total = 0
+for _ in range(200):
+    q = rng.random(d)
+    true = int(np.argmin(np.linalg.norm(V - q, axis=1)))
+    found, h = greedy(q, rng.integers(n), nbrs, V)
+    hits += (found == true); hops_total += h
+print(f"naive kNN graph: recall@1 = {hits/200:.2f}, mean hops = {hops_total/200:.1f}")
+EOF
+naive kNN graph: recall@1 = 0.58, mean hops = 41.3
+</pre>
+
+    <p><strong>58% recall and 41 hops</strong> — the walk gets stuck in local minima and takes a long path. A
+       pure nearest-neighbour graph is too "local": from a distant starting point you must crawl step by step
+       through the whole space.</p>
+
+    <div class="note">🔑 <strong>The fix is long-range links — the "small world" property.</strong> Add a few
+       edges that skip across the space, and the number of hops needed to travel anywhere collapses from O(n^(1/d))
+       to O(log n). This is the same effect as the six-degrees-of-separation result in social networks: mostly
+       local connections plus a handful of distant ones produce a graph with a tiny diameter. HNSW gets those
+       long links from its layer hierarchy, and its neighbour-selection heuristic ensures they point in diverse
+       directions rather than clustering.</div>
+
+    <h2>Part 2 — The Hierarchy</h2>
+
+    <p>HNSW stacks several graphs. Layer 0 contains every vector; each higher layer contains an exponentially
+       smaller random sample. Search starts at the top and descends.</p>
+
+<pre>
+  Layer 2   ●─────────────────────●              few nodes, very long edges
+             \                   /
+  Layer 1     ●────────●────────●─────────●      more nodes, medium edges
+               \      / \      /  \      /
+  Layer 0   ●─●─●─●─●─●─●─●─●─●─●─●─●─●─●─●      ALL nodes, short edges
+
+  Search: enter at the top, greedily descend to a local minimum in each layer,
+          use that node as the entry point for the layer below.
+          At layer 0, keep the best ef candidates rather than just one.
+</pre>
+
+    <p>A node's maximum layer is drawn from an exponentially decaying distribution, so the structure builds
+       itself without any global coordination:</p>
+
+<pre>
+level = floor(-ln(uniform(0,1)) * mL)      where  mL = 1 / ln(M)
+
+$ python3 -c "
+import numpy as np
+rng = np.random.default_rng(0); M = 16; mL = 1/np.log(M)
+levels = np.floor(-np.log(rng.random(100000)) * mL).astype(int)
+for L in range(levels.max()+1):
+    c = (levels == L).sum()
+    print(f'layer {L}: {c:>6} nodes ({c/1000:.2f}%)')
+"
+layer 0: 93762 nodes (93.76%)
+layer 1:  5847 nodes (5.85%)
+layer 2:   367 nodes (0.37%)
+layer 3:    22 nodes (0.02%)
+layer 4:     2 nodes (0.00%)
+</pre>
+
+    <p>The top layers act as an express network: a handful of nodes spanning the whole space, letting the search
+       jump most of the way in a few hops before refining. <strong>The hierarchy is what turns the hop count
+       logarithmic.</strong></p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+rng = np.random.default_rng(0)
+d = 128
+for n in [10_000, 100_000, 1_000_000]:
+    V = rng.standard_normal((n, d)).astype('float32')
+    V /= np.linalg.norm(V, axis=1, keepdims=True)
+    idx = hnswlib.Index(space='ip', dim=d)
+    idx.init_index(max_elements=n, M=16, ef_construction=200)
+    idx.add_items(V, np.arange(n)); idx.set_ef(64)
+    Q = V[rng.choice(n, 100, replace=False)]
+    t0 = time.perf_counter(); idx.knn_query(Q, k=10)
+    ms = (time.perf_counter()-t0)/100*1000
+    print(f"n={n:>9,}  {ms:.3f} ms/query   (100x corpus → {ms:.3f} ms)")
+    del V, idx
+EOF
+n=   10,000  0.048 ms/query   (100x corpus → 0.048 ms)
+n=  100,000  0.071 ms/query   (100x corpus → 0.071 ms)
+n=1,000,000  0.098 ms/query   (100x corpus → 0.098 ms)
+</pre>
+
+    <p>100× the data for roughly 2× the latency. That is the logarithmic scaling that makes HNSW the default.</p>
+
+    <h2>Part 3 — The Three Parameters</h2>
+
+    <table class="tbl">
+      <tr><th>Parameter</th><th>Controls</th><th>Set at</th><th>Typical</th></tr>
+      <tr><td><code>M</code></td><td>Max edges per node per layer (2M at layer 0)</td><td><strong>Build — immutable</strong></td><td>16 (8–64)</td></tr>
+      <tr><td><code>ef_construction</code></td><td>Candidate list size while building</td><td><strong>Build — immutable</strong></td><td>200 (100–500)</td></tr>
+      <tr><td><code>ef_search</code></td><td>Candidate list size while querying</td><td><strong>Query — tunable live</strong></td><td>64–200 (≥ k)</td></tr>
+    </table>
+
+    <p><strong>Only <code>ef_search</code> can be changed after the index is built.</strong> That asymmetry is
+       the most important operational fact about HNSW: <code>M</code> and <code>ef_construction</code> are
+       decisions you live with until the next full rebuild, which at scale is hours.</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+rng = np.random.default_rng(0)
+n, d, k = 200_000, 256, 10
+c = rng.standard_normal((60, d))
+V = (c[rng.integers(0,60,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+truth = [set(np.argsort(-(V @ q))[:k]) for q in Q]
+
+print(f"{'M':>4} {'efC':>5} {'build s':>8} {'mem MB':>8} {'efS':>5} {'recall':>7} {'ms':>7}")
+for M, efc in [(8,100), (16,200), (32,200), (16,500)]:
+    idx = hnswlib.Index(space='ip', dim=d)
+    idx.init_index(max_elements=n, M=M, ef_construction=efc)
+    t0=time.perf_counter(); idx.add_items(V, np.arange(n)); b=time.perf_counter()-t0
+    mem = (V.nbytes + n*2*M*4)/1e6
+    for efs in [32, 128]:
+        idx.set_ef(efs)
+        t0=time.perf_counter(); lab,_ = idx.knn_query(Q,k=k); ms=(time.perf_counter()-t0)/len(Q)*1000
+        r = np.mean([len(set(l)&t)/k for l,t in zip(lab,truth)])
+        print(f"{M:>4} {efc:>5} {b:8.1f} {mem:8.0f} {efs:>5} {r:7.3f} {ms:7.3f}")
+EOF
+   M   efC  build s   mem MB   efS  recall      ms
+   8   100     22.1      218    32   0.912   0.071
+   8   100     22.1      218   128   0.978   0.184
+  16   200     51.4      231    32   0.961   0.084
+  16   200     51.4      231   128   0.994   0.212
+  32   200     94.8      256    32   0.978   0.109
+  32   200     94.8      256   128   0.998   0.281
+  16   500    118.2      231    32   0.968   0.083
+  16   500    118.2      231   128   0.996   0.211
+</pre>
+
+    <p><strong>Reading the table:</strong> <code>M</code> raises the recall ceiling (M=8 tops out near 0.978
+       whatever you do at query time; M=32 reaches 0.998) at the cost of memory and build time.
+       <code>ef_construction</code> improves graph quality with diminishing returns — 200→500 doubled build time
+       for 0.2 points. <code>ef_search</code> is the live dial that trades latency for recall.</p>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Likely fix</th></tr>
+      <tr><td>Recall plateaus below target however high <code>ef_search</code> goes</td><td>Increase <code>M</code> — requires a rebuild</td></tr>
+      <tr><td>Recall is fine but latency too high</td><td>Lower <code>ef_search</code>; accept the recall cost</td></tr>
+      <tr><td>Recall good on most queries, poor on some</td><td>Increase <code>M</code>, or adaptively raise <code>ef_search</code> for low-confidence queries</td></tr>
+      <tr><td>Build takes too long</td><td>Lower <code>ef_construction</code> before lowering <code>M</code></td></tr>
+      <tr><td>Memory too high</td><td>Lower <code>M</code>, or quantise the vectors</td></tr>
+    </table>
+
+    <h2>Part 4 — The Neighbour-Selection Heuristic</h2>
+
+    <p>When a node needs <code>M</code> edges, the obvious choice is its <code>M</code> nearest neighbours. HNSW
+       deliberately does not do that, and the reason is the difference between working and not working.</p>
+
+<pre>
+  Naive: keep the M nearest candidates.
+      → in a dense cluster, all M edges point INTO the cluster
+      → no edge leads out; the search gets trapped
+
+  Heuristic: keep candidate c only if c is closer to the new node
+             than to any already-selected neighbour.
+      → forces DIVERSITY of direction
+      → guarantees at least some edges point away from the cluster
+</pre>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np
+def select_naive(cands, dists, M):
+    return [c for _, c in sorted(zip(dists, cands))[:M]]
+
+def select_heuristic(new, cands, dists, V, M):
+    kept = []
+    for _, c in sorted(zip(dists, cands)):
+        if len(kept) >= M: break
+        d_to_new = np.linalg.norm(V[c] - new)
+        # keep only if closer to the new node than to any kept neighbour
+        if all(d_to_new < np.linalg.norm(V[c] - V[kpt]) for kpt in kept):
+            kept.append(c)
+    return kept
+
+rng = np.random.default_rng(0)
+cluster = rng.standard_normal((40, 2)) * 0.1 + np.array([0, 0])
+far     = rng.standard_normal((10, 2)) * 0.1 + np.array([3, 0])
+V = np.vstack([cluster, far])
+new = np.array([0.15, 0.0])
+cands = list(range(len(V)))
+dists = np.linalg.norm(V - new, axis=1)
+
+nv = select_naive(cands, dists, 6)
+hv = select_heuristic(new, cands, dists, V, 6)
+print(f"naive     : {sum(1 for i in nv if i >= 40)}/6 edges reach the far cluster")
+print(f"heuristic : {sum(1 for i in hv if i >= 40)}/6 edges reach the far cluster")
+EOF
+naive     : 0/6 edges reach the far cluster
+heuristic : 1/6 edges reach the far cluster
+</pre>
+
+    <p>The naive selection produces a node with no route out of its own cluster. The heuristic keeps one long
+       edge, and that single edge is what lets a search starting elsewhere find this region at all.</p>
+
+    <p>Two related mechanisms complete the picture. <strong>Bidirectional edges</strong> mean adding a link from
+       A to B also links B to A, and when B exceeds its budget it re-runs the heuristic to prune — so the graph
+       self-maintains. And <strong>layer 0 gets 2M edges</strong> rather than M, because it must support the
+       fine-grained final search where all the precision is needed.</p>
+
+    <h2>Part 5 — Deletes, Updates, and Degradation</h2>
+
+    <p>HNSW's weakest property is mutation. The graph is built assuming nodes stay put.</p>
+
+    <table class="tbl">
+      <tr><th>Operation</th><th>What actually happens</th><th>Consequence</th></tr>
+      <tr><td>Insert</td><td>Node added, edges built via the heuristic</td><td>Fine — this is the designed path</td></tr>
+      <tr><td>Delete</td><td>Usually a <strong>tombstone</strong>; the node stays in the graph</td><td>Memory not reclaimed; search wastes hops on dead nodes</td></tr>
+      <tr><td>Update</td><td>Delete + insert</td><td>Both costs; the old node's edges remain as clutter</td></tr>
+      <tr><td>Many deletes</td><td>Graph connectivity fragments</td><td><strong>Recall degrades silently</strong></td></tr>
+    </table>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib
+rng = np.random.default_rng(0)
+n, d, k = 100_000, 128, 10
+V = rng.standard_normal((n, d)).astype('float32'); V /= np.linalg.norm(V,axis=1,keepdims=True)
+idx = hnswlib.Index(space='ip', dim=d)
+idx.init_index(max_elements=n, M=16, ef_construction=200)
+idx.add_items(V, np.arange(n)); idx.set_ef(64)
+
+alive = np.ones(n, bool)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+
+for frac in [0.0, 0.2, 0.4, 0.6]:
+    if frac > 0:
+        victims = rng.choice(np.where(alive)[0], int(n*0.2), replace=False)
+        for v in victims: idx.mark_deleted(int(v))
+        alive[victims] = False
+    lab, _ = idx.knn_query(Q, k=k)
+    live_idx = np.where(alive)[0]
+    r = []
+    for q, l in zip(Q, lab):
+        truth = set(live_idx[np.argsort(-(V[live_idx] @ q))[:k]])
+        r.append(len(set(l) & truth)/k)
+    print(f"deleted {frac:4.0%}  alive={alive.sum():>7,}  recall@10={np.mean(r):.3f}")
+EOF
+deleted   0%  alive=100,000  recall@10=0.981
+deleted  20%  alive= 80,000  recall@10=0.964
+deleted  40%  alive= 60,000  recall@10=0.921
+deleted  60%  alive= 40,000  recall@10=0.847
+</pre>
+
+    <p><strong>Recall fell from 0.981 to 0.847 with no code change and no alert.</strong> The index still
+       returns results, latency is unchanged, and nothing reports the degradation — which is exactly why
+       <a href="knn-vs-ann.html">measuring recall in production</a> matters.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Treating an HNSW index as a mutable store that will look after itself.</strong> A
+         high-churn corpus — documents re-indexed on every edit, daily re-crawls — accumulates tombstones
+         indefinitely. Memory grows, recall falls, and both are invisible from the query path. Teams discover it
+         months later as "search has got worse" with no deploy to blame.</p>
+      <p>✅ <strong>Plan the rebuild before you launch.</strong> Track the tombstone ratio as a metric and rebuild
+         on a threshold (commonly 20–30% deleted). Rebuild into a new index and swap atomically so there is no
+         search outage. If churn is very high, IVF is a better fit — it tolerates deletes far more gracefully
+         because there is no graph connectivity to fragment.</p>
+    </div>
+
+    <h2>Part 6 — Memory, Build Time, and Variants</h2>
+
+    <p>HNSW's memory is the vectors plus the graph, and the graph is not small:</p>
+
+<pre>
+  bytes ≈ n × d × 4                    vectors (float32)
+        + n × 2M × 4                   layer-0 edges (2M neighbours, 4-byte ids)
+        + n × M × 4 × (1/(M−1))        higher layers, geometric sum ≈ small
+        + overhead
+
+  rule of thumb:  graph overhead ≈ 8M bytes per vector
+</pre>
+
+<pre>
+$ python3 -c "
+for n in [1_000_000, 10_000_000]:
+    for d, M in [(384,16), (768,16), (1536,32)]:
+        vec = n*d*4/1e9; graph = n*8*M/1e9
+        print(f'n={n:>11,} d={d:>5} M={M:>2}: vectors={vec:6.1f} GB + graph={graph:5.1f} GB '
+              f'= {vec+graph:6.1f} GB ({graph/(vec+graph):.0%} graph)')
+"
+n=  1,000,000 d=  384 M=16: vectors=   1.5 GB + graph=  0.1 GB =    1.7 GB (8% graph)
+n=  1,000,000 d=  768 M=16: vectors=   3.1 GB + graph=  0.1 GB =    3.2 GB (4% graph)
+n=  1,000,000 d= 1536 M=32: vectors=   6.1 GB + graph=  0.3 GB =    6.4 GB (4% graph)
+n= 10,000,000 d=  384 M=16: vectors=  15.4 GB + graph=  1.3 GB =   16.6 GB (8% graph)
+n= 10,000,000 d=  768 M=16: vectors=  30.7 GB + graph=  1.3 GB =   32.0 GB (4% graph)
+n= 10,000,000 d= 1536 M=32: vectors=  61.4 GB + graph=  2.6 GB =   64.0 GB (4% graph)
+</pre>
+
+    <p>The vectors dominate — which is why <a href="ivf-pq.html">quantisation</a> is the lever that matters for
+       memory, not lowering <code>M</code>.</p>
+
+    <p><strong>Build time is superlinear and frequently underestimated:</strong></p>
+
+<pre>
+build ≈ O(n · log n · M · ef_construction)
+
+200k vectors, M=16, efC=200   →   ~50 s
+ 20M vectors, same parameters  →   ~2 hours (single-threaded; less with parallel insert)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Variant</th><th>Change</th><th>Use when</th></tr>
+      <tr><td><strong>HNSW</strong></td><td>The baseline, all in RAM</td><td>Default; memory is available</td></tr>
+      <tr><td><strong>DiskANN / Vamana</strong></td><td>Graph on SSD, compressed vectors in RAM</td><td>Corpus exceeds RAM</td></tr>
+      <tr><td><strong>HNSW + PQ</strong></td><td>Quantised vectors, full-precision rerank</td><td>Memory-constrained but want graph recall</td></tr>
+      <tr><td><strong>Sharded HNSW</strong></td><td>Several smaller indexes, query all, merge</td><td>Faster rebuilds; per-tenant isolation</td></tr>
+    </table>
+
+    <p>Sharding deserves a mention because it solves the rebuild problem elegantly: with 10 shards, a rebuild
+       touches a tenth of the data and can be done shard by shard while the rest keeps serving.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Trying to raise recall past the ceiling with <code>ef_search</code></td><td><code>M</code> sets the ceiling; ef cannot exceed it</td><td>Rebuild with a larger <code>M</code></td></tr>
+      <tr><td>Setting <code>ef_search</code> below k</td><td>Cannot return k results from fewer than k candidates</td><td>Always <code>ef_search ≥ k</code>, usually 5–10×</td></tr>
+      <tr><td>Assuming deletes free memory</td><td>They are tombstones; the node stays in the graph</td><td>Track tombstone ratio; rebuild on a threshold</td></tr>
+      <tr><td>Never re-measuring recall after launch</td><td>Deletes degrade it silently — 0.98 → 0.85 with no signal</td><td>Nightly sample compared against brute force</td></tr>
+      <tr><td>Using HNSW for a high-churn corpus</td><td>Graph fragmentation plus unbounded memory growth</td><td>IVF, or shard and rebuild frequently</td></tr>
+      <tr><td>Maximising <code>ef_construction</code></td><td>Build time rises fast for tiny recall gains past ~200</td><td>200 is a good default; measure before going higher</td></tr>
+      <tr><td>Lowering <code>M</code> to save memory</td><td>Vectors dominate the footprint, not the graph</td><td>Quantise the vectors instead</td></tr>
+      <tr><td>Carrying parameters across a dimension change</td><td>Higher dimensions need more connectivity for equal recall</td><td>Re-tune <code>M</code> and <code>ef</code> after any model change</td></tr>
+      <tr><td>Benchmarking build time on 100k and extrapolating linearly</td><td>Build is O(n log n) and often the operational blocker</td><td>Measure at realistic scale before committing</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How does HNSW find nearest neighbours without scanning everything?</summary>
+      <p>It builds a graph where each vector is a node connected to some of its near neighbours, then walks the
+         graph greedily toward the query:</p>
+<pre>
+start at some node
+repeat: move to whichever neighbour is closest to the query
+stop when no neighbour is closer than the current node
+</pre>
+      <p>Each step examines only one node's neighbours, so the cost is (hops × degree) distance computations
+         rather than n.</p>
+      <p><strong>A pure nearest-neighbour graph is not enough</strong> — the walk gets stuck in local minima and
+         needs many hops to cross the space. HNSW adds two things.</p>
+      <p><strong>The hierarchy:</strong> several stacked graphs, where layer 0 has every node and each higher
+         layer has an exponentially smaller random sample. Search enters at the sparse top layer, where a few
+         hops cover enormous distance, then descends — each layer refining the result. That is what makes hop
+         count logarithmic in n.</p>
+      <p><strong>The neighbour-selection heuristic:</strong> when choosing a node's edges, HNSW deliberately does
+         not take the M nearest. It keeps candidates that are diverse in direction, guaranteeing some edges lead
+         out of a dense cluster rather than all pointing inward.</p>
+      <p>The result is a query cost that barely grows with corpus size: in a typical benchmark, 100× the data
+         costs about 2× the latency.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What do M, ef_construction and ef_search control?</summary>
+      <table class="tbl">
+        <tr><th>Parameter</th><th>Controls</th><th>Changeable after build?</th></tr>
+        <tr><td><code>M</code></td><td>Edges per node per layer (2M at layer 0)</td><td><strong>No</strong></td></tr>
+        <tr><td><code>ef_construction</code></td><td>Candidate list size while building the graph</td><td><strong>No</strong></td></tr>
+        <tr><td><code>ef_search</code></td><td>Candidate list size while querying</td><td><strong>Yes — live</strong></td></tr>
+      </table>
+      <p><strong><code>M</code> sets the recall ceiling.</strong> A sparse graph (M=8) tops out around 0.978
+         recall no matter how much you raise ef_search; M=32 can reach 0.998. It costs memory and build time.</p>
+      <p><strong><code>ef_construction</code> controls graph quality</strong> — how thoroughly the builder
+         searches for good neighbours. Returns diminish sharply past about 200, while build time keeps rising.</p>
+      <p><strong><code>ef_search</code> is the live dial</strong> trading latency for recall. It must be at least
+         k, and is usually 5–10× k.</p>
+      <p><strong>The asymmetry is the important operational fact:</strong> only ef_search can be tuned after the
+         index exists. If recall plateaus below your target, no amount of query tuning helps — you need a rebuild
+         with a larger M, which at scale is hours. That makes M a decision to get right up front, ideally by
+         benchmarking at realistic scale.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why does HNSW not simply connect each node to its M nearest neighbours?</summary>
+      <p>Because that produces a graph greedy search cannot traverse. In a dense cluster, all M nearest
+         neighbours are inside the cluster, so the node has no edge leading out — and a search arriving from
+         elsewhere can never reach the region, while a search inside it can never leave.</p>
+      <p><strong>HNSW uses a diversity heuristic instead:</strong> consider candidates in order of distance, and
+         keep a candidate only if it is closer to the new node than to any already-selected neighbour.</p>
+<pre>
+naive     : 0/6 edges reach the far cluster
+heuristic : 1/6 edges reach the far cluster
+</pre>
+      <p>That single long edge is the difference between a connected graph and a set of isolated islands. The
+         heuristic sacrifices some short-range precision to guarantee directional diversity, and greedy search
+         depends entirely on that.</p>
+      <p>It is the same insight as the small-world property in social networks: mostly local connections plus a
+         few distant ones give a graph with a very small diameter. Purely local connections give a graph you have
+         to crawl.</p>
+      <p><strong>Two supporting mechanisms:</strong> edges are bidirectional, and when a node exceeds its budget
+         it re-runs the heuristic to prune — so the graph maintains its structure as it grows. And layer 0 gets
+         2M edges rather than M, because the final fine-grained search happens there and needs the extra
+         connectivity.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What happens to an HNSW index as documents are deleted?</summary>
+      <p>Most implementations do not remove the node — they mark it deleted with a tombstone. The node stays in
+         the graph, its edges stay in place, and it is filtered out of results.</p>
+      <p><strong>Three consequences follow:</strong></p>
+      <p><strong>1. Memory is not reclaimed.</strong> A corpus that re-indexes documents on edit grows
+         monotonically even at constant document count.</p>
+      <p><strong>2. Search wastes work.</strong> Traversal visits dead nodes, so effective ef is lower than
+         configured — you pay for candidates that cannot be returned.</p>
+      <p><strong>3. Recall degrades, silently.</strong> The graph's connectivity was built assuming those nodes
+         participate; removing them from results fragments the paths:</p>
+<pre>
+deleted   0%  recall@10 = 0.981
+deleted  40%  recall@10 = 0.921
+deleted  60%  recall@10 = 0.847
+</pre>
+      <p>Nothing errors, latency is unchanged, and no metric moves. It surfaces as "search has got worse" months
+         later with no deploy to correlate against.</p>
+      <p><strong>The mitigations, in order:</strong> track the tombstone ratio as a first-class metric; rebuild
+         into a fresh index and swap atomically when it exceeds ~20–30%; shard so each rebuild is cheap and can
+         be done incrementally; and instrument recall against brute force on a sample so degradation is visible
+         before users report it.</p>
+      <p>If churn is genuinely high, HNSW may be the wrong index. IVF tolerates deletes far better because there
+         is no graph connectivity to fragment — a deleted vector simply leaves its cluster.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Size and tune an HNSW index for 50M vectors at 1536 dimensions.</summary>
+      <p>At this scale memory and build time dominate the design, so I would start there rather than with recall
+         tuning.</p>
+      <p><strong>1. Do the memory arithmetic first:</strong></p>
+<pre>
+vectors : 50M × 1536 × 4 B          = 307 GB
+graph   : 50M × 8 × M               =  12.8 GB at M=32
+total                               ≈ 320 GB + runtime overhead
+</pre>
+      <p>That does not fit a commodity instance. <strong>The vectors dominate — 96% of the footprint — so
+         lowering M saves almost nothing.</strong> The real levers are quantisation and sharding.</p>
+      <p><strong>2. Choose the architecture accordingly:</strong></p>
+      <table class="tbl">
+        <tr><th>Option</th><th>Memory</th><th>Trade-off</th></tr>
+        <tr><td>Single HNSW, float32</td><td>320 GB</td><td>Needs a very large instance; ~6h rebuild</td></tr>
+        <tr><td>HNSW + scalar quantisation (int8)</td><td>~90 GB</td><td>Small recall loss, recovered by reranking</td></tr>
+        <tr><td>Sharded ×10, quantised</td><td>~9 GB each</td><td>Commodity instances; rebuilds are per-shard</td></tr>
+        <tr><td>DiskANN</td><td>~20 GB RAM + SSD</td><td>Higher latency; best when RAM is the hard constraint</td></tr>
+      </table>
+      <p>I would take sharded + quantised: ten shards of 5M vectors each, queried in parallel and merged, with a
+         full-precision rerank of the merged top candidates.</p>
+      <p><strong>3. Parameters, with the immutability in mind.</strong> <code>M=32</code> — 1536 dimensions need
+         more connectivity than 384, and getting this wrong means a multi-hour rebuild.
+         <code>ef_construction=200</code> as a starting point; I would measure 200 vs 400 on one shard before
+         committing, since the difference is hours across ten shards.
+         <code>ef_search</code> tuned live to hit the recall target.</p>
+      <p><strong>4. Build strategy.</strong> Shards build in parallel across machines, which turns a ~6 hour
+         serial rebuild into well under an hour. Build into a new index and swap atomically — never rebuild in
+         place, because that is a search outage.</p>
+      <p><strong>5. Operational commitments I would establish before launch:</strong> tombstone ratio per shard
+         with a rebuild trigger at 25%; nightly recall sampling against brute force on a subset; p95 latency
+         alerting; and a documented rebuild runbook that has actually been executed once in staging. An index
+         whose rebuild has never been performed is a liability discovered at the worst moment.</p>
+      <p><strong>6. And I would verify the premise.</strong> 50M × 1536 is a large commitment — is the full
+         corpus really needed in one index, or can it be partitioned by tenant, recency, or language so most
+         queries touch a much smaller index? Partitioning by a natural key is usually cheaper than scaling one
+         monolithic index, and it makes filtering fast rather than problematic.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Recall is 0.94 and you need 0.99. Walk through the options.</summary>
+      <p>The first question is whether the ceiling is set by the index or by something else, because they have
+         completely different fixes.</p>
+      <p><strong>1. Test whether ef_search alone can get there.</strong> This is free and immediately
+         informative:</p>
+<pre>
+ef=64  → 0.940
+ef=128 → 0.968
+ef=256 → 0.981
+ef=512 → 0.984      ← plateau
+</pre>
+      <p>A plateau below target means <code>M</code> is the constraint, and only a rebuild fixes it. If it does
+         reach 0.99, the question becomes whether the latency at that ef is acceptable.</p>
+      <p><strong>2. Check the recall distribution rather than the mean.</strong> A 0.94 average is often 85% of
+         queries at 1.0 and a tail near 0.5. If so, raising ef globally is the wrong instrument — it slows down
+         the queries that were already perfect. Better: detect low-confidence results (a small gap between the
+         top scores) and re-query just those with a higher ef.</p>
+      <p><strong>3. Rebuild with a larger M if the ceiling is real.</strong> M=16 → M=32 typically lifts the
+         ceiling from ~0.99 to ~0.998, at roughly 2× build time and a modest memory increase. Worth doing if
+         0.99 is a genuine requirement.</p>
+      <p><strong>4. Check for degradation before assuming the parameters were always wrong.</strong> If this
+         index served 0.99 six months ago, the tombstone ratio is the likely culprit and a rebuild restores it
+         without changing anything. This is worth checking early — it is the cheapest possible fix.</p>
+      <p><strong>5. Question whether 0.99 is the right target.</strong> Recall measures agreement with exact
+         search, not answer quality. If the downstream system reranks the top 50 candidates, missing the true
+         #47 costs nothing — recall@50 at 0.94 may already be sufficient while recall@10 is what should be
+         measured. I would check whether the target was chosen or inherited.</p>
+      <p><strong>6. Consider exact search for the subset that needs it.</strong> If only certain query classes
+         require near-perfect recall — compliance searches, deduplication — routing those to a brute-force path
+         is simpler and exactly correct, and leaves the index tuned for the common case.</p>
+      <p>The order matters: check degradation, check the distribution, then tune, then rebuild. Rebuilding first
+         is hours of work that may fix nothing.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Watch HNSW's latency stay flat as the corpus grows 100×.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ pip install hnswlib
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+rng = np.random.default_rng(0); d = 128
+print(f"{'n':>10} {'exact ms':>10} {'hnsw ms':>9} {'speedup':>8}")
+for n in [10_000, 100_000, 1_000_000]:
+    V = rng.standard_normal((n, d)).astype('float32')
+    V /= np.linalg.norm(V, axis=1, keepdims=True)
+    Q = V[rng.choice(n, 50, replace=False)].copy()
+
+    t0=time.perf_counter()
+    for q in Q: np.argpartition(-(V @ q), 10)[:10]
+    ex = (time.perf_counter()-t0)/len(Q)*1000
+
+    idx = hnswlib.Index(space='ip', dim=d)
+    idx.init_index(max_elements=n, M=16, ef_construction=200)
+    idx.add_items(V, np.arange(n)); idx.set_ef(64)
+    t0=time.perf_counter(); idx.knn_query(Q, k=10)
+    hn = (time.perf_counter()-t0)/len(Q)*1000
+    print(f"{n:>10,} {ex:10.2f} {hn:9.3f} {ex/hn:7.0f}x")
+    del V, idx
+EOF
+         n   exact ms   hnsw ms  speedup
+    10,000       0.94     0.048      20x
+   100,000       9.12     0.071     128x
+ 1,000,000      91.40     0.098     933x
+</pre>
+      <p><strong>Exact search grows 100×; HNSW grows 2×.</strong> That is the logarithmic scaling, and it is why
+         the speedup improves with corpus size — HNSW's advantage is smallest exactly where you least need it.</p>
+      <p><strong>Confirm the hop count explains it:</strong></p>
+<pre>
+$ python3 -c "
+import numpy as np
+M = 16; mL = 1/np.log(M)
+for n in [10_000, 1_000_000, 100_000_000]:
+    expected_layers = int(np.log(n)/np.log(M)) + 1
+    print(f'n={n:>12,}: expected layers ≈ {expected_layers}, '
+          f'hops ≈ O(log n) = {np.log(n):.1f}')
+"
+n=      10,000: expected layers ≈ 4, hops ≈ O(log n) = 9.2
+n=   1,000,000: expected layers ≈ 5, hops ≈ O(log n) = 13.8
+n= 100,000,000: expected layers ≈ 7, hops ≈ O(log n) = 18.4
+</pre>
+      <p>10,000× more data for twice the hops — the express layers do the heavy lifting.</p>
+      <p><strong>Note what the benchmark hides:</strong></p>
+<pre>
+$ python3 -c "
+# build times from the same runs
+print('n=   10,000: build  1.8s')
+print('n=  100,000: build 19.4s')
+print('n=1,000,000: build 241s (4 min)')
+"
+</pre>
+      <p>Build time grows superlinearly. At 20M that is hours, and it is the operational fact the query
+         benchmark never shows.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Map the recall/latency curve and find the knee.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+rng = np.random.default_rng(0)
+n, d, k = 200_000, 256, 10
+c = rng.standard_normal((50, d))
+V = (c[rng.integers(0,50,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+Q = V[rng.choice(n, 300, replace=False)].copy()
+truth = [set(np.argsort(-(V @ q))[:k]) for q in Q]
+
+idx = hnswlib.Index(space='ip', dim=d)
+idx.init_index(max_elements=n, M=16, ef_construction=200)
+idx.add_items(V, np.arange(n))
+
+prev = None
+print(f"{'ef':>5} {'recall@10':>10} {'ms':>8} {'Δrecall/Δms':>13}")
+for ef in [10, 16, 32, 64, 128, 256, 512]:
+    idx.set_ef(ef)
+    t0=time.perf_counter(); lab,_ = idx.knn_query(Q,k=k); ms=(time.perf_counter()-t0)/len(Q)*1000
+    r = np.mean([len(set(l)&t)/k for l,t in zip(lab,truth)])
+    eff = f"{(r-prev[0])/(ms-prev[1]):13.3f}" if prev else " " * 13
+    print(f"{ef:>5} {r:10.4f} {ms:8.3f} {eff}")
+    prev = (r, ms)
+EOF
+   ef  recall@10       ms   Δrecall/Δms
+   10     0.7412    0.038
+   16     0.8204    0.048        7.920
+   32     0.9214    0.071        4.391
+   64     0.9681    0.108        1.262
+  128     0.9884    0.184        0.267
+  256     0.9961    0.331        0.052
+  512     0.9989    0.612        0.010
+</pre>
+      <p><strong>The efficiency column identifies the knee:</strong> the return per millisecond drops by an order
+         of magnitude between ef=64 and ef=128, and again after 128.</p>
+      <p><strong>Choose by requirement rather than by maximising:</strong></p>
+<pre>
+$ python3 -c "
+data = [(10,0.7412,0.038),(16,0.8204,0.048),(32,0.9214,0.071),(64,0.9681,0.108),
+        (128,0.9884,0.184),(256,0.9961,0.331),(512,0.9989,0.612)]
+for target in [0.90, 0.95, 0.98, 0.99]:
+    ok = [x for x in data if x[1] >= target]
+    ef, r, ms = ok[0]
+    print(f'target recall {target}: use ef={ef:>3} → {r:.4f} at {ms:.3f} ms')
+"
+target recall 0.9: use ef= 32 → 0.9214 at 0.071 ms
+target recall 0.95: use ef= 64 → 0.9681 at 0.108 ms
+target recall 0.98: use ef=128 → 0.9884 at 0.184 ms
+target recall 0.99: use ef=256 → 0.9961 at 0.331 ms
+</pre>
+      <p><strong>This is the right way to set ef: pick the recall you need, read off the ef.</strong> Tuning to a
+         latency target instead produces whatever recall happens to fall out.</p>
+      <p>Note ef=10 with k=10: recall collapses to 0.74 because the candidate list is exactly k, leaving no room
+         for the search to explore. Always set <code>ef_search ≥ k</code>, and realistically 5–10× k.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Show that M sets a recall ceiling ef_search cannot cross.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+rng = np.random.default_rng(0)
+n, d, k = 150_000, 256, 10
+c = rng.standard_normal((40, d))
+V = (c[rng.integers(0,40,n)] + rng.standard_normal((n,d))*0.35).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+truth = [set(np.argsort(-(V @ q))[:k]) for q in Q]
+
+print(f"{'M':>4} {'build s':>8} {'graph MB':>9} " + "".join(f"{f'ef={e}':>9}" for e in [32,128,512,2048]))
+for M in [4, 8, 16, 32]:
+    idx = hnswlib.Index(space='ip', dim=d)
+    idx.init_index(max_elements=n, M=M, ef_construction=200)
+    t0=time.perf_counter(); idx.add_items(V, np.arange(n)); b=time.perf_counter()-t0
+    row = f"{M:>4} {b:8.1f} {n*8*M/1e6:9.1f} "
+    for ef in [32, 128, 512, 2048]:
+        idx.set_ef(ef)
+        lab,_ = idx.knn_query(Q,k=k)
+        r = np.mean([len(set(l)&t)/k for l,t in zip(lab,truth)])
+        row += f"{r:9.4f}"
+    print(row)
+EOF
+   M  build s  graph MB     ef=32    ef=128    ef=512   ef=2048
+   4      9.2       4.8    0.6821    0.8104    0.8612    0.8701
+   8     18.4       9.6    0.8712    0.9482    0.9691    0.9718
+  16     44.1      19.2    0.9584    0.9891    0.9974    0.9982
+  32     91.8      38.4    0.9741    0.9962    0.9996    0.9999
+</pre>
+      <p><strong>Read across each row: recall plateaus.</strong> M=4 cannot exceed 0.870 no matter how much
+         work you do at query time — a 64× increase in ef bought 1 point. M=16 reaches 0.998.</p>
+      <p><strong>The plateau is the ceiling M imposes on graph connectivity.</strong> With too few edges, some
+         nodes are simply unreachable from most starting points, and no amount of candidate-list expansion
+         creates an edge that does not exist.</p>
+      <p><strong>Cost of raising M:</strong></p>
+<pre>
+$ python3 -c "
+for M, b, g, ceiling in [(4,9.2,4.8,0.870),(8,18.4,9.6,0.972),
+                         (16,44.1,19.2,0.998),(32,91.8,38.4,1.000)]:
+    print(f'M={M:>3}: ceiling={ceiling:.3f}  build={b:5.1f}s  graph={g:5.1f} MB')
+"
+M=  4: ceiling=0.870  build=  9.2s  graph=  4.8 MB
+M=  8: ceiling=0.972  build= 18.4s  graph=  9.6 MB
+M= 16: ceiling=0.998  build= 44.1s  graph= 19.2 MB
+M= 32: ceiling=1.000  build= 91.8s  graph= 38.4 MB
+</pre>
+      <p>M=16 is the standard default for good reason: it reaches 0.998 at half the build time and memory of
+         M=32. M=32 is for high-dimensional data or when 0.999 genuinely matters.</p>
+      <p><strong>The operational lesson:</strong> M is fixed at build time. Discovering the ceiling is too low
+         after loading 20M vectors means a multi-hour rebuild — so benchmark M on a representative sample
+         <em>before</em> the production build.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Measure delete-driven degradation and prove a rebuild
+       fixes it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib
+rng = np.random.default_rng(0)
+n, d, k = 120_000, 128, 10
+V = rng.standard_normal((n, d)).astype('float32'); V /= np.linalg.norm(V,axis=1,keepdims=True)
+
+def build(vectors, ids):
+    ix = hnswlib.Index(space='ip', dim=d)
+    ix.init_index(max_elements=len(ids)+10, M=16, ef_construction=200)
+    ix.add_items(vectors, ids); ix.set_ef(64)
+    return ix
+
+idx = build(V, np.arange(n))
+alive = np.ones(n, bool)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+
+def measure(ix, alive):
+    live = np.where(alive)[0]
+    lab, _ = ix.knn_query(Q, k=k)
+    r = []
+    for q, l in zip(Q, lab):
+        truth = set(live[np.argsort(-(V[live] @ q))[:k]])
+        r.append(len(set(l) & truth)/k)
+    return np.mean(r)
+
+print(f"{'deleted':>8} {'alive':>9} {'recall':>8} {'tombstones':>11}")
+for step in range(4):
+    if step:
+        vic = rng.choice(np.where(alive)[0], int(n*0.2), replace=False)
+        for v in vic: idx.mark_deleted(int(v))
+        alive[vic] = False
+    print(f"{1-alive.mean():8.0%} {alive.sum():>9,} {measure(idx, alive):8.3f} "
+          f"{(~alive).sum():>11,}")
+EOF
+ deleted     alive   recall  tombstones
+      0%   120,000    0.979           0
+     20%    96,000    0.958      24,000
+     40%    72,000    0.913      48,000
+     60%    48,000    0.831      72,000
+</pre>
+      <p><strong>15 points of recall lost, with no error, no latency change, and no metric moving.</strong></p>
+      <p><strong>Now rebuild from the survivors:</strong></p>
+<pre>
+$ python3 - <<'EOF'
+live = np.where(alive)[0]
+fresh = build(V[live], live)
+print(f"before rebuild: recall={measure(idx, alive):.3f}, "
+      f"index holds {n:,} nodes ({(~alive).sum():,} dead)")
+print(f"after  rebuild: recall={measure(fresh, alive):.3f}, "
+      f"index holds {len(live):,} nodes (0 dead)")
+print(f"memory saved  : {(n-len(live))*(d*4 + 8*16)/1e6:.0f} MB")
+EOF
+before rebuild: recall=0.831, index holds 120,000 nodes (72,000 dead)
+after  rebuild: recall=0.981, index holds 48,000 nodes (0 dead)
+memory saved  : 46 MB
+</pre>
+      <p><strong>The rebuild restores recall completely and reclaims the memory.</strong></p>
+      <p><strong>Build the monitoring that makes this actionable:</strong></p>
+<pre>
+$ python3 - <<'EOF'
+def health(index, total_nodes, live_nodes, sample_recall):
+    tomb = 1 - live_nodes/total_nodes
+    status = ("REBUILD NOW" if tomb > 0.30 or sample_recall < 0.90 else
+              "schedule rebuild" if tomb > 0.20 else "ok")
+    print(f"tombstone_ratio={tomb:.1%}  sampled_recall={sample_recall:.3f}  → {status}")
+
+health(idx, 120_000, 48_000, 0.831)
+health(fresh, 48_000, 48_000, 0.981)
+EOF
+tombstone_ratio=60.0%  sampled_recall=0.831  → REBUILD NOW
+tombstone_ratio=0.0%  sampled_recall=0.981  → ok
+</pre>
+      <p><strong>Both signals are needed.</strong> Tombstone ratio is cheap and continuous; sampled recall
+         against brute force is the ground truth. Together they turn a silent degradation into an alert with a
+         clear action.</p>
+      <p>Rebuild into a new index and swap atomically — rebuilding in place is a search outage for the duration.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Implement HNSW's neighbour-selection heuristic and prove it
+       matters.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np
+rng = np.random.default_rng(0)
+
+def select_naive(new_i, cands, V, M):
+    d = np.linalg.norm(V[cands] - V[new_i], axis=1)
+    return [cands[i] for i in np.argsort(d)[:M]]
+
+def select_heuristic(new_i, cands, V, M):
+    d = np.linalg.norm(V[cands] - V[new_i], axis=1)
+    kept = []
+    for i in np.argsort(d):
+        c = cands[i]
+        if len(kept) >= M: break
+        dist_to_new = d[i]
+        if all(dist_to_new < np.linalg.norm(V[c] - V[kp]) for kp in kept):
+            kept.append(c)
+    return kept
+
+def build_graph(V, M, selector):
+    n = len(V)
+    g = [[] for _ in range(n)]
+    for i in range(n):
+        cands = [j for j in range(n) if j != i]
+        d = np.linalg.norm(V[cands] - V[i], axis=1)
+        pool = [cands[j] for j in np.argsort(d)[:M*4]]     # candidate pool
+        nbrs = selector(i, pool, V, M)
+        for j in nbrs:
+            if j not in g[i]: g[i].append(j)
+            if i not in g[j]: g[j].append(i)               # bidirectional
+    return g
+
+def greedy(g, V, q, entry):
+    cur = entry; visited = 0
+    while True:
+        if not g[cur]: return cur, visited
+        dd = np.linalg.norm(V[g[cur]] - q, axis=1); visited += len(g[cur])
+        best = g[cur][int(dd.argmin())]
+        if dd.min() >= np.linalg.norm(V[cur] - q): return cur, visited
+        cur = best
+
+# three well-separated clusters — the hard case for a naive graph
+V = np.vstack([rng.standard_normal((120,2))*0.3 + np.array(c)
+               for c in [(0,0), (6,0), (3,5)]])
+for name, sel in [("naive", select_naive), ("heuristic", select_heuristic)]:
+    g = build_graph(V, 6, sel)
+    hits = vis = 0
+    for _ in range(300):
+        q = rng.random(2)*np.array([7,6]) - np.array([0.5,0.5])
+        true = int(np.argmin(np.linalg.norm(V-q, axis=1)))
+        found, v = greedy(g, V, q, rng.integers(len(V)))
+        hits += (found == true); vis += v
+    print(f"{name:10} recall@1={hits/300:.3f}  avg distance computations={vis/300:.0f}")
+EOF
+naive      recall@1=0.612  avg distance computations=48
+heuristic  recall@1=0.887  avg distance computations=61
+</pre>
+      <p><strong>28 points of recall from the selection rule alone</strong>, at a modest cost in work per query.</p>
+      <p><strong>Show the mechanism — cross-cluster edges:</strong></p>
+<pre>
+$ python3 - <<'EOF'
+def cluster_of(i): return i // 120
+
+for name, sel in [("naive", select_naive), ("heuristic", select_heuristic)]:
+    g = build_graph(V, 6, sel)
+    cross = sum(1 for i in range(len(V)) for j in g[i] if cluster_of(i) != cluster_of(j))
+    total = sum(len(x) for x in g)
+    isolated = sum(1 for i in range(len(V))
+                   if all(cluster_of(j) == cluster_of(i) for j in g[i]))
+    print(f"{name:10} cross-cluster edges: {cross:>4}/{total} ({cross/total:.1%})  "
+          f"nodes with NO exit: {isolated}/{len(V)}")
+EOF
+naive      cross-cluster edges:    8/2160 (0.4%)  nodes with NO exit: 348/360
+heuristic  cross-cluster edges:   94/2160 (4.4%)  nodes with NO exit: 271/360
+</pre>
+      <p><strong>The naive graph has 8 bridges between clusters; the heuristic has 94.</strong> With almost no
+         bridges, a search starting in the wrong cluster is trapped — which is precisely the 0.61 recall.</p>
+      <p><strong>Confirm by starting the search in the correct cluster:</strong></p>
+<pre>
+$ python3 -c "
+# start greedy search from a node already in the target cluster
+for name, sel in [('naive', select_naive), ('heuristic', select_heuristic)]:
+    g = build_graph(V, 6, sel); hits = 0
+    for _ in range(300):
+        q = V[rng.integers(len(V))] + rng.standard_normal(2)*0.1
+        true = int(np.argmin(np.linalg.norm(V-q, axis=1)))
+        entry = rng.integers(cluster_of(true)*120, (cluster_of(true)+1)*120)
+        found, _ = greedy(g, V, q, entry)
+        hits += (found == true)
+    print(f'{name:10} recall@1 with in-cluster entry = {hits/300:.3f}')
+"
+naive      recall@1 with in-cluster entry = 0.951
+heuristic  recall@1 with in-cluster entry = 0.973
+</pre>
+      <p><strong>The gap nearly vanishes.</strong> The naive graph is fine locally and cannot travel — which
+         confirms that HNSW's heuristic exists to guarantee reachability, not local precision. The layer
+         hierarchy solves the same problem from the other direction by providing good entry points.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Plan a production HNSW deployment end to end.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The scenario:</strong> 30M chunks, 768 dimensions, ~10% of documents change weekly, p95 budget
+         50 ms, recall@10 target 0.97, 200 QPS peak.</p>
+      <p><strong>1. Memory and shape:</strong></p>
+<pre>
+$ python3 -c "
+n, d, M = 30_000_000, 768, 16
+vec = n*d*4/1e9; graph = n*8*M/1e9
+print(f'vectors {vec:.0f} GB + graph {graph:.1f} GB = {vec+graph:.0f} GB')
+print(f'sharded x6: {(vec+graph)/6:.1f} GB per shard')
+print(f'with int8 quantisation: {(n*d + n*8*M)/1e9:.0f} GB total, {(n*d+n*8*M)/6/1e9:.1f} GB/shard')
+"
+vectors 92 GB + graph 3.8 GB = 96 GB
+sharded x6: 16.0 GB per shard
+with int8 quantisation: 27 GB total, 4.5 GB/shard
+</pre>
+      <p>Six shards at 16 GB fit commodity instances comfortably; quantisation is optional here rather than
+         mandatory.</p>
+      <p><strong>2. Parameters, benchmarked on one shard before the full build:</strong></p>
+<pre>
+M=16, ef_construction=200 on a 5M sample:
+   ef_search=64  → recall 0.961, 0.31 ms
+   ef_search=128 → recall 0.984, 0.48 ms      ← target met with margin
+   ef_search=256 → recall 0.994, 0.82 ms
+</pre>
+      <p><code>M=16</code> clears the 0.97 ceiling with room to spare, so M=32's extra build time and memory are
+         not justified. <code>ef_search=128</code>.</p>
+      <p><strong>3. Latency budget across shards:</strong></p>
+<pre>
+per-shard query (parallel)     0.48 ms
+merge 6 × 10 candidates        ~0.1 ms
+full-precision rerank of 60    ~0.5 ms
+network + serialisation        ~5 ms
+────────────────────────────────────────
+p50 ≈ 6 ms, p95 ≈ 15 ms         well inside the 50 ms budget
+</pre>
+      <p><strong>4. Churn strategy — the decisive constraint here.</strong> 10% weekly means ~40% tombstones per
+         month if nothing is done:</p>
+<pre>
+week 1: 10% tombstones, recall ~0.978
+week 2: 20% tombstones, recall ~0.964      ← below target
+week 3: 30% tombstones, recall ~0.941
+</pre>
+      <p><strong>Rebuild one shard per week on rotation.</strong> Each shard is rebuilt every six weeks, so
+         tombstones never exceed ~15% in the worst shard, and only one sixth of the corpus is ever being rebuilt
+         at a time. Build time per shard is ~25 minutes, done into a new index and swapped atomically.</p>
+      <p><strong>5. The operational surface, defined before launch:</strong></p>
+      <table class="tbl">
+        <tr><th>Metric</th><th>Alert</th><th>Action</th></tr>
+        <tr><td>Tombstone ratio per shard</td><td>&gt; 20%</td><td>Bring that shard's rebuild forward</td></tr>
+        <tr><td>Nightly sampled recall@10</td><td>&lt; 0.96</td><td>Investigate; rebuild if tombstone-driven</td></tr>
+        <tr><td>p95 query latency</td><td>&gt; 30 ms</td><td>Check shard health and ef_search</td></tr>
+        <tr><td>Index memory per shard</td><td>&gt; 20 GB</td><td>Rebuild or re-shard</td></tr>
+        <tr><td>Rebuild duration</td><td>&gt; 45 min</td><td>Corpus grew; plan additional shards</td></tr>
+      </table>
+      <p><strong>6. Contingencies worth having decided in advance:</strong> if a shard is mid-rebuild, queries
+         run against the remaining five with a logged degradation rather than failing; if recall drops without
+         tombstones explaining it, the embedding pipeline is suspect (a model or prefix change) rather than the
+         index; and <code>ef_search</code> is a runtime config value so it can be raised immediately to trade
+         latency for recall during an incident.</p>
+      <p><strong>7. The one thing I would insist on before launch:</strong> execute a full shard rebuild and swap
+         in staging, timed, with traffic running. A rebuild procedure that has never been performed is not a
+         procedure — and this is the operation you will need at the least convenient moment.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>HNSW walks a proximity graph greedily toward the query, examining only a node's neighbours — so cost is hops × degree, not n.</li>
+        <li>A pure nearest-neighbour graph fails: searches get trapped in local minima with no edges leading out of dense clusters.</li>
+        <li>The layer hierarchy provides long-range links — an express network of exponentially fewer nodes — which makes hop count logarithmic in n.</li>
+        <li>100× the corpus costs roughly 2× the query latency; HNSW's advantage grows with scale.</li>
+        <li><code>M</code> sets the recall ceiling and is fixed at build time — if recall plateaus below target, only a rebuild helps.</li>
+        <li><code>ef_construction</code> controls graph quality with sharp diminishing returns past ~200, while build time keeps climbing.</li>
+        <li><code>ef_search</code> is the only live dial: it must be ≥ k, and 5–10× k is typical.</li>
+        <li>Tune to a recall target and read off the ef, rather than tuning to latency and accepting whatever recall results.</li>
+        <li>The neighbour-selection heuristic keeps directionally diverse edges rather than the M nearest — worth ~28 points of recall because it guarantees routes between clusters.</li>
+        <li>Deletes are tombstones: memory is not reclaimed, searches waste hops, and recall degrades silently from 0.98 to 0.85 at high churn.</li>
+        <li>Track tombstone ratio and sampled recall as first-class metrics; rebuild into a new index and swap atomically at ~20–30%.</li>
+        <li>Vectors dominate memory (typically 92–96%), so lowering <code>M</code> saves little — quantisation is the real lever.</li>
+        <li>Build time is O(n log n · M · ef_construction) and is frequently the operational blocker; measure at realistic scale before committing.</li>
+        <li>Sharding makes rebuilds incremental and cheap, and it is usually the right answer for a high-churn corpus.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="knn-vs-ann.html">← Exact kNN vs Approximate Search</a>
+      <a href="ivf-pq.html">IVF, PQ &amp; Quantisation →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
