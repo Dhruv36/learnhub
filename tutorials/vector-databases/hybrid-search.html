@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Metadata Filtering &amp; Hybrid Search — Vector Databases &amp; RAG — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Metadata Filtering &amp; Hybrid Search <span class="level-badge level-adv">The Landscape</span></h1>
+    <p><strong>What you'll master:</strong> the three filtering strategies — pre-, post- and during-traversal —
+       and the arithmetic that says which one a given selectivity demands; why a filtered HNSW search can silently
+       return three results instead of ten and how filterable graphs avoid it; why dense embeddings fail on exact
+       identifiers, rare terms and negation, and why BM25 still beats them there; how to combine two rankings
+       whose scores are not comparable, using Reciprocal Rank Fusion and when a weighted score is defensible
+       instead; and how to build and tune a hybrid retriever that measurably beats either half. Prerequisites:
+       <a href="hnsw.html">HNSW Deep Dive</a>, <a href="dedicated-stores.html">Dedicated Vector Stores</a>.</p>
+
+    <h2>Part 1 — Why Filtering Breaks ANN Search</h2>
+
+    <p>Filtering looks like the most ordinary feature in a database. In a vector index it is the hardest one,
+       because the index was built to answer exactly one question — "what is near this point?" — and a filter
+       asks a different one.</p>
+
+    <p>The problem is structural. <a href="hnsw.html">HNSW</a> finds neighbours by walking a graph whose edges
+       were chosen at build time, when nobody knew what filter you would apply. Restrict the result set to
+       <code>tenant = 57</code> and the graph's edges still point wherever they pointed — mostly at vectors that
+       are no longer eligible.</p>
+
+<pre>
+    graph neighbourhood of the query          eligible under tenant=57
+    ────────────────────────────────          ────────────────────────
+         ○ ○ ○ ○ ○ ○ ○ ○ ○ ○                        ●
+         ○ ○ ○ ● ○ ○ ○ ○ ○ ○                              ●
+         ○ ○ ○ ○ ○ ○ ● ○ ○ ○            ●
+         ○ ○ ● ○ ○ ○ ○ ○ ○ ○                    ●
+         ○ = filtered out (99.95%)     ● = eligible (0.05%)
+
+    the traversal walks through ○ nodes to reach ● nodes — or gives up first
+</pre>
+
+    <p>There are only three ways to resolve this, and the whole subject is knowing which one applies:</p>
+
+    <table class="tbl">
+      <tr><th>Strategy</th><th>How it works</th><th>Correct when</th><th>Fails when</th></tr>
+      <tr><td><strong>Post-filter</strong></td><td>ANN search for k′ &gt; k, then drop non-matching</td><td>Filter is broad (&gt;10% pass)</td><td>Selective filters — returns too few or none</td></tr>
+      <tr><td><strong>Pre-filter</strong></td><td>Resolve the filter first, then exact-scan the subset</td><td>Filter is narrow (&lt;1% pass)</td><td>Broad filters — the subset is the whole corpus</td></tr>
+      <tr><td><strong>Filter during traversal</strong></td><td>Skip ineligible nodes while walking the graph</td><td>Everywhere in between</td><td>Very narrow filters — the graph becomes disconnected</td></tr>
+    </table>
+
+    <p><strong>Post-filtering's cost is exactly 1/selectivity</strong>, and that number decides everything. To
+       return k results after filtering, you must fetch roughly k/s candidates where s is the fraction that
+       passes:</p>
+
+<pre>
+want k = 10 results
+
+selectivity 50%   →  fetch ~20    candidates    fine
+selectivity 10%   →  fetch ~100   candidates    fine
+selectivity  1%   →  fetch ~1,000 candidates    getting slow
+selectivity 0.1%  →  fetch ~10,000 candidates   slower than scanning the 0.1% exactly
+selectivity 0.05% →  fetch ~20,000 candidates   ← and HNSW recall degrades badly at that k
+</pre>
+
+    <p><strong>The design consequence:</strong> there is a crossover point where scanning the filtered subset
+       exactly is both faster <em>and</em> more accurate than approximating over the whole corpus. With 10M
+       vectors and a 0.05% filter, the eligible subset is 5,000 vectors — a brute-force scan of 5,000 vectors
+       takes about 2 ms and has recall 1.0. No approximation can beat exact-and-fast.</p>
+
+    <div class="note">🔑 <strong>This is precisely the choice <a href="pgvector.html">Postgres's planner</a> makes
+       automatically</strong> — vector index for broad filters, btree plus exact scan for narrow ones — and it is
+       why pgvector often beats dedicated stores on filtered workloads despite a less specialised index. In a
+       dedicated store the same decision exists, but you usually have to make it yourself, per query, in
+       application code.</div>
+
+    <h2>Part 2 — Filtered Traversal, and How It Fails</h2>
+
+    <p>The middle strategy is what stores like Qdrant mean by "filterable HNSW": the filter is evaluated
+       <em>during</em> the graph walk, so ineligible nodes are traversed but never enter the result heap.</p>
+
+<pre>
+def search_filtered(query, entry_point, ef, is_eligible):
+    candidates, visited, results = [entry_point], {entry_point}, []
+    while candidates:
+        node = pop_closest(candidates, query)
+        if worse_than_worst(node, results, ef):
+            break
+        for nb in node.neighbours:                  # walk the FULL graph
+            if nb in visited:
+                continue
+            visited.add(nb)
+            candidates.push(nb)
+            if is_eligible(nb):                     # but only collect eligible ones
+                results.push(nb)
+    return top_k(results)
+</pre>
+
+    <p>This gets the recall right where post-filtering does not, because the search keeps going until it has
+       found <code>ef</code> <em>eligible</em> candidates rather than stopping after <code>ef</code> candidates of
+       any kind. The cost is that it may traverse far more nodes to get there.</p>
+
+    <p><strong>The failure mode is graph disconnection.</strong> Below some selectivity, the eligible nodes are
+       so sparse that they are not reachable from one another through eligible-or-not edges within the search
+       budget — the walk exhausts its candidate list among ineligible nodes and returns early:</p>
+
+<pre>
+10M vectors, HNSW m=16, ef=128, filter selectivity varied:
+
+  selectivity   nodes visited   results returned   recall@10   latency
+  ───────────   ─────────────   ────────────────   ─────────   ───────
+      50%             310              10            0.98       2.4 ms
+      10%             820              10            0.97       3.1 ms
+       1%           4,100              10            0.94       8.7 ms
+     0.1%          28,400              10            0.81      41 ms
+    0.05%          61,200               6            0.58      93 ms   ← degrading badly
+    0.01%         140,000               2            0.19     210 ms   ← unusable
+</pre>
+
+    <p><strong>Read the "results returned" column, not just recall.</strong> At 0.05% the store returned six
+       results for a top-10 request, with no error and no warning. A RAG pipeline consuming that silently loses
+       40% of its context, and the answer quality drops for reasons that never appear in the retrieval
+       metrics.</p>
+
+    <p><strong>So real systems switch strategies by selectivity</strong>, and the switch is the thing you have to
+       build if the store does not:</p>
+
+<pre>
+def search(query_vec, filters, k=10):
+    est = estimate_selectivity(filters)          # from field cardinality stats
+
+    if est &lt; 0.01:                               # narrow: exact scan of the subset
+        ids = metadata_index.lookup(filters)     # e.g. an inverted index on payload
+        return exact_topk(query_vec, ids, k)     # recall 1.0, and fast because small
+
+    if est &gt; 0.20:                               # broad: ANN then filter
+        return post_filter(ann_search(query_vec, k * 3), filters, k)
+
+    return filtered_traversal(query_vec, filters, k)   # the middle
+</pre>
+
+    <p><strong>Estimating selectivity is the part people skip</strong>, and it is not hard: keep approximate
+       cardinality per filter field, multiply for conjunctions (accepting the independence assumption), and
+       correct with observed values over time. A rough estimate is enough, because the strategies overlap
+       comfortably — the boundaries are wide, not knife-edged.</p>
+
+    <p>One more option is worth knowing because it is often the best of all: <strong>partition by the filter</strong>.
+       If nearly every query filters on <code>tenant_id</code>, build a separate index per tenant. The filter
+       stops being a filter and becomes routing — no selectivity problem, no traversal penalty, and each index is
+       small enough to search exhaustively. It costs you cross-tenant queries and works badly with a long tail of
+       tiny tenants, but where it fits, it is strictly better than any filtering strategy.</p>
+
+    <h2>Part 3 — Where Dense Retrieval Actually Fails</h2>
+
+    <p>Embeddings capture meaning, which is exactly why they lose the parts of a query that are not meaning. This
+       is not a quality problem to be fixed with a better model — it is inherent to compressing text into a few
+       hundred floats.</p>
+
+    <table class="tbl">
+      <tr><th>Query</th><th>What dense retrieval does</th><th>Why</th></tr>
+      <tr><td><code>ERR_CONN_4021</code></td><td>Returns generic connection-error docs</td><td>A rare token contributes almost nothing to the embedding</td></tr>
+      <tr><td><code>invoice #A-99183</code></td><td>Returns other invoices</td><td>Identifiers have no semantics to encode</td></tr>
+      <tr><td><code>Kubernetes 1.29 changelog</code></td><td>Mixes in 1.27, 1.28, 1.30</td><td>Version numbers are near-identical in vector space</td></tr>
+      <tr><td><code>Contract without an arbitration clause</code></td><td>Returns contracts <em>with</em> arbitration clauses</td><td>Negation is not represented; the topic dominates</td></tr>
+      <tr><td><code>Torvalds' 2003 email about BitKeeper</code></td><td>Returns general BitKeeper history</td><td>Conjunctions of rare specifics dilute in a single vector</td></tr>
+    </table>
+
+    <p><strong>BM25 gets every one of these right</strong>, because it does the opposite thing: it scores on
+       exact term overlap, weighted so that rare terms count for more.</p>
+
+<pre>
+                    n - df(t) + 0.5              f(t,d) · (k₁ + 1)
+BM25(q,d) =  Σ  ln ────────────────── · ─────────────────────────────────────
+            t∈q        df(t) + 0.5       f(t,d) + k₁ · (1 - b + b · |d|/avgdl)
+                    └──────────────┘     └───────────────────────────────────┘
+                     IDF: rare terms          saturating term frequency,
+                     dominate the score        normalised by length
+</pre>
+
+    <p>Two properties matter for retrieval, and both are the mirror image of what dense retrieval gives you:</p>
+
+    <table class="tbl">
+      <tr><th>Property</th><th>Effect</th><th>Why it complements embeddings</th></tr>
+      <tr><td>IDF weighting</td><td><code>ERR_CONN_4021</code> appears in 3 of 2M docs → enormous weight</td><td>Exactly the token an embedding discards</td></tr>
+      <tr><td>Frequency saturation (k₁)</td><td>The 20th occurrence adds almost nothing over the 5th</td><td>Prevents keyword stuffing from winning</td></tr>
+      <tr><td>Length normalisation (b)</td><td>A long document does not win by having more words</td><td>Comparable to cosine's scale-invariance</td></tr>
+      <tr><td>Zero score for no overlap</td><td>Documents sharing no query terms score 0</td><td>Dense retrieval <em>always</em> returns something, however irrelevant</td></tr>
+    </table>
+
+    <p>That last row is the honest statement of the trade. BM25 returns nothing for a paraphrase that shares no
+       vocabulary; dense retrieval returns ten results for a query about something the corpus does not contain.
+       The failures are complementary, which is the entire argument for combining them.</p>
+
+<pre>
+query: "how do I stop the pod from restarting"
+
+BM25 top-3                                    dense top-3
+─────────────                                 ─────────────
+1. "stop a pod"          (term overlap)       1. "CrashLoopBackOff explained"   ← the answer
+2. "restart policy"      (term overlap)       2. "debugging container exits"
+3. "pod lifecycle"       (term overlap)       3. "restart policy"
+
+query: "CrashLoopBackOff"
+
+BM25 top-3                                    dense top-3
+─────────────                                 ─────────────
+1. "CrashLoopBackOff explained"  ← exact      1. "pod lifecycle"
+2. "kubelet backoff timing"                   2. "container restart behaviour"
+3. "pod restart backoff"                      3. "debugging container exits"
+</pre>
+
+    <h2>Part 4 — Fusing Two Rankings</h2>
+
+    <p>Having two result lists is easy. Combining them is where hybrid search is usually got wrong, because the
+       two scores are not comparable in any principled way.</p>
+
+<pre>
+cosine similarity:  bounded [-1, 1], typically clustered in 0.6–0.9 for a real corpus
+BM25:               unbounded [0, ∞), depends on corpus size, term rarity, document length
+
+  0.7 * cosine + 0.3 * bm25     ← adding a bounded number to an unbounded one
+</pre>
+
+    <p><strong>Score normalisation does not rescue this</strong>, though it is the usual first attempt.
+       Min-max normalising per query makes the top result 1.0 and the bottom 0.0 <em>in every query</em> —
+       including queries where the best BM25 hit was terrible. It manufactures confidence that was not
+       there:</p>
+
+<pre>
+query A (good lexical match):   raw BM25 = [31.2, 28.4, 12.1]  → normalised [1.0, 0.89, 0.0]
+query B (no lexical match):     raw BM25 = [ 2.1,  1.9,  1.8]  → normalised [1.0, 0.60, 0.0]
+                                                                            ↑
+                        a 2.1 and a 31.2 both become "1.0" — the signal is destroyed
+</pre>
+
+    <p><strong>Reciprocal Rank Fusion sidesteps the problem entirely by discarding the scores</strong> and using
+       only the ranks, which are comparable by construction:</p>
+
+<pre>
+                        1
+RRF(d) =  Σ    ──────────────────         k ≈ 60 by convention
+        r∈rankers   k + rank_r(d)
+
+rank 1  → 1/61 = 0.01639
+rank 2  → 1/62 = 0.01613     ← differences between adjacent ranks are small
+rank 10 → 1/70 = 0.01429
+rank 50 → 1/110 = 0.00909    ← and shrink further down the list
+</pre>
+
+    <p><strong>The constant k is a damping term</strong>, and its role is worth understanding rather than
+       copying: it flattens the difference between rank 1 and rank 2, so a document ranked #2 by both rankers
+       beats one ranked #1 by a single ranker. Agreement across rankers outweighs a strong showing in one.</p>
+
+<pre>
+doc   dense rank   bm25 rank   RRF score                       result
+────  ──────────   ─────────   ─────────────────────────       ──────
+A         1           47       1/61 + 1/107 = 0.0258            3rd
+B         3            2       1/63 + 1/62  = 0.0320            1st   ← agreed by both
+C         2           12       1/62 + 1/72  = 0.0300            2nd
+</pre>
+
+    <p>Doc A was the dense ranker's top hit and finishes third, because only one ranker liked it. That is RRF
+       working as intended — and also its main weakness, since a document that only one ranker <em>could</em>
+       find (an exact ID match, say) is penalised for the other's ignorance.</p>
+
+<pre>
+def rrf(rankings, k=60, weights=None):
+    """rankings: list of lists of doc ids, best first."""
+    weights = weights or [1.0] * len(rankings)
+    scores = {}
+    for ranking, w in zip(rankings, weights):
+        for rank, doc_id in enumerate(ranking, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + w / (k + rank)
+    return sorted(scores, key=scores.get, reverse=True)
+
+fused = rrf([dense_results, bm25_results], k=60, weights=[1.0, 0.7])
+</pre>
+
+    <table class="tbl">
+      <tr><th>Fusion method</th><th>Use when</th><th>Weakness</th></tr>
+      <tr><td><strong>RRF</strong></td><td>Default — no tuning, no score comparability needed</td><td>Discards confidence; penalises single-ranker finds</td></tr>
+      <tr><td>Weighted normalised scores</td><td>You have labelled data to fit the weights</td><td>Normalisation distorts; weights are corpus-specific</td></tr>
+      <tr><td>Learned fusion / reranker</td><td>Relevance is the product and you have judgements</td><td>Cost, latency, and a model to maintain — see <a href="retrieval-reranking.html">reranking</a></td></tr>
+      <tr><td>Convex combination on raw scores</td><td>Essentially never</td><td>The scores are on incomparable scales</td></tr>
+    </table>
+
+    <p><strong>Tune k against your own data</strong> rather than accepting 60. Lower k sharpens the advantage of
+       top ranks (closer to "trust the best ranker"); higher k flattens it (closer to "reward agreement"). The
+       useful range is roughly 10–100, and the difference between k=20 and k=60 on a real corpus is typically
+       worth a point or two of nDCG — small, but free.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Blending raw or min-max-normalised scores with a hand-picked weight.</strong>
+         <code>0.7·cosine + 0.3·bm25</code> adds numbers on incomparable scales, and per-query min-max
+         normalisation makes every query's best result look equally confident — so a query with no lexical match
+         at all contributes a spurious 1.0. The weights are then tuned by eye on a handful of queries and
+         quietly overfit to them.</p>
+      <p>✅ <strong>Fuse on ranks with RRF, and only move to weighted scores if labelled data justifies it.</strong>
+         Ranks are comparable by construction, RRF needs no per-corpus calibration, and it degrades gracefully
+         when one ranker returns nothing useful. If you do want weights, fit them against judged relevance on a
+         held-out query set and re-fit when the corpus changes.</p>
+    </div>
+
+    <h2>Part 5 — Building the Hybrid Retriever</h2>
+
+    <p>The complete shape, with filtering and fusion in their proper places:</p>
+
+<pre>
+                     query text
+                          │
+              ┌───────────┴───────────┐
+              ▼                       ▼
+      embed → dense search      analyse → BM25 search
+      (filter applied)          (filter applied)
+              │                       │
+         top-50 ids               top-50 ids
+              └───────────┬───────────┘
+                          ▼
+                    RRF fusion (k=60)
+                          │
+                      top-20
+                          │
+                          ▼
+               [optional] cross-encoder rerank
+                          │
+                       top-5 → LLM context
+</pre>
+
+<pre>
+def hybrid_search(query, filters=None, k=10, candidates=50):
+    dense = vector_store.search(embed(query), filter=filters, limit=candidates)
+    lexical = text_index.search(query, filter=filters, limit=candidates)
+
+    fused = rrf([[d.id for d in dense], [l.id for l in lexical]], k=60)
+    return fused[:k]
+</pre>
+
+    <p><strong>Both branches must apply the same filter.</strong> Filtering only the dense side is a real and
+       common bug: the lexical branch then contributes ineligible documents that survive fusion, and in a
+       multi-tenant system that is a data leak, not a relevance problem.</p>
+
+    <p><strong>Retrieve more candidates than you need — the standard mistake is fetching k from each branch.</strong>
+       If both return only 10 and they agree on 7, fusion has 13 documents to choose a top-10 from, and the
+       benefit of hybrid retrieval mostly evaporates. Fetch 5–10× k per branch; the extra ANN work is cheap
+       relative to the LLM call downstream.</p>
+
+<pre>
+candidates per branch    recall@10 after fusion    added latency
+─────────────────────    ──────────────────────    ─────────────
+        10                       0.79                 +0 ms
+        25                       0.88                 +1 ms
+        50                       0.93                 +3 ms       ← the knee
+       100                       0.945                +7 ms
+       200                       0.948                +18 ms
+</pre>
+
+    <p><strong>Run the two branches concurrently.</strong> They are independent, so hybrid search should cost
+       roughly max(dense, lexical) rather than their sum — and the embedding call usually dominates both:</p>
+
+<pre>
+import asyncio
+
+async def hybrid_search(query, filters=None, k=10, candidates=50):
+    vec = await embed_async(query)                      # ~15 ms, the real cost
+    dense, lexical = await asyncio.gather(
+        vector_store.search_async(vec, filter=filters, limit=candidates),   # ~4 ms
+        text_index.search_async(query, filter=filters, limit=candidates),   # ~6 ms
+    )
+    return rrf([[d.id for d in dense], [l.id for l in lexical]], k=60)[:k]
+</pre>
+
+    <p><strong>Sparse vectors are the third option</strong>, and they blur the distinction usefully. Models like
+       SPLADE produce a high-dimensional sparse vector whose non-zero dimensions are vocabulary terms —
+       including terms not present in the text, learned by the model as expansions. That gives exact-term
+       matching <em>plus</em> a degree of semantic expansion, in one index, and stores that support sparse
+       vectors can fuse them natively. The cost is another model in the ingestion path and larger indexes; the
+       benefit is that it fixes BM25's vocabulary-mismatch failure without giving up its precision on rare
+       terms.</p>
+
+    <h2>Part 6 — Measuring Whether It Helped</h2>
+
+    <p>Hybrid search is usually adopted on the strength of an argument rather than a measurement, which is how
+       teams end up maintaining two indexes for a result they never verified.</p>
+
+    <p><strong>The measurement needs three arms and query-class segmentation</strong>, because the aggregate
+       number reliably hides the effect:</p>
+
+<pre>
+                        overall   paraphrase   exact-ID   rare-term   negation
+                        ───────   ──────────   ────────   ─────────   ────────
+dense only               0.72        0.89        0.21       0.34        0.31
+BM25 only                0.61        0.38        0.98       0.91        0.44
+hybrid (RRF)             0.84        0.86        0.94       0.88        0.41
+</pre>
+
+    <p>Three things in that table are worth stating explicitly. Hybrid is best overall, but it is
+       <em>slightly worse than dense alone on paraphrase queries</em> — fusion costs a little where one ranker
+       was already right. It recovers nearly all of BM25's exact-ID performance, which is the main reason to
+       adopt it. And <strong>nothing fixes negation</strong>: 0.41 is barely better than either half, because
+       neither retriever represents "without". That is a query-understanding problem, not a retrieval one.</p>
+
+    <table class="tbl">
+      <tr><th>Metric</th><th>What it answers</th><th>When it is the right one</th></tr>
+      <tr><td>recall@k</td><td>Did the relevant chunk make it into the context?</td><td><strong>The primary RAG metric</strong> — the LLM cannot use what it never saw</td></tr>
+      <tr><td>nDCG@k</td><td>Are the good results near the top?</td><td>When position matters — long contexts bury later chunks</td></tr>
+      <tr><td>MRR</td><td>How high is the first relevant result?</td><td>Single-answer lookups</td></tr>
+      <tr><td>End-to-end answer quality</td><td>Did retrieval changes help the user?</td><td>The only one that ultimately matters</td></tr>
+    </table>
+
+    <p><strong>Recall@k is the metric to optimise for RAG</strong>, and it is worth being precise about why:
+       ranking within the retrieved set matters far less than the LLM seeing the right chunk at all. Moving the
+       answer from position 5 to position 2 changes little; moving it from position 12 to position 8 with k=10
+       changes everything. That asymmetry is why <a href="retrieval-reranking.html">reranking</a> is applied
+       after a generous retrieval rather than instead of one — and why the next lesson pairs a wide net with a
+       precise second pass.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Post-filtering a selective filter</td><td>Cost is 1/selectivity; at 0.1% you fetch 10,000 candidates for 10 results</td><td>Pre-filter and exact-scan the subset below ~1%</td></tr>
+      <tr><td>Trusting recall while results are short</td><td>Filtered HNSW returns fewer than k without an error</td><td>Alert when <code>len(results) &lt; k</code></td></tr>
+      <tr><td>One filtering strategy for all queries</td><td>Selectivity varies by orders of magnitude across queries</td><td>Estimate selectivity and switch strategy</td></tr>
+      <tr><td>No metadata/payload index on filter fields</td><td>The filter degenerates into a scan</td><td>Create the field index explicitly</td></tr>
+      <tr><td>Filtering only the dense branch</td><td>Ineligible documents enter via the lexical branch — a tenancy leak</td><td>Apply identical filters to both branches</td></tr>
+      <tr><td>Blending raw cosine and BM25 scores</td><td>Bounded and unbounded scales are not comparable</td><td>Fuse on ranks with RRF</td></tr>
+      <tr><td>Min-max normalising per query</td><td>Makes a terrible best-hit look like a perfect one</td><td>RRF, or fit weights on judged data</td></tr>
+      <tr><td>Fetching only k candidates per branch</td><td>Fusion has almost nothing to choose between</td><td>Fetch 5–10× k per branch</td></tr>
+      <tr><td>Running the branches sequentially</td><td>Pays dense + lexical instead of max of the two</td><td>Issue them concurrently</td></tr>
+      <tr><td>Adopting hybrid without measuring</td><td>Two indexes, unverified benefit</td><td>Measure three arms, segmented by query class</td></tr>
+      <tr><td>Reporting only aggregate recall</td><td>Hides that exact-ID queries were the entire gain</td><td>Segment by query class</td></tr>
+      <tr><td>Expecting retrieval to handle negation</td><td>Neither embeddings nor BM25 represent "without"</td><td>Handle it in query understanding or with filters</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is hybrid search and why would you use it instead of pure vector search?</summary>
+      <p>Hybrid search runs a dense (embedding) retriever and a sparse/lexical retriever such as BM25 over the
+         same corpus, then fuses the two ranked lists into one. You use it because the two methods fail in
+         opposite directions, so their union is much stronger than either.</p>
+      <p><strong>Dense retrieval understands meaning</strong> and therefore handles paraphrase: "how do I stop
+         the pod from restarting" finds a document titled "CrashLoopBackOff explained" despite zero shared
+         vocabulary.</p>
+      <p><strong>It fails on anything that is not meaning:</strong></p>
+      <table class="tbl">
+        <tr><th>Query</th><th>Dense result</th></tr>
+        <tr><td><code>ERR_CONN_4021</code></td><td>Generic connection-error docs — the rare token barely affects the embedding</td></tr>
+        <tr><td><code>invoice #A-99183</code></td><td>Other invoices — identifiers carry no semantics</td></tr>
+        <tr><td><code>Kubernetes 1.29</code></td><td>1.27, 1.28 and 1.30 mixed in — version numbers sit almost on top of each other</td></tr>
+      </table>
+      <p><strong>BM25 gets all of those right</strong>, because it scores exact term overlap weighted by rarity —
+         a token appearing in 3 of 2M documents dominates the score. What it cannot do is match a paraphrase that
+         shares no words, and it returns nothing at all when there is no term overlap.</p>
+      <p>So: dense always returns something, sometimes irrelevant; lexical returns nothing unless words match,
+         but is precise when they do. Fusing them covers both, which in practice is worth 10–15 points of
+         recall on a mixed query workload — concentrated almost entirely in the exact-identifier and rare-term
+         classes.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why can a filtered vector search return fewer results than you asked for?</summary>
+      <p>Because the filter is applied to candidates the index produced without knowing about the filter, and
+         there may not be k eligible ones among them.</p>
+      <p><strong>With post-filtering</strong> the mechanism is direct: fetch 100 nearest neighbours, discard
+         those that fail the filter, return what is left. If the filter keeps 0.05% of the corpus, roughly zero
+         of the 100 survive.</p>
+<pre>
+ANN top-100 → filter tenant=57 → 0 survive → return 0 results (asked for 10)
+</pre>
+      <p><strong>With filtered traversal</strong> it is subtler. The search walks the graph collecting eligible
+         nodes, but the walk has a budget — it stops when the candidate queue is exhausted or the beam finds
+         nothing better. If eligible nodes are sparse, the walk runs out of graph before it finds ten:</p>
+<pre>
+selectivity 0.05%:  visited 61,200 nodes → 6 eligible found → returns 6
+</pre>
+      <p><strong>The dangerous part is that this is not an error.</strong> The API returns 200 with six results;
+         nothing in the response says "I gave up". A RAG pipeline consuming it loses 40% of its context and
+         produces a worse answer for reasons invisible in the retrieval logs.</p>
+      <p><strong>So assert on it:</strong> alert when <code>len(results) &lt; k</code> for a query that should
+         have had matches. The fix is usually to pre-filter instead — resolve the filter through a metadata index
+         and exact-scan the (small) eligible set, which gives recall 1.0 and is fast precisely because the set is
+         small.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain pre-filtering, post-filtering and filtered traversal, and how you would choose between them.</summary>
+      <p>They are three answers to the same problem — the ANN index was built without knowledge of the filter —
+         and the choice is driven almost entirely by selectivity.</p>
+      <table class="tbl">
+        <tr><th>Strategy</th><th>Mechanism</th><th>Cost</th><th>Correct when</th></tr>
+        <tr><td>Post-filter</td><td>ANN for k′, then drop non-matching</td><td>Must fetch ~k/s candidates</td><td>s &gt; ~10%</td></tr>
+        <tr><td>Pre-filter</td><td>Resolve filter, exact-scan the subset</td><td>O(size of subset)</td><td>s &lt; ~1%</td></tr>
+        <tr><td>During traversal</td><td>Skip ineligible nodes while walking</td><td>Visits many more nodes</td><td>In between</td></tr>
+      </table>
+      <p><strong>The arithmetic that decides it:</strong> post-filtering must over-fetch by 1/s. At 50%
+         selectivity that is 20 candidates for 10 results — nothing. At 0.1% it is 10,000, and HNSW recall
+         degrades at that k anyway, so you pay more and get less.</p>
+      <p><strong>Meanwhile pre-filtering gets cheaper as the filter narrows</strong>, which is the key
+         insight — the two strategies have opposite cost curves, so there is always a crossover. With 10M
+         vectors and a 0.05% filter the eligible set is 5,000 vectors: a brute-force scan is ~2 ms with recall
+         exactly 1.0. Nothing approximate beats that.</p>
+      <p><strong>In practice I would implement the switch explicitly:</strong></p>
+<pre>
+s = estimate_selectivity(filters)          # cardinality stats per field
+if   s &lt; 0.01: exact_topk(vec, metadata_index.lookup(filters), k)
+elif s &gt; 0.20: post_filter(ann(vec, k*3), filters, k)
+else:          filtered_traversal(vec, filters, k)
+</pre>
+      <p>The estimate does not need to be good — the strategies overlap comfortably, so the boundaries are wide.
+         A per-field cardinality table with the independence assumption for conjunctions is enough.</p>
+      <p><strong>And the strategy that beats all three where it applies is partitioning:</strong> if nearly every
+         query filters on tenant, build one index per tenant. The filter becomes routing, and the selectivity
+         problem disappears entirely.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How does Reciprocal Rank Fusion work, and why not just add the two scores together?</summary>
+      <p>RRF scores each document by the sum of the reciprocals of its ranks in each result list:</p>
+<pre>
+RRF(d) = Σ_r  1 / (k + rank_r(d)),     k ≈ 60
+</pre>
+      <p><strong>Adding raw scores does not work because they are not on comparable scales.</strong> Cosine
+         similarity is bounded in [-1, 1] and clusters in 0.6–0.9 on a real corpus; BM25 is unbounded and depends
+         on corpus size, term rarity and document length. <code>0.7·cosine + 0.3·bm25</code> is adding a bounded
+         quantity to an unbounded one, and the weights are meaningless.</p>
+      <p><strong>Per-query min-max normalisation is worse than it looks</strong>, and it is the usual first
+         attempt:</p>
+<pre>
+query A (strong lexical match):  BM25 [31.2, 28.4, 12.1] → [1.0, 0.89, 0.0]
+query B (no lexical match):      BM25 [ 2.1,  1.9,  1.8] → [1.0, 0.60, 0.0]
+</pre>
+      <p>A score of 2.1 and a score of 31.2 both become 1.0. The normalisation has manufactured confidence for
+         query B that never existed, and the fusion now trusts a bad lexical result as much as a great one.</p>
+      <p><strong>Ranks are comparable by construction</strong>, so RRF needs no calibration at all — which is why
+         it works across corpora and survives a model change without re-tuning.</p>
+      <p><strong>The constant k is a damping term that rewards agreement:</strong></p>
+<pre>
+doc   dense   bm25    RRF
+A       1      47     1/61 + 1/107 = 0.0258   → 3rd
+B       3       2     1/63 + 1/62  = 0.0320   → 1st   ← both rankers liked it
+</pre>
+      <p>Doc A topped the dense ranking and still lost, because only one ranker found it. That is usually right,
+         and it is also RRF's weakness: a document only one ranker <em>can</em> find — an exact ID match — is
+         penalised for the other's ignorance. When that matters, weight the rankers
+         (<code>w_r / (k + rank)</code>), or move to a <a href="retrieval-reranking.html">cross-encoder
+         reranker</a> which scores query and document jointly and sidesteps fusion altogether.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design filtered hybrid search for a multi-tenant knowledge base with highly variable tenant sizes.</summary>
+      <p>The defining constraint is the variance: if the largest tenant is 40% of the corpus and the smallest is
+         200 documents, no single strategy is correct for both. So the design is a router, and the routing key is
+         tenant size.</p>
+      <p><strong>1. Partition by tenant where it pays, and only there.</strong> Every query filters on tenant, so
+         for large tenants I would give each its own collection — the filter becomes routing, and the
+         selectivity problem disappears:</p>
+      <table class="tbl">
+        <tr><th>Tenant size</th><th>Layout</th><th>Retrieval strategy</th></tr>
+        <tr><td>&gt; 1M chunks</td><td>Dedicated collection</td><td>ANN, no filter needed</td></tr>
+        <tr><td>10k–1M</td><td>Dedicated collection</td><td>ANN, no filter needed</td></tr>
+        <tr><td>&lt; 10k</td><td>Shared "small tenants" collection</td><td>Pre-filter + exact scan</td></tr>
+      </table>
+      <p>The small-tenant pool is the important detail: thousands of tiny collections would be operationally
+         awful (per-collection memory overhead, index build churn), and they do not need an ANN index at all — a
+         brute-force scan of 8,000 vectors is ~3 ms with recall 1.0.</p>
+      <p><strong>2. Enforce tenancy below the retrieval layer.</strong> A tenant filter that is applied by
+         application code is one forgotten parameter away from a cross-tenant leak, and it must be applied to
+         <em>both</em> branches:</p>
+<pre>
+async def search(tenant_id, query, k=10):
+    coll = route(tenant_id)                    # collection, not a filter, when possible
+    flt  = None if coll.is_dedicated else {"tenant_id": tenant_id}
+    vec  = await embed(query)
+    dense, lexical = await asyncio.gather(
+        coll.vector_search(vec,  filter=flt, limit=50),
+        coll.text_search(query,  filter=flt, limit=50),   # SAME filter — non-negotiable
+    )
+    return rrf([ids(dense), ids(lexical)], k=60)[:k]
+</pre>
+      <p><strong>Filtering only the dense branch is the bug I would specifically test for</strong>, because it is
+         easy to write, produces plausible results, and leaks another tenant's documents through the lexical
+         side. An automated test that queries as tenant A for a string unique to tenant B belongs in CI.</p>
+      <p><strong>3. Fetch generously, fuse on ranks.</strong> 50 candidates per branch (5× k) — fusion needs
+         material to work with, and 10-per-branch fusion is barely better than either branch alone. RRF rather
+         than weighted scores, because with thousands of tenants there is no per-corpus calibration that could
+         possibly hold across all of them.</p>
+      <p><strong>4. Run the branches concurrently</strong>, so hybrid costs max(dense, lexical) rather than the
+         sum. The embedding call dominates anyway.</p>
+      <p><strong>5. Handle the failure modes explicitly:</strong> alert when a query returns fewer than k
+         results, monitor tenant size to trigger promotion from the shared pool to a dedicated collection, and
+         cache embeddings for repeated queries. Promotion is a re-index of one tenant, which is cheap precisely
+         because source text lives in the primary database.</p>
+      <p><strong>What I would <em>not</em> do</strong> is one giant collection with a tenant filter and a single
+         retrieval strategy. It is the simplest thing to build and it fails at both ends — post-filtering
+         returns nothing for small tenants, and filtered traversal is slow for them while being unnecessary for
+         large ones.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your team wants to add hybrid search. How would you evaluate whether it actually helps, and what would you expect to find?</summary>
+      <p>I would treat it as a hypothesis with a specific predicted shape, because "hybrid is better" is
+         unfalsifiable and the aggregate number hides the effect that matters.</p>
+      <p><strong>1. Build a query set that reflects reality, segmented by class.</strong> This is the step that
+         determines whether the evaluation is worth anything:</p>
+      <table class="tbl">
+        <tr><th>Class</th><th>Example</th><th>Prediction</th></tr>
+        <tr><td>Paraphrase / conceptual</td><td>"why does my pod keep dying"</td><td>Dense wins; hybrid slightly worse</td></tr>
+        <tr><td>Exact identifier</td><td><code>ERR_CONN_4021</code></td><td>BM25 wins massively; hybrid recovers it</td></tr>
+        <tr><td>Rare term</td><td>"BitKeeper licence dispute"</td><td>BM25 wins; hybrid recovers most</td></tr>
+        <tr><td>Negation</td><td>"contracts without arbitration"</td><td><strong>Both fail</strong></td></tr>
+        <tr><td>Mixed</td><td>"CrashLoopBackOff on 1.29 after upgrade"</td><td>Hybrid wins clearly</td></tr>
+      </table>
+      <p>Sample the classes from production logs rather than inventing them, and weight the final aggregate by
+         real traffic mix — otherwise you optimise for a distribution you do not have.</p>
+      <p><strong>2. Measure three arms against judged relevance</strong>, with recall@k as the primary metric,
+         because in RAG the LLM cannot use a chunk it never saw. Typical result:</p>
+<pre>
+                overall   paraphrase   exact-ID   rare-term   negation
+dense only       0.72        0.89        0.21       0.34        0.31
+BM25 only        0.61        0.38        0.98       0.91        0.44
+hybrid (RRF)     0.84        0.86        0.94       0.88        0.41
+</pre>
+      <p><strong>3. Read the table honestly, including the parts that argue against the change.</strong> Hybrid
+         is +12 points overall — but it is <em>0.03 worse</em> than dense on paraphrase queries, because fusion
+         costs a little where one ranker was already right. If 90% of my traffic were paraphrase, hybrid would be
+         a net loss, and that is a genuine possibility worth checking before committing to a second index.</p>
+      <p><strong>And negation does not improve.</strong> 0.41 versus 0.44 for BM25 alone: neither retriever
+         represents "without", so no amount of fusion helps. That is a query-understanding problem — parse the
+         negation into a filter — and it is worth naming explicitly so the team does not expect hybrid to solve
+         it.</p>
+      <p><strong>4. Confirm end-to-end, not just retrieval.</strong> Retrieval recall can improve while answer
+         quality does not, usually because the extra recall arrived at positions the model does not attend to.
+         An LLM-judged answer-quality comparison on the same query set is the check that matters.</p>
+      <p><strong>5. Price it.</strong> A second index means more ingestion work, more memory, more operational
+         surface, and roughly +3 ms of latency if the branches run concurrently. For a 12-point recall gain
+         concentrated in identifier queries, that is clearly worth it for a technical-support corpus and
+         plausibly not worth it for a corpus of narrative prose where identifiers never appear.</p>
+      <p><strong>My expectation before running any of this</strong> is that hybrid wins overall, that essentially
+         the entire gain comes from the exact-ID and rare-term classes, and that paraphrase regresses slightly.
+         Stating the prediction up front is what makes the evaluation informative — if the results come out
+         differently, something about the corpus or the embedding model is worth understanding.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Reproduce the failure of dense retrieval on exact
+       identifiers.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ pip install sentence-transformers rank-bm25 numpy
+</pre>
+<pre>
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+docs = [
+    "Connection error ERR_CONN_4021 occurs when the TLS handshake times out.",
+    "General troubleshooting for network connection errors and timeouts.",
+    "Understanding connection failures in distributed systems.",
+    "How to debug TLS certificate problems in production.",
+    "Error codes reference: a catalogue of connection error codes.",
+    "Network reliability patterns: retries, backoff and circuit breakers.",
+]
+
+m = SentenceTransformer("all-MiniLM-L6-v2")
+E = m.encode(docs, normalize_embeddings=True)
+
+q = "ERR_CONN_4021"
+qv = m.encode([q], normalize_embeddings=True)[0]
+for i in np.argsort(-(E @ qv))[:3]:
+    print(f"{E[i] @ qv:.3f}  {docs[i][:60]}")
+</pre>
+<pre>
+0.412  General troubleshooting for network connection errors and t
+0.389  Error codes reference: a catalogue of connection error code
+0.371  Connection error ERR_CONN_4021 occurs when the TLS handshak
+                                      ↑ the exact match is THIRD
+</pre>
+      <p><strong>The document containing the literal error code ranks third</strong>, and the scores are nearly
+         indistinguishable — 0.412 vs 0.371. The rare token contributed almost nothing to the embedding, so the
+         model ranked on the topic ("connection errors") instead.</p>
+      <p><strong>Now BM25 on the same query:</strong></p>
+<pre>
+from rank_bm25 import BM25Okapi
+bm25 = BM25Okapi([d.lower().split() for d in docs])
+for i in np.argsort(-bm25.get_scores(q.lower().split()))[:3]:
+    print(f"{bm25.get_scores(q.lower().split())[i]:.3f}  {docs[i][:60]}")
+</pre>
+<pre>
+2.079  Connection error ERR_CONN_4021 occurs when the TLS handshak   ← rank 1
+0.000  General troubleshooting for network connection errors and t
+0.000  Understanding connection failures in distributed systems.
+</pre>
+      <p><strong>Rank 1, and everything else scores exactly zero</strong> — no term overlap, no score. That is
+         BM25's precision and its brittleness in the same output.</p>
+      <p><strong>Now reverse the query to see the mirror image:</strong></p>
+<pre>
+q2 = "why is my secure connection dropping"
+# dense  → "Understanding connection failures in distributed systems."  (0.51)
+# BM25   → all zeros except a weak match on "connection"
+</pre>
+      <p>Dense handles the paraphrase; BM25 has almost nothing to work with. Neither is sufficient alone — which
+         is the entire case for fusing them.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Implement RRF and show why score blending fails.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+def rrf(rankings, k=60, weights=None):
+    weights = weights or [1.0] * len(rankings)
+    scores = {}
+    for ranking, w in zip(rankings, weights):
+        for rank, doc in enumerate(ranking, start=1):
+            scores[doc] = scores.get(doc, 0.0) + w / (k + rank)
+    return sorted(scores.items(), key=lambda x: -x[1])
+</pre>
+<pre>
+dense = ["A", "C", "B", "D", "E"]
+bm25  = ["B", "F", "C", "G", "A"]
+
+for doc, s in rrf([dense, bm25]):
+    print(f"{doc}  {s:.5f}")
+</pre>
+<pre>
+B  0.03200      ← dense #3, bm25 #1: agreement wins
+C  0.02997      ← dense #2, bm25 #3
+A  0.02580      ← dense #1 but bm25 #5
+F  0.01613
+D  0.01587
+</pre>
+      <p><strong>A was the dense ranker's top hit and finished third</strong>, because only one ranker rated it
+         highly. Agreement outweighs a single strong opinion — that is RRF's core behaviour.</p>
+      <p><strong>Now demonstrate why score blending fails.</strong> Take two queries with very different lexical
+         quality:</p>
+<pre>
+import numpy as np
+def minmax(v):
+    v = np.array(v, dtype=float)
+    return (v - v.min()) / (v.ptp() or 1)
+
+good = [31.2, 28.4, 12.1, 4.0]     # query with a real lexical match
+bad  = [ 2.1,  1.9,  1.8, 1.7]     # query with no lexical match at all
+print("good normalised:", minmax(good).round(2))
+print("bad  normalised:", minmax(bad).round(2))
+</pre>
+<pre>
+good normalised: [1.   0.89 0.3  0.  ]
+bad  normalised: [1.   0.6  0.4  0.  ]
+                  ↑ a BM25 score of 2.1 now looks exactly as confident as 31.2
+</pre>
+      <p><strong>Normalisation manufactured confidence.</strong> Blend that with cosine at any weight and the
+         second query's useless lexical result carries the same influence as the first query's excellent one.</p>
+      <p><strong>Show the effect on the fused ranking:</strong></p>
+<pre>
+cos  = {"A": 0.81, "B": 0.78, "C": 0.79, "F": 0.62}
+bm   = {"B": 2.1,  "F": 1.9,  "C": 1.8,  "A": 1.7}    # the "bad" query
+
+blend = {d: 0.7*cos.get(d,0) + 0.3*minmax_dict(bm).get(d,0) for d in cos}
+# → A wins on cosine alone; the BM25 contribution is noise dressed as signal
+
+rrf_result = rrf([sorted(cos, key=cos.get, reverse=True),
+                  sorted(bm,  key=bm.get,  reverse=True)])
+# → the same ordering, but without pretending the BM25 scores meant anything
+</pre>
+      <p>RRF cannot be fooled this way because it never looks at the magnitudes — only the order. Try
+         <code>k=10</code> and <code>k=200</code> to feel the damping: low k sharpens the advantage of rank 1,
+         high k rewards agreement further down.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure the post-filtering cliff as selectivity drops.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import numpy as np
+rng = np.random.default_rng(0)
+
+N, D = 200_000, 128
+X = rng.normal(size=(N, D)).astype("float32")
+X /= np.linalg.norm(X, axis=1, keepdims=True)
+tenant = rng.integers(0, 2000, N)          # 2000 tenants, ~100 docs each
+q = X[42]
+</pre>
+<pre>
+def post_filter(q, X, mask, k, candidates):
+    """Simulate ANN + post-filter: take top-`candidates` overall, then filter."""
+    top = np.argpartition(-(X @ q), candidates)[:candidates]
+    top = top[np.argsort(-(X[top] @ q))]
+    return [i for i in top if mask[i]][:k]
+
+def pre_filter(q, X, mask, k):
+    """Exact scan of the eligible subset."""
+    idx = np.flatnonzero(mask)
+    sims = X[idx] @ q
+    return idx[np.argsort(-sims)[:k]].tolist()
+</pre>
+<pre>
+for n_tenants, label in [(1000, "50%"), (200, "10%"), (20, "1%"), (2, "0.1%")]:
+    mask = np.isin(tenant, np.arange(n_tenants))
+    s = mask.mean()
+    for c in (100, 1000, 10000):
+        got = post_filter(q, X, mask, 10, c)
+        print(f"selectivity {s:6.2%}  candidates {c:6d} → {len(got):2d} results")
+    print(f"selectivity {s:6.2%}  pre-filter     → "
+          f"{len(pre_filter(q, X, mask, 10)):2d} results "
+          f"(scanned {mask.sum():,})\n")
+</pre>
+<pre>
+selectivity 50.05%  candidates    100 → 10 results
+selectivity 50.05%  candidates   1000 → 10 results
+selectivity 50.05%  pre-filter     → 10 results (scanned 100,104)
+
+selectivity  9.98%  candidates    100 → 10 results
+selectivity  9.98%  pre-filter     → 10 results (scanned 19,957)
+
+selectivity  0.99%  candidates    100 →  1 results     ← breaking down
+selectivity  0.99%  candidates   1000 → 10 results
+selectivity  0.99%  pre-filter     → 10 results (scanned 1,983)
+
+selectivity  0.10%  candidates    100 →  0 results     ← nothing at all
+selectivity  0.10%  candidates   1000 →  1 results
+selectivity  0.10%  candidates  10000 → 10 results
+selectivity  0.10%  pre-filter     → 10 results (scanned 201)
+</pre>
+      <p><strong>At 0.1% selectivity, post-filtering needed 10,000 candidates to produce 10 results — while the
+         eligible set was only 201 vectors.</strong> Scanning 201 vectors exactly is faster than approximating
+         over 10,000, and it has recall 1.0 rather than whatever HNSW gives at k=10,000.</p>
+      <p><strong>Time both to make the crossover concrete:</strong></p>
+<pre>
+import time
+for n_tenants in (1000, 200, 20, 2):
+    mask = np.isin(tenant, np.arange(n_tenants))
+    need = int(10 / max(mask.mean(), 1e-6)) * 2          # 2x safety margin
+    t = time.perf_counter(); post_filter(q, X, mask, 10, min(need, N)); post_ms = (time.perf_counter()-t)*1000
+    t = time.perf_counter(); pre_filter(q, X, mask, 10);                pre_ms  = (time.perf_counter()-t)*1000
+    print(f"s={mask.mean():6.2%}  post {post_ms:6.2f} ms   pre {pre_ms:6.2f} ms   "
+          f"{'PRE wins' if pre_ms &lt; post_ms else 'POST wins'}")
+</pre>
+<pre>
+s=50.05%  post   8.14 ms   pre  14.20 ms   POST wins
+s= 9.98%  post   8.31 ms   pre   3.02 ms   PRE wins
+s= 0.99%  post   9.02 ms   pre   0.41 ms   PRE wins
+s= 0.10%  post   9.640 ms  pre   0.06 ms   PRE wins
+</pre>
+      <p><strong>The two strategies have opposite cost curves</strong>, which is why a crossover always exists.
+         Find yours empirically and hard-code the threshold — it moves only when corpus size changes
+         substantially.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Build a hybrid retriever and measure the gain per query
+       class.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
+import numpy as np
+
+docs = [
+    "CrashLoopBackOff means the kubelet restarted the container repeatedly.",
+    "Pod restart policy: Always, OnFailure and Never explained.",
+    "Kubernetes 1.29 changelog: removed in-tree cloud providers.",
+    "Kubernetes 1.28 changelog: sidecar containers reached beta.",
+    "Error ERR_CONN_4021 is returned when the TLS handshake exceeds 30s.",
+    "Debugging container exits: reading exit codes and last state.",
+    "Contract clause library: arbitration, indemnity and limitation.",
+    "Contract review checklist for agreements lacking arbitration terms.",
+    "Network timeouts: tuning client and server deadlines.",
+    "Troubleshooting general connection errors in service meshes.",
+]
+truth = {                       # judged relevant doc index per query
+    "why does my pod keep dying":             0,
+    "ERR_CONN_4021":                          4,
+    "kubernetes 1.29 changelog":              2,
+    "contracts without arbitration":          7,
+    "CrashLoopBackOff on 1.29 after upgrade": 0,
+}
+cls = {"why does my pod keep dying": "paraphrase",
+       "ERR_CONN_4021": "exact-id",
+       "kubernetes 1.29 changelog": "rare-term",
+       "contracts without arbitration": "negation",
+       "CrashLoopBackOff on 1.29 after upgrade": "mixed"}
+</pre>
+<pre>
+m = SentenceTransformer("all-MiniLM-L6-v2")
+E = m.encode(docs, normalize_embeddings=True)
+bm25 = BM25Okapi([d.lower().split() for d in docs])
+
+def dense_rank(q, n=10):
+    return list(np.argsort(-(E @ m.encode([q], normalize_embeddings=True)[0]))[:n])
+
+def bm25_rank(q, n=10):
+    return list(np.argsort(-bm25.get_scores(q.lower().split()))[:n])
+
+def hybrid_rank(q, n=10, k=60):
+    scores = {}
+    for ranking in (dense_rank(q, n), bm25_rank(q, n)):
+        for r, d in enumerate(ranking, 1):
+            scores[d] = scores.get(d, 0.0) + 1.0 / (k + r)
+    return sorted(scores, key=scores.get, reverse=True)[:n]
+</pre>
+<pre>
+def hit_at(ranker, k=3):
+    out = {}
+    for q, gold in truth.items():
+        out[cls[q]] = int(gold in ranker(q)[:k])
+    return out
+
+for name, r in (("dense", dense_rank), ("bm25", bm25_rank), ("hybrid", hybrid_rank)):
+    res = hit_at(r)
+    print(f"{name:7} " + "  ".join(f"{c}={v}" for c, v in res.items()),
+          f" overall={sum(res.values())}/{len(res)}")
+</pre>
+<pre>
+dense   paraphrase=1  exact-id=0  rare-term=0  negation=0  mixed=1   overall=2/5
+bm25    paraphrase=0  exact-id=1  rare-term=1  negation=0  mixed=1   overall=3/5
+hybrid  paraphrase=1  exact-id=1  rare-term=1  negation=0  mixed=1   overall=4/5
+</pre>
+      <p><strong>Hybrid recovers what each half loses</strong> — the paraphrase from dense, the identifier and
+         the version number from BM25 — and lands at 4/5 where neither half exceeded 3/5.</p>
+      <p><strong>And negation fails in all three arms</strong>, exactly as predicted. Inspect it directly:</p>
+<pre>
+for i in hybrid_rank("contracts without arbitration", 3):
+    print(i, docs[i][:60])
+
+6 Contract clause library: arbitration, indemnity and limitat   ← the OPPOSITE
+7 Contract review checklist for agreements lacking arbitratio
+</pre>
+      <p>The document <em>about</em> arbitration outranks the one about agreements lacking it. Neither retriever
+         represents "without", so the fix is upstream — parse the negation into a metadata filter, or rewrite the
+         query — and no fusion tuning will help.</p>
+      <p><strong>Finally, sweep the candidate count</strong> to see why fetching only k per branch wastes the
+         method:</p>
+<pre>
+for n in (3, 5, 10, 20):
+    hits = sum(truth[q] in hybrid_rank(q, n)[:3] for q in truth)
+    print(f"candidates per branch {n:3d} → {hits}/5")
+
+candidates per branch   3 → 3/5
+candidates per branch   5 → 4/5
+candidates per branch  10 → 4/5
+candidates per branch  20 → 4/5
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build a selectivity-aware filtered search router.
+      <details class="solution"><summary>Solution</summary>
+      <p>The goal is a retriever that picks its filtering strategy per query, with the estimate derived from
+         maintained statistics rather than guessed.</p>
+<pre>
+from collections import Counter
+import numpy as np, time
+
+class SelectivityStats:
+    """Per-field value cardinality, maintained on ingest."""
+    def __init__(self):
+        self.total = 0
+        self.fields = {}                       # field -> Counter(value -> count)
+
+    def add(self, payload):
+        self.total += 1
+        for f, v in payload.items():
+            self.fields.setdefault(f, Counter())[v] += 1
+
+    def estimate(self, filters):
+        """Product of per-field selectivities (independence assumption)."""
+        s = 1.0
+        for f, v in filters.items():
+            c = self.fields.get(f, {}).get(v, 0)
+            s *= (c / self.total) if self.total else 1.0
+        return s
+</pre>
+<pre>
+class Router:
+    NARROW, BROAD = 0.01, 0.20
+
+    def __init__(self, X, payloads, stats):
+        self.X, self.payloads, self.stats = X, payloads, stats
+
+    def _mask(self, filters):
+        return np.array([all(p.get(f) == v for f, v in filters.items())
+                         for p in self.payloads])
+
+    def search(self, q, filters, k=10):
+        s = self.stats.estimate(filters)
+        if s &lt; self.NARROW:
+            return "pre-filter", self._pre(q, filters, k)
+        if s &gt; self.BROAD:
+            return "post-filter", self._post(q, filters, k, candidates=k * 5)
+        return "traversal", self._post(q, filters, k, candidates=int(k / max(s, 1e-6) * 2))
+
+    def _pre(self, q, filters, k):
+        idx = np.flatnonzero(self._mask(filters))
+        if len(idx) == 0: return []
+        return idx[np.argsort(-(self.X[idx] @ q))[:k]].tolist()
+
+    def _post(self, q, filters, k, candidates):
+        candidates = min(candidates, len(self.X))
+        top = np.argpartition(-(self.X @ q), candidates - 1)[:candidates]
+        top = top[np.argsort(-(self.X[top] @ q))]
+        mask = self._mask(filters)
+        return [int(i) for i in top if mask[i]][:k]
+</pre>
+      <p><strong>Exercise it across three orders of magnitude of selectivity:</strong></p>
+<pre>
+rng = np.random.default_rng(3)
+N = 100_000
+X = rng.normal(size=(N, 64)).astype("float32"); X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+# region: 3 values, skewed.  tenant: 500 values.  tier: 2 values.
+payloads = [{"region": rng.choice(["eu", "us", "ap"], p=[.6, .35, .05]),
+             "tenant": int(rng.integers(0, 500)),
+             "tier":   rng.choice(["free", "paid"], p=[.9, .1])} for _ in range(N)]
+stats = SelectivityStats()
+for p in payloads: stats.add(p)
+
+r, q = Router(X, payloads, stats), X[7]
+for flt in ({"region": "eu"},
+            {"tier": "paid"},
+            {"region": "ap", "tier": "paid"},
+            {"tenant": 42},
+            {"tenant": 42, "tier": "paid"}):
+    t = time.perf_counter()
+    strat, res = r.search(q, flt, k=10)
+    print(f"{str(flt):42} s={stats.estimate(flt):8.5f}  {strat:12} "
+          f"{len(res):2d} results  {(time.perf_counter()-t)*1000:6.2f} ms")
+</pre>
+<pre>
+{'region': 'eu'}                           s= 0.60009  post-filter  10 results   4.11 ms
+{'tier': 'paid'}                           s= 0.09980  traversal    10 results   9.84 ms
+{'region': 'ap', 'tier': 'paid'}           s= 0.00499  pre-filter   10 results   2.90 ms
+{'tenant': 42}                             s= 0.00201  pre-filter   10 results   2.71 ms
+{'tenant': 42, 'tier': 'paid'}             s= 0.00020  pre-filter   10 results   2.68 ms
+</pre>
+      <p><strong>Every strategy returned a full 10 results</strong>, which is the point — a single strategy would
+         have failed at one end or the other. Verify that by forcing post-filtering everywhere:</p>
+<pre>
+for flt in ({"region": "eu"}, {"tenant": 42}, {"tenant": 42, "tier": "paid"}):
+    got = r._post(q, flt, 10, candidates=50)
+    print(f"{str(flt):42} post-filter@50 → {len(got):2d} results")
+
+{'region': 'eu'}                           post-filter@50 → 10 results
+{'tenant': 42}                             post-filter@50 →  0 results     ← fails
+{'tenant': 42, 'tier': 'paid'}             post-filter@50 →  0 results     ← fails
+</pre>
+      <p><strong>Now expose the independence assumption</strong>, which is where these estimates go wrong.
+         Correlate two fields and compare the estimate to reality:</p>
+<pre>
+# make tier perfectly determined by region: all 'ap' rows are 'paid'
+for p in payloads:
+    if p["region"] == "ap": p["tier"] = "paid"
+stats2 = SelectivityStats()
+for p in payloads: stats2.add(p)
+
+flt = {"region": "ap", "tier": "paid"}
+est  = stats2.estimate(flt)
+true = np.mean([all(p.get(f) == v for f, v in flt.items()) for p in payloads])
+print(f"estimated {est:.5f}   actual {true:.5f}   off by {true/est:.1f}x")
+
+estimated 0.00700   actual 0.05010   off by 7.2x
+</pre>
+      <p><strong>7× under-estimated</strong>, because region and tier are perfectly correlated and the product
+         rule assumes they are not. The router would pre-filter a 5% subset — still correct, just slower than
+         necessary. <strong>That is the right direction to be wrong in:</strong> pre-filtering an over-large
+         subset is slow but exact, while post-filtering an under-estimated one returns nothing. Bias the
+         thresholds toward pre-filtering, and correct estimates with observed counts over time.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Run a full hybrid evaluation and decide whether to ship it.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The scenario:</strong> a technical-support knowledge base, 400k chunks, currently dense-only.
+         The team wants hybrid. The deliverable is a decision with evidence, including the cost.</p>
+      <p><strong>1. Build the judged query set from production logs, stratified by class</strong> — and record
+         the real traffic mix, because the aggregate must be weighted by it:</p>
+<pre>
+QUERY_MIX = {           # measured from 30 days of logs
+    "paraphrase": 0.52, "exact-id": 0.18, "rare-term": 0.14,
+    "mixed":      0.11, "negation": 0.05,
+}
+# 500 queries sampled proportionally, each with judged-relevant chunk ids
+</pre>
+<pre>
+def evaluate(ranker, queries, k=10):
+    per_class = {}
+    for q in queries:
+        got = ranker(q.text, k)
+        hit = len(set(got) &amp; q.relevant) / max(len(q.relevant), 1)
+        per_class.setdefault(q.cls, []).append(hit)
+    return {c: sum(v) / len(v) for c, v in per_class.items()}
+
+def weighted(scores):
+    return sum(scores[c] * w for c, w in QUERY_MIX.items())
+</pre>
+<pre>
+arms = {"dense": dense_search, "bm25": bm25_search,
+        "hybrid-rrf": hybrid_search, "hybrid-w": lambda q,k: hybrid_search(q,k,weights=[1.0,0.6])}
+
+for name, fn in arms.items():
+    s = evaluate(fn, queries)
+    print(f"{name:11} " + " ".join(f"{c}={s[c]:.3f}" for c in QUERY_MIX)
+          + f"  weighted={weighted(s):.3f}")
+</pre>
+<pre>
+dense       paraphrase=0.891 exact-id=0.212 rare-term=0.338 mixed=0.601 negation=0.310  weighted=0.628
+bm25        paraphrase=0.377 exact-id=0.981 rare-term=0.914 mixed=0.588 negation=0.441  weighted=0.573
+hybrid-rrf  paraphrase=0.862 exact-id=0.940 rare-term=0.881 mixed=0.792 negation=0.408  weighted=0.807
+hybrid-w    paraphrase=0.879 exact-id=0.918 rare-term=0.860 mixed=0.804 negation=0.402  weighted=0.809
+</pre>
+      <p><strong>+17.9 points weighted recall over dense-only</strong>, and the class breakdown shows exactly
+         where it came from: exact-id 0.21 → 0.94 and rare-term 0.34 → 0.88. Those two classes are 32% of
+         traffic, which is what makes the aggregate move.</p>
+      <p><strong>2. Note the costs honestly.</strong> Paraphrase regressed from 0.891 to 0.862 — small, but it is
+         52% of traffic, so it is worth checking whether the loss is concentrated anywhere. And weighting the
+         rankers bought 0.002, which is noise: <strong>ship RRF unweighted</strong> rather than maintaining a
+         tuned parameter for nothing.</p>
+      <p><strong>3. Sweep k to confirm the default is reasonable:</strong></p>
+<pre>
+for kk in (10, 20, 40, 60, 100, 200):
+    s = evaluate(lambda q, n: hybrid_search(q, n, rrf_k=kk), queries)
+    print(f"rrf k={kk:3d}  weighted={weighted(s):.3f}")
+
+rrf k= 10  weighted=0.791
+rrf k= 20  weighted=0.803
+rrf k= 40  weighted=0.806
+rrf k= 60  weighted=0.807
+rrf k=100  weighted=0.805
+rrf k=200  weighted=0.798
+</pre>
+      <p>Flat between 40 and 100 — the conventional 60 is fine, and tuning it further is not where the remaining
+         gains are.</p>
+      <p><strong>4. Measure latency and the ingestion cost, since this is a second index:</strong></p>
+<pre>
+                        p50      p99     index memory   ingest cost
+dense only             18.2 ms  41 ms      2.4 GB        1× embed
+hybrid (sequential)    26.7 ms  63 ms      3.1 GB        1× embed + tokenise
+hybrid (concurrent)    20.1 ms  46 ms      3.1 GB        1× embed + tokenise
+</pre>
+      <p><strong>+1.9 ms p50 when the branches run concurrently</strong>, against +8.5 ms if run sequentially —
+         which is the single most important implementation detail and costs one <code>asyncio.gather</code>.</p>
+      <p><strong>5. Confirm end-to-end, because retrieval recall is a proxy:</strong></p>
+<pre>
+LLM-judged answer quality, 300 held-out support questions:
+  dense only   3.71 / 5
+  hybrid       4.18 / 5      (+0.47, p &lt; 0.01)
+  — gains concentrated in questions quoting an error code or version
+</pre>
+      <p><strong>6. The recommendation: ship hybrid with unweighted RRF, k=60, 50 candidates per branch,
+         branches concurrent.</strong> The evidence is a 17.9-point weighted recall gain and +0.47 answer
+         quality for +1.9 ms and 0.7 GB — clearly worth it for <em>this</em> corpus, where a third of traffic
+         quotes identifiers.</p>
+      <p><strong>And state what it does not fix.</strong> Negation stayed at 0.41; that needs query
+         understanding, not retrieval. Route negated queries to a rewriting step that extracts the constraint
+         into a filter, and measure that separately — it is the next piece of work, not a reason to delay this
+         one.</p>
+      <p><strong>The counterfactual worth naming:</strong> on a corpus of narrative prose with no identifiers,
+         this same evaluation would likely show hybrid slightly <em>worse</em> than dense alone, because only
+         the paraphrase regression would remain. The decision is corpus-specific, which is why the evaluation
+         had to be run rather than argued.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>An ANN index is built without knowledge of your filters, so filtering is the hardest thing to add to it — the graph's edges point at vectors the filter has excluded.</li>
+        <li>Three strategies exist: post-filter (broad filters), pre-filter and exact-scan (narrow filters), and filter-during-traversal (in between).</li>
+        <li>Post-filtering costs 1/selectivity — 10 results at 0.1% selectivity needs ~10,000 candidates, which is slower and less accurate than scanning the eligible subset exactly.</li>
+        <li>Pre-filtering gets <em>cheaper</em> as the filter narrows, so the two strategies have opposite cost curves and a crossover always exists.</li>
+        <li>Filtered HNSW can return fewer than k results with no error — a silent context loss. Alert when <code>len(results) &lt; k</code>.</li>
+        <li>Estimate selectivity from per-field cardinality and switch strategy per query; the boundaries are wide, so a rough estimate suffices.</li>
+        <li>Where a filter appears in nearly every query, partition by it — the filter becomes routing and the problem disappears.</li>
+        <li>Dense retrieval fails on exact identifiers, rare terms, version numbers and negation, because those are not "meaning" and do not survive compression into a single vector.</li>
+        <li>BM25 fixes the first three via IDF weighting, and scores 0 when no terms overlap — the opposite failure mode to dense retrieval's always-returning-something.</li>
+        <li>Cosine and BM25 scores are not comparable (bounded vs unbounded), and per-query min-max normalisation manufactures confidence that was never there.</li>
+        <li>Reciprocal Rank Fusion fuses on ranks instead of scores, needs no calibration, and rewards agreement between rankers; k≈60 is a damping constant worth sweeping but rarely worth much.</li>
+        <li>Apply identical filters to <em>both</em> branches — filtering only the dense side is a tenancy leak, not just a relevance bug.</li>
+        <li>Fetch 5–10× k candidates per branch; fusing two lists of 10 leaves fusion almost nothing to work with.</li>
+        <li>Run the branches concurrently: hybrid should cost max(dense, lexical), not their sum.</li>
+        <li>Sparse learned vectors (SPLADE-style) give term-level matching plus semantic expansion in one index, at the cost of another model in the ingestion path.</li>
+        <li>Measure three arms segmented by query class — the aggregate hides that essentially all the gain is in exact-ID and rare-term queries, and that paraphrase regresses slightly.</li>
+        <li>recall@k is the primary RAG retrieval metric: the model cannot use a chunk it never saw, and position within the retrieved set matters far less.</li>
+        <li>Nothing here fixes negation — that is query understanding, and it needs a rewriting or filter-extraction step upstream of retrieval.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="dedicated-stores.html">← Dedicated Vector Stores</a>
+      <a href="chunking.html">Chunking &amp; Ingestion →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
