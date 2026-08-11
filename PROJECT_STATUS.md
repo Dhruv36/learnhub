@@ -6,15 +6,27 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-07)
+## ▶️ RESUME HERE (last updated 2026-08-10)
 
-**Current task:** ✅ **Database Concepts & Architecture is COMPLETE** — 15 lessons + quiz bank (`10 200 0`,
-0 duplicate questions), whole track passes `validate.py` with 0 errors. Also fixed the stale
-`← CSS Track` nav link in its `quiz.html` (copy-paste from the CSS template, same bug found in SQL).
+**Current task:** ✅ **Unix & Linux (track 22) is COMPLETE** — 20 lessons (44–59KB, every one `det=12 ex=6`)
++ quiz bank (`10 200 0`, 0 duplicate stems). Whole track passes `validate.py` with 0 errors; pushed & live.
+Sections: Foundations ×4 · The Shell ×4 · Processes & The Kernel ×4 · The Running System ×4 ·
+Production Skills ×4. Its `quiz.html` was clean (no stale `← CSS Track` link).
 
-**Next action: build Vector Databases & RAG** (`tutorials/vector-databases/`) — new track, ~14 lessons at
-v4 depth + a 10×20 quiz bank. `quiz.html` is already scaffolded; `nav.js`, the lessons, both quiz banks
-and the root `index.html` card under `#databases` still need writing. Draft curriculum is in section B below.
+**🚧 IN PROGRESS: Vector Databases & RAG (track 21)** — `tutorials/vector-databases/`.
+Done so far: `nav.js` (15 lessons across 4 sections), `quiz.html` fixed (had the `← CSS Track` bug **and**
+mojibake from the scaffold — both repaired), root `index.html` card already present, and **3 of 15 lessons**
+written and validating clean:
+- ✅ `index.html` — What a Vector Database Is For
+- ✅ `embeddings.html` — Embeddings & Vector Space
+- ✅ `similarity-metrics.html` — Similarity Metrics & Normalisation
+- ⏳ **NEXT: `dimensionality.html`** (The Curse of Dimensionality), then Indexing & Search ×4
+  (knn-vs-ann, hnsw, ivf-pq, tuning-recall), The Landscape ×3 (pgvector, dedicated-stores, hybrid-search),
+  RAG in Production ×4 (chunking, retrieval-reranking, evaluation, scaling-ops), then both quiz banks.
+
+Lesson order and filenames are fixed by `tutorials/vector-databases/nav.js` — read it first on resume.
+Forward links to unwritten lessons show as "broken link" in validate.py; that is expected and clears as
+each file lands. Re-run the whole-track validate at the end.
 
 **How to work:** write each lesson at v4 depth, then
 ```
@@ -24,7 +36,7 @@ must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair. A forward li
 not-yet-written next lesson shows as a "broken link" error — that is expected and clears when the
 next file lands; re-run the whole-track validate at the end to confirm 0 errors.
 
-**Then, in order:** Vector Databases & RAG (new, 14 lessons + bank) → LeetCode v4 (21) → infra six (~70).
+**Then, in order:** finish Vector Databases & RAG (12 lessons + bank) → LeetCode v4 (21) → infra six (~70).
 
 **Quiz-bank recipe (per the 2026-08-05 decision — a track is not done without it):**
 sets are `{title:"Quiz N · Topic", desc, questions:[{q, options:[3], answer:<idx>, explain}×20]}`,
@@ -61,10 +73,11 @@ Validate with the node one-liner at the bottom of this file → must print `10 2
 | 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | ✅ v3 done · ⏳ v4 pending |
 | 19 | System Design | 36 lessons (Fundamentals ×11 + Deep Dives ×6 + Case Studies ×12 + Senior/Staff ×7) | 200 | ✅ DONE (v4) |
 | 20 | 🆕 Database Concepts & Architecture | **15 (v4)** | 200 | ✅ **DONE 15/15 + quiz bank** (2026-08-07) |
-| 21 | 🆕 Vector Databases & RAG | ~14 (planned) | 200 (to write) | ⏳ **NEW TRACK — not started** (quiz.html scaffolded) |
+| 21 | 🆕 Vector Databases & RAG | **3 of 15 (v4)** | 200 (to write) | 🚧 **IN PROGRESS** — nav.js + quiz.html done, lessons 1–3 written |
+| 22 | 🆕 Unix & Linux | **20 (v4)** | 200 | ✅ **DONE 20/20 + quiz bank** (2026-08-10) |
 
 **v3 build-out done: 19 full tracks (3,800 quiz questions), all committed & pushed.**
-**Tracks 20–21 are new (user-requested 2026-08-04) and built directly at v4 depth — no v3 stage.**
+**Tracks 20–22 are new (20–21 user-requested 2026-08-04, 22 added 2026-08-08) and built directly at v4 depth — no v3 stage.**
 
 ---
 
@@ -131,12 +144,13 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 4. ~~**Python**~~ ✅ **COMPLETE 2026-08-04** — 12/12 lessons, 0 validation errors
 5. ~~**SQL**~~ ✅ **COMPLETE 2026-08-05** — 12/12 lessons (47–57KB) + quiz bank retuned to v4 (20 swaps)
 6. ~~**Database Concepts & Architecture**~~ ✅ **COMPLETE 2026-08-07** — 15/15 lessons (50–59KB) + quiz bank `10 200 0`
-7. 🆕 **Vector Databases & RAG** — NEW track, not started (see below) ← **CURRENT**
-8. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
-9. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
+7. ~~**Unix & Linux**~~ ✅ **COMPLETE 2026-08-10** — new track, 20/20 lessons (44–59KB) + quiz bank `10 200 0`
+8. 🆕 **Vector Databases & RAG** — 🚧 **IN PROGRESS, 3/15 lessons** ← **CURRENT**
+9. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
+10. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
 
-**Remaining: ~105 lessons across 3 tracks + 1 quiz bank**
-(Vector/RAG 14 lessons & bank + LeetCode 21 + infra six ~70 under the approved expansion).
+**Remaining: ~103 lessons across 3 tracks + 1 quiz bank**
+(Vector/RAG 12 remaining lessons & bank + LeetCode 21 + infra six ~70 under the approved expansion).
 
 #### SQL v4 — per-lesson status (as of 2026-08-05)
 Rebuilt in place, no redirect stubs needed. Every done lesson `det=12 ex=6`, 0 validation errors.
