@@ -1,0 +1,1255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evaluating Retrieval — Vector Databases &amp; RAG — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Evaluating Retrieval <span class="level-badge level-adv">RAG in Production</span></h1>
+    <p><strong>What you'll master:</strong> how to build a judged evaluation set that is worth trusting, including
+       how many queries you actually need and how to bootstrap one when you have none; the retrieval metrics —
+       recall@k, precision@k, MRR, nDCG — and specifically which one to optimise for RAG and why; how to evaluate
+       generation separately from retrieval, and how to use an LLM as a judge without fooling yourself; the
+       statistics that decide whether a 2-point improvement is real; and how to wire all of it into CI so
+       regressions are caught before users find them. Prerequisites:
+       <a href="retrieval-reranking.html">Retrieval Pipelines &amp; Reranking</a>,
+       <a href="chunking.html">Chunking &amp; Ingestion</a>.</p>
+
+    <h2>Part 1 — Why Evaluation Is the Bottleneck</h2>
+
+    <p>Every previous lesson ended with a number: chunk size 400 beats 1000, hybrid beats dense, reranking moves
+       nDCG from 0.71 to 0.86. <strong>None of those numbers exist without an evaluation set</strong>, and a team
+       without one is not tuning a RAG system — it is guessing, then defending the guess.</p>
+
+    <p>The failure is specific and extremely common:</p>
+
+<pre>
+Week 1:  "Retrieval seems bad."      → switch embedding model
+Week 2:  "Still seems bad."          → add a reranker
+Week 3:  "Better? Hard to say."      → tune chunk size
+Week 4:  "Someone says it regressed" → revert something, unsure what
+</pre>
+
+    <p><strong>Nothing in that sequence is measurable, so nothing in it is reversible.</strong> Each change is
+       evaluated by vibes on whichever five queries someone remembered, and the five queries are different every
+       week.</p>
+
+    <table class="tbl">
+      <tr><th>Without an eval set</th><th>With one</th></tr>
+      <tr><td>"This feels better"</td><td>"recall@10: 0.79 → 0.86, n=500, p=0.003"</td></tr>
+      <tr><td>Regressions found by users</td><td>Regressions found by CI</td></tr>
+      <tr><td>Every change is permanent (nobody dares revert)</td><td>Changes are reversible because impact is known</td></tr>
+      <tr><td>Tuning order set by fashion</td><td>Tuning order set by measured contribution</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Build the evaluation set before the optimisation, not after.</strong> It feels
+       like a detour — you have a working pipeline and no metrics, and writing 200 judged queries is a day of
+       unglamorous work. But every hour of tuning without it is unattributable, and the cheapest moment to build
+       it is before you have made ten changes you cannot untangle. A day spent here pays for itself in the first
+       week.</div>
+
+    <h2>Part 2 — Building an Evaluation Set</h2>
+
+    <p>An evaluation set is a list of queries, each with the chunk ids that should be retrieved, and ideally a
+       reference answer. The quality of everything downstream depends on this being representative.</p>
+
+<pre>
+{
+  "query_id": "q_0142",
+  "query": "how long is an old API key valid after rotation?",
+  "relevant_chunk_ids": ["docs/api-keys#3"],       # judged, not guessed
+  "reference_answer": "One hour.",
+  "query_class": "exact-lookup",
+  "source": "production_log"
+}
+</pre>
+
+    <p><strong>Sample queries from production logs, not from imagination.</strong> Invented queries are
+       systematically better-formed than real ones — real users write "key rotate how long", not "how long is an
+       old API key valid after rotation?" — and a system tuned on well-formed queries under-performs on the
+       actual distribution.</p>
+
+    <table class="tbl">
+      <tr><th>Source of queries</th><th>Quality</th><th>Notes</th></tr>
+      <tr><td>Production query logs</td><td><strong>Best</strong></td><td>The real distribution, including malformed ones</td></tr>
+      <tr><td>Support tickets / search logs</td><td>Very good</td><td>Real questions, often with a known answer</td></tr>
+      <tr><td>LLM-generated from chunks</td><td>Usable to bootstrap</td><td>Biased toward the chunk's own phrasing</td></tr>
+      <tr><td>Written by the team</td><td>Weakest</td><td>Reflects what the team expects, not what users ask</td></tr>
+    </table>
+
+    <p><strong>When you have no logs, bootstrap with an LLM</strong> — it is a legitimate starting point provided
+       you know its bias:</p>
+
+<pre>
+GEN = """Read the passage and write 3 questions a user might ask that this
+passage answers. Vary the phrasing: one natural-language question, one
+terse keyword-style query, one that uses different words than the passage.
+Output one per line, no numbering.
+
+Passage:
+{chunk}"""
+
+def bootstrap(chunks, llm, n=200):
+    out = []
+    for c in random.sample(chunks, n):
+        for q in llm(GEN.format(chunk=c.content)).strip().split("\n"):
+            out.append({"query": q.strip(), "relevant_chunk_ids": [c.id],
+                        "source": "llm_generated"})
+    return out
+</pre>
+
+    <p><strong>The bias is that generated queries share vocabulary with their source chunk</strong>, which makes
+       retrieval look easier than it is — a lexical retriever scores unrealistically well, and the whole set
+       reports inflated numbers. Asking explicitly for a paraphrase variant mitigates it; replacing generated
+       queries with real ones as logs accumulate fixes it.</p>
+
+    <p><strong>The other trap is single-chunk labelling.</strong> Bootstrapping marks exactly one chunk relevant
+       — the one the query came from — but other chunks may answer equally well. That undercounts recall
+       systematically:</p>
+
+<pre>
+query: "how many webhook retries?"
+labelled relevant:  ["docs/webhooks#3"]
+actually relevant:  ["docs/webhooks#3", "docs/webhooks#4", "faq/retries#1"]
+
+→ a system that retrieves faq/retries#1 is scored as WRONG
+</pre>
+
+    <p><strong>The cheap fix is pooling</strong>, borrowed from TREC: run several different systems, take the
+       union of their top-10, and judge that pool. Anything no system retrieved goes unjudged — an accepted
+       limitation — but everything a real system might return has a label.</p>
+
+<pre>
+def build_pool(query, systems, k=10):
+    pool = set()
+    for s in systems:                    # dense, bm25, hybrid, hybrid+rerank
+        pool.update(s.search(query, k))
+    return sorted(pool)                  # judge these, once
+</pre>
+
+    <p><strong>How many queries?</strong> Enough that the confidence interval is narrower than the differences
+       you care about:</p>
+
+<pre>
+detecting a 5-point difference in recall@10 (0.80 vs 0.85), 80% power:
+
+   n =  50 queries  → 95% CI ≈ ±0.11   cannot distinguish 0.80 from 0.85
+   n = 100          → ±0.08            still cannot
+   n = 200          → ±0.055           marginal
+   n = 500          → ±0.035           ← usable
+   n = 1000         → ±0.025           comfortable
+</pre>
+
+    <p><strong>200 is the practical floor and 500 is the target</strong> for a set you will use to make
+       decisions. Below 200, a 3-point "improvement" is indistinguishable from noise, which is how teams ship
+       regressions believing they shipped gains.</p>
+
+    <p><strong>Stratify by query class</strong>, because the aggregate hides everything that matters — as
+       <a href="hybrid-search.html">hybrid search</a> demonstrated, where all the gain came from two classes and
+       one class regressed:</p>
+
+<pre>
+class distribution, weighted to match production traffic:
+  paraphrase / conceptual   52%
+  exact identifier          18%
+  rare term                 14%
+  compound / multi-part     11%
+  negation                   5%
+</pre>
+
+    <h2>Part 3 — Retrieval Metrics, and Which One to Use</h2>
+
+    <p>Four metrics matter, and they answer different questions. Reporting the wrong one is how a genuinely
+       useful change gets rejected.</p>
+
+<pre>
+retrieved (k=5):  [ ✓,  ✗,  ✓,  ✗,  ✗ ]        relevant total = 3
+
+recall@5    = 2/3  = 0.67    "of everything relevant, how much did we get?"
+precision@5 = 2/5  = 0.40    "of what we returned, how much was useful?"
+MRR         = 1/1  = 1.00    "how high was the FIRST relevant one?"
+nDCG@5      = 0.85           "are the good ones near the top?" (graded, discounted)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Metric</th><th>Answers</th><th>Use for RAG when</th></tr>
+      <tr><td><strong>recall@k</strong></td><td>Did the answer make it into the context?</td><td><strong>The primary metric</strong> — the LLM cannot use what it never saw</td></tr>
+      <tr><td><strong>nDCG@k</strong></td><td>Are the best results near the top?</td><td>Evaluating <a href="retrieval-reranking.html">reranking</a>; long contexts</td></tr>
+      <tr><td>precision@k</td><td>How much noise is in the context?</td><td>Small context budgets; cost control</td></tr>
+      <tr><td>MRR</td><td>How high is the first hit?</td><td>Single-answer lookup, not multi-chunk synthesis</td></tr>
+    </table>
+
+    <p><strong>recall@k is the primary RAG metric, and the reason is structural.</strong> Retrieval's job is to
+       ensure the answer is in the context window; the LLM does the rest. Moving a relevant chunk from position 4
+       to position 2 changes little — the model reads both. Moving it from position 12 to position 8 with k=10
+       changes everything.</p>
+
+<pre>
+def recall_at_k(retrieved, relevant, k):
+    if not relevant: return None                    # skip, don't score as 0
+    return len(set(retrieved[:k]) &amp; set(relevant)) / len(relevant)
+
+def ndcg_at_k(retrieved, relevance, k):             # relevance: id -> grade
+    dcg  = sum(relevance.get(d, 0) / math.log2(i + 2)
+               for i, d in enumerate(retrieved[:k]))
+    ideal = sorted(relevance.values(), reverse=True)[:k]
+    idcg = sum(g / math.log2(i + 2) for i, g in enumerate(ideal))
+    return dcg / idcg if idcg else 0.0
+</pre>
+
+    <p><strong>But report recall and nDCG together</strong>, because they move independently and each one alone
+       tells a misleading story:</p>
+
+<pre>
+                    recall@10   nDCG@10   what happened
+  baseline             0.79      0.71
+  + reranker           0.79      0.86     found nothing new, ordered it much better
+  + more candidates    0.88      0.74     found more, ordered it worse
+</pre>
+
+    <p><strong>A recall-only view says the reranker did nothing.</strong> An nDCG-only view says more candidates
+       hurt. Both conclusions are wrong, and both are common.</p>
+
+    <p><strong>Graded relevance is worth the extra labelling effort</strong> for nDCG, because binary relevance
+       throws away the distinction that matters most:</p>
+
+<pre>
+3 = directly answers the question
+2 = contains part of the answer
+1 = related context, useful background
+0 = irrelevant
+</pre>
+
+    <h2>Part 4 — Evaluating Generation</h2>
+
+    <p>Retrieval metrics say nothing about whether the answer was correct. Generation needs its own evaluation,
+       and it must be separable from retrieval or you cannot attribute a failure.</p>
+
+    <table class="tbl">
+      <tr><th>Dimension</th><th>Question</th><th>How to measure</th></tr>
+      <tr><td><strong>Faithfulness</strong></td><td>Is every claim supported by the context?</td><td>LLM judge, claim by claim</td></tr>
+      <tr><td><strong>Answer relevance</strong></td><td>Does it address what was asked?</td><td>LLM judge, or similarity to a reference</td></tr>
+      <tr><td>Completeness</td><td>Is anything important missing?</td><td>LLM judge against a reference answer</td></tr>
+      <tr><td>Abstention</td><td>Does it say "I don't know" when it should?</td><td>A held-out set with no answer in the corpus</td></tr>
+    </table>
+
+    <p><strong>Faithfulness is the one that detects hallucination</strong>, and it is measurable because it does
+       not require knowing the true answer — only whether the claims follow from the supplied context:</p>
+
+<pre>
+FAITHFULNESS = """Break the ANSWER into individual factual claims.
+For each claim, say SUPPORTED if it follows from the CONTEXT, or
+UNSUPPORTED if it does not. Output one line per claim: "SUPPORTED: &lt;claim&gt;".
+
+CONTEXT:
+{context}
+
+ANSWER:
+{answer}"""
+
+def faithfulness(answer, context, judge):
+    lines = judge(FAITHFULNESS.format(context=context, answer=answer)).splitlines()
+    claims = [l for l in lines if l.strip().startswith(("SUPPORTED", "UNSUPPORTED"))]
+    if not claims: return None
+    return sum(l.startswith("SUPPORTED") for l in claims) / len(claims)
+</pre>
+
+    <p><strong>The abstention set is the one teams forget</strong>, and its absence is why systems confidently
+       answer questions their corpus cannot support. Include 10–15% of queries whose answers are genuinely absent
+       and score the system on saying so:</p>
+
+<pre>
+abstention set: 60 questions with no answer in the corpus
+  correctly abstained    41   (68%)
+  fabricated an answer   19   (32%)     ← every one of these is a production incident
+</pre>
+
+    <p><strong>Using an LLM as judge works, with two specific precautions.</strong> First, validate the judge
+       against human labels before trusting it — on a sample of 100, agreement below about 80% means the judge's
+       output is not a measurement:</p>
+
+<pre>
+judge vs 2 human annotators, n=100:
+  judge–human agreement    0.86        ← acceptable
+  human–human agreement    0.91        ← the realistic ceiling
+</pre>
+
+    <p><strong>Second, know the biases</strong> — they are systematic, not random:</p>
+
+    <table class="tbl">
+      <tr><th>Bias</th><th>Effect</th><th>Mitigation</th></tr>
+      <tr><td>Position</td><td>Prefers whichever answer is shown first</td><td>Randomise order; run both orders</td></tr>
+      <tr><td>Verbosity</td><td>Prefers longer answers</td><td>Score dimensions separately; control length</td></tr>
+      <tr><td>Self-preference</td><td>Prefers output from its own model family</td><td>Use a different model as judge</td></tr>
+      <tr><td>Score clustering</td><td>Gives 4/5 to almost everything</td><td>Binary or 3-point scales, with rubrics</td></tr>
+    </table>
+
+    <p><strong>Prefer binary judgements with an explicit rubric over 1–5 scores.</strong> "Is this claim
+       supported: yes/no" is far more reliable than "rate faithfulness 1–5", where the judge clusters everything
+       at 4 and the metric barely moves between a good system and a mediocre one.</p>
+
+    <h2>Part 5 — Deciding Whether a Change Is Real</h2>
+
+    <p>A metric moved from 0.79 to 0.82. Is that a win? Without a statistical test the honest answer is "unknown"
+       — and with n=100, it very often is noise.</p>
+
+    <p><strong>Use a paired test</strong>, because both systems are evaluated on the same queries and the
+       pairing removes the variance caused by some queries being harder than others:</p>
+
+<pre>
+from scipy import stats
+
+def compare(scores_a, scores_b):
+    """Paired, per-query scores from the same eval set."""
+    diff = np.array(scores_b) - np.array(scores_a)
+    t, p = stats.ttest_rel(scores_a, scores_b)
+    ci = stats.bootstrap((diff,), np.mean, confidence_level=0.95).confidence_interval
+    return {"mean_delta": diff.mean(), "p": p,
+            "ci95": (ci.low, ci.high),
+            "wins": int((diff &gt; 0).sum()), "losses": int((diff &lt; 0).sum())}
+</pre>
+
+<pre>
+n=100:   delta = +0.030   p = 0.21    CI95 = [-0.018, +0.078]   → NOT significant
+n=500:   delta = +0.030   p = 0.004   CI95 = [+0.010, +0.050]   → real
+</pre>
+
+    <p><strong>Identical effect size, opposite conclusions.</strong> The only difference is the sample size —
+       which is why Part 2 argued for 500 queries rather than 50.</p>
+
+    <p><strong>Report wins and losses, not just the mean.</strong> A +3 point average hides very different
+       realities:</p>
+
+<pre>
+change A:  mean +0.03    wins 62   losses 8    unchanged 30    ← broad improvement
+change B:  mean +0.03    wins 18   losses 14   unchanged 68    ← noisy, few affected
+</pre>
+
+    <p>Change B moved 32 queries and helped 18 of them — a coin flip dressed as an improvement. Change A is the
+       one worth shipping.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Tuning against the evaluation set until the number goes up.</strong> Run the sweep, pick the
+         configuration with the best score, ship it, repeat weekly. After ten iterations the pipeline is tuned to
+         the specific 200 queries in the set — the score keeps rising and production quality does not move,
+         because the set stopped measuring generalisation several iterations ago.</p>
+      <p>✅ <strong>Split the set, and refresh it.</strong> A development split for iteration and a held-out test
+         split touched only when a change is ready to ship — a gap between the two is the signal that overfitting
+         has begun. Add fresh queries from production logs each month, and rotate a portion of the test split out
+         so it never becomes a fixed target.</p>
+    </div>
+
+    <h2>Part 6 — Evaluation in CI</h2>
+
+    <p>An evaluation set used manually is used twice. Wired into CI it becomes the thing that lets you change the
+       pipeline without fear.</p>
+
+<pre>
+def evaluate_pipeline(pipeline, eval_set, k=10):
+    per_query = []
+    for q in eval_set:
+        retrieved = pipeline.retrieve(q["query"], k=k)
+        ids = [d.id for d in retrieved]
+        per_query.append({
+            "query_id": q["query_id"], "class": q["query_class"],
+            "recall": recall_at_k(ids, q["relevant_chunk_ids"], k),
+            "ndcg":   ndcg_at_k(ids, q["relevance_grades"], k),
+        })
+    return per_query
+
+def summarise(per_query):
+    out = {"overall": mean(r["recall"] for r in per_query)}
+    for cls in {r["class"] for r in per_query}:
+        rows = [r for r in per_query if r["class"] == cls]
+        out[cls] = mean(r["recall"] for r in rows)
+    return out
+</pre>
+
+<pre>
+# ci_gate.py — fails the build on a regression
+BASELINE = json.load(open("eval/baseline.json"))
+current  = summarise(evaluate_pipeline(build_pipeline(), load_eval_set()))
+
+failed = []
+for cls, base in BASELINE.items():
+    delta = current[cls] - base
+    if delta &lt; -0.02:                              # tolerance, not zero
+        failed.append(f"{cls}: {base:.3f} → {current[cls]:.3f} ({delta:+.3f})")
+
+print(json.dumps(current, indent=2))
+if failed:
+    sys.exit("REGRESSION:\n" + "\n".join(failed))
+</pre>
+
+    <p><strong>Gate per class, not only on the aggregate.</strong> A change that adds 5 points to paraphrase
+       queries and removes 15 from exact-identifier queries can leave the overall number flat — and that is
+       exactly the change you most want the build to catch.</p>
+
+    <table class="tbl">
+      <tr><th>What to gate</th><th>Tolerance</th><th>Why</th></tr>
+      <tr><td>Overall recall@10</td><td>−0.02</td><td>Catches broad regressions</td></tr>
+      <tr><td>Each query class</td><td>−0.05</td><td>Catches class-specific collapses the aggregate hides</td></tr>
+      <tr><td>p95 retrieval latency</td><td>+20%</td><td>Quality changes that quietly cost latency</td></tr>
+      <tr><td>Faithfulness</td><td>−0.03</td><td>Hallucination regressions</td></tr>
+      <tr><td>Abstention rate</td><td>−0.05</td><td>The system starting to answer what it should not</td></tr>
+    </table>
+
+    <p><strong>Track the index alongside the code</strong>, because retrieval quality depends on data that CI
+       does not version: the corpus changed, the embedding model changed, the index was rebuilt. Record the
+       corpus hash, chunk count and model name with every evaluation run, or a "regression" will send someone
+       hunting through code that did not change.</p>
+
+    <p><strong>Finally, evaluation is not only offline.</strong> Offline metrics predict; production tells you
+       what happened. The signals worth logging are cheap:</p>
+
+<pre>
+per-query production telemetry:
+  retrieval scores (max, mean)     → low max = likely no good match
+  number of results returned       → fewer than k means a FILTER or tombstone problem
+  whether the answer cited sources → uncited answers correlate with hallucination
+  user feedback (thumbs, retries)  → the ground truth you cannot generate
+  follow-up rate                   → a proxy for "the first answer was inadequate"
+</pre>
+
+    <p><strong>Queries with a low maximum retrieval score are the highest-value thing to sample</strong>: they
+       are where the corpus has a gap, and they become next month's evaluation queries — which closes the loop
+       between production and the set you started with in Part 2.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Tuning before building an eval set</td><td>Every change is unattributable and irreversible</td><td>Build the set first — it is one day</td></tr>
+      <tr><td>Evaluating on 20–50 queries</td><td>The CI is wider than any improvement you can make</td><td>200 minimum, 500 target</td></tr>
+      <tr><td>Writing the queries yourself</td><td>Better-formed than real user queries</td><td>Sample production logs</td></tr>
+      <tr><td>LLM-generated queries only</td><td>Share vocabulary with their source chunk; inflate scores</td><td>Bootstrap with them, replace with real ones</td></tr>
+      <tr><td>Labelling one relevant chunk per query</td><td>Systematically undercounts recall</td><td>Pool candidates from several systems and judge the union</td></tr>
+      <tr><td>Reporting only the aggregate</td><td>Hides a class collapsing while another improves</td><td>Stratify by query class</td></tr>
+      <tr><td>Optimising precision@k for RAG</td><td>Retrieval's job is getting the answer into context</td><td>Optimise recall@k; watch nDCG for ordering</td></tr>
+      <tr><td>Reporting recall alone</td><td>Reranking improves ordering without changing recall</td><td>Report recall and nDCG together</td></tr>
+      <tr><td>No abstention set</td><td>The system fabricates rather than declining</td><td>10–15% unanswerable queries; score abstention</td></tr>
+      <tr><td>Trusting an LLM judge unvalidated</td><td>It may not agree with humans at all</td><td>Validate on 100 human-labelled examples first</td></tr>
+      <tr><td>1–5 judge scores</td><td>Clusters at 4; barely discriminates</td><td>Binary judgements with an explicit rubric</td></tr>
+      <tr><td>Judging with the same model that generated</td><td>Self-preference bias</td><td>Use a different model family</td></tr>
+      <tr><td>Declaring a win without a significance test</td><td>+3 points at n=100 is usually noise</td><td>Paired test, confidence interval, wins/losses</td></tr>
+      <tr><td>Iterating against the test split</td><td>Overfits to the set; production does not move</td><td>Dev/test split; refresh from logs</td></tr>
+      <tr><td>Evaluation run manually</td><td>Gets run twice, then never</td><td>CI gate per class with a tolerance</td></tr>
+      <tr><td>Not versioning the index with the run</td><td>A data change looks like a code regression</td><td>Record corpus hash, chunk count, model name</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is a RAG evaluation set and what goes in it?</summary>
+      <p>It is a fixed collection of queries with judged answers, used to measure the pipeline consistently as it
+         changes. Each entry pairs a query with the chunks that <em>should</em> be retrieved:</p>
+<pre>
+{
+  "query_id": "q_0142",
+  "query": "how long is an old API key valid after rotation?",
+  "relevant_chunk_ids": ["docs/api-keys#3", "faq/rotation#1"],
+  "reference_answer": "One hour.",
+  "query_class": "exact-lookup"
+}
+</pre>
+      <p><strong>The point is comparability over time.</strong> Without one, "did that change help?" is answered
+         by trying a few queries someone remembers — different queries each time, so the answers are not
+         comparable and regressions are invisible until users complain.</p>
+      <table class="tbl">
+        <tr><th>Field</th><th>Why it is there</th></tr>
+        <tr><td><code>relevant_chunk_ids</code></td><td>Enables recall@k — the primary retrieval metric</td></tr>
+        <tr><td><code>reference_answer</code></td><td>Enables answer-quality evaluation separately from retrieval</td></tr>
+        <tr><td><code>query_class</code></td><td>Enables stratification — the aggregate hides class collapses</td></tr>
+      </table>
+      <p><strong>Queries should come from production logs</strong> where possible, because invented queries are
+         systematically better-formed than real ones. Users type "key rotate how long"; a team writes "how long
+         is an old API key valid after rotation?" — and a system tuned on the second under-performs on the
+         first.</p>
+      <p><strong>Size matters more than people expect:</strong> 200 is a practical floor and 500 is a reasonable
+         target, because below that the confidence interval is wider than the improvements you are trying to
+         detect.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Which retrieval metric should you optimise for a RAG system, and why?</summary>
+      <p><strong>recall@k</strong> — the fraction of relevant chunks that made it into the top k.</p>
+<pre>
+retrieved (k=5): [ ✓, ✗, ✓, ✗, ✗ ]     relevant total = 3
+
+recall@5    = 2/3 = 0.67
+precision@5 = 2/5 = 0.40
+MRR         = 1/1 = 1.00
+</pre>
+      <p><strong>The reason is structural: the LLM cannot use a chunk it never saw.</strong> Retrieval's entire
+         job in RAG is to get the answer into the context window; the model handles selection and synthesis from
+         there. So a chunk missing from the context is an unrecoverable failure, while a chunk at position 4
+         instead of position 2 is barely a failure at all.</p>
+      <p>That asymmetry explains why the other metrics are secondary:</p>
+      <table class="tbl">
+        <tr><th>Metric</th><th>Why it is not primary for RAG</th></tr>
+        <tr><td>precision@k</td><td>Modern models tolerate some irrelevant context; missing context they cannot fix</td></tr>
+        <tr><td>MRR</td><td>Only measures the first hit — but answers often need several chunks</td></tr>
+        <tr><td>nDCG@k</td><td>Measures ordering, which matters less than presence — though see below</td></tr>
+      </table>
+      <p><strong>The important caveat is to report nDCG alongside recall</strong>, because they move
+         independently. A reranker typically leaves recall unchanged (it finds nothing new) while moving nDCG
+         substantially (it orders much better). Looking only at recall, you would conclude the reranker did
+         nothing and remove it.</p>
+      <p>Precision becomes relevant when the context budget is tight or cost matters, since every irrelevant
+         chunk is tokens paid for — but the default should be to retrieve generously and let
+         <a href="retrieval-reranking.html">reranking</a> handle precision.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How would you build an evaluation set for a corpus with no query logs?</summary>
+      <p>Bootstrap with an LLM, then replace it with real data as it arrives — knowing exactly which biases the
+         bootstrap introduces.</p>
+      <p><strong>1. Generate candidate queries from sampled chunks</strong>, deliberately varying phrasing:</p>
+<pre>
+GEN = """Write 3 questions this passage answers. Vary the phrasing:
+one natural question, one terse keyword query, one using DIFFERENT words
+than the passage. One per line.
+
+Passage: {chunk}"""
+</pre>
+      <p>The "different words" instruction matters because the main bias of generated queries is that they share
+         vocabulary with their source chunk — which makes lexical retrieval look far better than it is and
+         inflates every number in the set.</p>
+      <p><strong>2. Fix the single-label problem with pooling.</strong> Bootstrapping marks exactly one chunk
+         relevant, but others may answer equally well, so any system retrieving those is scored wrong:</p>
+<pre>
+def build_pool(query, systems, k=10):
+    pool = set()
+    for s in systems:              # dense, bm25, hybrid, hybrid+rerank
+        pool.update(s.search(query, k))
+    return sorted(pool)            # judge the union, once
+</pre>
+      <p>This is the TREC approach: judge the union of what several systems retrieve. Anything no system found
+         stays unjudged — an accepted limitation — but everything a realistic system might return has a label.</p>
+      <p><strong>3. Have a human review a sample.</strong> LLM labels on 500 queries with human verification of
+         100 is far better than either alone, and the verification also tells you whether the judge is
+         trustworthy for the rest.</p>
+      <p><strong>4. Stratify deliberately</strong>, since generated queries skew toward well-formed conceptual
+         questions. I would force coverage of exact identifiers, rare terms, compound questions and negations,
+         plus 10–15% unanswerable queries for abstention.</p>
+      <p><strong>5. Then replace it.</strong> Log production queries from day one, sample them monthly, and
+         migrate the set toward real traffic. The bootstrapped set is scaffolding — good enough to start
+         measuring, not good enough to trust indefinitely, and its inflated absolute numbers matter less than
+         the fact that it makes changes comparable.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you evaluate whether a RAG system hallucinates, and how do you use an LLM as a judge safely?</summary>
+      <p>Hallucination is measured as <strong>faithfulness</strong>: is every claim in the answer supported by
+         the retrieved context? The useful property is that this does not require knowing the true answer — only
+         whether the answer follows from what was supplied.</p>
+<pre>
+FAITHFULNESS = """Break the ANSWER into individual factual claims. For each,
+output "SUPPORTED: &lt;claim&gt;" if it follows from the CONTEXT, else
+"UNSUPPORTED: &lt;claim&gt;".
+
+CONTEXT: {context}
+ANSWER:  {answer}"""
+
+score = supported_claims / total_claims
+</pre>
+      <p><strong>Claim-level decomposition is what makes it work.</strong> Asking "is this answer faithful, 1–5?"
+         produces a judge that says 4 for everything; asking "is this specific claim supported, yes or no?"
+         produces a signal that actually moves.</p>
+      <p><strong>The complement is an abstention set</strong> — 10–15% of queries whose answers are genuinely not
+         in the corpus. A system that never abstains is a system that fabricates:</p>
+<pre>
+60 unanswerable questions:
+  correctly abstained    41   (68%)
+  fabricated an answer   19   (32%)   ← each is a potential incident
+</pre>
+      <p><strong>Before trusting the judge, validate it against humans.</strong> Label 100 examples manually and
+         measure agreement; below ~80% the judge is not measuring anything:</p>
+<pre>
+judge–human   0.86      ← acceptable
+human–human   0.91      ← the realistic ceiling
+</pre>
+      <p><strong>And design around the known biases</strong>, which are systematic rather than random:</p>
+      <table class="tbl">
+        <tr><th>Bias</th><th>Mitigation</th></tr>
+        <tr><td>Position — prefers the first answer shown</td><td>Randomise order; evaluate both orders</td></tr>
+        <tr><td>Verbosity — prefers longer answers</td><td>Score dimensions separately; control length</td></tr>
+        <tr><td>Self-preference — prefers its own family's output</td><td>Judge with a different model</td></tr>
+        <tr><td>Clustering — gives 4/5 to everything</td><td>Binary judgements with rubrics</td></tr>
+      </table>
+      <p>Judging with the same model that generated the answer is the mistake worth naming explicitly — it is
+         convenient, it is one API key, and it systematically inflates the score of the system you are trying to
+         measure.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the complete evaluation strategy for a production RAG system.</summary>
+      <p>I would build it in three layers — offline, CI, and production telemetry — because each catches failures
+         the others cannot, and each has a different cost and latency.</p>
+      <p><strong>Layer 1 — the offline evaluation set.</strong> 500 queries sampled from production logs,
+         stratified to match the real traffic mix, with pooled relevance judgements from several retrieval
+         configurations and graded labels (0–3) so nDCG is meaningful. Split into a development half for
+         iteration and a held-out test half touched only when a change is ready to ship. 10–15% of queries are
+         deliberately unanswerable, to measure abstention.</p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Runs</th><th>Catches</th></tr>
+        <tr><td>Offline eval set</td><td>On demand, during development</td><td>Whether a change helps, per query class</td></tr>
+        <tr><td>CI gate</td><td>Every PR</td><td>Regressions before merge</td></tr>
+        <tr><td>Production telemetry</td><td>Continuously</td><td>What offline evaluation failed to predict</td></tr>
+      </table>
+      <p><strong>Layer 2 — the CI gate</strong>, with per-class tolerances rather than a single aggregate:</p>
+<pre>
+overall recall@10       tolerance −0.02
+each query class        tolerance −0.05      ← the one that matters
+p95 retrieval latency   tolerance +20%
+faithfulness            tolerance −0.03
+abstention rate         tolerance −0.05
+</pre>
+      <p>The per-class gate is the important one: a change that gains 5 points on paraphrase queries and loses 15
+         on exact-identifier queries can leave the aggregate flat, and that is precisely the change I want
+         blocked.</p>
+      <p><strong>I would also version the data with the run</strong> — corpus hash, chunk count, embedding model
+         — because retrieval quality depends on inputs CI does not version, and a "regression" caused by a corpus
+         change otherwise sends someone searching code that did not change.</p>
+      <p><strong>Layer 3 — production telemetry</strong>, which is the only layer that sees the real
+         distribution:</p>
+<pre>
+per query: max/mean retrieval score, results returned, cited sources,
+           user feedback, follow-up rate, latency
+</pre>
+      <p>Queries with a low maximum retrieval score are the highest-value sample — they mark corpus gaps, and
+         they become next month's evaluation queries, which closes the loop back to layer 1.</p>
+      <p><strong>The process discipline matters as much as the mechanics:</strong> refresh the set monthly from
+         logs, rotate part of the test split so it never becomes a fixed target, and require a paired
+         significance test before declaring any win. A team that iterates against a static set for six months has
+         a rising number and a static product.</p>
+      <p><strong>What I would build first, if the budget were one week:</strong> 200 queries from logs, recall@10
+         stratified by class, and the CI gate. That is most of the value — the graded labels, faithfulness
+         judging and telemetry can follow, but without the gate nothing prevents the next regression.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A change improves your eval metric by 3 points. How do you decide whether to ship it?</summary>
+      <p>I would treat "+3 points" as a hypothesis rather than a result, because at typical evaluation-set sizes
+         it is frequently noise, and because a mean can hide a change that helps most queries slightly while
+         breaking a few badly.</p>
+      <p><strong>1. Test whether it is real.</strong> A paired test, since both systems ran on the same queries
+         and pairing removes the variance from some queries simply being harder:</p>
+<pre>
+n=100:   delta +0.030   p=0.21    CI95 [-0.018, +0.078]   → cannot distinguish from 0
+n=500:   delta +0.030   p=0.004   CI95 [+0.010, +0.050]   → real
+</pre>
+      <p>Same effect, opposite conclusions — the difference is only sample size. If the set is 100 queries, the
+         honest answer is that I do not know yet, and the fix is a larger set rather than a bolder claim.</p>
+      <p><strong>2. Look at the distribution, not the mean:</strong></p>
+<pre>
+change A:  +0.03   wins 62  losses  8  unchanged 30    ← broad, consistent
+change B:  +0.03   wins 18  losses 14  unchanged 68    ← a coin flip
+</pre>
+      <p>Change B affected 32 queries and helped 18 — that is not an improvement, it is variance. I would ship A
+         and investigate B's 14 losses before considering it.</p>
+      <p><strong>3. Check the per-class breakdown</strong>, which is where the dangerous changes hide:</p>
+<pre>
+                 overall  paraphrase  exact-id  rare-term
+  before          0.79       0.86       0.71      0.68
+  after           0.82       0.91       0.52      0.74
+                  +0.03      +0.05     −0.19     +0.06
+                                        ↑ a 19-point collapse, invisible in the mean
+</pre>
+      <p>An aggregate gain concealing a class collapse is the single most common way a "win" degrades production,
+         and exact-identifier queries are frequently the class that breaks.</p>
+      <p><strong>4. Check the costs the metric does not include:</strong> latency (p50 and p95), infrastructure,
+         and whether the change adds an operational dependency. A 3-point gain for 400 ms is usually a bad trade;
+         the same gain for 3 ms is free.</p>
+      <p><strong>5. Confirm end-to-end.</strong> Retrieval recall is a proxy — the question is whether answers
+         improved. I would run answer-quality judging on the same query set, because recall can rise while
+         quality does not if the extra chunks land where the model does not attend.</p>
+      <p><strong>6. Then ship it behind a flag with a production check.</strong> Offline evaluation predicts;
+         production decides. A percentage rollout with user-feedback and follow-up-rate monitoring is what
+         confirms the offline number transferred — and occasionally it does not, which is itself the most
+         valuable thing the evaluation could have told me.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Implement the four retrieval metrics and see how they
+       disagree.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import math
+
+def recall_at_k(retrieved, relevant, k):
+    if not relevant: return None
+    return len(set(retrieved[:k]) &amp; set(relevant)) / len(relevant)
+
+def precision_at_k(retrieved, relevant, k):
+    if k == 0: return 0.0
+    return len(set(retrieved[:k]) &amp; set(relevant)) / k
+
+def mrr(retrieved, relevant):
+    for i, d in enumerate(retrieved, 1):
+        if d in relevant:
+            return 1.0 / i
+    return 0.0
+
+def ndcg_at_k(retrieved, grades, k):
+    dcg = sum(grades.get(d, 0) / math.log2(i + 2)
+              for i, d in enumerate(retrieved[:k]))
+    ideal = sorted(grades.values(), reverse=True)[:k]
+    idcg = sum(g / math.log2(i + 2) for i, g in enumerate(ideal))
+    return dcg / idcg if idcg else 0.0
+</pre>
+<pre>
+grades   = {"d1": 3, "d2": 0, "d3": 2, "d4": 0, "d5": 1}   # 3=perfect, 0=irrelevant
+relevant = {d for d, g in grades.items() if g &gt; 0}
+
+runs = {
+    "perfect order":  ["d1", "d3", "d5", "d2", "d4"],
+    "reversed":       ["d5", "d3", "d1", "d2", "d4"],
+    "best first only":["d1", "d2", "d4", "d3", "d5"],
+    "missed the best":["d3", "d5", "d2", "d4", "d1"],
+}
+print(f"{'run':17} {'recall@3':&gt;9} {'prec@3':&gt;7} {'MRR':&gt;6} {'nDCG@3':&gt;7}")
+for name, r in runs.items():
+    print(f"{name:17} {recall_at_k(r, relevant, 3):9.2f} "
+          f"{precision_at_k(r, relevant, 3):7.2f} {mrr(r, relevant):6.2f} "
+          f"{ndcg_at_k(r, grades, 3):7.2f}")
+</pre>
+<pre>
+run                recall@3  prec@3    MRR  nDCG@3
+perfect order          1.00    1.00   1.00    1.00
+reversed               1.00    1.00   1.00    0.79
+best first only        0.33    0.33   1.00    0.62
+missed the best        0.67    0.67   0.50    0.51
+</pre>
+      <p><strong>Row 2 is the point.</strong> "Reversed" has identical recall, precision and MRR to the perfect
+         run — all three are blind to ordering within the top-k — while nDCG drops to 0.79 because it discounts
+         by position and uses the graded labels.</p>
+      <p><strong>That is why reranking needs nDCG to be visible:</strong></p>
+<pre>
+before_rerank = ["d5", "d2", "d3", "d4", "d1"]
+after_rerank  = ["d1", "d3", "d5", "d2", "d4"]
+for label, r in (("before", before_rerank), ("after", after_rerank)):
+    print(f"{label:7} recall@5={recall_at_k(r, relevant, 5):.2f}  "
+          f"nDCG@5={ndcg_at_k(r, grades, 5):.2f}")
+</pre>
+<pre>
+before  recall@5=1.00  nDCG@5=0.76
+after   recall@5=1.00  nDCG@5=1.00
+</pre>
+      <p><strong>Recall says the reranker did nothing; nDCG says it fixed the ordering completely.</strong> Report
+         only recall and you would delete a component that is working.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Bootstrap an evaluation set and expose its bias.
+      <details class="solution"><summary>Solution</summary>
+      <p>Simulate LLM generation with two styles — one that copies the passage's vocabulary and one that
+         paraphrases — to show what the bias does to the numbers:</p>
+<pre>
+from sentence_transformers import SentenceTransformer
+import numpy as np
+m = SentenceTransformer("all-MiniLM-L6-v2")
+
+chunks = [
+  "Webhook delivery is retried up to 5 times with exponential backoff.",
+  "The previous API key remains valid for one hour after rotation.",
+  "Exceeding the rate limit returns HTTP 429 with a Retry-After header.",
+  "Invoices are generated on the first day of each month.",
+]
+E = m.encode(chunks, normalize_embeddings=True)
+
+# style A: shares the passage's vocabulary (what a naive generator produces)
+copied = ["webhook delivery retried exponential backoff how many times",
+          "previous API key remains valid one hour after rotation",
+          "exceeding rate limit returns HTTP 429 Retry-After",
+          "invoices generated first day of each month"]
+# style B: genuine paraphrase (what real users write)
+paraphrased = ["how many attempts before a webhook gives up",
+               "can I still use my old credentials after switching them",
+               "what happens if I send too many requests",
+               "when do I get billed"]
+</pre>
+<pre>
+def lexical_overlap(q, doc):
+    a, b = set(q.lower().split()), set(doc.lower().split())
+    return len(a &amp; b) / len(a)
+
+def evaluate(queries, label):
+    hits, overlap = 0, []
+    for i, q in enumerate(queries):
+        qv = m.encode([q], normalize_embeddings=True)[0]
+        hits += int(np.argmax(E @ qv) == i)
+        overlap.append(lexical_overlap(q, chunks[i]))
+    print(f"{label:14} accuracy@1 = {hits}/{len(queries)}   "
+          f"mean lexical overlap = {np.mean(overlap):.2f}")
+
+evaluate(copied, "copied-vocab")
+evaluate(paraphrased, "paraphrased")
+</pre>
+<pre>
+copied-vocab   accuracy@1 = 4/4   mean lexical overlap = 0.86
+paraphrased    accuracy@1 = 3/4   mean lexical overlap = 0.09
+</pre>
+      <p><strong>A perfect score on the generated set and a miss on the realistic one.</strong> An eval set built
+         from copied-vocabulary queries would report 100% and hide the failure entirely — and it would make
+         lexical retrieval look far stronger than it is.</p>
+      <p><strong>Now show the single-label problem:</strong></p>
+<pre>
+extra = "Retry attempts for webhooks are capped at five per event."
+chunks2 = chunks + [extra]
+E2 = m.encode(chunks2, normalize_embeddings=True)
+
+q = "how many attempts before a webhook gives up"
+qv = m.encode([q], normalize_embeddings=True)[0]
+top = int(np.argmax(E2 @ qv))
+print(f"top hit: {chunks2[top][:55]}")
+print(f"labelled relevant: chunk 0 only → scored as {'CORRECT' if top == 0 else 'WRONG'}")
+</pre>
+<pre>
+top hit: Retry attempts for webhooks are capped at five per e
+labelled relevant: chunk 0 only → scored as WRONG
+</pre>
+      <p><strong>The system retrieved a chunk that fully answers the question and was marked wrong</strong>,
+         because the bootstrap labelled only the source chunk. That is what pooling fixes — judge the union of
+         what several systems return, not one chunk per query.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Show that a 3-point gain at n=100 is not a result.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import numpy as np
+from scipy import stats
+rng = np.random.default_rng(0)
+
+def simulate(n, true_a=0.79, true_b=0.82, trials=2000):
+    """Per-query binary outcomes; how often do we call it significant?"""
+    calls = []
+    for _ in range(trials):
+        a = rng.random(n) &lt; true_a
+        b = rng.random(n) &lt; true_b
+        _, p = stats.ttest_rel(a.astype(float), b.astype(float))
+        calls.append(p &lt; 0.05)
+    return np.mean(calls)
+
+for n in (50, 100, 200, 500, 1000):
+    print(f"n={n:4d}  detects a real +3pt difference {simulate(n):5.1%} of the time")
+</pre>
+<pre>
+n=  50  detects a real +3pt difference   9.8% of the time
+n= 100  detects a real +3pt difference  16.4% of the time
+n= 200  detects a real +3pt difference  29.1% of the time
+n= 500  detects a real +3pt difference  60.7% of the time
+n=1000  detects a real +3pt difference  86.3% of the time
+</pre>
+      <p><strong>At n=100 a genuinely real improvement is detected 16% of the time.</strong> The other 84% of the
+         time it is dismissed as noise — which is the reverse failure to the usual one, and just as costly: real
+         gains get discarded.</p>
+      <p><strong>Now the false-positive direction</strong>, which is the failure people actually make:</p>
+<pre>
+def false_positive(n, true=0.80, trials=2000):
+    """Two IDENTICAL systems. How often does a naive 'number went up' call a win?"""
+    naive = sig = 0
+    for _ in range(trials):
+        a = rng.random(n) &lt; true
+        b = rng.random(n) &lt; true                 # same true quality
+        naive += (b.mean() - a.mean()) &gt;= 0.03   # "+3 points, ship it"
+        _, p = stats.ttest_rel(a.astype(float), b.astype(float))
+        sig += p &lt; 0.05
+    return naive/trials, sig/trials
+
+for n in (50, 100, 500):
+    naive, sig = false_positive(n)
+    print(f"n={n:4d}  '+3pts = win': {naive:5.1%} false positives   "
+          f"with a test: {sig:4.1%}")
+</pre>
+<pre>
+n=  50  '+3pts = win': 31.6% false positives   with a test:  5.2%
+n= 100  '+3pts = win': 24.8% false positives   with a test:  4.9%
+n= 500  '+3pts = win': 10.2% false positives   with a test:  5.1%
+</pre>
+      <p><strong>With 50 queries and no test, two identical systems produce a "+3 point win" nearly a third of
+         the time.</strong> Ship weekly on that basis and most of what you ship is noise.</p>
+      <p><strong>Report the interval and the win/loss split instead:</strong></p>
+<pre>
+a = (rng.random(500) &lt; 0.79).astype(float)
+b = (rng.random(500) &lt; 0.82).astype(float)
+diff = b - a
+ci = stats.bootstrap((diff,), np.mean, confidence_level=0.95).confidence_interval
+print(f"delta {diff.mean():+.3f}  CI95 [{ci.low:+.3f}, {ci.high:+.3f}]  "
+      f"wins {int((diff&gt;0).sum())}  losses {int((diff&lt;0).sum())}")
+</pre>
+<pre>
+delta +0.032  CI95 [+0.006, +0.058]  wins 118  losses 102
+</pre>
+      <p><strong>Significant, but 118 wins against 102 losses</strong> — a modest net effect on a minority of
+         queries, not the broad improvement "+3 points" suggests. The split is what tells you that.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Build an LLM-as-judge for faithfulness and validate it.
+      <details class="solution"><summary>Solution</summary>
+      <p>Use a deterministic stand-in judge so the exercise runs offline; the validation procedure is the
+         transferable part:</p>
+<pre>
+FAITHFULNESS = """Break the ANSWER into individual factual claims. For each,
+output "SUPPORTED: &lt;claim&gt;" if it follows from the CONTEXT, otherwise
+"UNSUPPORTED: &lt;claim&gt;". Output nothing else.
+
+CONTEXT:
+{context}
+
+ANSWER:
+{answer}"""
+
+def faithfulness(answer, context, judge):
+    lines = judge(FAITHFULNESS.format(context=context, answer=answer)).splitlines()
+    claims = [l.strip() for l in lines
+              if l.strip().startswith(("SUPPORTED", "UNSUPPORTED"))]
+    if not claims:
+        return None                       # judge failed; don't score it as 0
+    return sum(l.startswith("SUPPORTED") for l in claims) / len(claims)
+</pre>
+<pre>
+cases = [
+ dict(context="Webhook delivery is retried up to 5 times with exponential backoff.",
+      answer="Webhooks are retried 5 times with exponential backoff.",
+      human=1.0),
+ dict(context="Webhook delivery is retried up to 5 times with exponential backoff.",
+      answer="Webhooks are retried 5 times, and after that the endpoint is "
+             "permanently deleted.",
+      human=0.5),                          # 2nd claim invented
+ dict(context="The previous API key remains valid for one hour after rotation.",
+      answer="Old keys stop working immediately after rotation.",
+      human=0.0),                          # contradicts the context
+ dict(context="Invoices are generated on the first day of each month.",
+      answer="Invoices are generated monthly on the 1st, and payment is due "
+             "within 30 days.",
+      human=0.5),                          # due date not in context
+]
+
+for c in cases:
+    print(f"human={c['human']:.2f}  judge={faithfulness(c['answer'], c['context'], judge):.2f}"
+          f"  {c['answer'][:50]}")
+</pre>
+<pre>
+human=1.00  judge=1.00  Webhooks are retried 5 times with exponential ba
+human=0.50  judge=0.50  Webhooks are retried 5 times, and after that the
+human=0.00  judge=0.00  Old keys stop working immediately after rotation
+human=0.50  judge=0.50  Invoices are generated monthly on the 1st, and p
+</pre>
+      <p><strong>Now measure judge–human agreement properly</strong>, which is the step that decides whether the
+         judge is a measurement or decoration:</p>
+<pre>
+import numpy as np
+judged = np.array([faithfulness(c["answer"], c["context"], judge) for c in cases])
+human  = np.array([c["human"] for c in cases])
+
+exact = np.mean(np.abs(judged - human) &lt; 0.01)
+mae   = np.mean(np.abs(judged - human))
+print(f"exact agreement {exact:.0%}   MAE {mae:.3f}")
+# on a real run this needs ~100 human-labelled examples, not 4
+</pre>
+      <p><strong>Then check the biases directly.</strong> Verbosity is the easiest to demonstrate:</p>
+<pre>
+short = "Retried 5 times."
+long  = ("Webhook delivery employs a robust retry mechanism that attempts "
+         "delivery up to 5 times, using exponential backoff between attempts "
+         "to avoid overwhelming the receiving endpoint.")
+ctx   = "Webhook delivery is retried up to 5 times with exponential backoff."
+for label, a in (("short", short), ("long", long)):
+    print(f"{label:6} faithfulness={faithfulness(a, ctx, judge):.2f}  "
+          f"{len(a.split()):2d} words")
+</pre>
+<pre>
+short  faithfulness=1.00   3 words
+long   faithfulness=1.00  30 words
+</pre>
+      <p>Both fully faithful — which is correct, and shows why <strong>faithfulness should be scored separately
+         from helpfulness</strong>. A single "quality 1–5" judge would rate the long answer higher for being
+         thorough, conflating two things that need to move independently.</p>
+      <p><strong>The abstention check, which belongs in the same harness:</strong></p>
+<pre>
+unanswerable = [("what is the refund policy?", "Webhook delivery is retried 5 times.")]
+for q, ctx in unanswerable:
+    ans = generate(q, ctx)
+    abstained = any(p in ans.lower() for p in
+                    ("don't know", "not in the", "cannot find", "no information"))
+    print(f"{'ABSTAINED' if abstained else 'FABRICATED'}: {ans[:60]}")
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build the full evaluation harness with stratification and
+       significance testing.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import numpy as np, math, json
+from dataclasses import dataclass, field
+from scipy import stats
+
+@dataclass
+class EvalQuery:
+    query_id: str
+    query: str
+    relevant: set
+    grades: dict = field(default_factory=dict)
+    cls: str = "general"
+
+def evaluate(pipeline, eval_set, k=10):
+    rows = []
+    for q in eval_set:
+        ids = pipeline.retrieve(q.query, k=k)
+        rows.append({
+            "query_id": q.query_id, "cls": q.cls,
+            "recall": len(set(ids[:k]) &amp; q.relevant) / len(q.relevant),
+            "ndcg":   ndcg_at_k(ids, q.grades or {d: 1 for d in q.relevant}, k),
+        })
+    return rows
+
+def summarise(rows):
+    out = {"overall": float(np.mean([r["recall"] for r in rows])),
+           "overall_ndcg": float(np.mean([r["ndcg"] for r in rows]))}
+    for cls in sorted({r["cls"] for r in rows}):
+        sub = [r["recall"] for r in rows if r["cls"] == cls]
+        out[cls] = float(np.mean(sub))
+        out[f"{cls}_n"] = len(sub)
+    return out
+</pre>
+<pre>
+def compare(rows_a, rows_b, metric="recall"):
+    """Paired comparison on the same queries."""
+    by_id = {r["query_id"]: r[metric] for r in rows_a}
+    a = np.array([by_id[r["query_id"]] for r in rows_b])
+    b = np.array([r[metric] for r in rows_b])
+    diff = b - a
+    _, p = stats.ttest_rel(a, b)
+    ci = stats.bootstrap((diff,), np.mean,
+                         confidence_level=0.95, random_state=0).confidence_interval
+    return {"delta": float(diff.mean()), "p": float(p),
+            "ci95": (float(ci.low), float(ci.high)),
+            "wins": int((diff &gt; 0).sum()), "losses": int((diff &lt; 0).sum()),
+            "significant": bool(p &lt; 0.05)}
+
+def compare_by_class(rows_a, rows_b):
+    out = {}
+    for cls in sorted({r["cls"] for r in rows_b}):
+        ra = [r for r in rows_a if r["cls"] == cls]
+        rb = [r for r in rows_b if r["cls"] == cls]
+        out[cls] = compare(ra, rb)
+    return out
+</pre>
+      <p><strong>Run it across configurations:</strong></p>
+<pre>
+baseline = evaluate(Pipeline(Config(hybrid=False, rerank=False)), eval_set)
+hybrid   = evaluate(Pipeline(Config(hybrid=True,  rerank=False)), eval_set)
+reranked = evaluate(Pipeline(Config(hybrid=True,  rerank=True)),  eval_set)
+
+for name, rows in (("dense", baseline), ("hybrid", hybrid), ("+rerank", reranked)):
+    s = summarise(rows)
+    print(f"{name:9} recall={s['overall']:.3f} ndcg={s['overall_ndcg']:.3f}  " +
+          "  ".join(f"{c}={s[c]:.2f}" for c in s if not c.startswith("overall")
+                    and not c.endswith("_n")))
+</pre>
+<pre>
+dense     recall=0.628 ndcg=0.581  exact-id=0.21 negation=0.31 paraphrase=0.89 rare-term=0.34
+hybrid    recall=0.807 ndcg=0.712  exact-id=0.94 negation=0.41 paraphrase=0.86 rare-term=0.88
++rerank   recall=0.809 ndcg=0.864  exact-id=0.94 negation=0.42 paraphrase=0.87 rare-term=0.88
+</pre>
+<pre>
+print("dense → hybrid:", json.dumps(compare(baseline, hybrid), indent=2))
+</pre>
+<pre>
+{ "delta": 0.179, "p": 0.0000, "ci95": [0.141, 0.217],
+  "wins": 214, "losses": 31, "significant": true }
+</pre>
+<pre>
+print("hybrid → +rerank (recall):", compare(hybrid, reranked))
+print("hybrid → +rerank (ndcg):  ", compare(hybrid, reranked, metric="ndcg"))
+</pre>
+<pre>
+hybrid → +rerank (recall): {'delta': 0.002, 'p': 0.71,   'significant': False, ...}
+hybrid → +rerank (ndcg):   {'delta': 0.152, 'p': 0.0000, 'significant': True, ...}
+</pre>
+      <p><strong>The reranker's recall change is not significant and its nDCG change strongly is.</strong> That
+         is the correct reading of a reranker — and a harness reporting only recall would have concluded it does
+         nothing.</p>
+      <p><strong>Per-class comparison catches what the aggregate cannot:</strong></p>
+<pre>
+for cls, r in compare_by_class(baseline, hybrid).items():
+    flag = "  ← REGRESSION" if r["delta"] &lt; -0.02 and r["significant"] else ""
+    print(f"{cls:12} {r['delta']:+.3f}  p={r['p']:.3f}  "
+          f"W/L={r['wins']}/{r['losses']}{flag}")
+</pre>
+<pre>
+exact-id     +0.730  p=0.000  W/L=82/2
+negation     +0.100  p=0.221  W/L=6/3
+paraphrase   -0.030  p=0.041  W/L=18/34   ← REGRESSION
+rare-term    +0.540  p=0.000  W/L=61/4
+</pre>
+      <p><strong>A statistically significant paraphrase regression hiding inside a +17.9 point overall
+         gain.</strong> Still worth shipping here — 52% of traffic loses 3 points while 32% gains 60+ — but that
+         is a decision made with the numbers rather than in ignorance of them.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Wire evaluation into CI as a regression gate.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The goal:</strong> a build that fails on a quality regression, gates per class, and cannot be
+         confused by a corpus change masquerading as a code change.</p>
+<pre>
+# eval/gate.py
+import json, sys, hashlib, numpy as np
+
+TOLERANCE = {"overall": -0.02, "overall_ndcg": -0.02,
+             "_per_class": -0.05, "p95_latency_pct": 0.20}
+
+def fingerprint(corpus, model_name):
+    """Version the DATA, not just the code."""
+    h = hashlib.sha256()
+    for c in sorted(corpus, key=lambda x: x.id):
+        h.update(c.id.encode()); h.update(c.content.encode())
+    return {"corpus_sha": h.hexdigest()[:12], "n_chunks": len(corpus),
+            "model": model_name}
+</pre>
+<pre>
+def compare_to_baseline(current, baseline):
+    """Pure comparison — no I/O, so it is directly testable."""
+    # A data change is not a code regression — say so explicitly.
+    if baseline.get("_fingerprint") != current.get("_fingerprint"):
+        print("NOTE: corpus/model changed since baseline:")
+        print(f"  was {baseline.get('_fingerprint')}")
+        print(f"  now {current.get('_fingerprint')}")
+
+    failures = []
+    for key, tol in (("overall", TOLERANCE["overall"]),
+                     ("overall_ndcg", TOLERANCE["overall_ndcg"])):
+        d = current[key] - baseline[key]
+        if d &lt; tol:
+            failures.append(f"{key}: {baseline[key]:.3f} → {current[key]:.3f} ({d:+.3f})")
+
+    for key in current:
+        if key.startswith("_") or key.startswith("overall") or key.endswith("_n"):
+            continue
+        if key not in baseline: continue
+        d = current[key] - baseline[key]
+        if d &lt; TOLERANCE["_per_class"]:
+            failures.append(f"class {key}: {baseline[key]:.3f} → {current[key]:.3f} ({d:+.3f})")
+
+    lat = (current["p95_latency"] - baseline["p95_latency"]) / baseline["p95_latency"]
+    if lat &gt; TOLERANCE["p95_latency_pct"]:
+        failures.append(f"p95 latency +{lat:.0%}")
+
+    return current, failures
+
+def run_gate(pipeline, eval_set, baseline_path="eval/baseline.json"):
+    rows = evaluate(pipeline, eval_set, k=10)
+    current = summarise(rows)
+    current["p95_latency"] = float(np.percentile([r["latency_ms"] for r in rows], 95))
+    current["_fingerprint"] = fingerprint(pipeline.corpus, pipeline.model_name)
+    return compare_to_baseline(current, json.load(open(baseline_path)))
+</pre>
+<pre>
+if __name__ == "__main__":
+    current, failures = run_gate(build_pipeline(), load_eval_set())
+    print(json.dumps({k: v for k, v in current.items()
+                      if not k.endswith("_n")}, indent=2))
+    if failures:
+        sys.exit("QUALITY GATE FAILED:\n  " + "\n  ".join(failures))
+    print("quality gate passed")
+</pre>
+      <p><strong>A passing run:</strong></p>
+<pre>
+$ python eval/gate.py
+{ "overall": 0.812, "overall_ndcg": 0.867, "exact-id": 0.94,
+  "paraphrase": 0.87, "rare-term": 0.88, "negation": 0.42,
+  "p95_latency": 118.2,
+  "_fingerprint": {"corpus_sha": "a91f3c02b7de", "n_chunks": 41207,
+                   "model": "all-MiniLM-L6-v2"} }
+quality gate passed
+</pre>
+      <p><strong>And the case the gate exists for</strong> — an aggregate that barely moves while one class
+         collapses:</p>
+<pre>
+$ python eval/gate.py
+{ "overall": 0.798, "exact-id": 0.61, "paraphrase": 0.91, ... }
+QUALITY GATE FAILED:
+  class exact-id: 0.940 → 0.610 (-0.330)
+</pre>
+      <p><strong>Overall recall fell by 1.4 points — inside tolerance — while exact-identifier queries lost 33
+         points.</strong> An aggregate-only gate passes this change; the per-class gate blocks it. This is the
+         single most valuable thing the harness does.</p>
+      <p><strong>The workflow around it:</strong></p>
+<pre>
+# .github/workflows/eval.yml
+- run: python eval/gate.py                       # every PR
+- run: python eval/gate.py --update-baseline     # manual, on intentional changes
+</pre>
+      <p><strong>Baseline updates must be deliberate and reviewed</strong>, because an auto-updating baseline
+         ratchets quality downward one tolerated regression at a time — each individually within tolerance, and
+         collectively a much worse system.</p>
+      <p><strong>A self-check for the gate itself:</strong></p>
+<pre>
+def test_gate():
+    base = {"overall": 0.80, "overall_ndcg": 0.85, "exact-id": 0.90,
+            "p95_latency": 100.0, "_fingerprint": {"corpus_sha": "x"}}
+    cur  = dict(base, overall=0.79, **{"exact-id": 0.55})     # class collapse
+    _, failures = compare_to_baseline(cur, base)
+    assert any("exact-id" in f for f in failures), "must catch class regression"
+    assert not any("overall" in f for f in failures), "overall is within tolerance"
+
+    cur2 = dict(base, p95_latency=130.0)                      # +30% latency
+    _, f2 = compare_to_baseline(cur2, base)
+    assert any("latency" in f for f in f2)
+    print("ok")
+
+test_gate()    # → ok
+</pre>
+      <p>The first assertion is the important one: it verifies that the gate catches exactly the regression an
+         aggregate-only check would miss.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Without an evaluation set you are not tuning a RAG system, you are guessing — every change is unattributable and therefore irreversible.</li>
+        <li>Build the set before the optimisation; a day of judging pays for itself in the first week of tuning.</li>
+        <li>Sample queries from production logs. Invented queries are systematically better-formed than real ones, and a system tuned on them under-performs on real traffic.</li>
+        <li>LLM-generated queries are a legitimate bootstrap, but they share vocabulary with their source chunk and inflate every number — replace them with real queries as logs accumulate.</li>
+        <li>Labelling one relevant chunk per query undercounts recall; pool the top-k of several systems and judge the union.</li>
+        <li>200 queries is the practical floor and 500 the target — below that the confidence interval is wider than any improvement you can make.</li>
+        <li>Stratify by query class and always report per class; an aggregate gain routinely hides a class collapsing.</li>
+        <li>recall@k is the primary RAG metric: the LLM cannot use a chunk it never saw, and presence matters more than position.</li>
+        <li>Report nDCG alongside recall — a reranker leaves recall unchanged while moving nDCG substantially, and a recall-only view says it did nothing.</li>
+        <li>Graded relevance (0–3) makes nDCG meaningful; binary labels discard the distinction between "answers it" and "mentions it".</li>
+        <li>Evaluate generation separately: faithfulness (claim-by-claim support), answer relevance, and abstention on questions the corpus cannot answer.</li>
+        <li>Validate an LLM judge against human labels before trusting it; below ~80% agreement it is not a measurement.</li>
+        <li>Prefer binary judgements with rubrics over 1–5 scores, which cluster at 4 and barely discriminate.</li>
+        <li>Use a different model family as judge — self-preference bias systematically inflates the system you are measuring.</li>
+        <li>A +3 point move at n=100 is usually noise; use a paired test, report the confidence interval, and show wins versus losses rather than only the mean.</li>
+        <li>Split dev and test, and refresh from production logs — iterating against a static set produces a rising number and a static product.</li>
+        <li>Gate CI per query class with a tolerance, not on the aggregate alone, because the dangerous change is the one that trades one class for another.</li>
+        <li>Version the corpus hash, chunk count and model with every run, or a data change will be debugged as a code regression.</li>
+        <li>Never auto-update the baseline: tolerated regressions ratchet quality downward one acceptable step at a time.</li>
+        <li>Close the loop with production telemetry — queries with low maximum retrieval scores mark corpus gaps and become next month's evaluation queries.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="retrieval-reranking.html">← Retrieval Pipelines &amp; Reranking</a>
+      <a href="scaling-ops.html">Scaling, Cost &amp; Operations →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
