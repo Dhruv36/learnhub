@@ -8,37 +8,29 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ## ▶️ RESUME HERE (last updated 2026-08-11)
 
-**Last completed:** ✅ **Unix & Linux (track 22)** — 20 lessons (44–59KB, every one `det=12 ex=6`)
-+ quiz bank (`10 200 0`, 0 duplicate stems). Whole track passes `validate.py` with 0 errors; pushed & live.
-Sections: Foundations ×4 · The Shell ×4 · Processes & The Kernel ×4 · The Running System ×4 ·
-Production Skills ×4. Its `quiz.html` was clean (no stale `← CSS Track` link).
+**Last completed:** ✅ **Vector Databases & RAG (track 21)** — **all 15 lessons** (51–68KB, every one
+`det=12 ex=6`) + quiz bank (`10 200 0`, 0 duplicate stems). Whole track passes `validate.py` with
+0 errors; pushed & live. Sections: Foundations ×4 · Indexing & Search ×4 · The Landscape ×3 ·
+RAG in Production ×4.
 
-**🚧 IN PROGRESS: Vector Databases & RAG (track 21)** — `tutorials/vector-databases/`.
-Scaffolding done: `nav.js` (15 lessons across 4 sections), `quiz.html` fixed (had the `← CSS Track` bug
-**and** mojibake from the scaffold — both repaired), root `index.html` card already present.
-**9 of 15 lessons written**, each 51–55KB and validating clean:
+*§1 Foundations* — `index.html` (What a Vector Database Is For) · `embeddings.html` ·
+`similarity-metrics.html` · `dimensionality.html`
+*§2 Indexing & Search* — `knn-vs-ann.html` · `hnsw.html` · `ivf-pq.html` · `tuning-recall.html`
+*§3 The Landscape* — `pgvector.html` · `dedicated-stores.html` (segments/tombstones/sharding,
+fan-out tail latency) · `hybrid-search.html` (pre/post/during-traversal filtering, BM25, RRF)
+*§4 RAG in Production* — `chunking.html` (dilution, small-to-big, contextual headers, idempotent
+ingestion) · `retrieval-reranking.html` (funnel, bi- vs cross-encoder, query rewriting, lost-in-the-middle)
+· `evaluation.html` (eval sets, recall vs nDCG, LLM judges, significance, CI gates) ·
+`scaling-ops.html` (memory sizing, cost breakdown, caching, monitoring, model migration, context poisoning)
 
-*§1 Foundations — COMPLETE ×4*
-- ✅ `index.html` — What a Vector Database Is For
-- ✅ `embeddings.html` — Embeddings & Vector Space
-- ✅ `similarity-metrics.html` — Similarity Metrics & Normalisation
-- ✅ `dimensionality.html` — The Curse of Dimensionality
+⚠️ **`quiz.html` mojibake was NOT actually fixed by the earlier scaffold pass** — it still contained
+`Â·` and `â†’` (double-encoded UTF-8) and was repaired on 2026-08-11. **Check any newly-scaffolded
+`quiz.html` for both the stale `← CSS Track` link AND mojibake before committing.**
 
-*§2 Indexing & Search — COMPLETE ×4*
-- ✅ `knn-vs-ann.html` — Exact kNN vs Approximate Search
-- ✅ `hnsw.html` — HNSW Deep Dive
-- ✅ `ivf-pq.html` — IVF, PQ & Quantisation
-- ✅ `tuning-recall.html` — Tuning Recall vs Latency
+**🚧 NEXT: LeetCode Patterns v4 (track 18)** — `tutorials/leetcode/`, 21 lessons currently at v3
+(~12KB each). Note `index.html` has **0** `<details>` blocks. Needs the full v4 treatment plus the
+batch-2 patterns. Read `tutorials/leetcode/nav.js` first for the fixed lesson order.
 
-*§3 The Landscape — 1 of 3*
-- ✅ `pgvector.html` — pgvector & SQL-Native Vectors
-- ⏳ **NEXT: `dedicated-stores.html`**, then `hybrid-search.html`
-
-*§4 RAG in Production — 0 of 4*
-- ⏳ `chunking.html` · `retrieval-reranking.html` · `evaluation.html` · `scaling-ops.html`
-- ⏳ then both quiz banks (`10 200 0`)
-
-Lesson order and filenames are fixed by `tutorials/vector-databases/nav.js` — read it first on resume.
 Forward links to unwritten lessons show as "broken link" in validate.py; that is expected and clears as
 each file lands. Re-run the whole-track validate at the end.
 
@@ -50,7 +42,8 @@ must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair. A forward li
 not-yet-written next lesson shows as a "broken link" error — that is expected and clears when the
 next file lands; re-run the whole-track validate at the end to confirm 0 errors.
 
-**Then, in order:** finish Vector Databases & RAG (6 lessons + bank) → LeetCode v4 (21) → infra six (~70).
+**Then, in order:** LeetCode v4 (21 lessons + bank retune) → infra six (~70 lessons: Docker,
+Kubernetes, AWS, CI/CD, MongoDB, Redis).
 
 **Quiz-bank recipe (per the 2026-08-05 decision — a track is not done without it):**
 sets are `{title:"Quiz N · Topic", desc, questions:[{q, options:[3], answer:<idx>, explain}×20]}`,
@@ -87,7 +80,7 @@ Validate with the node one-liner at the bottom of this file → must print `10 2
 | 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | ✅ v3 done · ⏳ v4 pending |
 | 19 | System Design | 36 lessons (Fundamentals ×11 + Deep Dives ×6 + Case Studies ×12 + Senior/Staff ×7) | 200 | ✅ DONE (v4) |
 | 20 | 🆕 Database Concepts & Architecture | **15 (v4)** | 200 | ✅ **DONE 15/15 + quiz bank** (2026-08-07) |
-| 21 | 🆕 Vector Databases & RAG | **9 of 15 (v4)** | 200 (to write) | 🚧 **IN PROGRESS** — §1+§2 complete, §3 at 1/3 |
+| 21 | 🆕 Vector Databases & RAG | **15 (v4)** | 200 | ✅ **DONE 15/15 + quiz bank** (2026-08-11) |
 | 22 | 🆕 Unix & Linux | **20 (v4)** | 200 | ✅ **DONE 20/20 + quiz bank** (2026-08-10) |
 
 **v3 build-out done: 19 full tracks (3,800 quiz questions), all committed & pushed.**
@@ -159,12 +152,12 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 5. ~~**SQL**~~ ✅ **COMPLETE 2026-08-05** — 12/12 lessons (47–57KB) + quiz bank retuned to v4 (20 swaps)
 6. ~~**Database Concepts & Architecture**~~ ✅ **COMPLETE 2026-08-07** — 15/15 lessons (50–59KB) + quiz bank `10 200 0`
 7. ~~**Unix & Linux**~~ ✅ **COMPLETE 2026-08-10** — new track, 20/20 lessons (44–59KB) + quiz bank `10 200 0`
-8. 🆕 **Vector Databases & RAG** — 🚧 **IN PROGRESS, 9/15 lessons** ← **CURRENT**
-9. **LeetCode** (22 @ 12KB) — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
+8. ~~🆕 **Vector Databases & RAG**~~ ✅ **COMPLETE 2026-08-11** — new track, 15/15 lessons (51–68KB) + quiz bank `10 200 0`
+9. **LeetCode** (21 @ 12KB) ← **CURRENT** — note: `index.html` has **0** `<details>`, needs graded sets + batch-2 patterns
 10. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
 
-**Remaining: ~97 lessons across 3 tracks + 1 quiz bank**
-(Vector/RAG 6 remaining lessons & bank + LeetCode 21 + infra six ~70 under the approved expansion).
+**Remaining: ~91 lessons across 2 tracks**
+(LeetCode 21 + infra six ~70 under the approved expansion).
 
 #### SQL v4 — per-lesson status (as of 2026-08-05)
 Rebuilt in place, no redirect stubs needed. Every done lesson `det=12 ex=6`, 0 validation errors.
@@ -205,14 +198,16 @@ theme: 1 How a DB Stores Data · 2 Pages/Heap/Row Layout · 3 B-Trees & LSM-Tree
 9 Physical Design/OLTP-OLAP/Engine Choice · 10 mixed mock exam. Validates `10 200 0`, 0 duplicate stems.
 **Track 20 is fully complete.**
 
-**B. Vector Databases & RAG** (`tutorials/vector-databases/`)
-Scope confirmed: **vector stores + RAG patterns** (the full practical track, incl. evaluation and production ops). Draft curriculum:
-1. *Foundations* — Embeddings & Vector Space · Similarity Metrics & Normalisation · The Curse of Dimensionality
-2. *Indexing & Search* — Exact kNN vs ANN · HNSW Deep Dive · IVF, PQ & Quantisation · Tuning Recall vs Latency
-3. *The Landscape* — pgvector & SQL-Native · Dedicated Stores (Pinecone/Qdrant/Weaviate/Milvus) · Metadata Filtering & Hybrid Search (BM25 + vector)
-4. *RAG in Production* — Chunking & Ingestion · Retrieval Pipeline & Reranking · Evaluating Retrieval · Scaling, Cost & Ops
+**B. Vector Databases & RAG** (`tutorials/vector-databases/`) — ✅ **COMPLETE 2026-08-11, 15/15 + bank**
+Scope: **vector stores + RAG patterns**, incl. evaluation and production ops. **As built** (whole track
+passes `python validate.py tutorials/vector-databases`, 0 errors, every lesson `det=12 ex=6` at 51–68KB):
+1. *Foundations* ×4 — `index.html` (What a Vector DB Is For: semantic vs lexical, the derived-index principle) · `embeddings.html` (lossy compression, **dilution**, model-space incompatibility) · `similarity-metrics.html` (cosine/IP/L2, **normalise then use IP**, pgvector's negated `<#>`) · `dimensionality.html` (distance concentration, **why learned manifolds escape it**)
+2. *Indexing & Search* ×4 — `knn-vs-ann.html` (recall@k, the exact-scan crossover) · `hnsw.html` (layers, `m`/`ef_construction`/`ef_search`, **why deletes need neighbour-list repair**) · `ivf-pq.html` (centroids/probes, SQ/PQ/binary, **rescoring recovers quantisation loss**) · `tuning-recall.html` (the recall/latency/memory triangle, knee-finding, adaptive escalation)
+3. *The Landscape* ×3 — `pgvector.html` (vectors as a column, operator-class mismatch → silent seq scan, **the planner's filter strategy switch**) · `dedicated-stores.html` (**segments + buffer + compaction**, tombstones, **fan-out tail latency arithmetic**, store-by-store differentiators, FAISS-is-a-library) · `hybrid-search.html` (**pre/post/during-traversal filtering by selectivity**, 1/s over-fetch cost, BM25 IDF, **RRF vs score blending**, filter BOTH branches)
+4. *RAG in Production* ×4 — `chunking.html` (**dilution measured**, structural > recursive > semantic > fixed, overlap-is-cargo-cult, **contextual headers**, small-to-big, idempotent/incremental ingestion) · `retrieval-reranking.html` (**the funnel**, bi- vs cross-encoder, candidate-count knee, truncation + uncalibrated logits, query rewriting, **lost-in-the-middle assembly**) · `evaluation.html` (**pooling**, n≥200/500, recall vs nDCG, faithfulness + abstention, **judge validation & bias**, paired significance, **per-class CI gates**) · `scaling-ops.html` (memory formula, **cost is ~78% LLM tokens**, cache keys must include filters + index version, **short-results & max-score alerts**, parallel-index model migration, **context poisoning**)
 
-Both need: `nav.js`, `quiz.html` + `quiz-bank-1.js`/`quiz-bank-2.js` (10 sets × 20 Qs), a card in root `index.html` → `#databases`, and every lesson at `det=12 ex=6`.
+**Quiz bank:** sets 1–5 = Foundations/Metrics/HNSW/IVF-Quantisation/pgvector-Stores;
+6–10 = Filtering-Hybrid/Chunking/Reranking/Evaluation-Ops/mixed mock. `10 200 0`, 0 duplicate stems.
 
 ### ✅ Settled decision: infra six scope (2026-08-05)
 **FULL EXPANSION — ~20 lessons each, ~70 total.** The build recommendation to deepen in place at 12 each (~40) was put to the user and **declined**; build out the curricula. Applies to Docker, Kubernetes, AWS, CI/CD, MongoDB and Redis.
@@ -221,7 +216,19 @@ Both need: `nav.js`, `quiz.html` + `quiz-bank-1.js`/`quiz-bank-2.js` (10 sets ×
 Database Concepts quiz bank written and validated (`10 200 0`, no duplicate question stems) — track 20 done.
 The `← CSS Track` nav bug from the quiz.html template struck again here (it was fixed in SQL on 2026-08-05);
 **when scaffolding a new track's quiz.html from `tutorials/css/quiz.html`, replace all three strings, and
-grep the new file for `CSS` before committing.** Next up: Vector Databases & RAG from zero.
+grep the new file for `CSS` before committing.**
+
+### Session note 2026-08-11
+Vector Databases & RAG finished from 9/15 → 15/15 + both quiz banks; track 21 done, all pushed & live.
+**Two gotchas worth carrying forward:**
+1. **`quiz.html` mojibake outlived its supposed fix.** The status file claimed it was repaired during
+   scaffolding; it still held `Â·` ×5 and `â†’` ×1 (double-encoded UTF-8). The hub cards split titles on
+   `" · "`, so mojibake silently breaks card subtitles. **Grep new quiz.html files for `Â` and `â†` as
+   well as `CSS`.**
+2. **`validate.py` earned its keep again** — it caught `<claim>` inside a `<pre>` in `evaluation.html`
+   (unescaped `<` swallows content in browsers). Prompt templates containing `<placeholder>` tokens are a
+   recurring source of this; escape them as `&lt;...&gt;`.
+Next up: LeetCode Patterns v4 (track 18).
 
 ### Session note 2026-08-06
 SQL v4 finished (5 lessons: transactions → indexes → isolation → optimization → scaling) **and its quiz bank retuned** — the first track to satisfy the new "not done without the bank" rule. Then Database Concepts built from zero: nav.js, quiz.html, root index card, and all 15 lessons.
