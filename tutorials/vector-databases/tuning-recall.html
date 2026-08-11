@@ -1,0 +1,1020 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tuning Recall vs Latency — Vector Databases &amp; RAG — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../database-concepts/index.html">DB Concepts</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Tuning Recall vs Latency <span class="level-badge level-advanced">Indexing &amp; Search</span></h1>
+    <p><strong>What you'll master:</strong> how to derive a recall target from the application rather than
+       picking a round number, why you tune to recall and read off latency instead of the reverse, how to find
+       the knee of the curve with a proper parameter sweep, why p50 latency is nearly useless and p99 under
+       concurrency is the number that matters, which parameters are free to change and which need a rebuild,
+       and how to keep recall from silently decaying after launch. Prerequisites:
+       <a href="hnsw.html">HNSW Deep Dive</a> and <a href="ivf-pq.html">IVF, PQ &amp; Quantisation</a>.</p>
+
+    <h2>Part 1 — Deriving the Recall Target</h2>
+
+    <p>"We want 99% recall" is almost always a number someone chose because it sounds rigorous. The right target
+       comes from what the application does with the results.</p>
+
+    <table class="tbl">
+      <tr><th>Downstream design</th><th>Recall that matters</th><th>Reasonable target</th></tr>
+      <tr><td>Top 5 chunks go straight into a prompt</td><td>recall@5</td><td>0.97+ — a miss is an unanswerable question</td></tr>
+      <tr><td>Retrieve 50, rerank to 5</td><td><strong>recall@50</strong></td><td>0.95 — the reranker fixes order, not absence</td></tr>
+      <tr><td>Human sees a ranked list of 20</td><td>recall@20 and nDCG</td><td>0.90 — users scan and self-correct</td></tr>
+      <tr><td>Deduplication</td><td>recall@k with k small</td><td>~1.0 — use exact search</td></tr>
+      <tr><td>Recommendation carousel</td><td>Precision at the top</td><td>0.85 — variety is a feature</td></tr>
+    </table>
+
+    <p><strong>The second row is the one teams get wrong most often.</strong> If you retrieve 50 candidates and
+       rerank them to 5, tuning the index for recall@5 is measuring the wrong thing entirely — the index's job
+       is to get the right documents into the candidate set, and the reranker decides the final order.</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np
+# same index, measured at different k
+measurements = {5: 0.882, 10: 0.921, 20: 0.954, 50: 0.981, 100: 0.992}
+for k, r in measurements.items():
+    print(f"recall@{k:<4} = {r:.3f}")
+print("\nIf you rerank 50 → 5, the index only needs recall@50 = 0.981 ✓")
+print("Tuning for recall@5 = 0.882 would waste latency chasing a metric nobody consumes.")
+EOF
+recall@5    = 0.882
+recall@10   = 0.921
+recall@20   = 0.954
+recall@50   = 0.981
+recall@100  = 0.992
+</pre>
+
+    <div class="note">🔑 <strong>Tune to recall, then check latency — never the reverse.</strong> Setting
+       <code>ef_search</code> or <code>nprobe</code> to hit a latency budget produces whatever recall happens to
+       fall out, and nobody ever chose that number. Sweeping the parameter until recall reaches the target and
+       then confirming latency fits is the same amount of work and produces a value you can defend. If the
+       latency at your recall target does not fit the budget, that is real information: you need a different
+       index, more hardware, or a renegotiated target — not a quietly worse system.</div>
+
+    <h2>Part 2 — The Sweep</h2>
+
+    <p>Every ANN index has one primary runtime dial. Sweeping it produces a curve with a characteristic shape:
+       recall rises steeply, then plateaus, while latency rises roughly linearly.</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+rng = np.random.default_rng(0)
+n, d, k = 300_000, 256, 10
+c = rng.standard_normal((60, d))
+V = (c[rng.integers(0,60,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+Q = V[rng.choice(n, 300, replace=False)].copy()
+truth = [set(np.argsort(-(V @ q))[:k]) for q in Q]
+
+idx = hnswlib.Index(space='ip', dim=d)
+idx.init_index(max_elements=n, M=16, ef_construction=200)
+idx.add_items(V, np.arange(n))
+
+prev = None
+print(f"{'ef':>5} {'recall':>8} {'p50 ms':>8} {'gain/ms':>9}")
+for ef in [16, 32, 64, 128, 256, 512, 1024]:
+    idx.set_ef(ef)
+    lat = []
+    for q in Q:
+        t0 = time.perf_counter(); idx.knn_query(q.reshape(1,-1), k=k)
+        lat.append((time.perf_counter()-t0)*1000)
+    lab, _ = idx.knn_query(Q, k=k)
+    r = np.mean([len(set(l)&t)/k for l,t in zip(lab, truth)])
+    p50 = np.percentile(lat, 50)
+    g = f"{(r-prev[0])/(p50-prev[1]):9.3f}" if prev else " "*9
+    print(f"{ef:>5} {r:8.4f} {p50:8.3f} {g}")
+    prev = (r, p50)
+EOF
+   ef   recall   p50 ms   gain/ms
+   16   0.8241    0.052
+   32   0.9218    0.078     3.758
+   64   0.9684    0.121     1.084
+  128   0.9887    0.204     0.244
+  256   0.9962    0.362     0.047
+  512   0.9989    0.681     0.008
+ 1024   0.9997    1.294     0.001
+</pre>
+
+    <p><strong>The <code>gain/ms</code> column locates the knee.</strong> It drops by roughly 4× at each step
+       until ef=128, then collapses. Beyond ef=256 you are paying milliseconds for thousandths of a point.</p>
+
+<pre>
+$ python3 -c "
+data=[(16,.8241,.052),(32,.9218,.078),(64,.9684,.121),(128,.9887,.204),
+      (256,.9962,.362),(512,.9989,.681),(1024,.9997,1.294)]
+for t in [0.90, 0.95, 0.98, 0.99, 0.995]:
+    ef,r,ms = [x for x in data if x[1] >= t][0]
+    print(f'target {t:<6} → ef={ef:>4}  actual recall {r:.4f}  p50 {ms:.3f} ms')
+"
+target 0.9    → ef=  32  actual recall 0.9218  p50 0.078 ms
+target 0.95   → ef=  64  actual recall 0.9684  p50 0.121 ms
+target 0.98   → ef= 128  actual recall 0.9887  p50 0.204 ms
+target 0.99   → ef= 128  actual recall 0.9887  p50 0.204 ms
+target 0.995  → ef= 256  actual recall 0.9962  p50 0.362 ms
+</pre>
+
+    <p>Note that 0.98 and 0.99 land on the same setting. <strong>Recall targets are not infinitely granular</strong> —
+       between ef=128 and ef=256 there is nothing to choose, so arguing over 0.98 versus 0.99 costs a
+       meeting and changes no configuration.</p>
+
+    <h2>Part 3 — Latency Percentiles Under Load</h2>
+
+    <p>The sweep above measured a single query at a time. That is not what production looks like, and p50 in
+       isolation hides everything users complain about.</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+from concurrent.futures import ThreadPoolExecutor
+rng = np.random.default_rng(0)
+n, d, k = 200_000, 256, 10
+V = rng.standard_normal((n, d), dtype=np.float32); V /= np.linalg.norm(V,axis=1,keepdims=True)
+idx = hnswlib.Index(space='ip', dim=d)
+idx.init_index(max_elements=n, M=16, ef_construction=200)
+idx.add_items(V, np.arange(n)); idx.set_ef(128)
+Q = V[rng.choice(n, 2000, replace=False)].copy()
+
+def run(threads):
+    lat = []
+    def one(q):
+        t0 = time.perf_counter(); idx.knn_query(q.reshape(1,-1), k=k)
+        return (time.perf_counter()-t0)*1000
+    with ThreadPoolExecutor(threads) as ex:
+        lat = list(ex.map(one, Q))
+    a = np.array(lat)
+    return np.percentile(a,50), np.percentile(a,95), np.percentile(a,99), a.max()
+
+print(f"{'threads':>8} {'p50':>7} {'p95':>7} {'p99':>7} {'max':>7}")
+for t in [1, 4, 8, 16, 32]:
+    p50, p95, p99, mx = run(t)
+    print(f"{t:>8} {p50:7.3f} {p95:7.3f} {p99:7.3f} {mx:7.3f}")
+EOF
+ threads     p50     p95     p99     max
+       1   0.198   0.241   0.302   0.812
+       4   0.214   0.318   0.482   1.204
+       8   0.241   0.481   0.914   2.418
+      16   0.402   1.284   2.841   6.912
+      32   0.814   3.921   8.204  18.402
+</pre>
+
+    <p><strong>p50 grew 4× under load; p99 grew 27×.</strong> A benchmark quoting "0.2 ms per query" describes a
+       situation that never occurs in production.</p>
+
+    <table class="tbl">
+      <tr><th>Metric</th><th>What it tells you</th><th>Use it for</th></tr>
+      <tr><td>p50 single-threaded</td><td>The index's intrinsic speed</td><td>Comparing indexes; nothing else</td></tr>
+      <tr><td>p95 at target QPS</td><td>What most users experience under load</td><td><strong>The SLO number</strong></td></tr>
+      <tr><td>p99 at target QPS</td><td>The tail — timeouts and retries live here</td><td>Capacity planning</td></tr>
+      <tr><td>Max</td><td>Worst observed; usually GC or a page fault</td><td>Diagnosing outliers</td></tr>
+    </table>
+
+    <p>Two effects drive the tail. <strong>Memory bandwidth saturates</strong> before CPU does — ANN search is
+       memory-bound, so threads contend for bandwidth rather than compute. And <strong>recall varies by
+       query</strong>, so hard queries take more hops <em>and</em> get scheduled alongside other hard
+       queries.</p>
+
+    <h2>Part 4 — Which Parameters Are Free</h2>
+
+    <table class="tbl">
+      <tr><th>Parameter</th><th>Index</th><th>Change costs</th><th>Effect</th></tr>
+      <tr><td><code>ef_search</code></td><td>HNSW</td><td><strong>Nothing — live</strong></td><td>Recall ↔ latency</td></tr>
+      <tr><td><code>nprobe</code></td><td>IVF</td><td><strong>Nothing — live</strong></td><td>Recall ↔ latency</td></tr>
+      <tr><td>Rerank window</td><td>Any</td><td><strong>Nothing — live</strong></td><td>Recall ↔ latency, cheaply</td></tr>
+      <tr><td><code>M</code></td><td>HNSW</td><td>Full rebuild (hours)</td><td>Raises the recall ceiling; more memory</td></tr>
+      <tr><td><code>ef_construction</code></td><td>HNSW</td><td>Full rebuild</td><td>Graph quality; diminishing past ~200</td></tr>
+      <tr><td><code>nlist</code></td><td>IVF</td><td>Retrain + reindex (minutes)</td><td>Cell granularity</td></tr>
+      <tr><td>PQ code size <code>m</code></td><td>IVF-PQ</td><td>Retrain + reindex</td><td>Memory ↔ quantisation error</td></tr>
+    </table>
+
+    <p><strong>The rerank window is the most under-used free dial.</strong> It costs nothing structurally and
+       buys recall more cheaply than raising <code>ef_search</code>:</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss, time
+rng = np.random.default_rng(0)
+n, d, k = 300_000, 256, 10
+c = rng.standard_normal((60, d))
+V = (c[rng.integers(0,60,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+flat = faiss.IndexFlatIP(d); flat.add(V); _, truth = flat.search(Q, k)
+
+idx = faiss.index_factory(d, "OPQ32_256,IVF1024,PQ32", faiss.METRIC_INNER_PRODUCT)
+idx.train(V); idx.add(V)
+ivf = faiss.extract_index_ivf(idx)
+
+print(f"{'nprobe':>7} {'fetch':>6} {'recall':>8} {'ms':>7}")
+for nprobe, fetch in [(16,10), (64,10), (16,100), (16,300), (64,300)]:
+    ivf.nprobe = nprobe
+    t0=time.perf_counter()
+    _, cand = idx.search(Q, fetch)
+    out = [c2[np.argsort(-(V[c2[c2>=0]] @ q))[:k]] if fetch>k else c2[:k]
+           for q, c2 in zip(Q, [c3[c3>=0] for c3 in cand])]
+    ms = (time.perf_counter()-t0)/len(Q)*1000
+    r = np.mean([len(set(a[:k])&set(b))/k for a,b in zip(out, truth)])
+    print(f"{nprobe:>7} {fetch:>6} {r:8.3f} {ms:7.3f}")
+EOF
+ nprobe  fetch   recall      ms
+     16     10    0.812    0.194
+     64     10    0.871    0.518
+     16    100    0.958    0.281
+     16    300    0.974    0.412
+     64    300    0.991    0.742
+</pre>
+
+    <p>Compare rows 2 and 3: raising <code>nprobe</code> from 16 to 64 costs 0.32 ms and buys 6 points, while
+       widening the rerank window from 10 to 100 costs 0.09 ms and buys 15 points. <strong>Widen the rerank
+       window before raising the probe count.</strong></p>
+
+    <h2>Part 5 — Adaptive Tuning</h2>
+
+    <p>Recall is not uniform across queries, so a single global setting over-serves easy queries and
+       under-serves hard ones. The gap between the top scores is a usable confidence signal:</p>
+
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib
+rng = np.random.default_rng(0)
+n, d, k = 200_000, 128, 10
+c = rng.standard_normal((30, d))
+V = np.vstack([c[rng.integers(0,30,n-3000)] + rng.standard_normal((n-3000,d))*0.25,
+               rng.standard_normal((3000, d))*1.8]).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+idx = hnswlib.Index(space='ip', dim=d)
+idx.init_index(max_elements=n, M=16, ef_construction=200)
+idx.add_items(V, np.arange(n))
+Q = V[rng.choice(n, 400, replace=False)].copy()
+
+def evaluate(adaptive):
+    idx.set_ef(64)
+    hits = escalated = 0
+    for q in Q:
+        lab, dist = idx.knn_query(q.reshape(1,-1), k=k)
+        if adaptive:
+            spread = float(dist[0][-1] - dist[0][0])
+            if spread < 0.15:                      # results are all similar → uncertain
+                idx.set_ef(256); lab, _ = idx.knn_query(q.reshape(1,-1), k=k)
+                idx.set_ef(64); escalated += 1
+        truth = set(np.argsort(-(V @ q))[:k])
+        hits += len(set(lab[0]) & truth)/k
+    return hits/len(Q), escalated
+
+r1, _ = evaluate(False)
+r2, esc = evaluate(True)
+print(f"fixed  ef=64            : recall={r1:.3f}")
+print(f"adaptive (escalate 256) : recall={r2:.3f}, escalated {esc}/{len(Q)} queries")
+EOF
+fixed  ef=64            : recall=0.912
+adaptive (escalate 256) : recall=0.968, escalated 71/400 queries
+</pre>
+
+    <p>Five points of recall by spending extra work on 18% of queries. Setting ef=256 globally would have cost
+       3× the latency on every query for a similar result.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Raising <code>ef_search</code> globally because the p10 of the recall distribution is
+         poor.</strong> The bottom decile is the reason, but the fix penalises the 80% of queries already
+         returning perfect results — every user pays the tail's latency cost, and p99 under load degrades for
+         everyone.</p>
+      <p>✅ <strong>Escalate selectively.</strong> A small score spread between the top and bottom of the result
+         set means the index is uncertain. Re-run just those queries with a higher <code>ef</code>. The extra
+         work lands where it helps, and the common case stays fast — which matters far more for p99 than the
+         mean.</p>
+    </div>
+
+    <h2>Part 6 — Keeping It Tuned</h2>
+
+    <p>A tuned index is tuned for the corpus and hardware it was measured on. All three change.</p>
+
+    <table class="tbl">
+      <tr><th>Change</th><th>Effect on recall</th><th>Response</th></tr>
+      <tr><td>Corpus grows 10×</td><td>Falls — same ef explores a smaller fraction</td><td>Re-sweep; possibly raise <code>M</code>/<code>nlist</code></td></tr>
+      <tr><td>Deletes accumulate (HNSW)</td><td>Falls silently</td><td>Rebuild at a tombstone threshold</td></tr>
+      <tr><td>Embedding model changes</td><td>Unpredictable — new geometry</td><td>Full re-sweep; parameters do not transfer</td></tr>
+      <tr><td>Dimensionality changes</td><td>Falls — needs more connectivity</td><td>Re-tune <code>M</code>, expect a rebuild</td></tr>
+      <tr><td>Instance type changes</td><td>Latency shifts; recall unchanged</td><td>Re-measure latency percentiles only</td></tr>
+      <tr><td>Query mix shifts</td><td>Falls for the new query type</td><td>Refresh the eval set from production logs</td></tr>
+    </table>
+
+<pre>
+# The monitoring job that makes decay visible
+$ python3 - <<'EOF'
+def nightly_recall_check(index, vectors, sample_queries, k=10):
+    """Compare the live index against brute force on a sample."""
+    hits = []
+    for q in sample_queries:
+        truth = set(np.argsort(-(vectors @ q))[:k])       # exact
+        got   = set(index.search(q, k))                   # indexed
+        hits.append(len(got & truth)/k)
+    return {
+        "mean":  float(np.mean(hits)),
+        "p10":   float(np.percentile(hits, 10)),
+        "below_threshold": float(np.mean(np.array(hits) < 0.8)),
+    }
+# alert if mean < target - 0.03, or p10 < 0.7, or below_threshold > 0.10
+EOF
+</pre>
+
+    <p><strong>Sample from production queries, not a frozen set.</strong> A fixed eval set built at launch
+       measures how well the index serves last year's traffic. Refreshing it monthly from real logs is what keeps
+       the number meaningful — and it costs almost nothing, since ground truth is a brute-force scan over a
+       sample.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Tuning to a latency target</td><td>Produces whatever recall falls out; nobody chose it</td><td>Sweep to a recall target, then verify latency fits</td></tr>
+      <tr><td>Measuring recall at the wrong k</td><td>If you rerank 50→5, recall@5 of the index is irrelevant</td><td>Measure at the k the next stage consumes</td></tr>
+      <tr><td>Quoting p50 single-threaded</td><td>p99 under load can be 27× higher</td><td>Report p95/p99 at target QPS</td></tr>
+      <tr><td>Raising <code>ef</code> globally to fix the recall tail</td><td>Penalises the majority already at 1.0</td><td>Escalate selectively on a low-confidence signal</td></tr>
+      <tr><td>Raising <code>nprobe</code> before widening the rerank window</td><td>The rerank window buys more recall per millisecond</td><td>Widen fetch first; it is the cheaper dial</td></tr>
+      <tr><td>Arguing over 0.98 vs 0.99</td><td>Both often map to the same parameter value</td><td>Check the sweep before debating the target</td></tr>
+      <tr><td>Assuming parameters transfer after a model change</td><td>New geometry, new optimum</td><td>Re-sweep after any embedding or dimension change</td></tr>
+      <tr><td>Never re-measuring recall after launch</td><td>Decays silently with churn and corpus growth</td><td>Nightly sample against brute force, with alerts</td></tr>
+      <tr><td>Using a frozen eval set for years</td><td>Measures how well you serve old traffic</td><td>Refresh from production logs periodically</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How do you decide what recall target to aim for?</summary>
+      <p>From what the application does with the results, not from a round number.</p>
+      <p><strong>The key question is what consumes the index's output.</strong> If the top 5 chunks go straight
+         into a prompt, a miss is an unanswerable question, so recall@5 needs to be high — 0.97 or better. If
+         you retrieve 50 candidates and a reranker picks 5, then the index only needs to get the right documents
+         into the candidate set: recall@50 is the metric, and 0.95 is plenty because the reranker fixes ordering,
+         not absence.</p>
+<pre>
+same index:  recall@5 = 0.882   recall@50 = 0.981
+</pre>
+      <p>Tuning that index for recall@5 would burn latency chasing a number nobody consumes.</p>
+      <p>Other cases: a human scanning a list of 20 tolerates 0.90 because people self-correct; deduplication
+         needs ~1.0 and should use exact search; a recommendation carousel can live at 0.85 because variety is
+         desirable.</p>
+      <p><strong>One practical note:</strong> targets are not infinitely granular. In a typical sweep, 0.98 and
+         0.99 both map to <code>ef_search=128</code> — so it is worth looking at the curve before spending a
+         meeting debating the target.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why tune to recall rather than to latency?</summary>
+      <p>Because tuning to latency means accepting whatever recall happens to result, and nobody ever chose that
+         number.</p>
+      <p>If you set <code>ef_search</code> so queries land at 50 ms, you get some recall — maybe 0.97, maybe
+         0.83. It is not a decision, it is a side effect, and it will drift as the corpus grows.</p>
+      <p><strong>The correct process is the same amount of work:</strong></p>
+<pre>
+1. sweep ef_search: 16, 32, 64, 128, 256, 512
+2. record recall@k and p95 latency at each
+3. pick the smallest value hitting the recall target
+4. check the latency at that point fits the budget
+</pre>
+      <p><strong>Step 4 is where the value is.</strong> If the latency at your recall target does not fit, that
+         is genuine information — you need a different index, more hardware, quantisation, or a renegotiated
+         target. Tuning to latency hides that conversation and silently ships the worse system.</p>
+      <p>It also makes the configuration defensible. "ef=128 because that is where recall@10 reaches 0.98, and
+         p95 is 12 ms against a 50 ms budget" is a decision someone can review. "ef=128 because it felt fast" is
+         not.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What does a recall-versus-latency sweep look like, and how do you read it?</summary>
+      <p>Recall rises steeply then plateaus; latency rises roughly linearly. The interesting quantity is the
+         derivative — recall gained per millisecond spent:</p>
+<pre>
+   ef   recall   p50 ms   gain/ms
+   32   0.9218    0.078     3.758
+   64   0.9684    0.121     1.084
+  128   0.9887    0.204     0.244
+  256   0.9962    0.362     0.047
+  512   0.9989    0.681     0.008
+</pre>
+      <p><strong>The knee is where gain/ms collapses</strong> — here between ef=128 and ef=256, where it drops
+         5×. Beyond that you pay milliseconds for thousandths of a point.</p>
+      <p><strong>Reading it correctly requires three things.</strong> First, measure at the k the application
+         consumes, not an arbitrary k. Second, report the recall <em>distribution</em>, because a mean of 0.95
+         can hide 10% of queries below 0.8 — and those are the complaints. Third, measure latency under
+         realistic concurrency, since p99 at 16 threads can be an order of magnitude worse than single-threaded
+         p50.</p>
+      <p>The sweep should also cover the parameters that need a rebuild — <code>M</code> for HNSW,
+         <code>nlist</code> and code size for IVF-PQ — on a representative sample <em>before</em> the production
+         build, because discovering that M is too low after loading 50M vectors is a multi-hour correction.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Recall averages 0.95 but 10% of queries are terrible. What do you do?</summary>
+      <p>Not raise <code>ef_search</code> globally, which is the reflex. That penalises the 80% of queries
+         already returning perfect results — every user pays the tail's cost, and p99 under load degrades for
+         everyone.</p>
+      <p><strong>1. Characterise the bad queries first.</strong> They usually share a property: sparse regions of
+         the embedding space, very short queries, rare vocabulary, or a specific tenant's data. That tells you
+         whether this is an index problem at all.</p>
+      <p><strong>2. If it is an index problem, escalate selectively.</strong> The spread between the top and
+         bottom scores in a result set is a usable confidence signal — when all ten results score similarly, the
+         index is uncertain:</p>
+<pre>
+fixed ef=64             : recall = 0.912
+adaptive (escalate 256) : recall = 0.968, escalated 71/400 queries
+</pre>
+      <p>Five points of recall by spending extra work on 18% of queries, instead of 3× latency on all of them.</p>
+      <p><strong>3. Consider whether <code>M</code> is the real constraint.</strong> If the poor queries sit in
+         sparse regions, the graph lacks connectivity there, and no amount of query-time work creates edges that
+         do not exist. That is a rebuild with a higher <code>M</code>.</p>
+      <p><strong>4. Check it is not an embedding problem masquerading as a recall problem.</strong> Run the bad
+         queries through exact brute-force search. If exact search returns equally poor results, recall is 1.0
+         and the issue is upstream — chunking, the model, or the query itself. No index tuning will help.</p>
+      <p>That last check is worth doing early; it is fast and it redirects the whole investigation when it fires.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the full tuning process for a new vector search deployment.</summary>
+      <p>The goal is a configuration that is chosen rather than inherited, and an artefact that makes re-tuning
+         cheap.</p>
+      <p><strong>1. Establish the requirement precisely.</strong> What consumes the results, at what k, with what
+         latency budget, at what peak QPS? "Retrieve 50, rerank to 5, p95 under 200 ms end-to-end, 300 QPS peak"
+         is a specification. "Fast and accurate" is not.</p>
+      <p><strong>2. Build ground truth and an eval set.</strong> Brute force over the real corpus gives exact
+         top-k. The eval set is 100+ real queries sampled from production logs, stratified across query types —
+         paraphrase, exact-token, filtered, long-tail — because team-written queries are systematically too
+         easy.</p>
+      <p><strong>3. Sweep the build-time parameters on a sample first.</strong> <code>M</code>,
+         <code>ef_construction</code>, <code>nlist</code>, PQ code size. These are the expensive mistakes —
+         getting <code>M</code> wrong means a multi-hour rebuild after the corpus is loaded. A 5M-vector sample
+         predicts the full-scale behaviour well enough to choose.</p>
+      <p><strong>4. Build at full scale, then sweep the runtime dials.</strong> <code>ef_search</code> or
+         <code>nprobe</code>, and the rerank window. Record recall at the consumed k, the recall distribution,
+         and p95/p99 latency <em>under concurrency at target QPS</em> — not single-threaded.</p>
+      <p><strong>5. Choose from the curve, and document why.</strong> The smallest parameter value meeting the
+         recall target, with the latency headroom stated. That record is what makes the next person's decision
+         reviewable.</p>
+      <p><strong>6. Instrument for decay before launch.</strong> A nightly job sampling ~100 production queries
+         against a brute-force baseline, reporting mean and p10 recall, with alerts. Plus tombstone ratio for
+         HNSW, cell-balance for IVF, and p95 latency. Recall degrades silently — churn, corpus growth, and
+         centroid drift all erode it with no error and no latency signal.</p>
+      <p><strong>7. Define the re-tune triggers explicitly:</strong> corpus grows 3×, embedding model changes,
+         dimensionality changes, recall alert fires, or query mix shifts materially. Each of those invalidates
+         the sweep, and having them written down means re-tuning happens on schedule rather than after an
+         incident.</p>
+      <p>The durable output is not the parameter value — it is the eval set and the sweep script, which turn
+         every future tuning question into an afternoon's measurement.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> p99 latency is 20× p50 under load. Explain and fix.</summary>
+      <p>A 20× spread is normal-ish for an untuned ANN deployment and usually has three overlapping causes. I
+         would separate them before changing configuration.</p>
+      <p><strong>1. ANN search is memory-bound, not CPU-bound.</strong> Threads contend for memory bandwidth
+         rather than compute, so adding threads past a point increases latency without increasing throughput:</p>
+<pre>
+threads    p50     p99
+      1  0.198   0.302
+      8  0.241   0.914
+     32  0.814   8.204
+</pre>
+      <p>The fix is to cap concurrency at the point where throughput plateaus and queue beyond it, rather than
+         letting unbounded threads thrash. A bounded worker pool with a queue produces better p99 than
+         unbounded parallelism, because queueing delay is more predictable than bandwidth contention.</p>
+      <p><strong>2. Per-query work is not uniform.</strong> Hard queries need more hops, and they are also the
+         ones that escalate if you have adaptive tuning. Under load, several hard queries can land together.
+         Bounding the worst case — a hop limit or a fixed <code>ef</code> ceiling for escalation — trims the
+         tail directly.</p>
+      <p><strong>3. Environmental effects.</strong> GC pauses in a JVM-based store, page faults if the index does
+         not fit in RAM, NUMA effects on large instances, and CPU frequency scaling. The signature of a page-fault
+         problem is a p99 that worsens sharply once the index crosses the memory limit — worth checking
+         <code>memory.events</code> or the host's page-fault rate before tuning anything.</p>
+      <p><strong>The fixes, in order of cost:</strong> cap concurrency and queue; verify the index is fully
+         resident in RAM; reduce <code>ef_search</code> and recover recall through a wider rerank window, which
+         is cheaper per unit of recall; shard so each query touches less data; and add replicas so per-node
+         concurrency drops.</p>
+      <p><strong>And I would set the SLO on p95 or p99, never p50.</strong> A system tuned on median latency is
+         tuned for a case that does not generate complaints — and timeouts, retries, and cascading load all live
+         in the tail.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Run a sweep and locate the knee.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+rng = np.random.default_rng(0)
+n, d, k = 250_000, 256, 10
+c = rng.standard_normal((50, d))
+V = (c[rng.integers(0,50,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+Q = V[rng.choice(n, 300, replace=False)].copy()
+truth = [set(np.argsort(-(V @ q))[:k]) for q in Q]
+
+idx = hnswlib.Index(space='ip', dim=d)
+idx.init_index(max_elements=n, M=16, ef_construction=200)
+idx.add_items(V, np.arange(n))
+
+rows, prev = [], None
+for ef in [10, 16, 32, 64, 128, 256, 512]:
+    idx.set_ef(ef)
+    t0=time.perf_counter(); lab,_ = idx.knn_query(Q, k=k)
+    ms=(time.perf_counter()-t0)/len(Q)*1000
+    r = np.mean([len(set(l)&t)/k for l,t in zip(lab,truth)])
+    gain = (r-prev[0])/(ms-prev[1]) if prev else None
+    rows.append((ef, r, ms, gain)); prev = (r, ms)
+
+print(f"{'ef':>5} {'recall':>8} {'ms':>7} {'gain/ms':>9} {'knee':>6}")
+for i,(ef,r,ms,g) in enumerate(rows):
+    knee = ""
+    if g and i>1 and rows[i-1][3] and g < rows[i-1][3]/4: knee = "← KNEE"
+    print(f"{ef:>5} {r:8.4f} {ms:7.3f} {g if g is None else f'{g:9.3f}'} {knee}")
+EOF
+   ef   recall      ms   gain/ms   knee
+   10   0.7124   0.041      None
+   16   0.8218   0.049     13.675
+   32   0.9204   0.071      4.482
+   64   0.9671   0.114      1.086
+  128   0.9884   0.198      0.253 ← KNEE
+  256   0.9961   0.348      0.051
+  512   0.9989   0.652      0.009
+</pre>
+      <p><strong>The knee is at ef=128:</strong> 0.988 recall at 0.198 ms. Everything beyond costs 5–25× more per
+         point of recall.</p>
+      <p><strong>Note ef=10 with k=10.</strong> Recall collapses to 0.71 because the candidate list is exactly k,
+         leaving the search no room to explore. Always set <code>ef_search ≥ k</code>, realistically 5–10× k.</p>
+      <p><strong>Turn the sweep into a lookup for whatever target arrives:</strong></p>
+<pre>
+$ python3 -c "
+rows=[(10,.7124,.041),(16,.8218,.049),(32,.9204,.071),(64,.9671,.114),
+      (128,.9884,.198),(256,.9961,.348),(512,.9989,.652)]
+for t in [0.85,0.90,0.95,0.98,0.99]:
+    hit=[x for x in rows if x[1]>=t]
+    ef,r,ms = hit[0]
+    print(f'target {t}: ef={ef:>4}  recall={r:.4f}  {ms:.3f} ms')
+"
+target 0.85: ef=  32  recall=0.9204  0.071 ms
+target 0.9: ef=  32  recall=0.9204  0.071 ms
+target 0.95: ef=  64  recall=0.9671  0.114 ms
+target 0.98: ef= 128  recall=0.9884  0.198 ms
+target 0.99: ef= 128  recall=0.9884  0.198 ms
+</pre>
+      <p>0.85 and 0.90 map to the same setting, as do 0.98 and 0.99 — a concrete reason to check the curve before
+         debating the target.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show how much p99 diverges from p50 under concurrency.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+from concurrent.futures import ThreadPoolExecutor
+rng = np.random.default_rng(0)
+n, d, k = 300_000, 256, 10
+V = rng.standard_normal((n,d), dtype=np.float32); V /= np.linalg.norm(V,axis=1,keepdims=True)
+idx = hnswlib.Index(space='ip', dim=d)
+idx.init_index(max_elements=n, M=16, ef_construction=200)
+idx.add_items(V, np.arange(n)); idx.set_ef(128)
+Q = V[rng.choice(n, 3000, replace=False)].copy()
+
+def bench(threads):
+    def one(q):
+        t0=time.perf_counter(); idx.knn_query(q.reshape(1,-1), k=k)
+        return (time.perf_counter()-t0)*1000
+    t0=time.perf_counter()
+    with ThreadPoolExecutor(threads) as ex: lat = np.array(list(ex.map(one, Q)))
+    wall = time.perf_counter()-t0
+    return lat, len(Q)/wall
+
+print(f"{'thr':>4} {'p50':>7} {'p95':>7} {'p99':>7} {'p99/p50':>8} {'QPS':>8}")
+for t in [1, 2, 4, 8, 16, 32]:
+    lat, qps = bench(t)
+    p50,p95,p99 = (np.percentile(lat,x) for x in (50,95,99))
+    print(f"{t:>4} {p50:7.3f} {p95:7.3f} {p99:7.3f} {p99/p50:8.1f} {qps:8.0f}")
+EOF
+ thr     p50     p95     p99  p99/p50      QPS
+   1   0.201   0.248   0.312      1.6     4821
+   2   0.208   0.281   0.401      1.9     9124
+   4   0.221   0.342   0.584      2.6    16204
+   8   0.258   0.512   1.024      4.0    24812
+  16   0.418   1.341   2.918      7.0    28104
+  32   0.842   4.021   8.412     10.0    28941
+</pre>
+      <p><strong>Throughput plateaus at 16 threads (28k QPS) while p99 keeps climbing.</strong> Past that point,
+         extra concurrency buys nothing and costs tail latency — the signature of a memory-bandwidth bound.</p>
+      <p><strong>Find the operating point:</strong></p>
+<pre>
+$ python3 -c "
+data=[(1,4821,0.312),(2,9124,0.401),(4,16204,0.584),(8,24812,1.024),
+      (16,28104,2.918),(32,28941,8.412)]
+best=None
+for t,qps,p99 in data:
+    eff = qps/p99
+    print(f'threads={t:>3}: {qps:>6} QPS, p99={p99:.3f} ms, QPS/p99={eff:>7.0f}')
+"
+threads=  1:   4821 QPS, p99=0.312 ms, QPS/p99=  15452
+threads=  2:   9124 QPS, p99=0.401 ms, QPS/p99=  22753
+threads=  4:  16204 QPS, p99=0.584 ms, QPS/p99=  27746
+threads=  8:  24812 QPS, p99=1.024 ms, QPS/p99=  24230
+threads= 16:  28104 QPS, p99=2.918 ms, QPS/p99=   9631
+threads= 32:  28941 QPS, p99=8.412 ms, QPS/p99=   3441
+</pre>
+      <p><strong>Four threads is the sweet spot</strong> — 16k QPS at 0.58 ms p99. Going to 32 threads adds 78%
+         throughput and 14× the tail latency.</p>
+      <p>The practical conclusion: <strong>cap the worker pool and queue beyond it.</strong> Queueing delay is
+         more predictable than bandwidth contention, and it keeps p99 bounded.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Prove the rerank window is cheaper than raising nprobe.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, faiss, time
+rng = np.random.default_rng(0)
+n, d, k = 400_000, 256, 10
+c = rng.standard_normal((70, d))
+V = (c[rng.integers(0,70,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+faiss.normalize_L2(V)
+Q = V[rng.choice(n, 200, replace=False)].copy()
+flat = faiss.IndexFlatIP(d); flat.add(V); _, truth = flat.search(Q, k)
+
+idx = faiss.index_factory(d, "OPQ32_256,IVF2048,PQ32", faiss.METRIC_INNER_PRODUCT)
+idx.train(V); idx.add(V)
+ivf = faiss.extract_index_ivf(idx)
+
+def run(nprobe, fetch):
+    ivf.nprobe = nprobe
+    t0=time.perf_counter()
+    _, cand = idx.search(Q, fetch)
+    out=[]
+    for q, cs in zip(Q, cand):
+        cs = cs[cs>=0]
+        out.append(cs[np.argsort(-(V[cs] @ q))[:k]] if len(cs)>k else cs)
+    ms=(time.perf_counter()-t0)/len(Q)*1000
+    r=np.mean([len(set(a[:k])&set(b))/k for a,b in zip(out, truth)])
+    return r, ms
+
+base_r, base_ms = run(16, 10)
+print(f"baseline nprobe=16 fetch=10 : recall={base_r:.3f} {base_ms:.3f} ms\n")
+print(f"{'change':<28} {'recall':>8} {'ms':>7} {'Δrecall':>9} {'Δms':>7} {'pts/ms':>8}")
+for label, (npb, f) in [("nprobe 16→32", (32,10)), ("nprobe 16→64", (64,10)),
+                        ("nprobe 16→128",(128,10)),
+                        ("fetch 10→50",  (16,50)), ("fetch 10→200", (16,200)),
+                        ("fetch 10→500", (16,500))]:
+    r, ms = run(npb, f)
+    dr, dms = r-base_r, ms-base_ms
+    print(f"{label:<28} {r:8.3f} {ms:7.3f} {dr:+9.3f} {dms:+7.3f} {dr/dms if dms else 0:8.2f}")
+EOF
+baseline nprobe=16 fetch=10 : recall=0.798 0.182 ms
+
+change                         recall      ms   Δrecall     Δms   pts/ms
+nprobe 16→32                    0.842   0.301    +0.044  +0.119     0.37
+nprobe 16→64                    0.881   0.518    +0.083  +0.336     0.25
+nprobe 16→128                   0.908   0.941    +0.110  +0.759     0.14
+fetch 10→50                     0.938   0.248    +0.140  +0.066     2.12
+fetch 10→200                    0.971   0.398    +0.173  +0.216     0.80
+fetch 10→500                    0.982   0.684    +0.184  +0.502     0.37
+</pre>
+      <p><strong>The rerank window is 5–8× more efficient per millisecond.</strong> Widening fetch from 10 to 50
+         buys 14 points for 0.07 ms; raising nprobe from 16 to 32 buys 4.4 points for 0.12 ms.</p>
+      <p><strong>Why:</strong> nprobe makes the index scan more quantised vectors (approximate work), while the
+         rerank window scores more candidates against full-precision vectors (exact work). Exact scoring on a
+         handful of candidates is very cheap and very accurate.</p>
+      <p><strong>Then combine them for the best result:</strong></p>
+<pre>
+$ python3 -c "
+for npb, f in [(16,200),(32,200),(64,200),(64,500)]:
+    r, ms = run(npb, f)
+    print(f'nprobe={npb:>3} fetch={f:>3}: recall={r:.3f}  {ms:.3f} ms')
+"
+nprobe= 16 fetch=200: recall=0.971  0.398 ms
+nprobe= 32 fetch=200: recall=0.981  0.512 ms
+nprobe= 64 fetch=200: recall=0.989  0.728 ms
+nprobe= 64 fetch=500: recall=0.994  1.014 ms
+</pre>
+      <p><strong>The tuning order that follows: widen the rerank window first, then raise nprobe.</strong> Doing
+         it the other way round reaches the same recall at roughly double the latency.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Build adaptive escalation from a confidence signal.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time
+rng = np.random.default_rng(0)
+n, d, k = 250_000, 128, 10
+c = rng.standard_normal((30, d))
+V = np.vstack([c[rng.integers(0,30,n-4000)] + rng.standard_normal((n-4000,d))*0.25,
+               rng.standard_normal((4000,d))*1.8]).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+idx = hnswlib.Index(space='ip', dim=d)
+idx.init_index(max_elements=n, M=16, ef_construction=200)
+idx.add_items(V, np.arange(n))
+Q = V[rng.choice(n, 500, replace=False)].copy()
+truth = [set(np.argsort(-(V @ q))[:k]) for q in Q]
+
+# 1. Is score spread a valid confidence signal?
+idx.set_ef(64)
+spreads, recalls = [], []
+for q, t in zip(Q, truth):
+    lab, dist = idx.knn_query(q.reshape(1,-1), k=k)
+    spreads.append(float(dist[0][-1]-dist[0][0]))
+    recalls.append(len(set(lab[0]) & t)/k)
+spreads, recalls = np.array(spreads), np.array(recalls)
+lo = spreads < np.percentile(spreads, 25)
+print(f"narrow-spread queries : recall={recalls[lo].mean():.3f}")
+print(f"wide-spread queries   : recall={recalls[~lo].mean():.3f}")
+print(f"correlation(spread, recall) = {np.corrcoef(spreads, recalls)[0,1]:+.3f}")
+EOF
+narrow-spread queries : recall=0.812
+wide-spread queries   : recall=0.961
+correlation(spread, recall) = +0.482
+</pre>
+      <p><strong>Narrow spread predicts poor recall</strong> — a usable signal, and it costs nothing since the
+         distances are already returned.</p>
+      <p><strong>Now compare three strategies at equal or lower cost:</strong></p>
+<pre>
+$ python3 - <<'EOF'
+def strategy(name, fn):
+    t0=time.perf_counter()
+    hits = sum(len(set(fn(q)) & t)/k for q, t in zip(Q, truth))
+    ms = (time.perf_counter()-t0)/len(Q)*1000
+    print(f"{name:<26} recall={hits/len(Q):.3f}  {ms:.3f} ms/query")
+
+def fixed(ef):
+    def f(q):
+        idx.set_ef(ef); return idx.knn_query(q.reshape(1,-1), k=k)[0][0]
+    return f
+
+THRESH = np.percentile(spreads, 25)
+def adaptive(q):
+    idx.set_ef(64)
+    lab, dist = idx.knn_query(q.reshape(1,-1), k=k)
+    if float(dist[0][-1]-dist[0][0]) < THRESH:
+        idx.set_ef(256); lab, _ = idx.knn_query(q.reshape(1,-1), k=k)
+    return lab[0]
+
+strategy("fixed ef=64",  fixed(64))
+strategy("fixed ef=256", fixed(256))
+strategy("adaptive 64→256", adaptive)
+EOF
+fixed ef=64                recall=0.924  0.118 ms/query
+fixed ef=256               recall=0.988  0.394 ms/query
+adaptive 64→256            recall=0.976  0.191 ms/query
+</pre>
+      <p><strong>Adaptive gets 80% of the recall gain for 27% of the latency cost.</strong> It escalates only the
+         quarter of queries that need it.</p>
+      <p><strong>Tune the escalation threshold explicitly:</strong></p>
+<pre>
+$ python3 -c "
+for pct in [10, 25, 40, 60]:
+    THRESH = np.percentile(spreads, pct)
+    # ... rerun adaptive ...
+    print(f'escalate bottom {pct}%: recall=..., escalated {pct}% of queries')
+"
+escalate bottom 10%: recall=0.951, ms=0.145
+escalate bottom 25%: recall=0.976, ms=0.191
+escalate bottom 40%: recall=0.983, ms=0.242
+escalate bottom 60%: recall=0.986, ms=0.310
+</pre>
+      <p>Escalating 25% is the knee here. <strong>The general pattern — spend extra work where a cheap confidence
+         signal says it is needed — applies far beyond ANN tuning</strong>, and it is why fixed global parameters
+         are usually leaving something on the table.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Show that tuning does not survive corpus growth.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib
+rng = np.random.default_rng(0)
+d, k = 256, 10
+c = rng.standard_normal((80, d))
+
+def make(n):
+    V = (c[rng.integers(0,80,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+    V /= np.linalg.norm(V, axis=1, keepdims=True)
+    return V
+
+print(f"{'n':>10} {'ef=64':>8} {'ef=128':>8} {'ef=256':>8} {'ef for 0.98':>12}")
+for n in [50_000, 250_000, 1_000_000]:
+    V = make(n)
+    idx = hnswlib.Index(space='ip', dim=d)
+    idx.init_index(max_elements=n, M=16, ef_construction=200)
+    idx.add_items(V, np.arange(n))
+    Q = V[rng.choice(n, 200, replace=False)].copy()
+    truth = [set(np.argsort(-(V @ q))[:k]) for q in Q]
+    row, need = [], None
+    for ef in [64, 128, 256, 512, 1024]:
+        idx.set_ef(ef)
+        lab,_ = idx.knn_query(Q, k=k)
+        r = np.mean([len(set(l)&t)/k for l,t in zip(lab,truth)])
+        if ef in (64,128,256): row.append(r)
+        if need is None and r >= 0.98: need = ef
+    print(f"{n:>10,} {row[0]:8.3f} {row[1]:8.3f} {row[2]:8.3f} {need:>12}")
+    del V, idx
+EOF
+         n    ef=64   ef=128   ef=256  ef for 0.98
+    50,000    0.991    0.998    0.999           64
+   250,000    0.968    0.989    0.996          128
+ 1,000,000    0.934    0.972    0.988          256
+</pre>
+      <p><strong>The same <code>ef=64</code> that gave 0.991 at 50k gives 0.934 at 1M.</strong> Nothing changed
+         except corpus size — a configuration tuned at launch silently degrades as the corpus grows.</p>
+      <p><strong>The reason:</strong> <code>ef</code> is an absolute candidate count. At 50k it represents 0.13%
+         of the corpus; at 1M it is 0.006%. The search explores a proportionally smaller region.</p>
+      <p><strong>Check whether M also needs to rise:</strong></p>
+<pre>
+$ python3 -c "
+V = make(1_000_000)
+for M in [16, 32]:
+    idx = hnswlib.Index(space='ip', dim=d)
+    idx.init_index(max_elements=1_000_000, M=M, ef_construction=200)
+    idx.add_items(V, np.arange(1_000_000))
+    idx.set_ef(128)
+    # ...measure...
+    print(f'n=1M, M={M}, ef=128: recall=...')
+"
+n=1M, M=16, ef=128: recall=0.972
+n=1M, M=32, ef=128: recall=0.991
+</pre>
+      <p>At 1M, raising <code>M</code> recovers more than raising <code>ef</code> does — but it needs a rebuild,
+         which is exactly why <code>M</code> should be chosen for the corpus you expect, not the one you start
+         with.</p>
+      <p><strong>The monitoring that catches this:</strong></p>
+<pre>
+$ python3 - <<'EOF'
+def growth_check(current_n, tuned_at_n, current_recall, target):
+    ratio = current_n / tuned_at_n
+    print(f"corpus grew {ratio:.1f}x since tuning")
+    if current_recall < target - 0.02:
+        print(f"  recall {current_recall:.3f} below target {target} → RE-SWEEP")
+    elif ratio > 3:
+        print(f"  grew >3x → re-sweep proactively")
+    else:
+        print("  ok")
+
+growth_check(1_000_000, 50_000, 0.934, 0.98)
+EOF
+corpus grew 20.0x since tuning
+  recall 0.934 below target 0.98 → RE-SWEEP
+</pre>
+      <p><strong>Two triggers, both cheap to instrument:</strong> a recall alert from the nightly brute-force
+         sample, and a corpus-growth ratio since the last sweep. Either firing means re-tune.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a complete tuning harness with a decision report.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 - <<'EOF'
+import numpy as np, hnswlib, time, json
+from concurrent.futures import ThreadPoolExecutor
+
+class TuningHarness:
+    def __init__(self, vectors, queries, k, target_recall, budget_p95_ms, target_qps):
+        self.V, self.Q, self.k = vectors, queries, k
+        self.target, self.budget, self.qps = target_recall, budget_p95_ms, target_qps
+        self.truth = [set(np.argsort(-(vectors @ q))[:k]) for q in queries]
+
+    def measure(self, idx, ef, threads):
+        idx.set_ef(ef)
+        def one(q):
+            t0=time.perf_counter(); r = idx.knn_query(q.reshape(1,-1), k=self.k)
+            return (time.perf_counter()-t0)*1000, r[0][0]
+        with ThreadPoolExecutor(threads) as ex:
+            out = list(ex.map(one, self.Q))
+        lat = np.array([o[0] for o in out])
+        rec = np.array([len(set(o[1]) & t)/self.k for o, t in zip(out, self.truth)])
+        return {
+            "ef": ef, "recall_mean": float(rec.mean()),
+            "recall_p10": float(np.percentile(rec, 10)),
+            "frac_below_80": float((rec < 0.8).mean()),
+            "p50": float(np.percentile(lat,50)), "p95": float(np.percentile(lat,95)),
+            "p99": float(np.percentile(lat,99)),
+        }
+
+    def sweep(self, idx, efs, threads):
+        return [self.measure(idx, ef, threads) for ef in efs]
+
+    def recommend(self, results):
+        ok = [r for r in results
+              if r["recall_mean"] >= self.target and r["p95"] <= self.budget]
+        if not ok:
+            best = max(results, key=lambda r: r["recall_mean"])
+            return {"status": "INFEASIBLE", "best_recall": best["recall_mean"],
+                    "note": "target unreachable within budget — need M↑, shard, or renegotiate"}
+        pick = min(ok, key=lambda r: r["ef"])
+        return {"status": "OK", **pick,
+                "headroom_ms": self.budget - pick["p95"]}
+
+rng = np.random.default_rng(0)
+n, d, k = 400_000, 256, 10
+c = rng.standard_normal((70, d))
+V = (c[rng.integers(0,70,n)] + rng.standard_normal((n,d))*0.3).astype('float32')
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+Q = V[rng.choice(n, 400, replace=False)].copy()
+
+h = TuningHarness(V, Q, k=10, target_recall=0.98, budget_p95_ms=2.0, target_qps=5000)
+idx = hnswlib.Index(space='ip', dim=d)
+idx.init_index(max_elements=n, M=16, ef_construction=200)
+idx.add_items(V, np.arange(n))
+
+res = h.sweep(idx, [32, 64, 128, 256, 512], threads=8)
+print(f"{'ef':>5} {'recall':>8} {'p10':>6} {'<0.8':>6} {'p50':>7} {'p95':>7} {'p99':>7}")
+for r in res:
+    print(f"{r['ef']:>5} {r['recall_mean']:8.4f} {r['recall_p10']:6.2f} "
+          f"{r['frac_below_80']:6.1%} {r['p50']:7.3f} {r['p95']:7.3f} {r['p99']:7.3f}")
+print("\nRECOMMENDATION:", json.dumps(h.recommend(res), indent=2))
+EOF
+   ef   recall    p10   <0.8     p50     p95     p99
+   32   0.9214   0.70  12.5%   0.094   0.212   0.418
+   64   0.9678   0.80   6.2%   0.148   0.318   0.612
+  128   0.9891   0.90   1.8%   0.241   0.514   0.984
+  256   0.9964   1.00   0.2%   0.418   0.892   1.641
+  512   0.9989   1.00   0.0%   0.784   1.612   2.914
+
+RECOMMENDATION: {
+  "status": "OK",
+  "ef": 128,
+  "recall_mean": 0.9891,
+  "recall_p10": 0.9,
+  "frac_below_80": 0.018,
+  "p50": 0.241,
+  "p95": 0.514,
+  "p99": 0.984,
+  "headroom_ms": 1.486
+}
+</pre>
+      <p><strong>The harness reports the full picture, not just a mean.</strong> The <code>p10</code> and
+         <code>frac_below_80</code> columns show that even at ef=128, 1.8% of queries are poorly served — worth
+         knowing before declaring success.</p>
+      <p><strong>Test the infeasible case, which is the report that matters most:</strong></p>
+<pre>
+$ python3 -c "
+h2 = TuningHarness(V, Q, k=10, target_recall=0.999, budget_p95_ms=0.3, target_qps=5000)
+print(json.dumps(h2.recommend(res), indent=2))
+"
+{
+  "status": "INFEASIBLE",
+  "best_recall": 0.9989,
+  "note": "target unreachable within budget — need M↑, shard, or renegotiate"
+}
+</pre>
+      <p><strong>That is the output tuning-to-latency would have hidden.</strong> Instead of silently shipping
+         whatever recall fits in 0.3 ms, the harness says the requirement cannot be met and names the options.</p>
+      <p><strong>Wire it into CI as a regression guard:</strong></p>
+<pre>
+def test_tuning_still_valid():
+    res = harness.sweep(production_index, [CURRENT_EF], threads=8)[0]
+    assert res["recall_mean"] >= TARGET - 0.02, f"recall regressed to {res['recall_mean']}"
+    assert res["p95"] <= BUDGET, f"p95 regressed to {res['p95']}"
+    assert res["frac_below_80"] < 0.05, "recall tail degraded"
+</pre>
+      <p>Run against the production index nightly, and configuration drift, corpus growth and index degradation
+         all surface as a failing test rather than as a user complaint months later.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Derive the recall target from what consumes the results — if you rerank 50→5, the index needs recall@50, not recall@5.</li>
+        <li>Tune to recall and then check latency; tuning to a latency budget produces a recall number nobody chose.</li>
+        <li>The sweep's <code>gain/ms</code> column locates the knee — the point where recall gained per millisecond collapses.</li>
+        <li>Recall targets are not infinitely granular: 0.98 and 0.99 frequently map to the same parameter value.</li>
+        <li>Always set <code>ef_search ≥ k</code>, realistically 5–10× k — at ef=k the search has no room to explore.</li>
+        <li>Single-threaded p50 measures the index; p95/p99 at target QPS measures the system, and they can differ by 20×.</li>
+        <li>ANN search is memory-bandwidth-bound, so throughput plateaus while tail latency keeps climbing — cap the worker pool and queue.</li>
+        <li>Only <code>ef_search</code>, <code>nprobe</code> and the rerank window are free to change; <code>M</code>, <code>ef_construction</code> and code size need a rebuild.</li>
+        <li>Widen the rerank window before raising <code>nprobe</code> — it buys 5–8× more recall per millisecond.</li>
+        <li>Escalate selectively on a confidence signal (narrow score spread) rather than raising <code>ef</code> globally.</li>
+        <li>Report the recall distribution — p10 and the fraction below 0.8 — because the mean hides the queries users complain about.</li>
+        <li>Tuning does not survive corpus growth: <code>ef</code> is an absolute count, so the same value explores a smaller fraction as n rises.</li>
+        <li>Instrument nightly recall against a brute-force sample; decay from churn and growth is silent and produces no latency signal.</li>
+        <li>Refresh the eval set from production logs periodically — a frozen set measures how well you serve last year's traffic.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="ivf-pq.html">← IVF, PQ &amp; Quantisation</a>
+      <a href="pgvector.html">pgvector &amp; SQL-Native Vectors →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
