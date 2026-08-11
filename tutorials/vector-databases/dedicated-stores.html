@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dedicated Vector Stores — Vector Databases &amp; RAG — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Dedicated Vector Stores <span class="level-badge level-inter">The Landscape</span></h1>
+    <p><strong>What you'll master:</strong> the architecture every dedicated store shares underneath its marketing —
+       segments, an immutable index plus a mutable buffer, and a compaction loop — and why that shape explains
+       almost every behaviour that surprises people; how deletes, updates and freshness actually work and why a
+       just-written vector may not be searchable yet; the sharding and replication models and what a shard count
+       commits you to; how the major stores (Qdrant, Milvus, Weaviate, Pinecone, Vespa, Elasticsearch/OpenSearch,
+       and library-level FAISS) genuinely differ once you strip the benchmarks away; and how to run an evaluation
+       that produces a defensible decision rather than a preference. Prerequisites:
+       <a href="hnsw.html">HNSW Deep Dive</a>, <a href="ivf-pq.html">IVF, PQ &amp; Quantisation</a> and
+       <a href="pgvector.html">pgvector</a>.</p>
+
+    <h2>Part 1 — What "Dedicated" Actually Buys</h2>
+
+    <p>The previous lesson argued for pgvector as the default. This one is about the case where that stops being
+       true — and the honest answer is that a dedicated store buys you four things, all of which are consequences
+       of one decision: <strong>the vector index is the primary data structure rather than a secondary index on a
+       row store.</strong></p>
+
+    <table class="tbl">
+      <tr><th>What you get</th><th>Why the architecture allows it</th><th>What it costs</th></tr>
+      <tr><td>Memory-resident indexes at large scale</td><td>Nothing else competes for the buffer cache</td><td>A second stateful system to operate</td></tr>
+      <tr><td>Aggressive quantisation (PQ, SQ, binary)</td><td>The store owns the storage format end to end</td><td>Recall becomes a tuning problem, not a given</td></tr>
+      <tr><td>Horizontal sharding of the index itself</td><td>Search is embarrassingly parallel across shards</td><td>Fan-out latency = the slowest shard</td></tr>
+      <tr><td>Purpose-built ingestion and compaction</td><td>Writes go to a buffer, not into a live graph</td><td>Eventual consistency on the search path</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The thing you actually give up is transactional consistency between a vector and
+       the row it describes.</strong> Every operational problem specific to dedicated stores traces back to this:
+       orphaned vectors after a failed delete, results citing documents that no longer exist, metadata that has
+       drifted from the source of record. It is a real cost, it is permanent, and it is worth paying only when
+       there is a measured problem it solves. Nothing in this lesson changes the conclusion of
+       <a href="pgvector.html">the previous one</a> — it tells you what to do once that conclusion no longer
+       holds.</div>
+
+    <p>Notice what is <em>not</em> on the list: better recall. Recall comes from the algorithm — HNSW is HNSW
+       whether it runs inside Postgres or inside Qdrant. A dedicated store lets you push further along the
+       recall/latency/memory curve at scale; it does not move the curve.</p>
+
+    <h2>Part 2 — The Architecture Every Store Shares</h2>
+
+    <p>Vendors describe their systems very differently. Underneath, essentially all of them are the same shape,
+       borrowed from Lucene: <strong>an append-only set of immutable segments, plus a small mutable buffer, plus a
+       background process that merges them.</strong></p>
+
+<pre>
+              write path                                read path
+              ----------                                ---------
+  upsert ──▶ [ WAL ]                              query ──┬──▶ segment 1 (immutable, HNSW)
+                │                                         ├──▶ segment 2 (immutable, HNSW)
+                ▼                                         ├──▶ segment 3 (immutable, HNSW)
+          [ mutable buffer ]  ──── flush ───▶ new         └──▶ mutable buffer (brute force)
+           (brute-force or       (on size /   segment              │
+            small graph)          interval)                       ▼
+                                                          merge top-k from each
+                                       ▲                          │
+                                       │                          ▼
+                              [ compaction / merge ]          final top-k
+                              rebuilds N segments into
+                              one, dropping tombstones
+</pre>
+
+    <p>Three consequences follow immediately, and between them they explain most "why is my vector store doing
+       that" questions:</p>
+
+    <table class="tbl">
+      <tr><th>Consequence</th><th>Why</th><th>What you observe</th></tr>
+      <tr><td>Writes are cheap; indexing is deferred</td><td>The buffer is appended to, the graph is not touched</td><td>High ingest throughput, but a freshness lag</td></tr>
+      <tr><td>Search cost grows with segment count</td><td>Every segment is searched, then results merged</td><td>Latency creeps up during heavy ingest, recovers after compaction</td></tr>
+      <tr><td>Deletes are tombstones, not deletions</td><td>You cannot cheaply remove a node from a built HNSW graph</td><td>Memory does not drop until compaction runs</td></tr>
+    </table>
+
+    <p><strong>Searching N segments is not free, and the cost is worse than linear in a subtle way.</strong> To
+       return a true top-10 across 8 segments you must ask each segment for its top-10 and merge — that is 8 ANN
+       searches, and each one has its own recall. Independent recall of 0.95 per segment does not give you 0.95
+       overall, because a global top-10 result can be missed by the one segment that holds it:</p>
+
+<pre>
+one segment,  ef=100:   recall@10 = 0.98    latency = 2.1 ms
+8 segments,   ef=100:   recall@10 = 0.94    latency = 6.8 ms   ← each segment searched
+8 segments,   ef=200:   recall@10 = 0.98    latency = 9.4 ms   ← recover recall by raising ef
+after compaction to 2 segments, ef=100:     recall@10 = 0.975  latency = 2.9 ms
+</pre>
+
+    <p><strong>The design consequence:</strong> compaction is not housekeeping, it is a latency and recall
+       control. A store that has fallen behind on compaction is a store that is quietly slower and less accurate,
+       and the metric to alert on is segment count, not just memory.</p>
+
+    <h2>Part 3 — Freshness, Deletes and the Consistency Model</h2>
+
+    <p>This is the part that most teams discover in production rather than in the docs.</p>
+
+    <p><strong>A successful write does not mean a searchable vector.</strong> The write is durable once it is in
+       the WAL, but it becomes searchable only when it is in the mutable buffer's structure or in a flushed
+       segment — and stores differ in whether that is microseconds or seconds:</p>
+
+<pre>
+# The bug this produces, in every RAG pipeline that has it
+client.upsert(collection="chunks", points=[{"id": 42, "vector": v, "payload": meta}])
+results = client.search(collection="chunks", query_vector=v, limit=10)
+assert 42 in [r.id for r in results]     # ← flaky: passes locally, fails under load
+</pre>
+
+<pre>
+# The fix is to make the requirement explicit, not to add a sleep
+client.upsert(collection="chunks", points=[...], wait=True)   # Qdrant: block until applied
+# Elasticsearch equivalent: refresh="wait_for"
+# Milvus equivalent:        consistency_level="Strong" on the search
+</pre>
+
+    <p><strong>Never fix this with <code>time.sleep()</code>.</strong> It passes on a laptop and fails on a loaded
+       cluster, and it converts a correctness requirement into a race that gets slower as you scale.</p>
+
+    <table class="tbl">
+      <tr><th>Consistency level</th><th>Meaning</th><th>When to use it</th></tr>
+      <tr><td>Strong / <code>wait=True</code></td><td>Write is searchable before the call returns</td><td>Tests, and read-after-write user flows</td></tr>
+      <tr><td>Bounded staleness</td><td>Reads see writes older than <em>t</em></td><td>The sensible production default</td></tr>
+      <tr><td>Eventual</td><td>No guarantee; maximum throughput</td><td>Bulk ingestion of a corpus</td></tr>
+    </table>
+
+    <p><strong>Deletes are the more expensive half.</strong> Removing a node from a built HNSW graph would require
+       repairing every neighbour list that pointed at it, so no store does that on the delete path. Instead the id
+       is tombstoned and filtered out of results:</p>
+
+<pre>
+delete(id=4821)
+   → mark 4821 in the deleted bitmap        (fast, O(1))
+   → the vector stays in the graph          (still traversed during search)
+   → results containing 4821 are dropped    (post-filter, at query time)
+   → memory is reclaimed only at compaction (which rewrites the segment)
+</pre>
+
+    <p><strong>The failure mode this creates</strong> is a workload with heavy churn — a corpus that re-ingests
+       daily, say. Tombstones accumulate, the graph keeps traversing dead nodes, and the search returns fewer
+       results than requested because a top-10 request now yields 10 candidates of which 4 are deleted:</p>
+
+<pre>
+after 30 days of daily re-ingestion, no compaction tuning:
+  live vectors:      2,400,000
+  tombstoned:        6,100,000        ← 72% of the graph is dead
+  memory:            4.1× the live set
+  recall@10:         0.71             ← candidates exhausted by tombstones
+  p99 latency:       41 ms  (was 6 ms)
+</pre>
+
+    <div class="note">🔑 <strong>Tombstone ratio is the single most valuable health metric on a dedicated
+       store</strong>, and almost nobody alerts on it. It degrades recall and latency together, it looks like
+       nothing in the memory graph until it is severe, and the fix — forcing compaction, or tuning the merge
+       policy to be more aggressive — is cheap once you know that is what you are looking at. Alert when
+       deleted/total exceeds roughly 20%.</div>
+
+    <p><strong>Updates are deletes plus inserts.</strong> There is no in-place update of a vector in an immutable
+       segment, so re-embedding a chunk costs a tombstone and a new node. A pipeline that re-embeds unchanged
+       content is therefore not merely wasting embedding API spend — it is actively degrading the index. That is
+       what the <code>content_hash</code> column in the <a href="pgvector.html">pgvector schema</a> was protecting
+       against, and the protection matters more here, not less.</p>
+
+    <h2>Part 4 — Sharding, Replication and Fan-Out</h2>
+
+    <p>Once a collection exceeds one machine's memory, it is split into shards, each holding a disjoint subset of
+       vectors with its own complete index.</p>
+
+<pre>
+                        ┌──────────────┐
+       query ──────────▶│ coordinator  │
+                        └──────┬───────┘
+             ┌────────────┬────┴───────┬────────────┐
+             ▼            ▼            ▼            ▼
+         shard 0      shard 1      shard 2      shard 3
+         top-10       top-10       top-10       top-10        ← each does a full ANN search
+             └────────────┴──────┬─────┴────────────┘
+                                 ▼
+                        merge → global top-10
+</pre>
+
+    <p><strong>Every shard searches for the full k.</strong> You cannot ask shard 0 for 3 results and shard 1 for
+       7 — you do not know in advance where the true neighbours live, so each shard returns k and the coordinator
+       keeps the best k of N×k. Two costs follow:</p>
+
+    <table class="tbl">
+      <tr><th>Cost</th><th>Arithmetic</th><th>Design consequence</th></tr>
+      <tr><td>Total work multiplies</td><td>N shards × one full ANN search each</td><td>Sharding buys memory capacity, not throughput per query</td></tr>
+      <tr><td>Latency = the slowest shard</td><td>p99 of a 10-shard fan-out ≈ p99.9 of one shard</td><td>Tail latency degrades as shards increase</td></tr>
+    </table>
+
+    <p>That second row is worth doing the arithmetic on, because it is counter-intuitive. If a single shard has a
+       99th-percentile latency of 20 ms and each shard's latency is roughly independent, the probability that
+       <em>all</em> 10 shards come in under 20 ms is 0.99<sup>10</sup> ≈ 0.90 — so what was a p99 becomes
+       roughly a p90:</p>
+
+<pre>
+single shard:    p50 = 4 ms    p99 = 20 ms
+10-shard fan-out: p50 = 6 ms   p99 = 38 ms      ← you now pay one shard's p99.9 on every query
+(measured: 40M vectors, 768-dim, HNSW ef=128)
+</pre>
+
+    <p><strong>The design consequence: pick the smallest shard count that fits in memory, not the largest you can
+       afford.</strong> Over-sharding is a common and expensive mistake — people shard for "scalability" and buy
+       themselves worse tail latency and more merge work for no capacity they needed.</p>
+
+    <p><strong>Replicas do the opposite:</strong> they are full copies of a shard, so queries are load-balanced
+       across them and throughput scales linearly with replica count while latency stays flat. <em>Shards for
+       capacity, replicas for QPS</em> is the whole rule.</p>
+
+<pre>
+shards   → capacity (memory)   → latency gets WORSE   (fan-out)
+replicas → throughput (QPS)    → latency stays FLAT   (load balance)
+</pre>
+
+    <p><strong>Resharding is the expensive operation.</strong> Most stores cannot change a collection's shard
+       count in place — the shard assignment is a hash of the id, so changing N moves nearly every vector. In
+       practice resharding means creating a new collection and re-indexing into it, which is why the shard count
+       is one of the few decisions worth thinking about before you create the collection. Over-provision slightly
+       rather than exactly.</p>
+
+    <h2>Part 5 — The Landscape Without the Marketing</h2>
+
+    <p>The stores differ far less in algorithm than in operational model. Every one of them runs HNSW (most also
+       offer IVF and quantisation variants), so the honest comparison is about how they are deployed, how they
+       filter, and what happens at 3 a.m.</p>
+
+    <table class="tbl">
+      <tr><th>Store</th><th>Its actual differentiator</th><th>Choose it when</th><th>Watch out for</th></tr>
+      <tr><td><strong>Qdrant</strong></td><td>Filterable HNSW — filters are applied <em>during</em> traversal, not after</td><td>Filtering is central and you self-host</td><td>Payload indexes must be created explicitly or filters scan</td></tr>
+      <tr><td><strong>Milvus</strong></td><td>Disaggregated compute/storage; many index types; built for very large scale</td><td>&gt;100M vectors, and you have platform engineers</td><td>Many components (etcd, object store, message queue) — real operational surface</td></tr>
+      <tr><td><strong>Weaviate</strong></td><td>Object model with schema, references and built-in vectorisation modules</td><td>You want the store to own embedding too</td><td>Coupling ingestion to the store makes model changes harder</td></tr>
+      <tr><td><strong>Pinecone</strong></td><td>Fully managed; no index tuning exposed</td><td>You want zero operations and accept the pricing model</td><td>Little control when recall is wrong; cost scales with pods/units</td></tr>
+      <tr><td><strong>Vespa</strong></td><td>True hybrid ranking with a real ranking framework and multi-phase scoring</td><td>Relevance is the product, not a feature</td><td>The steepest learning curve of the set</td></tr>
+      <tr><td><strong>Elasticsearch / OpenSearch</strong></td><td>Vectors added to a mature search engine you may already run</td><td>You already operate it and need hybrid BM25 + vector</td><td>Memory model and JVM tuning; vector search is a newer surface</td></tr>
+      <tr><td><strong>FAISS (library)</strong></td><td>Not a database — an index library, the reference implementation of most ANN research</td><td>You are embedding search into your own service and own persistence</td><td>No persistence, no filtering, no replication, no API — you build all of it</td></tr>
+      <tr><td><strong>pgvector</strong></td><td>Transactional consistency with the source of record</td><td>The default, up to ~10–50M vectors</td><td>See <a href="pgvector.html">the previous lesson</a> for the leave signals</td></tr>
+    </table>
+
+    <p><strong>FAISS deserves a note</strong>, because it is frequently compared against the others as if it were
+       one of them. It is a library: it gives you an in-memory index object with <code>add</code> and
+       <code>search</code>. Persistence, filtering, updates, sharding, replication, an API and an operational
+       story are all yours to build. Reaching for FAISS directly is right when you are building the store; it is
+       usually wrong when you are building the application.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Choosing a store from a benchmark leaderboard.</strong> Published ANN benchmarks measure a
+         static, pre-loaded, unfiltered, single-node index on a public dataset — a workload that resembles no
+         production system. They tell you nothing about filtered recall, behaviour under continuous ingestion,
+         tombstone accumulation, fan-out tail latency, or what the failure modes look like. Two stores within
+         2× on a leaderboard can differ by 50× on <em>your</em> filtered workload.</p>
+      <p>✅ <strong>Benchmark your own corpus, your own query distribution and your own filters.</strong> Load a
+         representative slice, replay real queries with their real filters, ingest continuously while you measure,
+         and record recall against exact ground truth alongside p50/p99. Then kill a node and see what happens.
+         That evaluation takes a few days and is the only one that predicts production.</p>
+    </div>
+
+    <h2>Part 6 — Choosing and Migrating, Concretely</h2>
+
+    <p>A defensible decision comes from a fixed procedure, not from a preference. The order matters: cheap
+       disqualifying constraints first, expensive measurement last.</p>
+
+    <table class="tbl">
+      <tr><th>Step</th><th>Question</th><th>What it eliminates</th></tr>
+      <tr><td>1</td><td>Do you have a measured reason to leave <a href="pgvector.html">pgvector</a>?</td><td>Usually the whole exercise</td></tr>
+      <tr><td>2</td><td>Managed or self-hosted? Data-residency constraints?</td><td>Roughly half the candidates, for free</td></tr>
+      <tr><td>3</td><td>Is filtering central, and how selective are the filters?</td><td>Stores that only post-filter</td></tr>
+      <tr><td>4</td><td>Do you need hybrid lexical + vector ranking?</td><td>Pushes toward Vespa / Elasticsearch / Weaviate</td></tr>
+      <tr><td>5</td><td>What is the real vector count in 2 years, and the memory bill at that size?</td><td>Decides whether quantisation is mandatory</td></tr>
+      <tr><td>6</td><td>Now benchmark the 2 survivors on your corpus</td><td>The preference you were about to act on</td></tr>
+    </table>
+
+    <p><strong>Estimate the memory bill before the benchmark</strong>, because it frequently decides the
+       question on its own:</p>
+
+<pre>
+10M vectors × 1536 dims × 4 bytes (float32)      = 61.4 GB   raw
+  + HNSW graph, m=16: 10M × 16 × 2 × 8 bytes     =  2.6 GB
+  + payload/metadata (varies)                    ≈  5.0 GB
+                                                 ─────────
+                                            total ≈ 69 GB    → a 96 GB instance, or shard it
+
+with scalar quantisation (int8):  61.4 → 15.4 GB → total ≈ 23 GB   → one 32 GB instance
+with PQ (m=96, 8 bits):           61.4 →  0.96 GB → total ≈  8 GB   → cheap, recall needs work
+</pre>
+
+    <p><strong>That single calculation is often the entire argument.</strong> Quantisation moves a 3-node cluster
+       to one node, which changes the cost by more than any store choice does — and it is available in most of
+       them, so it is a decision about your workload rather than about the vendor.</p>
+
+    <p><strong>The migration itself should be a re-index, never a data migration.</strong> If source text and
+       metadata live in your primary database, moving stores is running the ingestion pipeline against a new
+       target — a pipeline you need anyway for embedding-model changes:</p>
+
+<pre>
+# Dual-write, shadow-evaluate, then shift traffic — never a big-bang cutover
+def search(query, vec):
+    primary = old_store.search(vec, k=10)
+    if shadow_enabled():                        # sampled, off the critical path
+        record_shadow(new_store.search(vec, k=10), primary)
+    return primary
+
+# Promote only when the shadow comparison holds on YOUR eval set:
+#   recall@10 within tolerance, p99 no worse, filtered queries specifically checked
+</pre>
+
+    <p><strong>Shadow evaluation almost always reveals a query class where the new store is worse</strong>, even
+       when aggregate recall improves — usually the heavily filtered queries. Finding that before the cutover is
+       the entire point, and it is the difference between a migration and an incident.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Adopting a dedicated store without a measured problem</td><td>A permanent second stateful system for an assumed benefit</td><td>Require a measured signal; see <a href="pgvector.html">when to leave pgvector</a></td></tr>
+      <tr><td>Choosing from a public ANN benchmark</td><td>Static, unfiltered, single-node — resembles no production workload</td><td>Benchmark your corpus, queries and filters</td></tr>
+      <tr><td>Asserting a search finds a just-written vector</td><td>Writes are durable before they are searchable</td><td>Use <code>wait=True</code> / strong consistency in tests</td></tr>
+      <tr><td>Fixing freshness flakiness with <code>sleep()</code></td><td>Converts a correctness need into a race that worsens with load</td><td>Request the consistency level you actually need</td></tr>
+      <tr><td>Not monitoring tombstone ratio</td><td>Degrades recall and latency together, invisibly</td><td>Alert above ~20% deleted; tune compaction</td></tr>
+      <tr><td>Re-embedding unchanged content</td><td>Every update is a tombstone plus an insert — it degrades the index</td><td>Content-hash the source and skip unchanged chunks</td></tr>
+      <tr><td>Over-sharding for "scalability"</td><td>Fan-out makes p99 worse and multiplies total work</td><td>Smallest shard count that fits memory; replicas for QPS</td></tr>
+      <tr><td>Adding shards to increase throughput</td><td>Shards add capacity, not QPS</td><td>Add replicas for QPS</td></tr>
+      <tr><td>Ignoring segment count during heavy ingest</td><td>Every segment is searched; recall drops and latency rises</td><td>Monitor segment count; let compaction keep up</td></tr>
+      <tr><td>Filtering without creating a payload/metadata index</td><td>The filter degenerates into a scan</td><td>Create the field index explicitly (Qdrant, Milvus, Weaviate all require it)</td></tr>
+      <tr><td>Treating the store as the system of record</td><td>Model changes and migrations become impossible</td><td>Keep source text and metadata in your primary database</td></tr>
+      <tr><td>Big-bang cutover between stores</td><td>Filtered query classes regress in ways aggregate recall hides</td><td>Dual-write, shadow-evaluate, shift traffic gradually</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is a dedicated vector database, and how does it differ from adding vector search to an existing database?</summary>
+      <p>A dedicated vector store is a database whose <strong>primary</strong> data structure is the vector index.
+         In something like pgvector, the vector index is a secondary index on a row store — the rows are the
+         data, and the index points at them. That inversion is the whole difference, and everything else follows
+         from it.</p>
+      <table class="tbl">
+        <tr><th></th><th>Dedicated store</th><th>Vector search in an RDBMS</th></tr>
+        <tr><td>Primary structure</td><td>The ANN index</td><td>Rows; the index is secondary</td></tr>
+        <tr><td>Memory</td><td>Dedicated to the index</td><td>Shared with OLTP buffer cache</td></tr>
+        <tr><td>Quantisation</td><td>Extensive (SQ, PQ, binary)</td><td>Limited</td></tr>
+        <tr><td>Sharding of the index</td><td>Native</td><td>Manual, via partitioning</td></tr>
+        <tr><td>Consistency with source rows</td><td><strong>None</strong> — a separate system</td><td>Transactional</td></tr>
+      </table>
+      <p><strong>What you gain</strong> is scale: indexes that stay memory-resident past the point where a shared
+         database instance could hold them, aggressive quantisation to cut that memory by 4–64×, and horizontal
+         sharding.</p>
+      <p><strong>What you give up</strong> is that last row, and it is the one that bites. There is no transaction
+         spanning your <code>documents</code> table and the vector store, so deleting a document is two
+         operations across a network that can partially fail — which is how you end up with an assistant citing a
+         document that was deleted last week.</p>
+      <p>The practical rule is that a dedicated store should be adopted in response to a measured problem — index
+         no longer fitting in memory, rebuild exceeding the maintenance window, search degrading OLTP — and not
+         because a corpus crossed a round number.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why can't you just delete a vector from an HNSW index?</summary>
+      <p>Because HNSW is a graph whose edges are stored as neighbour lists on each node. Node 4821 appears in the
+         neighbour list of every node that selected it as a link — potentially hundreds of them, scattered across
+         the graph. Genuinely removing it means finding all of those and repairing each list, and repairing a
+         list well means re-running neighbour selection, which is most of the cost of inserting a node in the
+         first place.</p>
+<pre>
+true delete of node 4821 would require:
+  1. find every node whose neighbour list contains 4821   ← no reverse index exists
+  2. remove it from each list                             ← leaves those nodes under-connected
+  3. re-select replacements for each                      ← ~an insert's worth of work, each
+  4. repeat per layer
+</pre>
+      <p>Under-connected nodes are the real danger: the graph's search quality depends on connectivity, and
+         removing links without replacing them can disconnect a region entirely, making those vectors
+         unreachable — a silent recall loss, not an error.</p>
+      <p><strong>So every store tombstones instead:</strong> mark the id in a deleted bitmap, keep traversing the
+         node during search, and filter it out of the results. The delete is O(1) and the space is reclaimed
+         later, when compaction rewrites the segment without the dead nodes.</p>
+      <p>The consequence to remember is that <strong>deleted vectors still cost you</strong> — memory, traversal
+         time, and candidate slots. A top-10 search that finds 10 candidates of which 6 are tombstoned returns 4
+         results, so heavy churn degrades recall directly.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A search immediately after a successful write does not return the new vector. Is this a bug?</summary>
+      <p>No — it is the store's consistency model, and it is the single most common surprise for teams arriving
+         from relational databases. The write returned successfully because it is <strong>durable</strong>: it is
+         in the write-ahead log. Durable and searchable are different milestones.</p>
+<pre>
+upsert() returns  ──▶ in WAL           (durable, NOT searchable)
+                  ──▶ in mutable buffer (searchable, brute-forced)
+                  ──▶ flushed to segment (searchable via the index)
+</pre>
+      <p>The gap exists because inserting into a live HNSW graph is expensive, so writes are buffered and indexed
+         in batches. Trading a little freshness for an order of magnitude of ingest throughput is the right trade
+         for most workloads — but it has to be an explicit decision rather than a discovery.</p>
+      <p><strong>The fix is to ask for the guarantee you need:</strong></p>
+<pre>
+client.upsert(collection="chunks", points=[...], wait=True)   # Qdrant
+es.index(index="chunks", document=doc, refresh="wait_for")    # Elasticsearch
+client.search(..., consistency_level="Strong")                # Milvus
+</pre>
+      <p><strong>Not with a sleep.</strong> A <code>sleep(0.5)</code> passes locally and fails on a loaded cluster
+         where flush is queued behind bulk ingestion; it turns a correctness requirement into a race condition
+         that degrades exactly when the system is busiest.</p>
+      <p><strong>Where it genuinely matters in a RAG product</strong> is read-after-write on the user's own
+         upload: they add a document and immediately ask about it. Use strong consistency on that path only, and
+         leave bulk ingestion eventual — per-request consistency is why these are request-level options rather
+         than a global setting.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do sharding and replication affect vector search latency and throughput?</summary>
+      <p>They pull in opposite directions, and conflating them is a common and expensive mistake.</p>
+      <p><strong>Shards partition the vectors.</strong> Because you cannot know in advance which shard holds the
+         true nearest neighbours, every shard must run a full top-k search and the coordinator merges:</p>
+<pre>
+query → coordinator → 4 shards, each a FULL ANN search for k=10
+                    → merge 40 candidates → global top-10
+</pre>
+      <table class="tbl">
+        <tr><th></th><th>Shards</th><th>Replicas</th></tr>
+        <tr><td>Adds</td><td>Memory capacity</td><td>Query throughput</td></tr>
+        <tr><td>Latency effect</td><td><strong>Worse</strong> (fan-out tail)</td><td>Flat</td></tr>
+        <tr><td>Total work per query</td><td>Multiplied by shard count</td><td>Unchanged</td></tr>
+      </table>
+      <p><strong>The tail-latency arithmetic is the part people miss.</strong> With 10 shards and independent
+         latencies, a query is only fast if <em>every</em> shard is fast: at a per-shard p99 of 20 ms, the
+         probability all ten come in under 20 ms is 0.99<sup>10</sup> ≈ 0.90. Your former p99 is now roughly a
+         p90, and the real p99 is set by each shard's p99.9.</p>
+      <p><strong>So: shard only as much as memory forces you to, and add replicas for QPS.</strong> Over-sharding
+         to "be scalable" buys worse tail latency, more merge work and more compaction, for capacity you did not
+         need.</p>
+      <p>There is one exception worth knowing: if the data partitions naturally along a filter that is present in
+         every query — per-tenant collections, for instance — you can route to a single shard and skip the
+         fan-out entirely. That converts sharding from a latency cost into a latency <em>win</em>, and it is why
+         tenant-per-shard layouts are common in multi-tenant RAG.</p>
+      <p>Finally, shard count is difficult to change later: assignment is usually a hash of the id, so changing
+         the count relocates nearly everything. In practice resharding means re-indexing into a new collection,
+         so it is worth over-provisioning slightly at creation time.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How would you evaluate and choose a vector store for a production RAG system?</summary>
+      <p>I would run a fixed procedure that puts the cheap disqualifying constraints first and the expensive
+         measurement last, because the goal is a defensible decision rather than a preference.</p>
+      <p><strong>Step 0 — Establish that we need to leave the primary database.</strong> The first question is
+         whether pgvector is genuinely failing: is the index still resident, does the rebuild fit the maintenance
+         window, is search degrading OLTP p99? If none of those fire, the honest recommendation is to stay, and
+         that ends the evaluation. Most of the time it does.</p>
+      <p><strong>Step 1 — Apply the constraints that eliminate candidates for free:</strong></p>
+      <table class="tbl">
+        <tr><th>Constraint</th><th>Effect</th></tr>
+        <tr><td>Data residency / no third-party processors</td><td>Removes managed-only options</td></tr>
+        <tr><td>Team has no platform engineers</td><td>Removes the operationally heavy options</td></tr>
+        <tr><td>Existing Elasticsearch investment</td><td>Makes reusing it the option to beat</td></tr>
+        <tr><td>Hybrid lexical + vector ranking required</td><td>Pushes toward Vespa / ES / Weaviate</td></tr>
+      </table>
+      <p><strong>Step 2 — Size the memory bill</strong>, which frequently decides it outright:</p>
+<pre>
+10M × 1536 × 4 B = 61 GB raw + graph + payload ≈ 69 GB   → cluster
+     with int8 scalar quantisation             ≈ 23 GB   → one node
+</pre>
+      <p>If quantisation moves us from three nodes to one, that is a bigger cost lever than the choice of vendor,
+         and it reframes the question as "which stores implement the quantisation we need well".</p>
+      <p><strong>Step 3 — Benchmark the two survivors on our own workload</strong>, because published benchmarks
+         measure a static unfiltered single-node index and our workload is none of those things. The harness must
+         include: our corpus at realistic scale, replayed production queries with their real filter
+         distributions, continuous ingestion running <em>during</em> measurement, recall computed against exact
+         ground truth, and p50/p99 recorded separately for filtered and unfiltered queries.</p>
+      <p><strong>Step 4 — Test the operational reality, which is what actually differs:</strong> kill a node
+         mid-query and measure recovery; run the churn workload for a week and watch tombstone ratio, segment
+         count and memory; time a full re-index, since that is the model-change cost; and confirm what the
+         backup and restore story really is.</p>
+      <p><strong>Step 5 — Decide on total cost of ownership</strong>, counting engineering time to operate, not
+         just infrastructure. A managed store at twice the infrastructure cost is frequently cheaper than a
+         self-hosted one that consumes an engineer.</p>
+      <p><strong>And regardless of the winner, I would keep source text and metadata in the primary
+         database</strong>, so the store remains a derived artefact and this decision stays reversible. The
+         evaluation I have just described is only affordable because we can re-index; a store holding the only
+         copy of the data would make every future re-evaluation prohibitive.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the migration from pgvector to a dedicated store for a live RAG system with zero downtime.</summary>
+      <p>I would treat it as a re-index with a gradual traffic shift, never a cutover, and I would define the
+         rollback and the success criteria before writing any migration code.</p>
+      <p><strong>Phase 1 — Establish ground truth first.</strong> Before anything moves, build the eval set:
+         200–500 real queries with judged relevant chunks, plus the exact-kNN top-10 for each from the current
+         system. Without this, "the new store is better" is unfalsifiable, and the entire migration becomes a
+         matter of opinion.</p>
+<pre>
+-- ground truth from the current system, index disabled for exactness
+SET enable_indexscan = off;
+SELECT q.id, array_agg(c.id ORDER BY c.embedding &lt;#&gt; q.embedding) AS truth
+FROM eval_queries q, LATERAL (
+  SELECT id, embedding FROM chunks ORDER BY embedding &lt;#&gt; q.embedding LIMIT 10
+) c GROUP BY q.id;
+</pre>
+      <p><strong>Phase 2 — Backfill by re-indexing, not by copying vectors.</strong> Source text lives in
+         Postgres, so the new store is populated by running the ingestion pipeline against it — the same pipeline
+         needed for model changes. Backfill in id order with a watermark so it is resumable, and let ongoing
+         writes dual-write to both stores from the moment the backfill starts.</p>
+<pre>
+def ingest(chunk):
+    pg.upsert(chunk)                       # source of record, transactional
+    try:
+        new_store.upsert(chunk)            # best-effort during migration
+    except Exception:
+        outbox.enqueue(chunk.id)           # reconcile later; never fail the write
+</pre>
+      <p><strong>The outbox is not optional.</strong> Dual-writing without one produces exactly the divergence
+         the migration is supposed to avoid, and the reconciler is also what proves the two stores agree before
+         cutover.</p>
+      <p><strong>Phase 3 — Shadow-read before serving anything.</strong> On a sampled fraction of live traffic,
+         query both and record the comparison off the critical path:</p>
+<pre>
+primary = pg.search(vec, k=10, filters=f)
+if sample():
+    shadow  = new_store.search(vec, k=10, filters=f)
+    metrics.record(overlap=jaccard(primary, shadow),
+                   recall_vs_truth=recall(shadow, ground_truth),
+                   latency=(pg_ms, new_ms), filtered=bool(f))
+return primary
+</pre>
+      <p><strong>Segment those metrics by filter selectivity.</strong> Aggregate recall almost always looks fine;
+         the regression, when there is one, is concentrated in heavily filtered queries where the new store
+         post-filters ANN candidates. That is the specific failure the shadow phase exists to catch, and finding
+         it here costs a config change rather than an incident.</p>
+      <p><strong>Phase 4 — Shift traffic gradually</strong>, 1% → 5% → 25% → 50% → 100%, with a single env-var
+         revert and at least a day at each step. Watch end-to-end answer quality, not just retrieval metrics:
+         retrieval recall can hold while answer quality drops, usually because result ordering changed and the
+         top-3 that the model actually reads are different.</p>
+      <p><strong>Phase 5 — Keep pgvector as a fallback for a full cycle</strong> before decommissioning, and only
+         then drop the index (never the <code>content</code> column, which stays the system of record).</p>
+      <table class="tbl">
+        <tr><th>Gate before promoting</th><th>Criterion</th></tr>
+        <tr><td>recall@10 vs ground truth</td><td>Within 1 point, <em>including</em> filtered queries</td></tr>
+        <tr><td>p99 latency</td><td>No worse than current</td></tr>
+        <tr><td>Reconciler divergence</td><td>Zero outstanding for 24 h</td></tr>
+        <tr><td>Answer quality on the eval set</td><td>No regression</td></tr>
+      </table>
+      <p><strong>The rollback is what makes this safe:</strong> because Postgres keeps serving throughout and
+         holds the source of record, reverting is a flag flip with no data loss at any point. A migration without
+         that property is not a migration plan, it is a launch.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Run a dedicated store locally and observe the segment
+       architecture.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant
+$ pip install qdrant-client numpy
+</pre>
+<pre>
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+import numpy as np
+
+c = QdrantClient("localhost", port=6333)
+c.recreate_collection(
+    "demo",
+    vectors_config=VectorParams(size=128, distance=Distance.COSINE),
+)
+
+rng = np.random.default_rng(0)
+vecs = rng.normal(size=(50_000, 128)).astype("float32")
+vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)      # normalise: cosine == dot
+
+for start in range(0, 50_000, 5_000):                    # 10 batches
+    c.upsert("demo", points=[
+        PointStruct(id=int(start+i), vector=v.tolist(),
+                    payload={"batch": start // 5_000})
+        for i, v in enumerate(vecs[start:start+5_000])
+    ])
+    info = c.get_collection("demo")
+    print(f"after {start+5000:6d}: segments={info.segments_count} "
+          f"indexed={info.indexed_vectors_count} points={info.points_count}")
+</pre>
+<pre>
+after   5000: segments=2 indexed=0     points=5000
+after  10000: segments=3 indexed=0     points=10000
+after  20000: segments=5 indexed=10000 points=20000    ← indexing threshold crossed
+after  35000: segments=6 indexed=30000 points=35000
+after  50000: segments=4 indexed=50000 points=50000    ← compaction merged segments
+</pre>
+      <p><strong>Two things to notice.</strong> First, <code>indexed_vectors_count</code> lags
+         <code>points_count</code> — vectors are searchable before they are in an HNSW graph, served by
+         brute-force scan of the buffer until then. Second, segment count goes <em>down</em> at the end: that is
+         compaction merging segments, and it is why latency improves after ingestion stops.</p>
+      <p><strong>Confirm the freshness gap directly:</strong></p>
+<pre>
+new_id, v = 999_999, vecs[0].tolist()
+c.upsert("demo", points=[PointStruct(id=new_id, vector=v)], wait=False)
+hits = c.search("demo", query_vector=v, limit=5)
+print("found immediately:", new_id in [h.id for h in hits])   # → often False
+
+c.upsert("demo", points=[PointStruct(id=new_id, vector=v)], wait=True)
+hits = c.search("demo", query_vector=v, limit=5)
+print("found with wait:  ", new_id in [h.id for h in hits])   # → always True
+</pre>
+      <p>That pair is the assertion worth putting in a test suite — it pins the consistency requirement
+         explicitly instead of leaving it to a <code>sleep</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Measure how deletes affect memory, recall and latency.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import time
+
+def measure(label):
+    info = c.get_collection("demo")
+    q = vecs[7].tolist()
+    t = time.perf_counter()
+    for _ in range(200):
+        hits = c.search("demo", query_vector=q, limit=10)
+    ms = (time.perf_counter() - t) / 200 * 1000
+    print(f"{label:22} points={info.points_count:6d} "
+          f"returned={len(hits):2d}  {ms:5.2f} ms")
+
+measure("baseline")
+</pre>
+<pre>
+# delete 70% of the collection
+from qdrant_client.models import Filter, FieldCondition, MatchAny
+c.delete("demo", points_selector=Filter(must=[
+    FieldCondition(key="batch", match=MatchAny(any=[0,1,2,3,4,5,6]))
+]), wait=True)
+measure("after deleting 70%")
+</pre>
+<pre>
+baseline               points= 50000 returned=10   1.84 ms
+after deleting 70%     points= 15000 returned=10   3.91 ms   ← SLOWER with fewer points
+</pre>
+      <p><strong>Fewer vectors, more than double the latency.</strong> That is the tombstone effect: the graph
+         still contains all 50,000 nodes and search still traverses them, but 35,000 of the candidates it finds
+         are discarded before returning. The work went up and the useful yield went down.</p>
+      <p><strong>Now force compaction and measure again:</strong></p>
+<pre>
+from qdrant_client.models import OptimizersConfigDiff
+c.update_collection("demo",
+    optimizer_config=OptimizersConfigDiff(deleted_threshold=0.1,
+                                          vacuum_min_vector_number=100))
+time.sleep(15)                      # let the optimizer run
+measure("after compaction")
+</pre>
+<pre>
+after compaction       points= 15000 returned=10   1.12 ms   ← graph rebuilt without dead nodes
+</pre>
+      <p><strong>3.5× faster, from an operation that changed no data.</strong> Push the deletion further to see
+         the recall failure, which is the more dangerous symptom:</p>
+<pre>
+# delete 97% and search BEFORE compaction runs
+hits = c.search("demo", query_vector=q, limit=10)
+print("requested 10, got", len(hits))
+requested 10, got 3          ← candidates exhausted by tombstones
+</pre>
+      <p>The store returned three results without an error. A RAG pipeline consuming this silently loses most of
+         its context, which is why <strong>deleted/total is worth alerting on above ~20%</strong>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Quantify the fan-out tail-latency cost of sharding.
+      <details class="solution"><summary>Solution</summary>
+      <p>Simulate first — the effect is a property of the maximum of independent draws, so it is visible without
+         a cluster:</p>
+<pre>
+import numpy as np
+rng = np.random.default_rng(1)
+
+# one shard's latency: lognormal, p50 ~4 ms with a realistic tail
+def shard_latency(n): return rng.lognormal(mean=np.log(4), sigma=0.55, size=n)
+
+for shards in (1, 2, 4, 8, 16):
+    per_query = shard_latency((200_000, shards)).max(axis=1)   # slowest shard wins
+    print(f"{shards:2d} shards  p50={np.percentile(per_query,50):5.2f}  "
+          f"p95={np.percentile(per_query,95):5.2f}  "
+          f"p99={np.percentile(per_query,99):6.2f} ms")
+</pre>
+<pre>
+ 1 shards  p50= 4.00  p95= 9.90  p99= 14.42 ms
+ 2 shards  p50= 5.02  p95=11.55  p99= 16.31 ms
+ 4 shards  p50= 6.28  p95=13.30  p99= 18.28 ms
+ 8 shards  p50= 7.64  p95=15.19  p99= 20.42 ms
+16 shards  p50= 9.15  p95=17.24  p99= 22.71 ms
+</pre>
+      <p><strong>p50 more than doubles from 1 to 16 shards, and the p99 rises by 58% — with no change in data,
+         index or query.</strong> The median moves because the median of a maximum is not the maximum of medians:
+         with 16 shards you need <em>all sixteen</em> to be fast.</p>
+      <p><strong>Verify against a real store</strong> by creating the same data with different shard counts:</p>
+<pre>
+for n in (1, 4, 8):
+    c.recreate_collection(f"shards{n}", shard_number=n,
+        vectors_config=VectorParams(size=128, distance=Distance.COSINE))
+    c.upsert(f"shards{n}", points=[PointStruct(id=i, vector=v.tolist())
+                                   for i, v in enumerate(vecs)], wait=True)
+
+    lat = []
+    for q in vecs[:500]:
+        t = time.perf_counter(); c.search(f"shards{n}", query_vector=q.tolist(), limit=10)
+        lat.append((time.perf_counter()-t)*1000)
+    print(f"{n} shard(s): p50={np.percentile(lat,50):.2f}  p99={np.percentile(lat,99):.2f} ms")
+</pre>
+<pre>
+1 shard(s): p50=1.81  p99= 4.902 ms
+4 shard(s): p50=2.94  p99= 8.14 ms
+8 shard(s): p50=3.71  p99=11.02 ms
+</pre>
+      <p><strong>The conclusion to carry into a design review:</strong> shard because memory forces you to, and
+         choose the smallest count that fits. If someone proposes more shards to make search faster, this table
+         is the answer — shards add capacity, replicas add throughput, and only replicas leave latency alone.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Compare filtered search: filter-during-traversal vs
+       post-filtering.
+      <details class="solution"><summary>Solution</summary>
+      <p>This is the difference that matters most in production and that public benchmarks never measure. Build a
+         collection with a skewed filter field:</p>
+<pre>
+from qdrant_client.models import PayloadSchemaType
+
+c.recreate_collection("filt",
+    vectors_config=VectorParams(size=128, distance=Distance.COSINE))
+
+# tenant 1 owns 95%; tenants 2..100 share the remaining 5%
+tenants = np.where(rng.random(50_000) &lt; 0.95, 1, rng.integers(2, 101, 50_000))
+c.upsert("filt", points=[
+    PointStruct(id=i, vector=v.tolist(), payload={"tenant": int(t)})
+    for i, (v, t) in enumerate(zip(vecs, tenants))], wait=True)
+</pre>
+      <p><strong>First, without a payload index — the trap:</strong></p>
+<pre>
+flt = Filter(must=[FieldCondition(key="tenant", match=MatchValue(value=57))])
+t = time.perf_counter()
+hits = c.search("filt", query_vector=vecs[3].tolist(), query_filter=flt, limit=10)
+print(f"no payload index: {len(hits)} hits in {(time.perf_counter()-t)*1000:.1f} ms")
+
+no payload index: 10 hits in 38.4 ms
+</pre>
+      <p><strong>Now create the payload index and repeat:</strong></p>
+<pre>
+c.create_payload_index("filt", field_name="tenant",
+                       field_schema=PayloadSchemaType.INTEGER)
+time.sleep(3)
+t = time.perf_counter()
+hits = c.search("filt", query_vector=vecs[3].tolist(), query_filter=flt, limit=10)
+print(f"with payload index: {len(hits)} hits in {(time.perf_counter()-t)*1000:.1f} ms")
+
+with payload index: 10 hits in 2.1 ms          ← 18x faster, same results
+</pre>
+      <p><strong>The payload index is not optional.</strong> Without it the filter is evaluated by scanning
+         payloads, which is the most common cause of "our vector store is slow when we filter" — and it is a
+         one-line fix that most teams find months late.</p>
+      <p><strong>Now simulate what post-filtering would have done</strong>, which is what a store lacking
+         filterable traversal must do:</p>
+<pre>
+# retrieve N unfiltered candidates, then filter in the client
+for n in (10, 100, 1000):
+    cands = c.search("filt", query_vector=vecs[3].tolist(), limit=n)
+    kept = [h for h in cands if h.payload["tenant"] == 57]
+    print(f"post-filter from {n:5d} candidates → {len(kept):2d} survivors")
+</pre>
+<pre>
+post-filter from    10 candidates →  0 survivors
+post-filter from   100 candidates →  0 survivors
+post-filter from  1000 candidates →  1 survivors     ← asked for 10
+</pre>
+      <p><strong>Zero results from 100 candidates, for a query the filtered search answered exactly in 2 ms.</strong>
+         With a filter keeping 0.05% of the corpus, post-filtering has to over-fetch by roughly 1/selectivity —
+         20,000 candidates for 10 results — which is slower than a brute-force scan of the matching subset.</p>
+      <table class="tbl">
+        <tr><th>Approach</th><th>Result</th><th>Latency</th></tr>
+        <tr><td>Filter during traversal, no payload index</td><td>10 correct</td><td>38.4 ms</td></tr>
+        <tr><td>Filter during traversal, payload index</td><td>10 correct</td><td><strong>2.1 ms</strong></td></tr>
+        <tr><td>Post-filter 100 candidates</td><td><strong>0</strong></td><td>1.9 ms</td></tr>
+      </table>
+      <p>This is the same failure the <a href="pgvector.html">Postgres planner</a> avoids by switching to an exact
+         scan of the filtered subset — and it is why "how does it filter?" belongs in step 3 of any evaluation,
+         well before the benchmark.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build an evaluation harness that would actually decide a
+       store choice.
+      <details class="solution"><summary>Solution</summary>
+      <p>The requirement is a harness that measures the things production exercises and benchmarks do not:
+         filtered recall, behaviour under concurrent ingestion, and tail latency — all against exact ground
+         truth.</p>
+<pre>
+import numpy as np, time, threading
+from dataclasses import dataclass, field
+
+@dataclass
+class Result:
+    name: str
+    recalls: list = field(default_factory=list)
+    latencies: list = field(default_factory=list)
+
+def exact_topk(corpus, q, k, mask=None):
+    """Ground truth by brute force. mask = boolean filter over the corpus."""
+    sims = corpus @ q
+    idx = np.arange(len(corpus))
+    if mask is not None:
+        sims, idx = sims[mask], idx[mask]
+    top = np.argsort(-sims)[:k]
+    return set(idx[top].tolist())
+</pre>
+<pre>
+def evaluate(store, corpus, queries, filters, k=10, ingest_during=False):
+    res = Result(store.name)
+    stop = threading.Event()
+
+    def background_ingest():                 # the load benchmarks never apply
+        i = 10_000_000
+        while not stop.is_set():
+            store.upsert_batch(np.random.normal(size=(500, corpus.shape[1])), start_id=i)
+            i += 500
+            time.sleep(0.1)
+
+    if ingest_during:
+        threading.Thread(target=background_ingest, daemon=True).start()
+
+    for q, f in zip(queries, filters):
+        mask = None if f is None else (tenants == f)
+        truth = exact_topk(corpus, q, k, mask)
+
+        t = time.perf_counter()
+        got = store.search(q, k=k, filter=f)
+        res.latencies.append((time.perf_counter() - t) * 1000)
+        res.recalls.append(len(truth & set(got)) / max(len(truth), 1))
+
+    stop.set()
+    return res
+</pre>
+      <p><strong>Report filtered and unfiltered separately</strong> — the aggregate number hides the regression
+         that matters:</p>
+<pre>
+def report(res, filters):
+    for label, keep in (("unfiltered", [f is None for f in filters]),
+                        ("filtered",   [f is not None for f in filters])):
+        r = np.array(res.recalls)[keep]; l = np.array(res.latencies)[keep]
+        print(f"{res.name:10} {label:10} recall@10={r.mean():.3f}  "
+              f"p50={np.percentile(l,50):5.2f}  p99={np.percentile(l,99):6.2f} ms")
+</pre>
+<pre>
+store_a    unfiltered recall@10=0.981  p50= 2.10  p99=  5.40 ms
+store_a    filtered   recall@10=0.974  p50= 2.44  p99=  6.81 ms
+store_b    unfiltered recall@10=0.986  p50= 1.92  p99=  4.88 ms     ← "wins" the benchmark
+store_b    filtered   recall@10=0.412  p50= 1.88  p99=  5.02 ms     ← post-filters
+</pre>
+      <p><strong>Store B wins on every number a public leaderboard would print, and is unusable for this
+         workload.</strong> Aggregate recall across all queries would have read 0.70 vs 0.98 — bad, but not
+         obviously a filtering problem. Segmenting is what makes the cause visible.</p>
+      <p><strong>Then run it again with ingestion in flight</strong>, which is the second thing benchmarks omit:</p>
+<pre>
+report(evaluate(store_a, corpus, queries, filters, ingest_during=True), filters)
+
+store_a    unfiltered recall@10=0.958  p50= 3.81  p99= 14.20 ms   ← segments accumulating
+store_a    filtered   recall@10=0.951  p50= 4.02  p99= 15.88 ms
+</pre>
+      <p>Recall drops 2 points and p99 nearly triples — the multi-segment effect from Part 2. A store evaluated
+         only at rest will look materially better than it behaves.</p>
+      <p><strong>The checklist this harness implements:</strong></p>
+      <table class="tbl">
+        <tr><th>Dimension</th><th>Why benchmarks miss it</th></tr>
+        <tr><td>Filtered recall, by selectivity</td><td>They test unfiltered queries only</td></tr>
+        <tr><td>Recall under concurrent ingest</td><td>They pre-load a static index</td></tr>
+        <tr><td>p99, not just p50</td><td>Averages hide fan-out and compaction pauses</td></tr>
+        <tr><td>Your embedding distribution</td><td>SIFT/GloVe cluster differently than your corpus</td></tr>
+        <tr><td>Node failure and recovery</td><td>Single-node measurement</td></tr>
+        <tr><td>Full re-index time</td><td>Never measured, yet it is the model-change cost</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Plan a zero-downtime migration with a reconciliation
+       guarantee.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The scenario:</strong> 40M chunks in pgvector, index no longer resident (cache hit rate 84%),
+         p99 at 340 ms and rising, live RAG traffic at 60 QPS. The decision to move is justified; the plan must
+         not drop a query or lose a vector.</p>
+      <p><strong>Step 1 — Freeze the ground truth before anything changes.</strong></p>
+<pre>
+-- 500 real queries sampled from production logs, exact top-10 from the current system
+CREATE TABLE eval_truth AS
+SELECT q.id AS query_id,
+       (SELECT array_agg(c.id ORDER BY c.embedding &lt;#&gt; q.embedding)
+        FROM (SELECT id, embedding FROM chunks
+              ORDER BY embedding &lt;#&gt; q.embedding LIMIT 10) c) AS truth
+FROM eval_queries q;
+</pre>
+      <p>Exact, not ANN — otherwise you are comparing the new store against the old store's errors.</p>
+      <p><strong>Step 2 — Dual-write with an outbox, before backfilling.</strong> Turning this on first means the
+         backfill has a fixed endpoint rather than chasing a moving target:</p>
+<pre>
+def write_chunk(chunk):
+    with pg.transaction():
+        pg.upsert(chunk)
+        pg.insert_outbox(chunk.id, op="upsert")     # same transaction: cannot be lost
+
+# separate worker drains the outbox
+def drain():
+    for row in pg.claim_outbox(limit=500):
+        try:
+            new_store.upsert(pg.load_chunk(row.chunk_id))
+            pg.delete_outbox(row.id)
+        except Exception:
+            pg.bump_retry(row.id)                    # stays queued; never silently dropped
+</pre>
+      <p><strong>The outbox row is written in the same transaction as the data.</strong> That is what makes the
+         guarantee real: a crash between the two writes cannot produce a vector that exists in Postgres and never
+         reaches the new store.</p>
+      <p><strong>Step 3 — Backfill by re-indexing, resumably:</strong></p>
+<pre>
+def backfill(batch=2000):
+    last = load_watermark() or 0
+    while True:
+        rows = pg.query("SELECT id, content, tenant_id, model FROM chunks "
+                        "WHERE id &gt; %s ORDER BY id LIMIT %s", last, batch)
+        if not rows: break
+        new_store.upsert_batch([embed_or_reuse(r) for r in rows])
+        last = rows[-1].id
+        save_watermark(last)          # resumable: a crash costs one batch
+</pre>
+      <p><code>embed_or_reuse</code> matters: the embeddings already exist in Postgres, so re-embedding 40M
+         chunks would cost real money for no benefit — read the stored vector unless the model is also
+         changing.</p>
+      <p><strong>Step 4 — Reconcile, and prove agreement:</strong></p>
+<pre>
+def reconcile():
+    """Sample-based, continuous. Cheap enough to run forever."""
+    ids = pg.sample_ids(10_000)
+    missing = [i for i in ids if not new_store.exists(i)]
+    extra   = [i for i in new_store.sample_ids(10_000) if not pg.exists(i)]
+    metrics.gauge("migration.missing", len(missing))
+    metrics.gauge("migration.orphaned", len(extra))     # deletes that did not propagate
+    for i in missing: outbox.enqueue(i)
+    for i in extra:   new_store.delete(i)
+</pre>
+      <p><strong>Orphans are the direction people forget.</strong> A delete applied to Postgres but lost on the
+         way to the store leaves a vector that will be retrieved and cited — a deleted document resurfacing is
+         worse than a missing one.</p>
+      <p><strong>Step 5 — Shadow-read, segmented by filter selectivity:</strong></p>
+<pre>
+shadow (5% sample, 48 h):
+  unfiltered      overlap@10 = 0.94   recall_vs_truth = 0.972   p99  41 ms (was 340)
+  filter &gt;10%     overlap@10 = 0.91   recall_vs_truth = 0.968   p99  44 ms
+  filter &lt;1%      overlap@10 = 0.38   recall_vs_truth = 0.402   p99  39 ms   ← REGRESSION
+</pre>
+      <p><strong>There it is.</strong> Aggregate recall reads 0.93 and looks like a clear win; the narrow-filter
+         class collapsed because the new store post-filters ANN candidates while Postgres was switching to an
+         exact scan. The fix is a store-side payload index plus raising the candidate count for selective
+         filters — and finding it here costs a configuration change instead of an incident.</p>
+      <p><strong>Step 6 — Shift traffic behind a flag, with gates:</strong></p>
+      <table class="tbl">
+        <tr><th>Stage</th><th>Duration</th><th>Gate to advance</th></tr>
+        <tr><td>1%</td><td>24 h</td><td>No error-rate change; recall gates met</td></tr>
+        <tr><td>5%</td><td>24 h</td><td>p99 improved; answer quality flat or better</td></tr>
+        <tr><td>25%</td><td>48 h</td><td>Reconciler clean; memory and segment count stable</td></tr>
+        <tr><td>50% → 100%</td><td>1 week</td><td>Full cycle including the weekly re-ingest</td></tr>
+      </table>
+      <p><strong>Include a full ingestion cycle before 100%.</strong> Tombstone accumulation and compaction
+         behaviour only appear after the churn workload has run at least once, and they are exactly the
+         properties that were invisible in every benchmark.</p>
+      <p><strong>Step 7 — Decommission carefully.</strong> Keep pgvector's index for one more cycle as a
+         one-flag fallback, then drop the <em>index</em> — never the <code>content</code> column. Postgres
+         remains the system of record, which is what keeps this decision reversible and the next evaluation
+         affordable.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>A dedicated store makes the vector index the primary data structure; everything it gains and everything it costs follows from that inversion.</li>
+        <li>What you give up is transactional consistency with the source of record — the origin of orphaned vectors, stale metadata and results citing deleted documents.</li>
+        <li>Recall comes from the algorithm, not the vendor: HNSW is HNSW everywhere. A dedicated store lets you go further along the recall/latency/memory curve at scale; it does not move the curve.</li>
+        <li>Nearly all of them share one architecture: immutable segments + a mutable buffer + background compaction. Most surprising behaviour is a consequence of that shape.</li>
+        <li>Every segment is searched and results merged, so segment count raises latency and lowers recall — compaction is a performance control, not housekeeping.</li>
+        <li>A durable write is not a searchable write; use explicit strong consistency (<code>wait=True</code>, <code>refresh="wait_for"</code>) rather than <code>sleep()</code>.</li>
+        <li>Deletes are tombstones because removing a node from a built HNSW graph would require repairing every neighbour list that points at it.</li>
+        <li>Tombstones cost memory, traversal and candidate slots; above ~20% deleted, recall and latency degrade together. Alert on the ratio.</li>
+        <li>An update is a delete plus an insert, so re-embedding unchanged content actively degrades the index — content-hash and skip.</li>
+        <li>Shards add capacity and make tail latency worse (every shard runs a full top-k search); replicas add throughput and leave latency flat.</li>
+        <li>Pick the smallest shard count that fits in memory; shard count is effectively fixed at creation because resharding means re-indexing.</li>
+        <li>Filtering is the real differentiator: filtering during traversal returns correct results where post-filtering ANN candidates returns none.</li>
+        <li>Payload/metadata indexes must be created explicitly, or filters degenerate into scans — a one-line fix teams find months late.</li>
+        <li>Public ANN benchmarks measure a static, unfiltered, single-node index; benchmark your corpus, your filters, and measure while ingesting.</li>
+        <li>Size the memory bill early — quantisation often changes the cost more than the choice of vendor does.</li>
+        <li>Keep source text and metadata in your primary database so the store stays a derived artefact and migration is a re-index.</li>
+        <li>Migrate by dual-writing through a transactional outbox, backfilling resumably, shadow-evaluating by filter selectivity, then shifting traffic behind a revertible flag.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="pgvector.html">← pgvector &amp; SQL-Native Vectors</a>
+      <a href="hybrid-search.html">Metadata Filtering &amp; Hybrid Search →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
