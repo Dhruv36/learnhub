@@ -1,0 +1,1191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scaling, Cost &amp; Operations — Vector Databases &amp; RAG — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Scaling, Cost &amp; Operations <span class="level-badge level-adv">RAG in Production</span></h1>
+    <p><strong>What you'll master:</strong> how to size a vector workload from first principles and why memory,
+       not CPU, is the binding constraint; where the money actually goes in a RAG system and which levers move it
+       by 10× rather than 10%; the caching layers that matter and the invalidation rule that keeps them honest;
+       what to monitor and the specific alerts that catch silent degradation before users do; how to change an
+       embedding model without downtime; and the failure modes — cold indexes, tombstone drift, poisoned context
+       — that only appear in production. Prerequisites:
+       <a href="dedicated-stores.html">Dedicated Vector Stores</a>,
+       <a href="evaluation.html">Evaluating Retrieval</a>.</p>
+
+    <h2>Part 1 — Sizing: Memory Is the Constraint</h2>
+
+    <p>Vector search is a memory-bound workload. The index must be resident, or every query pays disk latency and
+       no amount of CPU recovers it. So capacity planning starts and mostly ends with one calculation.</p>
+
+<pre>
+raw vectors     = n × dims × bytes_per_component
+HNSW graph      ≈ n × m × 2 × 8 bytes            (m = links per node, bidirectional)
+payload/metadata= n × avg_payload_bytes
+                  ─────────────────────────────
+total ≈ the sum, plus ~20% headroom for compaction and query working set
+</pre>
+
+<pre>
+10M chunks, 1536 dims, float32, m=16, ~500 B payload:
+
+  vectors   10M × 1536 × 4       = 61.4 GB
+  graph     10M × 16 × 2 × 8     =  2.6 GB
+  payload   10M × 500            =  5.0 GB
+                                   ───────
+                                    69.0 GB  → +20% → ~83 GB → a 96 GB instance
+</pre>
+
+    <table class="tbl">
+      <tr><th>Quantisation</th><th>Bytes/component</th><th>10M × 1536</th><th>Typical recall cost</th></tr>
+      <tr><td>float32</td><td>4</td><td>61.4 GB</td><td>baseline</td></tr>
+      <tr><td>float16</td><td>2</td><td>30.7 GB</td><td>~0 — usually free</td></tr>
+      <tr><td>int8 scalar (SQ)</td><td>1</td><td><strong>15.4 GB</strong></td><td>1–2 points, recoverable by rescoring</td></tr>
+      <tr><td>Product quantisation (PQ)</td><td>~0.06</td><td>0.9 GB</td><td>5–15 points without rescoring</td></tr>
+      <tr><td>Binary</td><td>0.125</td><td>1.9 GB</td><td>Large, needs a rescoring pass</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Scalar quantisation with rescoring is the single best cost lever in the
+       stack.</strong> int8 cuts vector memory 4× for 1–2 points of recall — and those points come back if you
+       rescore the top ~100 candidates against full-precision vectors read from disk, which costs a few
+       milliseconds. That one change takes the example above from 83 GB to ~28 GB: a three-node cluster becomes
+       one node. No choice of vendor, index type or embedding model moves cost that much.</div>
+
+    <p><strong>Dimensionality is the other lever, and it is often free.</strong> Matryoshka-style embedding
+       models are trained so that truncating the vector degrades gracefully — 1536 dims cut to 512 keeps most of
+       the quality at a third of the memory:</p>
+
+<pre>
+dims kept    memory (10M)    recall@10
+  1536         61.4 GB         0.984
+   768         30.7 GB         0.979
+   512         20.5 GB         0.971      ← 3x cheaper for 1.3 points
+   256         10.2 GB         0.943
+</pre>
+
+    <p><strong>Verify truncation works with your model before relying on it</strong> — a non-Matryoshka model
+       degrades sharply instead of gracefully. It is a ten-minute test against your eval set.</p>
+
+    <p><strong>CPU sizing is secondary but not free.</strong> Roughly: HNSW search touches
+       <code>ef_search × m</code> nodes per query, each a distance computation over <code>dims</code>
+       floats:</p>
+
+<pre>
+ef=100, m=16, 1536 dims → ~1,600 distance computations × 1536 multiply-adds
+                        ≈ 2.5M FLOPs per query, ~1–3 ms on one modern core
+
+40 QPS × 2.5 ms = 0.1 cores of pure search   ← search is rarely the CPU bottleneck
+                                                embedding usually is
+</pre>
+
+    <h2>Part 2 — Where the Money Goes</h2>
+
+    <p>RAG cost is usually assumed to be the vector database. It is usually not.</p>
+
+<pre>
+1M queries/month, 10M chunks, typical mid-size RAG deployment:
+
+  LLM generation      1M × 3k tokens in, 500 out    ~$4,500/mo    ████████████ 78%
+  Vector DB hosting   96 GB instance                  ~$900/mo    ██ 16%
+  Query embeddings    1M × 30 tokens                   ~$150/mo   ▌ 3%
+  Reranking           1M × 50 pairs (self-hosted GPU)  ~$120/mo   ▌ 2%
+  Ingestion embeddings 10M chunks, amortised            ~$60/mo   ▏ 1%
+</pre>
+
+    <table class="tbl">
+      <tr><th>Lever</th><th>Effect</th><th>Cost of the lever</th></tr>
+      <tr><td><strong>Retrieve fewer, better chunks</strong></td><td>Cuts the dominant LLM input cost linearly</td><td>Needs a reranker; ~80 ms</td></tr>
+      <tr><td><strong>Cache LLM responses</strong></td><td>30–60% hit rate on head-heavy traffic</td><td>Near zero</td></tr>
+      <tr><td>Scalar quantisation</td><td>4× less index memory</td><td>1–2 recall points</td></tr>
+      <tr><td>Smaller/truncated embeddings</td><td>2–3× less memory</td><td>~1 recall point</td></tr>
+      <tr><td>Cache query embeddings</td><td>Removes most embedding spend</td><td>Near zero</td></tr>
+      <tr><td>Skip re-embedding unchanged content</td><td>Removes most ingestion spend</td><td>A content hash</td></tr>
+    </table>
+
+    <p><strong>The top row is the one teams miss.</strong> Sending 10 chunks instead of 5 doubles the dominant
+       cost line, and — per <a href="retrieval-reranking.html">reranking</a> — usually does not improve answers,
+       because the extra chunks land where the model does not attend. Reranking to 5 good chunks is a quality
+       improvement <em>and</em> roughly a 40% reduction in total system cost.</p>
+
+<pre>
+context: 10 chunks × 400 tokens = 4,000 tokens in   →  $6,000/mo
+context:  5 chunks × 400 tokens = 2,000 tokens in   →  $3,000/mo
+                                                        ────────
+                                                        same or better answers
+</pre>
+
+    <p><strong>Ingestion cost is a one-off that people budget as recurring, and vice versa.</strong> Embedding
+       10M chunks once is real money; re-embedding them monthly because the pipeline lacks a content hash is the
+       same money every month for no benefit — and, per <a href="chunking.html">ingestion</a>, it degrades the
+       index with tombstones while it does so.</p>
+
+    <h2>Part 3 — Caching</h2>
+
+    <p>RAG query distributions are extremely head-heavy — a small number of questions account for a large share
+       of traffic — which makes caching unusually effective.</p>
+
+<pre>
+      user query
+          │
+    ┌─────▼──────┐   hit (~35%)
+    │ 1. answer  ├──────────────▶ return          saves EVERYTHING
+    │    cache   │
+    └─────┬──────┘
+          │ miss
+    ┌─────▼──────┐   hit (~60%)
+    │ 2. embed   ├──────────────▶ skip embedding  saves ~15 ms + API cost
+    │    cache   │
+    └─────┬──────┘
+    ┌─────▼──────┐   hit (~25%)
+    │ 3. retrieval├─────────────▶ skip search     saves ~30 ms
+    │    cache   │
+    └─────┬──────┘
+          ▼
+      full pipeline
+</pre>
+
+<pre>
+import hashlib, json
+
+def cache_key(*parts):
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
+
+def retrieve_cached(query, filters, cache, ttl=300):
+    key = cache_key("retrieval", query, filters, INDEX_VERSION)   # version matters
+    if (hit := cache.get(key)) is not None:
+        return hit
+    result = pipeline.retrieve(query, filters)
+    cache.set(key, result, ttl=ttl)
+    return result
+</pre>
+
+    <p><strong>The cache key must include everything that changes the result</strong> — the filters, and an index
+       version that increments when the corpus or model changes. Omitting the filters is a correctness bug and,
+       in a multi-tenant system, a data leak: tenant A's cached results served to tenant B.</p>
+
+    <table class="tbl">
+      <tr><th>Cache</th><th>Key</th><th>TTL</th><th>Invalidate on</th></tr>
+      <tr><td>Query embedding</td><td>hash(text, model)</td><td>Very long</td><td>Model change only — text→vector is deterministic</td></tr>
+      <tr><td>Retrieval results</td><td>hash(query, filters, index_version)</td><td>Minutes</td><td>Index version bump</td></tr>
+      <tr><td>Generated answer</td><td>hash(query, context_ids, prompt_version)</td><td>Hours</td><td>Content change, prompt change</td></tr>
+      <tr><td>Reranker scores</td><td>hash(query, chunk_id, model)</td><td>Long</td><td>Model change</td></tr>
+    </table>
+
+    <p><strong>Embedding caches are the easiest win</strong> because the mapping is deterministic and permanent:
+       the same text with the same model always produces the same vector, so the only invalidation event is a
+       model change — handled by putting the model name in the key.</p>
+
+    <p><strong>Semantic caching — matching near-duplicate queries by embedding similarity — is tempting and
+       risky.</strong> "How do I enable webhooks?" and "How do I disable webhooks?" sit close in vector space and
+       have opposite answers:</p>
+
+<pre>
+cosine("how do I enable webhooks", "how do I disable webhooks") = 0.94
+                                                                  ↑
+                    above almost any sensible cache threshold, opposite answers
+</pre>
+
+    <p>If you use it, set the threshold very high (≥0.97), exclude queries containing negations, and treat it as
+       a latency optimisation with a correctness risk rather than free money.</p>
+
+    <h2>Part 4 — Monitoring</h2>
+
+    <p>Vector search degrades quietly. It returns results, with no errors, that are simply worse — so the
+       monitoring that matters is not uptime.</p>
+
+    <table class="tbl">
+      <tr><th>Signal</th><th>Alert when</th><th>What it means</th></tr>
+      <tr><td><strong>Results returned &lt; k</strong></td><td>Rate &gt; 1%</td><td>Filter too selective, or tombstones exhausting candidates</td></tr>
+      <tr><td><strong>Max retrieval score</strong></td><td>p50 drops &gt;10%</td><td>Corpus gap, or a partially-migrated index</td></tr>
+      <tr><td><strong>Tombstone ratio</strong></td><td>&gt; 20% deleted</td><td>Recall and latency degrading together</td></tr>
+      <tr><td><strong>Segment count</strong></td><td>Rising steadily</td><td>Compaction falling behind ingestion</td></tr>
+      <tr><td>Index memory vs RAM</td><td>&gt; 80% of available</td><td>About to start hitting disk</td></tr>
+      <tr><td>Cache hit rate</td><td>Sudden drop</td><td>Index version churn, or a key bug</td></tr>
+      <tr><td>p99 search latency</td><td>&gt; 2× baseline</td><td>Cold cache, compaction, or fan-out</td></tr>
+      <tr><td>Empty-context rate</td><td>Rising</td><td>Threshold too high, or corpus gaps</td></tr>
+    </table>
+
+    <p><strong>The first two are the ones almost nobody has, and they are the most valuable.</strong> A query
+       returning 6 results for a top-10 request is a silent context loss. A falling maximum retrieval score
+       across many queries is the signature of a broken or half-migrated index — and it appears days before
+       anyone reports bad answers.</p>
+
+<pre>
+def observe(query, results, k):
+    metrics.histogram("retrieval.max_score", results[0].score if results else 0)
+    metrics.histogram("retrieval.returned", len(results))
+    if len(results) &lt; k:
+        metrics.increment("retrieval.short_result")        # ← the silent failure
+    if not results:
+        metrics.increment("retrieval.empty")
+</pre>
+
+    <p><strong>Recall cannot be measured in production</strong> — there is no ground truth for a live query — so
+       use proxies plus a scheduled offline run:</p>
+
+<pre>
+hourly canary: run 50 queries from the eval set against production
+               → recall@10 vs known-good answers, alerted on
+               → this is the only real quality signal you get continuously
+</pre>
+
+    <p>That canary is cheap and catches what synthetic health checks cannot: an index rebuilt with the wrong
+       model, a filter regression, a corpus that lost a section during ingestion.</p>
+
+    <h2>Part 5 — Changing the Embedding Model Without Downtime</h2>
+
+    <p>Model changes are the highest-risk routine operation in a RAG system, because <strong>vectors from
+       different models are not comparable</strong>. A partially-migrated index is not degraded — it is
+       meaningless, since distances between the old and new spaces have no interpretation.</p>
+
+<pre>
+❌ in-place migration
+   re-embed chunks one by one into the same index
+   → during the migration, the index holds two incompatible vector spaces
+   → distances are nonsense; results are arbitrary
+   → and there is no rollback
+
+✅ parallel index
+   build a second index with the new model, dual-write, shadow-evaluate,
+   shift traffic behind a flag, keep the old one until confident
+</pre>
+
+<pre>
+def ingest(chunk):
+    pg.upsert(chunk)                                    # source of record
+    index_v1.upsert(chunk.id, embed_v1(chunk.text))     # current
+    if MIGRATING:
+        index_v2.upsert(chunk.id, embed_v2(chunk.text)) # new, in parallel
+
+def search(query, k=10):
+    idx, embed = ((index_v2, embed_v2) if flag("use_v2")
+                  else (index_v1, embed_v1))            # never mix
+    return idx.search(embed(query), k)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Phase</th><th>Action</th><th>Gate to advance</th></tr>
+      <tr><td>1</td><td>Freeze the eval set and record v1's scores</td><td>Baseline exists</td></tr>
+      <tr><td>2</td><td>Build index v2; dual-write new chunks</td><td>Backfill complete; counts match</td></tr>
+      <tr><td>3</td><td>Shadow-evaluate v2 on live queries</td><td>recall/nDCG ≥ v1 <em>per query class</em></td></tr>
+      <tr><td>4</td><td>Shift traffic 1% → 100% behind a flag</td><td>No regression in answer quality</td></tr>
+      <tr><td>5</td><td>Decommission v1 after a full cycle</td><td>Confidence, and a re-index path if needed</td></tr>
+    </table>
+
+    <p><strong>The cost of the migration window is running two indexes</strong> — double the memory for its
+       duration. That is the price of a rollback, and it is worth paying; a migration without a revert path is a
+       launch.</p>
+
+    <p><strong>Dimension changes make it worse, not better.</strong> If v2 has different dimensionality the two
+       indexes cannot even share a schema, so the parallel-index approach stops being a choice and becomes the
+       only option.</p>
+
+    <h2>Part 6 — Failure Modes That Only Appear in Production</h2>
+
+    <p><strong>The cold index.</strong> A restarted node has an empty page cache, so the first queries read the
+       index from disk — 50–100× slower — and if traffic arrives before it warms, the latency spike looks like an
+       outage:</p>
+
+<pre>
+after restart:  p50 = 340 ms   (disk reads on every traversal)
+after warming:  p50 =   4 ms
+
+fix: run warm-up queries before adding the node to the load balancer
+</pre>
+
+<pre>
+def warm_up(index, sample_queries, n=500):
+    """Touch a representative slice of the graph before serving."""
+    for q in sample_queries[:n]:
+        index.search(q.vector, k=10)
+    return index.stats().cache_hit_rate      # gate readiness on this
+</pre>
+
+    <p><strong>Tombstone drift</strong>, from <a href="dedicated-stores.html">dedicated stores</a>: a corpus that
+       re-ingests daily accumulates deleted vectors that still cost memory, traversal and candidate slots. The
+       symptom is recall and latency degrading together over weeks, with no code change to blame.</p>
+
+    <p><strong>Context poisoning</strong> is the failure mode unique to RAG, and it is worth naming because the
+       usual instinct — bigger corpus, more recall — makes it worse:</p>
+
+<pre>
+corpus contains:
+  docs/setup-v1.html  "The timeout defaults to 30 seconds."     (2023, superseded)
+  docs/setup-v2.html  "The timeout defaults to 5 seconds."      (current)
+
+both retrieve; the model averages them or picks arbitrarily
+→ answer is confidently wrong, cites a real document, passes faithfulness
+</pre>
+
+    <table class="tbl">
+      <tr><th>Mitigation</th><th>Mechanism</th></tr>
+      <tr><td>Filter by recency or version</td><td>Metadata filter at retrieval — see <a href="hybrid-search.html">filtering</a></td></tr>
+      <tr><td>Delete superseded content</td><td>The cheapest fix; most corpora are never pruned</td></tr>
+      <tr><td>Include dates in context</td><td>Lets the model prefer current information</td></tr>
+      <tr><td>Deduplicate near-identical chunks</td><td>Stops both versions occupying the context</td></tr>
+    </table>
+
+    <p><strong>Corpus hygiene is an operational task, not a one-off ingestion concern.</strong> A RAG system's
+       answer quality decays as its corpus accumulates superseded documents, and no retrieval improvement fixes
+       it — the retrieval was correct, the corpus was wrong.</p>
+
+    <p><strong>Finally, capacity in one line:</strong> shard when memory forces it, replicate for QPS, and expect
+       neither to help the other. That asymmetry, from
+       <a href="dedicated-stores.html">the sharding discussion</a>, is the whole of vector-store capacity
+       planning.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Optimising the vector database because it is the component you think of as "the RAG
+         system".</strong> Teams spend weeks on index parameters, shard layouts and store migrations while 78% of
+         the bill is LLM tokens, most of the latency is the embedding and generation calls, and the largest
+         available saving — retrieving 5 good chunks instead of 10 mediocre ones — sits untouched because it
+         looks like a quality change rather than a cost one.</p>
+      <p>✅ <strong>Profile the cost and the latency before optimising either.</strong> Break the bill into
+         generation, hosting, embeddings, reranking and ingestion, and the p99 into its per-stage contributions.
+         In most deployments the ranked list of levers is: fewer/better chunks, response caching, scalar
+         quantisation, embedding caching — and the index parameters that feel like the real work are near the
+         bottom.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Sizing on vector bytes alone</td><td>Graph, payload and headroom are 20–30% more</td><td>Include all four terms, then add 20%</td></tr>
+      <tr><td>Letting the index exceed RAM</td><td>Every query hits disk; no tuning recovers it</td><td>Quantise, truncate dims, or shard</td></tr>
+      <tr><td>Skipping quantisation</td><td>Leaves a 4× memory saving unclaimed</td><td>int8 + rescoring: 1–2 points, recoverable</td></tr>
+      <tr><td>Truncating dims without testing</td><td>Non-Matryoshka models degrade sharply</td><td>Verify against the eval set first</td></tr>
+      <tr><td>Assuming the vector DB is the main cost</td><td>LLM tokens are usually ~80%</td><td>Profile the bill before optimising</td></tr>
+      <tr><td>Sending 10 chunks when 5 suffice</td><td>Doubles the dominant cost for no quality gain</td><td>Rerank to fewer, better chunks</td></tr>
+      <tr><td>Cache keys without filters</td><td>Cross-tenant results served from cache — a leak</td><td>Key on query + filters + index version</td></tr>
+      <tr><td>Cache keys without an index version</td><td>Stale results survive a re-index</td><td>Bump a version on every index change</td></tr>
+      <tr><td>Semantic caching at a low threshold</td><td>"enable" and "disable" are 0.94 similar</td><td>≥0.97, exclude negations, or skip it</td></tr>
+      <tr><td>Monitoring only uptime and latency</td><td>Vector search degrades without erroring</td><td>Alert on short results and max score</td></tr>
+      <tr><td>No tombstone or segment alerting</td><td>Recall and latency decay invisibly for weeks</td><td>Alert above 20% deleted; watch segment count</td></tr>
+      <tr><td>In-place embedding model migration</td><td>Two incompatible vector spaces in one index</td><td>Parallel index, dual-write, flag the cutover</td></tr>
+      <tr><td>Serving a node before it is warm</td><td>Cold page cache: 50–100× slower queries</td><td>Warm-up queries gated on cache hit rate</td></tr>
+      <tr><td>Never pruning superseded documents</td><td>Context poisoning — confidently wrong, correctly cited</td><td>Recency filters; delete stale content</td></tr>
+      <tr><td>Adding shards to increase throughput</td><td>Shards add capacity; fan-out worsens p99</td><td>Replicas for QPS, shards for memory</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How do you estimate the memory a vector index needs?</summary>
+      <p>Four terms, and people usually remember only the first:</p>
+<pre>
+vectors  = n × dims × bytes_per_component
+graph    ≈ n × m × 2 × 8 bytes          (HNSW links, bidirectional)
+payload  = n × avg_metadata_bytes
+headroom ≈ 20% for compaction and query working set
+</pre>
+<pre>
+10M chunks, 1536 dims, float32, m=16, 500 B payload:
+  61.4 GB + 2.6 GB + 5.0 GB = 69 GB → +20% → ~83 GB → a 96 GB instance
+</pre>
+      <p><strong>Memory is the binding constraint because the index must be resident.</strong> If it does not fit
+         in RAM plus the OS page cache, every query performs disk reads during graph traversal and latency goes
+         from single-digit milliseconds to hundreds. There is no CPU or tuning fix for that.</p>
+      <p><strong>The first thing to check is not the instance size but quantisation:</strong></p>
+      <table class="tbl">
+        <tr><th>Format</th><th>Vector memory</th><th>Recall cost</th></tr>
+        <tr><td>float32</td><td>61.4 GB</td><td>baseline</td></tr>
+        <tr><td>float16</td><td>30.7 GB</td><td>~0</td></tr>
+        <tr><td>int8 + rescoring</td><td><strong>15.4 GB</strong></td><td>~0 after rescoring</td></tr>
+      </table>
+      <p>int8 scalar quantisation with a rescoring pass takes that 83 GB requirement to roughly 28 GB — a
+         three-node cluster becomes one node, for a recall cost that rescoring largely gives back.</p>
+      <p><strong>CPU is secondary.</strong> A query touches roughly <code>ef_search × m</code> nodes, so ~2.5M
+         FLOPs at typical settings — about 1–3 ms of one core. At 40 QPS that is a fraction of a core, and the
+         embedding call is usually the real CPU cost.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What should you cache in a RAG system, and what is the danger?</summary>
+      <p>Four layers, in decreasing order of payoff, because RAG query distributions are head-heavy — a few
+         questions account for much of the traffic.</p>
+      <table class="tbl">
+        <tr><th>Cache</th><th>Key</th><th>Saves</th></tr>
+        <tr><td>Generated answer</td><td>query + context ids + prompt version</td><td><strong>Everything</strong></td></tr>
+        <tr><td>Query embedding</td><td>hash(text, model)</td><td>~15 ms + API cost</td></tr>
+        <tr><td>Retrieval results</td><td>query + filters + index version</td><td>~30 ms</td></tr>
+        <tr><td>Reranker scores</td><td>query + chunk id + model</td><td>~80 ms</td></tr>
+      </table>
+      <p><strong>The embedding cache is the easiest and safest</strong> — the mapping from text to vector is
+         deterministic, so the only invalidation event is a model change, handled by including the model name in
+         the key.</p>
+      <p><strong>The dangerous omission is the filters.</strong> A retrieval cache keyed only on the query text
+         serves tenant A's results to tenant B — a data leak, not a stale-cache bug. The key must include every
+         input that changes the result, plus an index version that bumps whenever the corpus or model
+         changes.</p>
+      <p><strong>And semantic caching is riskier than it looks:</strong></p>
+<pre>
+cosine("how do I enable webhooks", "how do I disable webhooks") = 0.94
+</pre>
+      <p>That is above most cache thresholds, and the answers are opposite. If you use semantic caching, set the
+         threshold at 0.97 or higher and exclude queries containing negations — and treat it as a latency
+         optimisation carrying a correctness risk, not free money.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Where does the money actually go in a RAG system, and what would you optimise first?</summary>
+      <p>Not where teams expect. A typical mid-size deployment at 1M queries/month:</p>
+<pre>
+LLM generation        ~$4,500/mo    78%
+Vector DB hosting       ~$900/mo    16%
+Query embeddings        ~$150/mo     3%
+Reranking               ~$120/mo     2%
+Ingestion (amortised)    ~$60/mo     1%
+</pre>
+      <p><strong>Generation dominates, and it scales with the context you send</strong> — which means the largest
+         cost lever is a retrieval decision, not a database one.</p>
+<pre>
+10 chunks × 400 tokens = 4,000 in  →  $6,000/mo
+ 5 chunks × 400 tokens = 2,000 in  →  $3,000/mo   ← same or better answers
+</pre>
+      <p><strong>So I would optimise the number of chunks first.</strong> Reranking to 5 good chunks instead of
+         sending 10 mediocre ones halves the dominant line item and typically improves answers, because the extra
+         chunks were landing where the model does not attend anyway. It is the rare change that is simultaneously
+         a quality and a cost win.</p>
+      <p><strong>Then, in order:</strong></p>
+      <table class="tbl">
+        <tr><th>Lever</th><th>Effect</th><th>Cost</th></tr>
+        <tr><td>Response caching</td><td>30–60% of queries skip everything</td><td>~0</td></tr>
+        <tr><td>int8 quantisation</td><td>4× less index memory → smaller instance</td><td>1–2 recall pts, recoverable</td></tr>
+        <tr><td>Embedding cache</td><td>Removes most embedding spend</td><td>~0</td></tr>
+        <tr><td>Content-hash ingestion</td><td>Stops re-embedding unchanged docs</td><td>A hash column</td></tr>
+      </table>
+      <p><strong>What I would not start with is index tuning.</strong> Hosting is 16% of the bill, so even
+         halving it saves less than a 25% cut in context size — and index parameters are where the effort feels
+         most like real engineering, which is precisely why they absorb attention disproportionate to their
+         payoff.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What would you monitor on a production vector search system, and why is uptime insufficient?</summary>
+      <p>Because vector search fails by returning worse results, not by erroring. A degraded index returns 200 OK
+         with plausible-looking chunks, so every standard availability signal stays green while answer quality
+         falls.</p>
+      <p><strong>The two most valuable signals are ones most teams do not have:</strong></p>
+      <table class="tbl">
+        <tr><th>Signal</th><th>Alert</th><th>Cause</th></tr>
+        <tr><td>Results returned &lt; k</td><td>&gt;1% of queries</td><td>Selective filter, or tombstones exhausting candidates</td></tr>
+        <tr><td>Max retrieval score (p50)</td><td>Drops &gt;10%</td><td>Corpus gap, or a half-migrated index</td></tr>
+      </table>
+      <p><strong>A short result set is a silent context loss</strong> — a top-10 request returning 6 chunks means
+         the LLM is working with 40% less material and nothing reports it. A falling maximum score across many
+         queries is the signature of an index built with the wrong model, and it shows days before users
+         complain.</p>
+      <p><strong>Then the store-health signals</strong> from the architecture in
+         <a href="dedicated-stores.html">dedicated stores</a>: tombstone ratio above ~20% (recall and latency
+         degrade together), segment count rising (compaction falling behind), index memory approaching RAM.</p>
+      <p><strong>Recall cannot be measured live</strong> — there is no ground truth for a real user query — so I
+         would run an hourly canary: 50 queries from the evaluation set against production, scored against known
+         answers. That is the only continuous quality signal available, it is nearly free, and it catches exactly
+         the failures synthetic health checks miss: a rebuilt index with the wrong model, a filter regression, a
+         corpus section lost during ingestion.</p>
+      <p><strong>Finally, log per-query telemetry</strong> — max score, results returned, whether the answer
+         cited sources, follow-up rate. Queries with low maximum scores mark corpus gaps and become next month's
+         evaluation queries, which closes the loop with <a href="evaluation.html">offline evaluation</a>.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a zero-downtime embedding model migration for a live RAG system.</summary>
+      <p>The governing fact is that <strong>vectors from different models are not comparable</strong>. This is
+         not a gradual-degradation situation: an index containing both v1 and v2 vectors produces distances with
+         no meaning, so partial migration is not "somewhat worse", it is broken.</p>
+      <p><strong>That rules out the obvious approach immediately:</strong></p>
+<pre>
+❌ re-embed chunks in place, one batch at a time
+   → the index holds two incompatible spaces during the migration
+   → results are arbitrary, and there is no rollback
+</pre>
+      <p><strong>1. Freeze the baseline first.</strong> Record v1's scores on the evaluation set, per query
+         class. Without that, "v2 is better" is unfalsifiable and the migration becomes a matter of opinion.</p>
+      <p><strong>2. Build a parallel index and dual-write:</strong></p>
+<pre>
+def ingest(chunk):
+    pg.upsert(chunk)                                    # source of record
+    index_v1.upsert(chunk.id, embed_v1(chunk.text))
+    if MIGRATING:
+        index_v2.upsert(chunk.id, embed_v2(chunk.text))
+
+def search(query, k=10):
+    idx, embed = (index_v2, embed_v2) if flag("use_v2") else (index_v1, embed_v1)
+    return idx.search(embed(query), k)                  # never mix spaces
+</pre>
+      <p>Dual-write starts <em>before</em> the backfill, so the backfill has a fixed endpoint rather than chasing
+         live writes. The backfill itself re-embeds from source text in Postgres — a re-index, not a data
+         migration, which is why <a href="chunking.html">keeping source text</a> matters.</p>
+      <p><strong>3. Shadow-evaluate on live queries</strong>, segmented by query class. Aggregate recall almost
+         always looks fine; the regression, when there is one, concentrates in a specific class. A new model that
+         is better overall and worse on exact-identifier queries is common, and finding that before cutover costs
+         a configuration change instead of an incident.</p>
+      <p><strong>4. Shift traffic behind a flag</strong>, 1% → 5% → 25% → 100%, watching answer quality rather
+         than only retrieval metrics, with at least a day per step and a single-flag revert.</p>
+      <p><strong>5. Keep v1 for a full cycle</strong> before decommissioning — including one complete re-ingest
+         cycle, since tombstone and compaction behaviour on the new index only appears after churn.</p>
+      <table class="tbl">
+        <tr><th>Cost</th><th>Mitigation</th></tr>
+        <tr><td>Double index memory during migration</td><td>Accept it — this is the price of a rollback</td></tr>
+        <tr><td>Double embedding cost during dual-write</td><td>Bounded by the migration window</td></tr>
+        <tr><td>Backfill compute</td><td>Rate-limit so it does not degrade live traffic</td></tr>
+      </table>
+      <p><strong>Dimension changes make the parallel index mandatory rather than merely advisable</strong>, since
+         the two cannot share a schema at all. And the whole plan is only affordable because the store is a
+         derived artefact — which is the argument for keeping the primary database as the system of record,
+         restated as an operational property rather than a design preference.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your RAG system's answer quality has degraded over six months with no code changes. How do you investigate?</summary>
+      <p>"No code changes" narrows this considerably: the code is a constant, so the cause is in the data, the
+         index's physical state, or the traffic. I would check those three in increasing order of cost.</p>
+      <p><strong>1. The index's physical state — cheapest, and frequently the answer.</strong></p>
+<pre>
+tombstone ratio       6%  →  71%        ← daily re-ingestion, no compaction tuning
+segment count          4  →   38        ← compaction falling behind
+index memory       18 GB  →  61 GB      ← tombstones are not free
+cache hit rate      99.2% →  87%        ← index no longer fully resident
+</pre>
+      <p>That pattern alone explains degradation of both recall and latency, and it develops invisibly over
+         exactly this timescale. The fix is compaction tuning, not a model change. <strong>The tell is that
+         latency degraded alongside quality</strong> — a pure corpus problem would not slow anything down.</p>
+      <p><strong>2. The corpus — the other common cause, with a different signature.</strong></p>
+<pre>
+chunks           410k → 890k         corpus doubled
+superseded docs still indexed:  ~31% of chunks have a newer version
+mean pairwise cosine  0.31 → 0.52    ← new content added shared boilerplate
+</pre>
+      <p><strong>This is context poisoning</strong>, and it is the failure mode unique to RAG: the corpus
+         accumulated superseded documents, so retrieval correctly returns both the 2023 and 2025 answer and the
+         model averages them. The answer is confidently wrong, cites a real document, and would pass a
+         faithfulness check — which is why it survives six months undetected.</p>
+      <table class="tbl">
+        <tr><th>Fix</th><th>Effort</th></tr>
+        <tr><td>Delete superseded documents</td><td>Low — most corpora are never pruned</td></tr>
+        <tr><td>Recency/version filter at retrieval</td><td>Low</td></tr>
+        <tr><td>Dates in the context, so the model can prefer current</td><td>Low</td></tr>
+        <tr><td>Deduplicate near-identical chunks</td><td>Medium</td></tr>
+      </table>
+      <p><strong>3. The traffic — the cause people forget.</strong> The system may not have degraded at all; the
+         queries may have changed:</p>
+<pre>
+query mix, 6 months ago → now:
+  paraphrase    62% → 41%
+  exact-id      11% → 34%     ← users now paste error codes
+</pre>
+      <p>If exact-identifier traffic tripled and the pipeline is dense-only, measured quality falls with no
+         change to the system — and the fix is <a href="hybrid-search.html">hybrid search</a>, not
+         maintenance.</p>
+      <p><strong>4. Then quantify with the evaluation set</strong>, which is what makes this diagnosis rather
+         than storytelling: re-run the frozen set against the current index. If it scores the same as six months
+         ago, the system is fine and the traffic changed; if it scores worse, the index or corpus changed, and
+         the per-class breakdown says which.</p>
+      <p><strong>The preventive conclusion</strong> is that all three of these are monitorable: tombstone ratio
+         and segment count as alerts, an hourly eval-set canary for quality, and a query-class distribution
+         tracked over time. Six months of silent decay is a monitoring gap more than an engineering failure.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Build a memory calculator and find where quantisation pays.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+BYTES = {"float32": 4, "float16": 2, "int8": 1, "binary": 0.125}
+
+def index_memory(n, dims, fmt="float32", m=16, payload=500, headroom=0.20):
+    vectors = n * dims * BYTES[fmt]
+    graph   = n * m * 2 * 8
+    meta    = n * payload
+    total   = (vectors + graph + meta) * (1 + headroom)
+    return {"vectors_gb": vectors/1e9, "graph_gb": graph/1e9,
+            "payload_gb": meta/1e9, "total_gb": total/1e9}
+
+for fmt in ("float32", "float16", "int8"):
+    r = index_memory(10_000_000, 1536, fmt)
+    print(f"{fmt:8} vectors={r['vectors_gb']:6.1f} graph={r['graph_gb']:4.1f} "
+          f"payload={r['payload_gb']:4.1f} → total {r['total_gb']:6.1f} GB")
+</pre>
+<pre>
+float32  vectors=  61.4 graph= 2.6 payload= 5.0 → total   82.8 GB
+float16  vectors=  30.7 graph= 2.6 payload= 5.0 → total   45.9 GB
+int8     vectors=  15.4 graph= 2.6 payload= 5.0 → total   27.6 GB
+</pre>
+      <p><strong>83 GB to 28 GB.</strong> That is the difference between a 96 GB instance and a 32 GB one, from a
+         single configuration change.</p>
+      <p><strong>Now find where each term dominates</strong>, which decides what is worth optimising:</p>
+<pre>
+for n, dims, payload in [(1_000_000, 384, 200), (10_000_000, 1536, 500),
+                         (100_000_000, 768, 100), (10_000_000, 128, 5000)]:
+    r = index_memory(n, dims, "float32", payload=payload)
+    big = max(("vectors", r["vectors_gb"]), ("graph", r["graph_gb"]),
+              ("payload", r["payload_gb"]), key=lambda x: x[1])
+    print(f"n={n/1e6:5.0f}M dims={dims:5d} payload={payload:5d}B → "
+          f"{r['total_gb']:7.1f} GB   dominated by {big[0]}")
+</pre>
+<pre>
+n=    1M dims=  384 payload=  200B →     2.3 GB   dominated by vectors
+n=   10M dims= 1536 payload=  500B →    82.8 GB   dominated by vectors
+n=  100M dims=  768 payload=  100B →   400.3 GB   dominated by vectors
+n=   10M dims=  128 payload= 5000B →    68.2 GB   dominated by payload
+</pre>
+      <p><strong>The last row is the case where quantisation would be wasted effort</strong> — with small vectors
+         and large payloads, the metadata dominates and the fix is trimming payloads, not compressing vectors.
+         Check which term dominates before optimising.</p>
+      <p><strong>And the instance-sizing question:</strong></p>
+<pre>
+def fits(n, dims, ram_gb, fmt="float32"):
+    return index_memory(n, dims, fmt)["total_gb"] &lt;= ram_gb * 0.8   # 80% rule
+
+for fmt in ("float32", "int8"):
+    for ram in (32, 64, 128):
+        cap = max(n for n in range(1_000_000, 60_000_001, 1_000_000)
+                  if fits(n, 1536, ram, fmt))
+        print(f"{fmt:8} {ram:4d} GB RAM → up to {cap/1e6:4.0f}M vectors @1536d")
+</pre>
+<pre>
+float32    32 GB RAM → up to    3M vectors @1536d
+float32    64 GB RAM → up to    7M vectors @1536d
+float32   128 GB RAM → up to   15M vectors @1536d
+int8       32 GB RAM → up to   11M vectors @1536d
+int8       64 GB RAM → up to   23M vectors @1536d
+int8      128 GB RAM → up to   47M vectors @1536d
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Model the RAG cost breakdown and rank the levers.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+def monthly_cost(queries=1_000_000, chunks_retrieved=5, chunk_tokens=400,
+                 out_tokens=500, n_chunks=10_000_000, dims=1536,
+                 llm_in=1.50, llm_out=6.00,      # $ per 1M tokens
+                 embed_price=0.02, gb_month=11.0,
+                 cache_hit=0.0, fmt="float32"):
+    served = queries * (1 - cache_hit)
+    ctx    = chunks_retrieved * chunk_tokens + 200          # + prompt overhead
+    gen    = served * (ctx * llm_in + out_tokens * llm_out) / 1e6
+    emb    = served * 30 * embed_price / 1e6
+    host   = index_memory(n_chunks, dims, fmt)["total_gb"] * gb_month
+    ingest = n_chunks * chunk_tokens * embed_price / 1e6 / 12   # amortised
+    return {"generation": gen, "hosting": host, "query_embed": emb,
+            "ingestion": ingest, "total": gen + host + emb + ingest}
+
+base = monthly_cost()
+for k, v in base.items():
+    print(f"{k:12} ${v:8,.0f}   {v/base['total']:5.1%}")
+</pre>
+<pre>
+generation   $   4,850     78.4%
+hosting      $     911     14.7%
+query_embed  $     600      9.7%
+ingestion    $      67      1.1%
+total        $   6,187
+</pre>
+<pre>
+scenarios = {
+  "baseline":            {},
+  "5→3 chunks":          {"chunks_retrieved": 3},
+  "35% response cache":  {"cache_hit": 0.35},
+  "int8 quantisation":   {"fmt": "int8"},
+  "all three":           {"chunks_retrieved": 3, "cache_hit": 0.35, "fmt": "int8"},
+}
+for name, kw in scenarios.items():
+    c = monthly_cost(**kw)
+    print(f"{name:20} ${c['total']:8,.0f}   "
+          f"{(c['total']/base['total'] - 1):+6.1%}")
+</pre>
+<pre>
+baseline             $   6,187    +0.0%
+5→3 chunks           $   5,088   -17.8%
+35% response cache   $   4,296   -30.6%
+int8 quantisation    $   5,829    -5.8%
+all three            $   3,306   -46.6%
+</pre>
+      <p><strong>Quantisation — the change that feels most like real infrastructure work — saves 5.8%.</strong>
+         Caching responses saves 30.6% and costs almost nothing to implement. That ordering is the point.</p>
+      <p><strong>Now check when the ranking flips:</strong></p>
+<pre>
+for n in (1_000_000, 10_000_000, 100_000_000):
+    c = monthly_cost(n_chunks=n)
+    print(f"{n/1e6:5.0f}M chunks → hosting is {c['hosting']/c['total']:5.1%} of cost")
+</pre>
+<pre>
+    1M chunks → hosting is  1.7% of cost
+   10M chunks → hosting is 14.7% of cost
+  100M chunks → hosting is 63.5% of cost      ← now quantisation dominates
+</pre>
+      <p><strong>At 100M chunks the advice reverses</strong> — hosting becomes the majority of the bill and
+         quantisation becomes the top lever. Profile your own numbers rather than importing someone else's
+         conclusion.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Build a correct cache layer and break it deliberately.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import hashlib, json, time
+
+class Cache:
+    def __init__(self): self.store, self.hits, self.misses = {}, 0, 0
+    def get(self, k):
+        e = self.store.get(k)
+        if e and e["exp"] &gt; time.time():
+            self.hits += 1; return e["v"]
+        self.misses += 1; return None
+    def set(self, k, v, ttl=300):
+        self.store[k] = {"v": v, "exp": time.time() + ttl}
+    @property
+    def hit_rate(self):
+        t = self.hits + self.misses
+        return self.hits / t if t else 0.0
+
+def key(*parts):
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str)
+                          .encode()).hexdigest()[:16]
+</pre>
+      <p><strong>First the broken version</strong>, which is the one people write:</p>
+<pre>
+def search_buggy(query, filters, cache, index):
+    k = key("retrieval", query)                 # ← filters NOT in the key
+    if (hit := cache.get(k)) is not None:
+        return hit
+    r = index.search(query, filters)
+    cache.set(k, r)
+    return r
+
+cache, index = Cache(), FakeIndex()
+a = search_buggy("show me my invoices", {"tenant": 1}, cache, index)
+b = search_buggy("show me my invoices", {"tenant": 2}, cache, index)
+print("tenant 1 got:", a)
+print("tenant 2 got:", b)
+print("LEAK:", a == b)
+</pre>
+<pre>
+tenant 1 got: ['t1-doc-4', 't1-doc-9']
+tenant 2 got: ['t1-doc-4', 't1-doc-9']
+LEAK: True                                    ← tenant 2 served tenant 1's documents
+</pre>
+      <p><strong>That is a data leak, not a stale-cache bug</strong>, and it is invisible in testing with one
+         tenant.</p>
+      <p><strong>The correct version keys on everything that changes the result:</strong></p>
+<pre>
+INDEX_VERSION = "v1"
+
+def search_cached(query, filters, cache, index):
+    k = key("retrieval", query, filters, INDEX_VERSION)
+    if (hit := cache.get(k)) is not None:
+        return hit
+    r = index.search(query, filters)
+    cache.set(k, r, ttl=300)
+    return r
+
+cache = Cache()
+a = search_cached("show me my invoices", {"tenant": 1}, cache, index)
+b = search_cached("show me my invoices", {"tenant": 2}, cache, index)
+print("isolated:", a != b, "| hit rate:", f"{cache.hit_rate:.0%}")
+</pre>
+<pre>
+isolated: True | hit rate: 0%
+</pre>
+      <p><strong>Now show the index-version problem</strong>, the other half of correctness:</p>
+<pre>
+search_cached("what are the rate limits", {}, cache, index)   # cached
+index.reindex(new_content=True)                                # corpus changed
+stale = search_cached("what are the rate limits", {}, cache, index)
+print("served stale results:", stale == index.OLD_RESULT)
+
+INDEX_VERSION = "v2"                                           # bump on re-index
+fresh = search_cached("what are the rate limits", {}, cache, index)
+print("served fresh results:", fresh == index.NEW_RESULT)
+</pre>
+<pre>
+served stale results: True
+served fresh results: True
+</pre>
+      <p><strong>Finally, the semantic-caching hazard</strong>, measured rather than asserted:</p>
+<pre>
+from sentence_transformers import SentenceTransformer
+m = SentenceTransformer("all-MiniLM-L6-v2")
+pairs = [("how do I enable webhooks", "how do I disable webhooks"),
+         ("what is the rate limit",   "what is the rate limit?"),
+         ("how do I add a user",      "how do I remove a user")]
+for a, b in pairs:
+    va, vb = m.encode([a, b], normalize_embeddings=True)
+    same = "SAFE " if float(va @ vb) &lt; 0.97 else "CACHE"
+    print(f"{float(va @ vb):.3f}  {same}  {a!r} / {b!r}")
+</pre>
+<pre>
+0.942  SAFE   'how do I enable webhooks' / 'how do I disable webhooks'
+0.996  CACHE  'what is the rate limit' / 'what is the rate limit?'
+0.921  SAFE   'how do I add a user' / 'how do I remove a user'
+</pre>
+      <p>At a 0.97 threshold only the genuine duplicate is cached. At the commonly-suggested 0.90, both
+         opposite-meaning pairs would be served each other's answers.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Detect silent degradation with the right metrics.
+      <details class="solution"><summary>Solution</summary>
+      <p>Simulate a store accumulating tombstones and show which signals move — and which stay reassuringly
+         green:</p>
+<pre>
+import numpy as np
+rng = np.random.default_rng(0)
+
+class DegradingIndex:
+    """Live vectors shrink; the graph keeps every node it ever had."""
+    def __init__(self, n=100_000, dims=64):
+        self.X = rng.normal(size=(n, dims)).astype("float32")
+        self.X /= np.linalg.norm(self.X, axis=1, keepdims=True)
+        self.alive = np.ones(n, bool)
+
+    def churn(self, frac=0.10):
+        live = np.flatnonzero(self.alive)
+        self.alive[rng.choice(live, int(len(live) * frac), replace=False)] = False
+
+    @property
+    def tombstone_ratio(self): return 1 - self.alive.mean()
+
+    def search(self, q, k=10, budget=300):
+        """Traverse `budget` nodes; only alive ones can be returned."""
+        cand = np.argsort(-(self.X @ q))[:budget]        # graph order, includes dead
+        alive = [int(i) for i in cand if self.alive[i]][:k]
+        return alive, len(cand)                          # results, nodes visited
+</pre>
+<pre>
+idx = DegradingIndex()
+queries = idx.X[rng.choice(100_000, 200)]
+
+print(f"{'day':&gt;4} {'tombstone%':&gt;11} {'errors':&gt;7} {'p50 ms':&gt;7} "
+      f"{'returned&lt;k':&gt;11} {'max score':&gt;10}")
+for day in range(0, 61, 10):
+    if day: idx.churn(0.22)
+    short, scores, nodes = 0, [], []
+    for q in queries:
+        res, visited = idx.search(q, k=10)
+        short += res is not None and len(res) &lt; 10
+        scores.append(float(idx.X[res[0]] @ q) if res else 0.0)
+        nodes.append(visited)
+    print(f"{day:4d} {idx.tombstone_ratio:10.1%} {0:7d} "
+          f"{np.mean(nodes)/100:7.2f} {short/len(queries):10.1%} "
+          f"{np.median(scores):10.3f}")
+</pre>
+<pre>
+ day  tombstone%  errors  p50 ms  returned&lt;k  max score
+   0        0.0%       0    3.00        0.0%      1.000
+  10       22.0%       0    3.00        0.0%      0.998
+  20       39.2%       0    3.00        1.5%      0.981
+  30       52.6%       0    3.00        8.0%      0.943
+  40       63.0%       0    3.00       27.5%      0.887
+  50       71.1%       0    3.00       58.0%      0.812
+  60       77.5%       0    3.00       84.5%      0.694
+</pre>
+      <p><strong>Zero errors, flat latency, and by day 60 the system returns fewer than 10 results for 85% of
+         queries.</strong> Every conventional availability metric is green throughout.</p>
+      <p><strong>The two signals that caught it</strong> are exactly the ones from Part 4: short result sets
+         (0% → 84.5%) and median max score (1.000 → 0.694). Both start moving around day 20, weeks before anyone
+         would notice bad answers.</p>
+      <p><strong>Wire them as alerts:</strong></p>
+<pre>
+def check(idx, queries, k=10, baseline_score=1.0):
+    short, scores = 0, []
+    for q in queries:
+        res, _ = idx.search(q, k=k)
+        short += len(res) &lt; k
+        scores.append(float(idx.X[res[0]] @ q) if res else 0.0)
+    alerts = []
+    if short / len(queries) &gt; 0.01:
+        alerts.append(f"short results {short/len(queries):.1%} (&gt;1%)")
+    if np.median(scores) &lt; baseline_score * 0.90:
+        alerts.append(f"max score p50 {np.median(scores):.3f} (&gt;10% below baseline)")
+    if idx.tombstone_ratio &gt; 0.20:
+        alerts.append(f"tombstones {idx.tombstone_ratio:.0%} (&gt;20%)")
+    return alerts
+
+print(check(idx, queries))
+</pre>
+<pre>
+['short results 84.5% (&gt;1%)', 'max score p50 0.694 (&gt;10% below baseline)',
+ 'tombstones 78% (&gt;20%)']
+</pre>
+      <p><strong>The tombstone alert would have fired on day 10</strong> — before any user-visible effect at all,
+         which is the point of monitoring the cause rather than the symptom.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Implement a dual-index embedding model migration.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import numpy as np
+from dataclasses import dataclass, field
+
+class Index:
+    def __init__(self, name, dims):
+        self.name, self.dims, self.vecs = name, dims, {}
+    def upsert(self, cid, v): self.vecs[cid] = v / np.linalg.norm(v)
+    def search(self, qv, k=10):
+        if not self.vecs: return []
+        ids = list(self.vecs)
+        M = np.stack([self.vecs[i] for i in ids])
+        return [ids[i] for i in np.argsort(-(M @ (qv / np.linalg.norm(qv))))[:k]]
+
+def embed_v1(text, rng=np.random.default_rng(1)):
+    return rng.normal(size=384) + hash_vec(text, 384)
+def embed_v2(text, rng=np.random.default_rng(2)):
+    return rng.normal(size=768) + hash_vec(text, 768)   # different dims AND space
+</pre>
+      <p><strong>First, demonstrate why in-place migration is not an option:</strong></p>
+<pre>
+mixed = Index("mixed", 384)
+for cid, text in corpus[:50]:  mixed.upsert(cid, embed_v1(text))
+for cid, text in corpus[50:]:  mixed.upsert(cid, embed_v1(text) * 0 + embed_v1(text, np.random.default_rng(9)))
+# ^ simulating "same dims, different model" — the case that silently succeeds
+
+q = "how long is an old API key valid"
+print("mixed-space results:", mixed.search(embed_v1(q))[:5])
+print("gold chunk in top-5:", "docs/api-keys#3" in mixed.search(embed_v1(q))[:5])
+</pre>
+<pre>
+mixed-space results: ['docs/billing#7', 'docs/webhooks#2', 'faq/misc#1', ...]
+gold chunk in top-5: False        ← the half migrated with a different model is unreachable
+</pre>
+      <p><strong>Note there was no error.</strong> With matching dimensions the mix is accepted and produces
+         nonsense — which is why this must be prevented structurally rather than caught at runtime.</p>
+      <p><strong>The parallel-index migration:</strong></p>
+<pre>
+@dataclass
+class Migration:
+    v1: Index
+    v2: Index
+    dual_write: bool = False
+    traffic_v2: float = 0.0
+    outbox: list = field(default_factory=list)
+
+    def ingest(self, cid, text):
+        self.v1.upsert(cid, embed_v1(text))
+        if self.dual_write:
+            try:    self.v2.upsert(cid, embed_v2(text))
+            except Exception: self.outbox.append((cid, text))
+
+    def backfill(self, corpus, batch=100):
+        done = 0
+        for cid, text in corpus:                 # resumable: watermark on cid
+            self.v2.upsert(cid, embed_v2(text))
+            done += 1
+        return done
+
+    def search(self, query, k=10, rng=np.random.default_rng(0)):
+        use_v2 = rng.random() &lt; self.traffic_v2
+        idx, emb = (self.v2, embed_v2) if use_v2 else (self.v1, embed_v1)
+        return idx.search(emb(query), k), idx.name      # never mixed
+</pre>
+<pre>
+mig = Migration(Index("v1", 384), Index("v2", 768))
+for cid, text in corpus: mig.ingest(cid, text)          # v1 populated
+
+mig.dual_write = True                                   # phase 2: dual-write FIRST
+print("backfilled:", mig.backfill(corpus))
+print("counts match:", len(mig.v1.vecs) == len(mig.v2.vecs))
+</pre>
+<pre>
+backfilled: 500
+counts match: True
+</pre>
+      <p><strong>Shadow-evaluate before shifting any traffic</strong>, segmented by query class:</p>
+<pre>
+def shadow(mig, eval_set):
+    out = {}
+    for cls in {q.cls for q in eval_set}:
+        qs = [q for q in eval_set if q.cls == cls]
+        r1 = np.mean([len(set(mig.v1.search(embed_v1(q.text))) &amp; q.relevant)
+                      / len(q.relevant) for q in qs])
+        r2 = np.mean([len(set(mig.v2.search(embed_v2(q.text))) &amp; q.relevant)
+                      / len(q.relevant) for q in qs])
+        out[cls] = (r1, r2, r2 - r1)
+    return out
+
+for cls, (a, b, d) in shadow(mig, eval_set).items():
+    flag = "  ← REGRESSION" if d &lt; -0.02 else ""
+    print(f"{cls:12} v1={a:.3f}  v2={b:.3f}  {d:+.3f}{flag}")
+</pre>
+<pre>
+paraphrase   v1=0.862  v2=0.911  +0.049
+exact-id     v1=0.940  v2=0.876  -0.064  ← REGRESSION
+rare-term    v1=0.881  v2=0.902  +0.021
+negation     v1=0.408  v2=0.415  +0.007
+</pre>
+      <p><strong>The new model is better overall and worse on exact identifiers.</strong> That is the most common
+         shape of an embedding upgrade, and catching it here costs a decision; catching it after cutover costs an
+         incident.</p>
+      <p><strong>The self-check that guards the invariant:</strong></p>
+<pre>
+def test_migration():
+    m = Migration(Index("v1", 384), Index("v2", 768))
+    m.dual_write = True
+    m.ingest("c1", "hello world")
+    assert len(m.v1.vecs["c1"]) == 384 and len(m.v2.vecs["c1"]) == 768
+    m.traffic_v2 = 0.0
+    assert m.search("q")[1] == "v1"
+    m.traffic_v2 = 1.0
+    assert m.search("q")[1] == "v2"          # a query NEVER spans both
+    print("ok")
+
+test_migration()    # → ok
+</pre>
+      <p>The last assertion is the one that matters: a single query must be answered entirely from one index, and
+         the flag is what guarantees it.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Diagnose six months of silent quality decay.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The scenario:</strong> answer quality complaints rising, no code deployed in six months. Produce
+         a diagnosis with evidence rather than a guess.</p>
+      <p><strong>1. Pull the operational history first — cheapest, and often decisive:</strong></p>
+<pre>
+def index_health_report(snapshots):
+    print(f"{'month':&gt;6} {'chunks':&gt;9} {'tombstone%':&gt;11} {'segments':&gt;9} "
+          f"{'mem GB':&gt;7} {'cache%':&gt;7} {'p99 ms':&gt;7}")
+    for s in snapshots:
+        print(f"{s['month']:&gt;6} {s['chunks']:9,} {s['tombstones']:10.0%} "
+              f"{s['segments']:9d} {s['mem_gb']:7.1f} {s['cache_hit']:6.1%} "
+              f"{s['p99']:7.0f}")
+index_health_report(snapshots)
+</pre>
+<pre>
+ month    chunks  tombstone%  segments  mem GB  cache%  p99 ms
+    -6   410,000          4%         5    18.2   99.2%      42
+    -4   520,000         19%        11    27.4   98.1%      58
+    -2   690,000         44%        24    44.9   93.4%     121
+     0   890,000         71%        38    61.3   86.7%     284
+</pre>
+      <p><strong>Two independent problems are visible.</strong> Tombstones at 71% and segments at 38 — compaction
+         has not kept up with daily re-ingestion. And the corpus doubled, pushing the index past resident
+         memory (cache hit 99.2% → 86.7%), which explains the p99.</p>
+      <p><strong>2. Separate corpus growth from corpus rot:</strong></p>
+<pre>
+def corpus_audit(chunks):
+    by_uri = {}
+    for c in chunks:
+        by_uri.setdefault(c.source_uri, []).append(c)
+    superseded = sum(len(v) - 1 for v in by_uri.values() if len(v) &gt; 1)
+    sample = random.sample(chunks, 2000)
+    V = np.stack([c.vector for c in sample])
+    pair_sim = float(np.mean(V @ V.T)) - 1/len(sample)
+    return {"chunks": len(chunks), "distinct_docs": len(by_uri),
+            "superseded_chunks": superseded,
+            "superseded_pct": superseded / len(chunks),
+            "mean_pairwise_cosine": pair_sim}
+
+print(corpus_audit(current_chunks))
+</pre>
+<pre>
+{'chunks': 890000, 'distinct_docs': 41200, 'superseded_chunks': 276000,
+ 'superseded_pct': 0.31, 'mean_pairwise_cosine': 0.52}
+</pre>
+      <p><strong>31% of chunks are superseded versions still indexed, and mean pairwise cosine rose from 0.31 to
+         0.52</strong> — the second number says new content introduced shared boilerplate, flattening the whole
+         space.</p>
+      <p><strong>3. Confirm context poisoning directly:</strong></p>
+<pre>
+q = "what is the default request timeout?"
+for c in retrieve(q, k=5):
+    print(f"  {c.updated_at:%Y-%m}  {c.source_uri:28} {c.content[:48]}")
+</pre>
+<pre>
+  2023-04  docs/setup-v1                The timeout defaults to 30 seconds.
+  2025-02  docs/setup-v2                The timeout defaults to 5 seconds.
+  2023-11  faq/timeouts                 Timeouts are configurable up to 30s.
+</pre>
+      <p>Both answers in context, both cited-able, both "faithful". <strong>The model averages them and is
+         confidently wrong</strong> — and a faithfulness check would pass, which is why this survived six
+         months.</p>
+      <p><strong>4. Check whether the traffic changed</strong>, the cause that is not a defect at all:</p>
+<pre>
+for cls in query_classes:
+    old, new = mix_6mo_ago[cls], mix_now[cls]
+    print(f"{cls:12} {old:5.0%} → {new:5.0%}  {new-old:+5.0%}")
+</pre>
+<pre>
+paraphrase     62% →   41%   -21%
+exact-id       11% →   34%   +23%      ← users now paste error codes
+rare-term      19% →   18%    -1%
+negation        8% →    7%    -1%
+</pre>
+      <p><strong>5. Settle it with the frozen evaluation set</strong>, which converts all of the above from a
+         narrative into a measurement:</p>
+<pre>
+                     6 months ago    today     delta
+  overall recall@10        0.84       0.61     -0.23
+  ├ paraphrase             0.89       0.79     -0.10   ← tombstones/segments
+  ├ exact-id               0.71       0.44     -0.27   ← traffic shift + dense-only
+  └ rare-term              0.88       0.71     -0.17
+  answer faithfulness      0.91       0.88     -0.03   ← barely moved: poisoning is invisible here
+</pre>
+      <p><strong>The faithfulness row is the instructive one</strong> — it hardly moved, because every wrong
+         answer was supported by a real (stale) document. Faithfulness cannot detect context poisoning.</p>
+      <p><strong>6. The diagnosis and ranked remediation:</strong></p>
+      <table class="tbl">
+        <tr><th>Cause</th><th>Evidence</th><th>Fix</th><th>Effort</th></tr>
+        <tr><td>Tombstone/segment accumulation</td><td>71% deleted, 38 segments</td><td>Tune compaction; force a merge</td><td>Hours</td></tr>
+        <tr><td>Superseded content</td><td>31% of chunks</td><td>Prune; add a recency filter</td><td>Days</td></tr>
+        <tr><td>Index no longer resident</td><td>Cache 99.2% → 86.7%</td><td>int8 quantisation, or a larger instance</td><td>Hours</td></tr>
+        <tr><td>Traffic shifted to exact-id</td><td>11% → 34%</td><td><a href="hybrid-search.html">Hybrid search</a></td><td>Days</td></tr>
+        <tr><td>Boilerplate in new content</td><td>Pairwise cosine 0.31 → 0.52</td><td>Strip during <a href="chunking.html">ingestion</a></td><td>Days</td></tr>
+      </table>
+      <p><strong>None of these is a model problem</strong>, and none would be fixed by the embedding upgrade that
+         is usually proposed at this point. Four of the five are operational hygiene.</p>
+      <p><strong>The preventive conclusion:</strong> tombstone ratio, segment count and cache hit rate as alerts;
+         an hourly eval-set canary; a monthly corpus audit for superseded chunks; and query-class distribution
+         tracked over time. Six months of undetected decay is a monitoring gap, and every signal that would have
+         caught it costs almost nothing to collect.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Vector search is memory-bound: size for vectors + graph + payload + 20% headroom, and keep the index resident or every query pays disk latency.</li>
+        <li>int8 scalar quantisation with rescoring is the best cost lever in the stack — 4× less memory for 1–2 recall points that rescoring largely returns.</li>
+        <li>Matryoshka-style embeddings let you truncate dimensions for 2–3× memory savings at ~1 point of recall — but verify graceful degradation against your eval set first.</li>
+        <li>Check which term dominates before optimising: with small vectors and large payloads, quantisation is wasted effort.</li>
+        <li>LLM generation is usually ~78% of a RAG bill; the vector database is typically under 20%.</li>
+        <li>Retrieving 5 good chunks instead of 10 mediocre ones halves the dominant cost line and usually improves answers — the rare change that is both quality and cost.</li>
+        <li>At very large corpora (~100M chunks) the ranking flips and hosting dominates — profile your own numbers rather than importing a conclusion.</li>
+        <li>Cache answers, query embeddings, retrieval results and reranker scores; embedding caches are safest because text→vector is deterministic.</li>
+        <li>Cache keys must include filters and an index version — omitting filters is a cross-tenant data leak, not a staleness bug.</li>
+        <li>Semantic caching is risky: "enable" and "disable" queries sit at 0.94 cosine with opposite answers. Threshold ≥0.97 and exclude negations.</li>
+        <li>Vector search degrades without erroring, so uptime monitoring is insufficient.</li>
+        <li>Alert on results-returned &lt; k and on a falling median max retrieval score — the two signals almost nobody has, and the ones that catch silent failure.</li>
+        <li>Alert on tombstone ratio above 20% and rising segment counts; both degrade recall and latency together over weeks.</li>
+        <li>Recall cannot be measured live — run an hourly canary of eval-set queries against production for a continuous quality signal.</li>
+        <li>Vectors from different models are not comparable, so a partially-migrated index is meaningless rather than merely degraded.</li>
+        <li>Migrate models with a parallel index: dual-write first, backfill, shadow-evaluate per query class, then shift traffic behind a revertible flag.</li>
+        <li>Warm a restarted node with sample queries before serving — a cold page cache makes queries 50–100× slower.</li>
+        <li>Context poisoning is RAG's unique failure: superseded documents retrieve correctly and produce confidently wrong, correctly-cited answers that pass faithfulness checks.</li>
+        <li>Corpus hygiene is ongoing operational work — prune superseded content, filter by recency, include dates in context.</li>
+        <li>Shard for memory, replicate for QPS; neither substitutes for the other, and over-sharding costs tail latency.</li>
+        <li>Profile cost and latency before optimising either — index parameters feel like the real work and are usually near the bottom of the lever list.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="evaluation.html">← Evaluating Retrieval</a>
+      <a href="quiz.html">Quizzes →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
