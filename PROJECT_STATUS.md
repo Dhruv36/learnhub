@@ -27,9 +27,29 @@ ingestion) · `retrieval-reranking.html` (funnel, bi- vs cross-encoder, query re
 `Â·` and `â†’` (double-encoded UTF-8) and was repaired on 2026-08-11. **Check any newly-scaffolded
 `quiz.html` for both the stale `← CSS Track` link AND mojibake before committing.**
 
-**🚧 NEXT: LeetCode Patterns v4 (track 18)** — `tutorials/leetcode/`, 21 lessons currently at v3
-(~12KB each). Note `index.html` has **0** `<details>` blocks. Needs the full v4 treatment plus the
-batch-2 patterns. Read `tutorials/leetcode/nav.js` first for the fixed lesson order.
+**🚧 IN PROGRESS: LeetCode Patterns v4 (track 18)** — `tutorials/leetcode/`, 21 lessons, rebuilding
+v3 (~12KB) → v4 (~48-54KB, `det=12 ex=6`). Its `quiz.html` is clean (no `← CSS Track`, no mojibake)
+and the bank already validates `10 200 0` with sets mapped to this curriculum — **a light retune at
+the end, not a rewrite.**
+
+**4 of 21 done — §Foundations COMPLETE:**
+- ✅ `index.html` (54KB) — Overview: recognition vs recall, constraint→complexity table, the decision
+  procedure, running the 45 minutes, what is actually scored, 8-week plan
+- ✅ `big-o.html` (49KB) — O/Ω/Θ precision, the ladder + arithmetic, reading complexity off code,
+  recurrence shortcuts, amortised analysis, space incl. call stack, constraint inference
+- ✅ `arrays-strings.html` (48KB) — read/write pointer template, string immutability O(n²) trap,
+  prefix/suffix precomputation, ops that hide loops, rotation/Dutch-flag, Unicode traps
+- ✅ `hashing.html` (48KB) — the four roles, canonical key design, complement pattern, collisions and
+  the O(n) worst case, frequency-array vs Map, language traps
+
+**⏳ NEXT: `two-pointers.html`** (currently 6KB), then the rest of §Core Patterns ×7:
+sliding-window, prefix-sum, fast-slow-pointers, merge-intervals, binary-search, monotonic-stack,
+linked-list-reversal. Then §Trees & Graphs ×4, §Advanced ×6, then the quiz-bank retune.
+
+**Format used** (matches the v4 language-track recipe): "What you'll master" intro with prerequisite
+links → Parts 1–6 → one `.mistake-pair` → Common Mistakes table (12 rows) → 6 tiered interview Qs
+(2 beginner / 2 mid / 2 senior) → 6 graded exercises with runnable checks and real measured output →
+Key Takeaways → pager. Heavy cross-linking between pattern lessons.
 
 Forward links to unwritten lessons show as "broken link" in validate.py; that is expected and clears as
 each file lands. Re-run the whole-track validate at the end.
