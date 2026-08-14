@@ -46,7 +46,7 @@ making the quiz guessable — options are now deterministically shuffled (66/71/
 **🚧 IN PROGRESS: Redis v4 (track 10)** — `tutorials/redis/`, rebuilding 11 v3 lessons (~9KB) into
 **21 lessons at v4 depth** (47–53KB, `det=12 ex=6`). New `nav.js` written: 5 sections.
 
-**5 of 21 done — §1 Foundations COMPLETE:**
+**7 of 21 done — §1 Foundations COMPLETE (5), §2 Working With Redis 2 of 4:**
 - ✅ `index.html` (47KB) — data-structure server vs blob cache, where speed comes from, the durability
   spectrum, RESP + round trips, keyspace/naming, when Redis is the wrong tool
 - ✅ `strings-keys.html` (52KB) — int/embstr/raw encodings, modern `SET` options, atomic numerics,
@@ -57,14 +57,24 @@ making the quiz guessable — options are now deterministically shuffled (66/71/
   and its mixed-score trap, sliding windows, delayed queues with atomic claiming
 - ✅ `single-threaded.html` (51KB) — the event loop, atomicity for free, **head-of-line blocking
   measured**, what Redis actually threads, fork pauses and CoW, scaling order
+- ✅ `pipelining.html` (52KB) — round-trip arithmetic, batch sizing (100–1000 sweet spot), pipeline
+  vs MULTI proven non-atomic, variadic commands, connection pooling, per-command pipeline errors
+- ✅ `transactions.html` (53KB) — **MULTI has NO rollback**, queue-time vs runtime errors, WATCH
+  optimistic locking and its retry storms (8× slower than Lua at 50 threads), EVALSHA/NOSCRIPT,
+  safe Lua lock release, the **unkillable-script hazard** after a write
 
-**⏳ NEXT: §2 Working With Redis ×4** — `pipelining.html`, `transactions.html`, `caching.html`,
-`cache-invalidation.html`. Then §3 Messaging ×3 (pubsub, streams, rate-limiting), §4 Durability ×4
-(persistence, replication, cluster, locks), §5 Production ×5 (memory, performance, observability,
-security-ops, use-cases), then the quiz-bank retune.
+**⏳ NEXT: finish §2** — `caching.html`, then `cache-invalidation.html`. Then §3 Messaging ×3
+(pubsub, streams, rate-limiting), §4 Durability ×4 (persistence, replication, cluster, locks),
+§5 Production ×5 (memory, performance, observability, security-ops, use-cases), then the
+quiz-bank retune.
+
+Forward links to unwritten lessons show as "broken link" in validate.py — currently 5, all expected;
+they clear as each file lands. Re-run the whole-track validate at the end.
 
 ⚠️ **The Redis quiz bank has ALL 200 answers at index 1** (worse than LeetCode's 191/200) — it must
-be de-skewed as well as retuned. Reuse the scripts in the scratchpad from the LeetCode retune.
+be de-skewed as well as retuned. NOTE: the retune/shuffle scripts lived in a session-specific
+scratchpad and are GONE — rewrite them (each is ~40 lines: load both banks via a `window` shim,
+apply swaps, Fisher-Yates the options with a fixed seed, re-emit the JS).
 
 **Then the remaining infra five, in the user's order:** Docker → Kubernetes → AWS → CI/CD → MongoDB.
 
@@ -122,7 +132,7 @@ Validate with the node one-liner at the bottom of this file → must print `10 2
 | 7 | Java | 12 | 200 | ✅ DONE |
 | 8 | SQL | 12 | 200 | ✅ **v4 DONE 12/12 + quiz retuned** (2026-08-05) |
 | 9 | MongoDB | 12 | 200 | ✅ DONE |
-| 10 | Redis | 11 → **21 (v4)** | 200 | 🚧 **v4 IN PROGRESS 5/21** — Foundations complete |
+| 10 | Redis | 11 → **21 (v4)** | 200 | 🚧 **v4 IN PROGRESS 7/21** — Foundations complete, §2 at 2/4 |
 | 11 | Docker | 12 | 200 | ✅ DONE |
 | 12 | Kubernetes | 12 | 200 | ✅ DONE |
 | 13 | AWS | 12 | 200 | ✅ DONE |
