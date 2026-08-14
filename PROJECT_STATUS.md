@@ -43,9 +43,30 @@ making the quiz guessable — options are now deterministically shuffled (66/71/
 ⚠️ **Scaffolding reminder:** any newly-copied `quiz.html` must be checked for BOTH the stale
 `← CSS Track` link AND mojibake (`Â·`, `â†’` — double-encoded UTF-8) before committing.
 
-**⏳ NEXT: the infra six** — the last remaining v3 tracks, all still at ~12–16KB per lesson with
-3 `<details>` blocks. Per the 2026-08-05 user decision this is a **FULL EXPANSION** (~20 lessons
-each, ~70 total), not a deepen-in-place:
+**🚧 IN PROGRESS: Redis v4 (track 10)** — `tutorials/redis/`, rebuilding 11 v3 lessons (~9KB) into
+**21 lessons at v4 depth** (47–53KB, `det=12 ex=6`). New `nav.js` written: 5 sections.
+
+**5 of 21 done — §1 Foundations COMPLETE:**
+- ✅ `index.html` (47KB) — data-structure server vs blob cache, where speed comes from, the durability
+  spectrum, RESP + round trips, keyspace/naming, when Redis is the wrong tool
+- ✅ `strings-keys.html` (52KB) — int/embstr/raw encodings, modern `SET` options, atomic numerics,
+  **how expiry actually works** (lazy + active sampling), the **TTL-loss bug**, key-schema design
+- ✅ `data-structures.html` (54KB) — hashes/lists/sets, **listpack thresholds and the memory cliff**,
+  reliable queues with `BLMOVE`, server-side set algebra, the O(n) commands that block
+- ✅ `sorted-sets.html` (53KB) — skiplist+hashtable, **the 2⁵³ score precision budget**, ZRANGEBYLEX
+  and its mixed-score trap, sliding windows, delayed queues with atomic claiming
+- ✅ `single-threaded.html` (51KB) — the event loop, atomicity for free, **head-of-line blocking
+  measured**, what Redis actually threads, fork pauses and CoW, scaling order
+
+**⏳ NEXT: §2 Working With Redis ×4** — `pipelining.html`, `transactions.html`, `caching.html`,
+`cache-invalidation.html`. Then §3 Messaging ×3 (pubsub, streams, rate-limiting), §4 Durability ×4
+(persistence, replication, cluster, locks), §5 Production ×5 (memory, performance, observability,
+security-ops, use-cases), then the quiz-bank retune.
+
+⚠️ **The Redis quiz bank has ALL 200 answers at index 1** (worse than LeetCode's 191/200) — it must
+be de-skewed as well as retuned. Reuse the scripts in the scratchpad from the LeetCode retune.
+
+**Then the remaining infra five, in the user's order:** Docker → Kubernetes → AWS → CI/CD → MongoDB.
 
 | Track | Dir | Now | Target |
 |-------|-----|-----|--------|
@@ -54,11 +75,9 @@ each, ~70 total), not a deepen-in-place:
 | AWS | `tutorials/aws/` | 12 | ~20 |
 | CI/CD | `tutorials/cicd/` | 12 | ~20 |
 | MongoDB | `tutorials/mongodb/` | 12 | ~20 |
-| Redis | `tutorials/redis/` | 11 | ~20 |
 
-Suggested order: **Docker → Kubernetes** (they build on each other) **→ CI/CD → AWS → MongoDB →
-Redis**. Each track: write `nav.js` first, then lessons (commit every ~2), then retune the quiz bank
-to `10 200 0`, then a whole-track validate.
+Each track: write `nav.js` first, then lessons (commit every 1–2), then retune the quiz bank to
+`10 200 0` with de-skewed answer positions, then a whole-track validate.
 
 **Format used** (matches the v4 language-track recipe): "What you'll master" intro with prerequisite
 links → Parts 1–6 → one `.mistake-pair` → Common Mistakes table (12 rows) → 6 tiered interview Qs
@@ -103,7 +122,7 @@ Validate with the node one-liner at the bottom of this file → must print `10 2
 | 7 | Java | 12 | 200 | ✅ DONE |
 | 8 | SQL | 12 | 200 | ✅ **v4 DONE 12/12 + quiz retuned** (2026-08-05) |
 | 9 | MongoDB | 12 | 200 | ✅ DONE |
-| 10 | Redis | 11 | 200 | ✅ DONE |
+| 10 | Redis | 11 → **21 (v4)** | 200 | 🚧 **v4 IN PROGRESS 5/21** — Foundations complete |
 | 11 | Docker | 12 | 200 | ✅ DONE |
 | 12 | Kubernetes | 12 | 200 | ✅ DONE |
 | 13 | AWS | 12 | 200 | ✅ DONE |
