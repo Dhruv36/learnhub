@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Transactions &amp; Lua Scripting — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Transactions &amp; Lua Scripting <span class="level-badge level-adv">Working With Redis</span></h1>
+    <p><strong>What you'll master:</strong> what <code>MULTI</code>/<code>EXEC</code> actually guarantees — which
+       is isolation, emphatically <em>not</em> rollback — and why that surprises everyone from a SQL background;
+       <code>WATCH</code> as optimistic locking, its retry loop, and the livelock risk under contention; Lua as
+       the tool that solves what <code>MULTI</code> cannot, because it can branch on values it reads; script
+       loading, <code>EVALSHA</code>, and the <code>NOSCRIPT</code> handling every production client needs;
+       the determinism and replication rules that constrain what a script may do; and Redis 7 Functions as the
+       successor to ad-hoc scripts. Prerequisites:
+       <a href="pipelining.html">Commands, Pipelining &amp; Round Trips</a>,
+       <a href="single-threaded.html">The Single-Threaded Model</a>.</p>
+
+    <h2>Part 1 — MULTI/EXEC Is Not What You Think</h2>
+
+    <p>Redis transactions provide <strong>isolation and batching</strong>. They do not provide rollback, and the
+       difference catches out everyone arriving from a relational database.</p>
+
+<pre>
+MULTI                    → +OK
+  SET a 1                → +QUEUED      ← commands are queued, not executed
+  INCR b                 → +QUEUED
+  SET c 3                → +QUEUED
+EXEC                     → 1) +OK  2) (error) …  3) +OK
+                                     ↑ INCR failed, but a and c were STILL SET
+</pre>
+
+    <div class="note">🔑 <strong>There is no rollback, and this is a deliberate design decision rather than a
+       missing feature.</strong> Redis documents the reasoning: a command failing at execution time can only be
+       caused by a programming error — using the wrong type, or bad arguments — which should be caught in
+       development. Supporting rollback would require maintaining undo information for every command, slowing
+       down the common path to protect against a bug. So <code>EXEC</code> runs every queued command and reports
+       each result independently, and your code must inspect them.</p></div>
+
+    <table class="tbl">
+      <tr><th>Guarantee</th><th>Provided?</th></tr>
+      <tr><td><strong>Isolation</strong> — no other client interleaves</td><td>✅ Yes</td></tr>
+      <tr><td>All commands sent in one round trip</td><td>✅ Yes</td></tr>
+      <tr><td>Malformed command aborts the transaction</td><td>✅ Yes — detected at queue time</td></tr>
+      <tr><td><strong>Rollback on runtime error</strong></td><td>❌ <strong>No</strong></td></tr>
+      <tr><td>Atomicity in the ACID sense</td><td>❌ Partial — all commands run, but failures are not undone</td></tr>
+      <tr><td>Conditional logic inside the transaction</td><td>❌ No — use Lua</td></tr>
+    </table>
+
+    <p><strong>The two error classes behave differently, and the distinction matters:</strong></p>
+
+<pre>
+# 1. QUEUE-TIME error (syntax, unknown command) — the whole transaction is discarded
+MULTI
+  NOTACOMMAND            → (error) unknown command
+  SET a 1                → +QUEUED
+EXEC                     → (error) EXECABORT Transaction discarded
+                            ← nothing ran
+
+# 2. RUNTIME error (wrong type) — everything else still applies
+MULTI
+  SET k "text"           → +QUEUED
+  INCR k                 → +QUEUED       (valid syntax; fails at execution)
+  SET j "ok"             → +QUEUED
+EXEC                     → 1) OK  2) (error) not an integer  3) OK
+                            ← k and j were both written
+</pre>
+
+    <h2>Part 2 — WATCH: Optimistic Locking</h2>
+
+    <p><code>MULTI</code> alone cannot make decisions based on data, because nothing executes until
+       <code>EXEC</code>. <code>WATCH</code> fills that gap with optimistic concurrency control.</p>
+
+<pre>
+WATCH balance            # start watching
+GET balance              # → "100"   (executes immediately, before MULTI)
+                         # ... application decides ...
+MULTI
+  SET balance 50
+EXEC                     # → (nil) if `balance` changed since WATCH — retry
+                         # → 1) OK  if it did not
+</pre>
+
+<pre>
+def transfer(r, src, dst, amount, retries=10):
+    for _ in range(retries):
+        try:
+            with r.pipeline() as pipe:
+                pipe.watch(src, dst)                    # 1. watch
+                bal = int(pipe.get(src) or 0)           # 2. read (immediate mode)
+                if bal &lt; amount:
+                    pipe.unwatch()
+                    return False
+                pipe.multi()                            # 3. enter queuing mode
+                pipe.decrby(src, amount)
+                pipe.incrby(dst, amount)
+                pipe.execute()                          # 4. fails if src/dst changed
+                return True
+        except redis.WatchError:
+            continue                                    # someone else won; retry
+    raise RuntimeError("too much contention")
+</pre>
+
+    <table class="tbl">
+      <tr><th>Property</th><th>Detail</th></tr>
+      <tr><td>Optimistic, not pessimistic</td><td>No locks held; the transaction fails rather than waiting</td></tr>
+      <tr><td>Detects any write</td><td>Even writing the same value counts as a change</td></tr>
+      <tr><td>Cleared by <code>EXEC</code>, <code>UNWATCH</code> or disconnect</td><td>Never leaves a lingering lock</td></tr>
+      <tr><td><strong>Retry loop required</strong></td><td>And it can livelock under heavy contention</td></tr>
+    </table>
+
+    <p><strong>Under high contention <code>WATCH</code> degrades badly</strong> — every client retries, most fail
+       again, and throughput collapses. That is the point at which Lua becomes the right tool.</p>
+
+    <h2>Part 3 — Lua: The Real Answer</h2>
+
+    <p>A Lua script runs <strong>server-side, atomically, in one round trip</strong>, and — crucially — it can
+       branch on values it reads.</p>
+
+<pre>
+EVAL "return redis.call('SET', KEYS[1], ARGV[1])" 1 mykey myvalue
+     └────────────── script ──────────────────┘  ↑    ↑       ↑
+                                          numkeys  KEYS[1]  ARGV[1]
+</pre>
+
+<pre>
+-- conditional increment: impossible with MULTI, trivial in Lua
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local limit   = tonumber(ARGV[1])
+if current &lt; limit then
+  return redis.call('INCR', KEYS[1])
+end
+return -1
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th><code>MULTI</code>/<code>WATCH</code></th><th>Lua</th></tr>
+      <tr><td>Atomic</td><td>✅</td><td>✅</td></tr>
+      <tr><td>Round trips</td><td>2+ (and retries)</td><td><strong>1</strong></td></tr>
+      <tr><td>Conditional logic</td><td>❌ Client-side only</td><td>✅ Server-side</td></tr>
+      <tr><td>Behaviour under contention</td><td>Degrades — retry storms</td><td>Unaffected</td></tr>
+      <tr><td>Blocks the server</td><td>Only while executing</td><td><strong>For the whole script</strong></td></tr>
+    </table>
+
+    <p><strong>KEYS and ARGV must be separated properly.</strong> Every key the script touches belongs in
+       <code>KEYS</code> — this is not stylistic, it is what allows <a href="cluster.html">Cluster</a> to route
+       the script and what keeps replication correct:</p>
+
+<pre>
+-- WRONG: the key is hidden in ARGV; Cluster cannot route this
+EVAL "return redis.call('GET', ARGV[1])" 0 mykey
+
+-- RIGHT
+EVAL "return redis.call('GET', KEYS[1])" 1 mykey
+</pre>
+
+    <h2>Part 4 — Script Caching and EVALSHA</h2>
+
+    <p>Sending the script text on every call wastes bandwidth. Redis caches scripts by SHA-1:</p>
+
+<pre>
+SCRIPT LOAD "return redis.call('GET', KEYS[1])"
+  → "4e6d8fc8bb01276962cce5371fa795a7763657ae"
+
+EVALSHA 4e6d8fc8bb01276962cce5371fa795a7763657ae 1 mykey
+  → the value
+
+# if the cache was flushed or the server restarted:
+  → (error) NOSCRIPT No matching script
+</pre>
+
+    <p><strong>Every production client must handle <code>NOSCRIPT</code></strong> by falling back to
+       <code>EVAL</code> and re-caching — a restarted server or a <code>SCRIPT FLUSH</code> otherwise breaks the
+       application:</p>
+
+<pre>
+def run_script(r, sha, script, keys, args):
+    try:
+        return r.evalsha(sha, len(keys), *keys, *args)
+    except redis.exceptions.NoScriptError:
+        return r.eval(script, len(keys), *keys, *args)   # re-caches automatically
+</pre>
+
+    <p>Most client libraries wrap this — redis-py's <code>register_script</code> returns a callable that handles
+       the fallback for you.</p>
+
+    <table class="tbl">
+      <tr><th>Command</th><th>Purpose</th></tr>
+      <tr><td><code>SCRIPT LOAD</code></td><td>Cache a script, returning its SHA</td></tr>
+      <tr><td><code>SCRIPT EXISTS sha</code></td><td>Check whether it is cached</td></tr>
+      <tr><td><code>SCRIPT FLUSH</code></td><td>Clear the cache — invalidates every SHA</td></tr>
+      <tr><td><code>SCRIPT KILL</code></td><td>Terminate a running script (only if it has not written)</td></tr>
+    </table>
+
+    <h2>Part 5 — Determinism, Replication and Blocking</h2>
+
+    <p>Scripts replicate to replicas and the AOF. Historically Redis replicated the <em>script</em>, which meant
+       non-deterministic scripts produced divergent state — so it enforced strict rules.</p>
+
+    <table class="tbl">
+      <tr><th>Rule</th><th>Reason</th></tr>
+      <tr><td>Use <code>redis.call('TIME')</code>, not Lua's clock</td><td>Every replica must see the same time</td></tr>
+      <tr><td>Seed randomness from ARGV, or use <code>redis.replicate_commands()</code></td><td>Otherwise replicas diverge</td></tr>
+      <tr><td>Do not iterate an unordered collection and write based on order</td><td><code>SMEMBERS</code> order is not guaranteed</td></tr>
+      <tr><td>All keys in <code>KEYS</code></td><td>Cluster routing and replication correctness</td></tr>
+    </table>
+
+    <p><strong>Redis 5+ replicates effects rather than scripts by default</strong>, which relaxes most of these —
+       but writing deterministic scripts remains good practice, and Cluster still requires correct
+       <code>KEYS</code> declaration.</p>
+
+    <p><strong>The blocking hazard is the serious operational concern.</strong> A script holds the
+       <a href="single-threaded.html">single thread</a> for its entire duration:</p>
+
+<pre>
+-- this blocks EVERY client for as long as it runs
+for i = 1, 10000000 do
+  redis.call('SET', 'key:'..i, i)
+end
+</pre>
+
+<pre>
+lua-time-limit 5000          # after 5s, Redis starts replying BUSY to other clients
+SCRIPT KILL                  # works only if the script has not yet WRITTEN
+SHUTDOWN NOSAVE              # the only escape once it has written — data loss
+</pre>
+
+    <p><strong>Once a script has performed a write it cannot be killed</strong>, because killing it would leave
+       partial state that violates atomicity. The only recovery is to restart the server, losing everything since
+       the last save.</p>
+
+    <h2>Part 6 — Redis Functions (7.0+)</h2>
+
+    <p>Functions are the successor to ad-hoc <code>EVALSHA</code>: named, versioned libraries that persist across
+       restarts and replicate properly.</p>
+
+<pre>
+#!lua name=mylib
+
+redis.register_function('conditional_incr', function(keys, args)
+  local current = tonumber(redis.call('GET', keys[1]) or '0')
+  if current &lt; tonumber(args[1]) then
+    return redis.call('INCR', keys[1])
+  end
+  return -1
+end)
+</pre>
+
+<pre>
+$ redis-cli -x FUNCTION LOAD &lt; mylib.lua
+"mylib"
+$ redis-cli FCALL conditional_incr 1 counter 10
+(integer) 1
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th><code>EVALSHA</code> scripts</th><th>Functions</th></tr>
+      <tr><td>Survive restart</td><td>❌ Cache is lost</td><td>✅ Persisted</td></tr>
+      <tr><td>Named</td><td>❌ SHA only</td><td>✅ Human-readable</td></tr>
+      <tr><td>Replicated to replicas</td><td>Effects only</td><td>✅ The library itself</td></tr>
+      <tr><td><code>NOSCRIPT</code> handling needed</td><td>✅ Yes</td><td>❌ No</td></tr>
+      <tr><td>Availability</td><td>All versions</td><td>Redis 7.0+</td></tr>
+    </table>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Treating <code>MULTI</code>/<code>EXEC</code> as a SQL transaction with rollback.</strong> The
+         code wraps several writes in a transaction, assumes a failure undoes the batch, and never inspects the
+         results array. When one command fails at runtime — an <code>INCR</code> on a value that is not a number,
+         or an operation on the wrong type — every other command in the transaction has already applied. The
+         result is silent partial state: a balance decremented without the matching credit, or an index updated
+         for a record that was never written.</p>
+      <p>✅ <strong>Treat <code>MULTI</code> as "these run together without interruption" and check every
+         result.</strong> <code>EXEC</code> returns one reply per queued command, and any of them can be an
+         error while the rest succeeded — so inspect the array rather than assuming success. Where the operation
+         genuinely must be all-or-nothing, or must branch on a value it reads, use a <strong>Lua script</strong>:
+         it is atomic, it is one round trip, and it can validate preconditions before performing any write, which
+         is the only way to get "check then act" semantics in Redis.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Expecting rollback from <code>MULTI</code></td><td>Failed commands do not undo the others</td><td>Validate first, or use Lua</td></tr>
+      <tr><td>Not inspecting <code>EXEC</code> results</td><td>Errors are per-command replies</td><td>Check every element</td></tr>
+      <tr><td>Reading inside <code>MULTI</code> to make a decision</td><td>Nothing executes until <code>EXEC</code></td><td><code>WATCH</code>, or Lua</td></tr>
+      <tr><td>No retry loop with <code>WATCH</code></td><td><code>EXEC</code> returns nil on conflict — silently no-ops</td><td>Loop, with a retry cap</td></tr>
+      <tr><td><code>WATCH</code> under heavy contention</td><td>Retry storms; throughput collapses</td><td>Lua</td></tr>
+      <tr><td>Keys passed in <code>ARGV</code></td><td>Breaks Cluster routing and replication</td><td>Declare them in <code>KEYS</code></td></tr>
+      <tr><td>No <code>NOSCRIPT</code> fallback</td><td>Restart or <code>SCRIPT FLUSH</code> breaks the app</td><td>Catch it and <code>EVAL</code></td></tr>
+      <tr><td>Long-running scripts</td><td>Blocks every client; unkillable after a write</td><td>Keep them short; chunk the work</td></tr>
+      <tr><td>Non-deterministic scripts</td><td>Replica divergence on older versions</td><td><code>redis.call('TIME')</code>; seed from ARGV</td></tr>
+      <tr><td>Business logic in Lua</td><td>Unversioned, untestable, hard to debug</td><td>Small scripts; Functions for real logic</td></tr>
+      <tr><td>Assuming a pipeline is a transaction</td><td>Other clients interleave</td><td><code>MULTI</code> or Lua</td></tr>
+      <tr><td><code>SCRIPT KILL</code> on a writing script</td><td>Refused — would break atomicity</td><td>Prevent it; <code>SHUTDOWN NOSAVE</code> is the only escape</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does a Redis transaction guarantee?</summary>
+      <p>Isolation and batching — not rollback.</p>
+<pre>
+MULTI                → OK
+  SET a 1            → QUEUED
+  INCR a             → QUEUED
+EXEC                 → 1) OK  2) (integer) 2
+</pre>
+      <table class="tbl">
+        <tr><th>Guarantee</th><th>Provided?</th></tr>
+        <tr><td>No other client interleaves</td><td>✅ Yes</td></tr>
+        <tr><td>One round trip</td><td>✅ Yes</td></tr>
+        <tr><td><strong>Rollback on error</strong></td><td>❌ <strong>No</strong></td></tr>
+      </table>
+      <p><strong>The absence of rollback is deliberate.</strong> Redis's reasoning is that a command failing at
+         execution time indicates a programming error — wrong type, wrong arguments — which belongs in
+         development, not production. Supporting rollback would mean recording undo information for every
+         command, slowing the common path to guard against a bug.</p>
+<pre>
+MULTI
+  SET k "text"
+  INCR k              ← fails: not an integer
+  SET j "value"
+EXEC
+→ 1) OK  2) (error) …  3) OK
+     ↑ k and j were BOTH written despite the failure
+</pre>
+      <p><strong>The two error types differ:</strong> a malformed command is caught at queue time and aborts the
+         whole transaction (<code>EXECABORT</code>); a runtime error only fails that one command.</p>
+      <p><strong>The practical consequence is that you must inspect the results array.</strong> Assuming success
+         because <code>EXEC</code> did not raise is how partial state gets written silently.</p>
+      <p><strong>And <code>MULTI</code> cannot branch</strong> — nothing executes until <code>EXEC</code>, so a
+         decision based on a value read inside the transaction is impossible. That needs <code>WATCH</code> or,
+         better, Lua.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is <code>WATCH</code> and how do you use it?</summary>
+      <p><code>WATCH</code> provides optimistic locking: it marks keys, and if any of them changes before
+         <code>EXEC</code>, the transaction is cancelled and returns nil.</p>
+<pre>
+WATCH balance
+GET balance          → "100"        (executes immediately)
+   ← another client writes balance here
+MULTI
+  SET balance 50
+EXEC                 → (nil)        ← aborted; retry
+</pre>
+<pre>
+def decrement_if_positive(r, key):
+    while True:
+        try:
+            with r.pipeline() as pipe:
+                pipe.watch(key)
+                value = int(pipe.get(key) or 0)
+                if value &lt;= 0:
+                    pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.decr(key)
+                pipe.execute()
+                return True
+        except redis.WatchError:
+            continue        # someone changed it; try again
+</pre>
+      <p><strong>It is optimistic, not pessimistic</strong> — no lock is held and no client waits. The
+         transaction simply fails if there was a conflict, which means <strong>a retry loop is mandatory</strong>;
+         without it, <code>EXEC</code> returning nil is a silent no-op.</p>
+      <table class="tbl">
+        <tr><th>Behaviour</th><th>Detail</th></tr>
+        <tr><td>Any write invalidates</td><td>Even writing the identical value counts</td></tr>
+        <tr><td>Cleared automatically</td><td>By <code>EXEC</code>, <code>UNWATCH</code>, or disconnect</td></tr>
+        <tr><td>Multiple keys</td><td><code>WATCH k1 k2 k3</code> — any change aborts</td></tr>
+      </table>
+      <p><strong>The scaling weakness is contention.</strong> With many clients competing for the same key, most
+         retries fail again and throughput collapses — in the exercise in this lesson, <code>WATCH</code> managed
+         a fraction of Lua's throughput under 50 concurrent clients.</p>
+      <p><strong>So the rule I would give is:</strong> <code>WATCH</code> is fine for low-contention
+         check-then-act, and Lua is the right answer whenever the key is hot — it achieves the same result in one
+         round trip with no retries at all.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> When would you use Lua instead of MULTI/WATCH?</summary>
+      <p>Whenever the operation needs to make a decision based on data it reads, or whenever the key is
+         contended.</p>
+      <table class="tbl">
+        <tr><th></th><th><code>MULTI</code>/<code>WATCH</code></th><th>Lua</th></tr>
+        <tr><td>Conditional logic</td><td>❌ Client-side, needs a retry loop</td><td>✅ Server-side</td></tr>
+        <tr><td>Round trips</td><td>2+ per attempt</td><td><strong>1</strong></td></tr>
+        <tr><td>Under contention</td><td>Retry storms</td><td>Unaffected</td></tr>
+        <tr><td>Blocks the server</td><td>Briefly</td><td><strong>For the script's duration</strong></td></tr>
+      </table>
+      <p><strong>The canonical example is a bounded counter</strong>, which <code>MULTI</code> cannot express at
+         all:</p>
+<pre>
+-- one round trip, atomic, no retries
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+if current &lt; tonumber(ARGV[1]) then
+  return redis.call('INCR', KEYS[1])
+end
+return -1
+</pre>
+      <p><strong>Compare with the <code>WATCH</code> version</strong>, which needs a loop, two or more round trips
+         per attempt, and degrades as contention rises.</p>
+      <p><strong>Other cases where Lua is the only clean answer:</strong></p>
+      <table class="tbl">
+        <tr><th>Operation</th><th>Why Lua</th></tr>
+        <tr><td>Safe lock release</td><td>Compare the owner token, then delete — atomically</td></tr>
+        <tr><td>Sliding-window rate limit</td><td>Trim, count, decide and add as one unit</td></tr>
+        <tr><td>Claim N due jobs</td><td>Read a range and remove it without a gap</td></tr>
+        <tr><td>Conditional multi-key update</td><td>Validate all preconditions before any write</td></tr>
+      </table>
+      <p><strong>The cost is that a script blocks the single thread for its entire duration</strong>, so scripts
+         must be short. A loop over a million keys inside Lua stalls every client — and once the script has
+         written, it cannot even be killed.</p>
+      <p><strong>My rule of thumb:</strong> if it can be one command, use one command; if it is independent
+         commands, pipeline; if it needs to read-then-decide, use Lua; and keep the script small enough that its
+         worst-case runtime is measured in microseconds.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why must all keys be declared in <code>KEYS</code>?</summary>
+      <p>Because Redis needs to know which keys a script touches <em>before</em> running it, for two independent
+         reasons.</p>
+<pre>
+-- WRONG: the key is in ARGV
+EVAL "return redis.call('GET', ARGV[1])" 0 mykey
+
+-- RIGHT
+EVAL "return redis.call('GET', KEYS[1])" 1 mykey
+</pre>
+      <p><strong>1. Cluster routing.</strong> <a href="cluster.html">Redis Cluster</a> shards by key hash slot. It
+         inspects the declared <code>KEYS</code> to decide which node should run the script and to verify they
+         all live in one slot. Keys hidden in <code>ARGV</code> are invisible to that check, so the script may
+         run on a node that does not own the data:</p>
+<pre>
+EVAL "..." 2 user:{123}:name user:{123}:email     ← same slot via the hash tag, OK
+EVAL "..." 2 user:1:name user:2:email             ← CROSSSLOT error, correctly rejected
+EVAL "..." 0 user:1:name                          ← no error, but WRONG NODE possible
+</pre>
+      <p><strong>2. Replication and correctness.</strong> Declaring keys lets Redis reason about what the script
+         affects. Historically scripts were replicated verbatim, so undeclared keys could produce divergence;
+         modern Redis replicates effects, which relaxes this, but Cluster routing still depends on it
+         entirely.</p>
+      <p><strong>Redis does not enforce it</strong> — a script accessing an undeclared key works fine on a single
+         instance, which is exactly why the bug survives development and appears only after a move to
+         Cluster.</p>
+      <p><strong>The related determinism rules</strong> matter for the same reason:</p>
+      <table class="tbl">
+        <tr><th>Avoid</th><th>Use instead</th></tr>
+        <tr><td>Lua's <code>os.time()</code></td><td><code>redis.call('TIME')</code></td></tr>
+        <tr><td>Unseeded <code>math.random()</code></td><td>Seed from <code>ARGV</code></td></tr>
+        <tr><td>Writing based on <code>SMEMBERS</code> order</td><td>Sort explicitly first</td></tr>
+      </table>
+      <p><strong>The practical guidance is to write scripts as if Cluster were mandatory</strong>, even on a
+         single instance — it costs nothing and prevents a migration from breaking every script at once.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a safe distributed lock with Lua. What can go wrong?</summary>
+      <p>The acquire is a single command; the <em>release</em> is what requires Lua.</p>
+<pre>
+# acquire: atomic, self-expiring, uniquely owned
+SET lock:resource &lt;random-token&gt; NX PX 30000
+  → OK    acquired
+  → nil   held by someone else
+</pre>
+      <p><strong>A naive release is unsafe:</strong></p>
+<pre>
+# WRONG
+if r.get("lock:resource") == my_token:      ← the lock can expire HERE
+    r.delete("lock:resource")               ← now deleting SOMEONE ELSE'S lock
+</pre>
+      <p><strong>The gap is real:</strong> client A's lock expires, client B acquires it, then A's delete
+         removes B's lock while B still believes it holds it. Lua closes the gap:</p>
+<pre>
+-- release: compare and delete atomically
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+else
+  return 0
+end
+</pre>
+      <p><strong>Extending a held lock needs the same treatment:</strong></p>
+<pre>
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+</pre>
+      <table class="tbl">
+        <tr><th>Failure mode</th><th>Consequence</th><th>Mitigation</th></tr>
+        <tr><td>Holder crashes</td><td>Deadlock</td><td>The TTL releases it</td></tr>
+        <tr><td>Work outlives the TTL</td><td>Two holders simultaneously</td><td>Watchdog extends while working</td></tr>
+        <tr><td>Non-atomic release</td><td>Deletes another's lock</td><td>Lua compare-and-delete</td></tr>
+        <tr><td><strong>Failover</strong></td><td><strong>Lock lost — async replication</strong></td><td>See below</td></tr>
+        <tr><td>Clock drift</td><td>TTLs mean different things per node</td><td>Do not rely on wall clocks</td></tr>
+      </table>
+      <p><strong>The failover case is the one that cannot be fixed with better code.</strong> Replication is
+         asynchronous, so a master can acknowledge a lock acquisition and fail before replicating it — the
+         promoted replica has no record of the lock, and a second client acquires it. Two clients then hold the
+         "same" lock.</p>
+      <p><strong>Redlock is the proposed answer</strong> — acquire on a majority of N independent masters — and it
+         is genuinely contested. Martin Kleppmann's critique is that it relies on bounded clock drift and bounded
+         pauses, neither of which a GC pause or a VM migration respects.</p>
+      <p><strong>So the position I would take:</strong> Redis locks are excellent for <em>efficiency</em> —
+         preventing duplicated work, deduplicating cron runs — where a rare double-execution is wasteful but
+         harmless. For <em>correctness</em>, where two holders would corrupt data or double-charge a customer, I
+         would use a system with consensus (etcd, ZooKeeper) or, better, make the operation idempotent so the
+         lock stops being load-bearing. Covered further in <a href="locks.html">Distributed Locks</a>.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A Lua script is blocking production. What do you do, and how do you prevent it?</summary>
+      <p><strong>Immediate response, in order:</strong></p>
+<pre>
+# 1. confirm — clients are getting BUSY errors
+127.0.0.1:6379&gt; PING
+(error) BUSY Redis is busy running a script...
+
+# 2. try to kill it
+127.0.0.1:6379&gt; SCRIPT KILL
+OK                                    ← works ONLY if it has not written
+
+(error) UNKILLABLE Sorry the script already executed write commands...
+                                      ← now the only option is:
+127.0.0.1:6379&gt; SHUTDOWN NOSAVE       ← restart, losing data since the last save
+</pre>
+      <p><strong>The distinction is critical:</strong> a read-only script can be killed safely, because nothing
+         has changed. A script that has written cannot be killed without leaving partial state that would violate
+         the atomicity guarantee — so Redis refuses, and the only escape is a restart with data loss.</p>
+      <p><strong><code>lua-time-limit</code> is misunderstood</strong> — it does not terminate the script. After
+         that many milliseconds, Redis merely starts replying <code>BUSY</code> to <em>other</em> clients so they
+         can react, while the script continues running:</p>
+<pre>
+lua-time-limit 5000        # after 5s, others get BUSY — the script still runs
+</pre>
+      <p><strong>Prevention, which is where the real work is:</strong></p>
+      <table class="tbl">
+        <tr><th>Practice</th><th>Effect</th></tr>
+        <tr><td>Bound every loop by an argument</td><td>No unbounded iteration over a keyspace</td></tr>
+        <tr><td>Test against production-scale data</td><td>A script fast on 100 keys may be lethal on 10M</td></tr>
+        <tr><td>Chunk large work into many small calls</td><td>The loop is released between chunks</td></tr>
+        <tr><td>Never call <code>KEYS</code> or <code>SMEMBERS</code> on big collections in a script</td><td>The O(n) hazard, now unkillable</td></tr>
+        <tr><td>Review scripts like production code</td><td>They run with no timeout and no isolation</td></tr>
+      </table>
+<pre>
+-- BAD: unbounded, and unkillable once it writes
+for i = 1, 10000000 do redis.call('SET', 'k:'..i, i) end
+
+-- GOOD: bounded by the caller, resumable
+local count = tonumber(ARGV[1])
+local start = tonumber(ARGV[2])
+for i = start, start + count - 1 do
+  redis.call('SET', KEYS[1]..':'..i, i)
+end
+return start + count            -- the caller resumes from here
+</pre>
+      <p><strong>The architectural point I would make</strong> is that Lua's atomicity and its blocking are the
+         same property. You cannot have "atomic" without "nothing else runs" on a single-threaded server — so the
+         discipline is to keep scripts measured in microseconds, and to treat any script whose runtime depends on
+         data size as a latent outage.</p>
+      <p><strong>Monitoring:</strong> the slow log records scripts by their <code>EVAL</code>/<code>EVALSHA</code>
+         entry, so a script creeping upward in duration is visible before it becomes an incident.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove that MULTI does not roll back.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ redis-cli FLUSHDB
+</pre>
+<pre>
+127.0.0.1:6379&gt; SET counter "not-a-number"
+OK
+127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379(TX)&gt; SET before "written"
+QUEUED
+127.0.0.1:6379(TX)&gt; INCR counter
+QUEUED
+127.0.0.1:6379(TX)&gt; SET after "written"
+QUEUED
+127.0.0.1:6379(TX)&gt; EXEC
+1) OK
+2) (error) ERR value is not an integer or out of range
+3) OK
+</pre>
+<pre>
+127.0.0.1:6379&gt; MGET before after
+1) "written"
+2) "written"                    ← BOTH applied despite the error
+</pre>
+      <p><strong>No rollback.</strong> The failing command failed alone; its neighbours committed.</p>
+      <p><strong>Now the queue-time error, which behaves differently:</strong></p>
+<pre>
+127.0.0.1:6379&gt; FLUSHDB
+127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379(TX)&gt; SET x 1
+QUEUED
+127.0.0.1:6379(TX)&gt; NOTACOMMAND foo
+(error) ERR unknown command 'NOTACOMMAND'
+127.0.0.1:6379(TX)&gt; SET y 2
+QUEUED
+127.0.0.1:6379(TX)&gt; EXEC
+(error) EXECABORT Transaction discarded because of previous errors.
+127.0.0.1:6379&gt; MGET x y
+1) (nil)
+2) (nil)                        ← NOTHING ran
+</pre>
+      <table class="tbl">
+        <tr><th>Error type</th><th>Detected</th><th>Result</th></tr>
+        <tr><td>Unknown command / bad arity</td><td>Queue time</td><td><strong>Whole transaction discarded</strong></td></tr>
+        <tr><td>Wrong type / bad value</td><td>Execution time</td><td>That command fails; others apply</td></tr>
+      </table>
+      <p><strong>Verify from a client that the results must be inspected:</strong></p>
+<pre>
+import redis
+r = redis.Redis(decode_responses=True)
+r.flushdb(); r.set("k", "text")
+
+p = r.pipeline(transaction=True)
+p.set("a", 1); p.incr("k"); p.set("b", 2)
+results = p.execute(raise_on_error=False)
+
+for i, res in enumerate(results):
+    print(f"  [{i}] {'ERROR: ' + str(res) if isinstance(res, Exception) else res}")
+print("state:", r.mget("a", "b"))
+</pre>
+<pre>
+  [0] True
+  [1] ERROR: value is not an integer or out of range
+  [2] True
+state: ['1', '2']
+</pre>
+      <p><strong>If the code had assumed <code>EXEC</code> succeeding meant all-or-nothing</strong>, it would now
+         have written a and b while believing the whole batch failed.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Use WATCH for a safe check-then-act.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading
+r = redis.Redis(decode_responses=True)
+
+def unsafe_decrement(client, key):
+    """Read then write — racy."""
+    v = int(client.get(key) or 0)
+    if v &gt; 0:
+        client.set(key, v - 1)
+        return True
+    return False
+
+def safe_decrement(client, key):
+    """WATCH makes the read-then-write atomic."""
+    while True:
+        try:
+            with client.pipeline() as pipe:
+                pipe.watch(key)
+                v = int(pipe.get(key) or 0)
+                if v &lt;= 0:
+                    pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.set(key, v - 1)
+                pipe.execute()
+                return True
+        except redis.WatchError:
+            continue
+</pre>
+<pre>
+STOCK = 100
+for label, fn, key in [("unsafe", unsafe_decrement, "stock:unsafe"),
+                       ("WATCH ", safe_decrement, "stock:safe")]:
+    r.set(key, STOCK)
+    sold = []
+    lock = threading.Lock()
+
+    def worker():
+        c = redis.Redis(decode_responses=True)
+        for _ in range(20):
+            if fn(c, key):
+                with lock: sold.append(1)
+
+    ts = [threading.Thread(target=worker) for _ in range(20)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    remaining = int(r.get(key))
+    print(f"{label}: sold {len(sold):3}, stock left {remaining:4}  "
+          f"(sold + left = {len(sold)+remaining}, should be {STOCK})")
+</pre>
+<pre>
+unsafe: sold 400, stock left    0  (sold + left = 400, should be 100)
+WATCH : sold 100, stock left    0  (sold + left = 100, should be 100)
+</pre>
+      <p><strong>The unsafe version oversold by 300 units</strong> — it sold 400 items from a stock of 100,
+         because concurrent reads all saw a positive value.</p>
+      <p><strong>Now measure WATCH's weakness under contention:</strong></p>
+<pre>
+import time
+def counted_safe_decrement(client, key, stats):
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            with client.pipeline() as pipe:
+                pipe.watch(key)
+                v = int(pipe.get(key) or 0)
+                if v &lt;= 0:
+                    pipe.unwatch(); stats.append(attempts); return False
+                pipe.multi(); pipe.set(key, v - 1); pipe.execute()
+                stats.append(attempts); return True
+        except redis.WatchError:
+            continue
+
+for threads in [2, 10, 50]:
+    r.set("contended", 500)
+    stats, lock = [], threading.Lock()
+    def worker():
+        c = redis.Redis(decode_responses=True)
+        local = []
+        for _ in range(10): counted_safe_decrement(c, "contended", local)
+        with lock: stats.extend(local)
+    t0 = time.perf_counter()
+    ts = [threading.Thread(target=worker) for _ in range(threads)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    el = time.perf_counter() - t0
+    print(f"{threads:3} threads: avg {sum(stats)/len(stats):5.2f} attempts/op, "
+          f"max {max(stats):3}, {el*1000:6.0f} ms")
+</pre>
+<pre>
+  2 threads: avg  1.04 attempts/op, max   3,     94 ms
+ 10 threads: avg  2.87 attempts/op, max  19,    412 ms
+ 50 threads: avg 11.43 attempts/op, max  87,   3184 ms
+</pre>
+      <p><strong>At 50 threads each operation retried 11 times on average and one took 87 attempts</strong> —
+         that is the retry storm, and it is why Lua is the right tool for hot keys.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Replace WATCH with Lua and compare throughput.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+
+DECREMENT = r.register_script("""
+local v = tonumber(redis.call('GET', KEYS[1]) or '0')
+if v &gt; 0 then
+  redis.call('SET', KEYS[1], v - 1)
+  return 1
+end
+return 0
+""")
+
+def watch_decrement(client, key):
+    while True:
+        try:
+            with client.pipeline() as pipe:
+                pipe.watch(key)
+                v = int(pipe.get(key) or 0)
+                if v &lt;= 0: pipe.unwatch(); return False
+                pipe.multi(); pipe.set(key, v - 1); pipe.execute()
+                return True
+        except redis.WatchError:
+            continue
+
+def lua_decrement(client, key):
+    script = client.register_script(DECREMENT.script)
+    return script(keys=[key]) == 1
+</pre>
+<pre>
+for threads in [10, 50]:
+    for label, fn, key in [("WATCH", watch_decrement, f"w{threads}"),
+                           ("Lua  ", lua_decrement, f"l{threads}")]:
+        r.set(key, 2000)
+        sold, lock = [], threading.Lock()
+        def worker():
+            c = redis.Redis(decode_responses=True)
+            n = 0
+            for _ in range(40):
+                if fn(c, key): n += 1
+            with lock: sold.append(n)
+        t0 = time.perf_counter()
+        ts = [threading.Thread(target=worker) for _ in range(threads)]
+        [t.start() for t in ts]; [t.join() for t in ts]
+        el = time.perf_counter() - t0
+        total = sum(sold)
+        left = int(r.get(key))
+        print(f"{threads:3} threads {label}: {total:5} ops in {el*1000:7.0f} ms "
+              f"({total/el:8,.0f} ops/s)  integrity: {total+left == 2000}")
+</pre>
+<pre>
+ 10 threads WATCH:   400 ops in     318 ms (   1,258 ops/s)  integrity: True
+ 10 threads Lua  :   400 ops in      82 ms (   4,878 ops/s)  integrity: True
+ 50 threads WATCH:  2000 ops in    3241 ms (     617 ops/s)  integrity: True
+ 50 threads Lua  :  2000 ops in     398 ms (   5,025 ops/s)  integrity: True
+</pre>
+      <table class="tbl">
+        <tr><th>Threads</th><th>WATCH</th><th>Lua</th><th>Lua advantage</th></tr>
+        <tr><td>10</td><td>1,258 ops/s</td><td>4,878 ops/s</td><td>3.9×</td></tr>
+        <tr><td>50</td><td>617 ops/s</td><td>5,025 ops/s</td><td><strong>8.1×</strong></td></tr>
+      </table>
+      <p><strong>WATCH throughput fell as concurrency rose</strong> — 1,258 to 617 ops/s — while Lua stayed flat.
+         That is the defining difference: optimistic locking degrades under contention, server-side atomicity
+         does not.</p>
+      <p><strong>Both preserved integrity</strong>, so this is purely a performance argument — but at 50 threads
+         it is an 8× one.</p>
+      <p><strong>Now a bounded counter, which WATCH needs a loop for and Lua expresses directly:</strong></p>
+<pre>
+BOUNDED = r.register_script("""
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local limit = tonumber(ARGV[1])
+if current &lt; limit then
+  return redis.call('INCR', KEYS[1])
+end
+return -1
+""")
+
+r.delete("quota")
+results = [BOUNDED(keys=["quota"], args=[5]) for _ in range(8)]
+print("results:", results)
+print("final:", r.get("quota"))
+</pre>
+<pre>
+results: [1, 2, 3, 4, 5, -1, -1, -1]
+final: 5
+</pre>
+      <p><strong>Exactly 5 admitted, in one round trip each</strong>, with no retry logic anywhere.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Handle NOSCRIPT correctly.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+r = redis.Redis(decode_responses=True)
+
+SCRIPT = "return redis.call('GET', KEYS[1])"
+sha = r.script_load(SCRIPT)
+print("SHA:", sha)
+print("cached:", r.script_exists(sha))
+
+r.set("mykey", "hello")
+print("EVALSHA:", r.evalsha(sha, 1, "mykey"))
+</pre>
+<pre>
+SHA: 4e6d8fc8bb01276962cce5371fa795a7763657ae
+cached: [True]
+EVALSHA: hello
+</pre>
+      <p><strong>Now simulate what a restart or SCRIPT FLUSH does:</strong></p>
+<pre>
+r.script_flush()
+print("cached after flush:", r.script_exists(sha))
+try:
+    r.evalsha(sha, 1, "mykey")
+except redis.exceptions.NoScriptError as e:
+    print(f"EVALSHA failed: {type(e).__name__}")
+</pre>
+<pre>
+cached after flush: [False]
+EVALSHA failed: NoScriptError
+</pre>
+      <p><strong>Every production client needs this fallback:</strong></p>
+<pre>
+class CachedScript:
+    def __init__(self, client, script):
+        self.client, self.script = client, script
+        self.sha = client.script_load(script)
+        self.reloads = 0
+    def __call__(self, keys=(), args=()):
+        try:
+            return self.client.evalsha(self.sha, len(keys), *keys, *args)
+        except redis.exceptions.NoScriptError:
+            self.reloads += 1
+            self.sha = self.client.script_load(self.script)      # re-cache
+            return self.client.evalsha(self.sha, len(keys), *keys, *args)
+
+s = CachedScript(r, SCRIPT)
+print("call 1:", s(keys=["mykey"]))
+r.script_flush()                                   # simulate a restart
+print("call 2:", s(keys=["mykey"]), f"(reloads: {s.reloads})")
+</pre>
+<pre>
+call 1: hello
+call 2: hello (reloads: 1)
+</pre>
+      <p><strong>Recovered transparently.</strong> Without the fallback, every call after a restart would raise
+         until the process was redeployed.</p>
+      <p><strong>redis-py's <code>register_script</code> does this for you:</strong></p>
+<pre>
+managed = r.register_script(SCRIPT)
+print("managed:", managed(keys=["mykey"]))
+r.script_flush()
+print("after flush:", managed(keys=["mykey"]))     # handled internally
+</pre>
+<pre>
+managed: hello
+after flush: hello
+</pre>
+      <p><strong>Measure what EVALSHA saves over EVAL:</strong></p>
+<pre>
+import time
+BIG = "-- padding\n" * 500 + "return redis.call('GET', KEYS[1])"
+big_sha = r.script_load(BIG)
+N = 2000
+
+t0 = time.perf_counter()
+for _ in range(N): r.eval(BIG, 1, "mykey")
+eval_t = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+for _ in range(N): r.evalsha(big_sha, 1, "mykey")
+sha_t = time.perf_counter() - t0
+
+print(f"script size: {len(BIG)} bytes")
+print(f"EVAL:    {eval_t*1000:7.1f} ms   ({len(BIG)*N/1024/1024:.1f} MB sent)")
+print(f"EVALSHA: {sha_t*1000:7.1f} ms   ({40*N/1024:.1f} KB sent)")
+print(f"speedup: {eval_t/sha_t:.1f}x")
+</pre>
+<pre>
+script size: 5533 bytes
+EVAL:      412.7 ms   (10.6 MB sent)
+EVALSHA:   187.3 ms   (78.1 KB sent)
+speedup: 2.2x
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build a safe distributed lock with Lua.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, uuid, time, threading
+r = redis.Redis(decode_responses=True)
+
+RELEASE = r.register_script("""
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+""")
+
+EXTEND = r.register_script("""
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+""")
+
+class Lock:
+    def __init__(self, client, name, ttl_ms=5000):
+        self.r, self.name, self.ttl = client, f"lock:{name}", ttl_ms
+        self.token = None
+    def acquire(self, timeout=None):
+        deadline = time.time() + timeout if timeout else None
+        token = uuid.uuid4().hex
+        while True:
+            if self.r.set(self.name, token, nx=True, px=self.ttl):
+                self.token = token
+                return True
+            if deadline and time.time() &gt; deadline:
+                return False
+            time.sleep(0.01)
+    def release(self):
+        if not self.token: return False
+        ok = RELEASE(keys=[self.name], args=[self.token]) == 1
+        self.token = None
+        return ok
+    def extend(self, ttl_ms=None):
+        return EXTEND(keys=[self.name], args=[self.token, ttl_ms or self.ttl]) == 1
+</pre>
+<pre>
+r.flushdb()
+a, b = Lock(r, "resource"), Lock(r, "resource")
+print("A acquires:", a.acquire())
+print("B acquires:", b.acquire(timeout=0.2))
+print("A releases:", a.release())
+print("B acquires:", b.acquire(timeout=0.2))
+b.release()
+</pre>
+<pre>
+A acquires: True
+B acquires: False
+A releases: True
+B acquires: True
+</pre>
+      <p><strong>Now prove the naive release is dangerous:</strong></p>
+<pre>
+r.flushdb()
+# A takes a SHORT lock and stalls
+a = Lock(r, "res", ttl_ms=300)
+a.acquire()
+a_token = a.token
+time.sleep(0.4)                       # A's lock EXPIRES
+
+# B acquires the now-free lock
+b = Lock(r, "res", ttl_ms=5000)
+b.acquire()
+print(f"B holds the lock: {r.get('lock:res') == b.token}")
+
+# A finishes and does a NAIVE release
+if r.get("lock:res"):
+    r.delete("lock:res")              # ← deletes B's lock!
+print(f"after A's naive release, B still holds it: {r.get('lock:res') == b.token}")
+</pre>
+<pre>
+B holds the lock: True
+after A's naive release, B still holds it: False
+</pre>
+      <p><strong>A deleted B's lock</strong> while B was still working. Now the Lua release:</p>
+<pre>
+r.flushdb()
+a = Lock(r, "res", ttl_ms=300); a.acquire(); a_token = a.token
+time.sleep(0.4)
+b = Lock(r, "res", ttl_ms=5000); b.acquire()
+
+released = RELEASE(keys=["lock:res"], args=[a_token])     # A tries with ITS token
+print(f"A's release returned: {released} (0 = refused)")
+print(f"B still holds it: {r.get('lock:res') == b.token}")
+</pre>
+<pre>
+A's release returned: 0 (0 = refused)
+B still holds it: True
+</pre>
+      <p><strong>The token comparison refused the release</strong> — the whole reason Lua is required.</p>
+      <p><strong>Test mutual exclusion under load:</strong></p>
+<pre>
+r.flushdb()
+counter = {"value": 0, "violations": 0}
+lock_g = threading.Lock()
+
+def critical_section():
+    c = redis.Redis(decode_responses=True)
+    l = Lock(c, "shared", ttl_ms=3000)
+    for _ in range(30):
+        if l.acquire(timeout=5):
+            try:
+                v = counter["value"]
+                time.sleep(0.0005)              # widen the window
+                with lock_g:
+                    if counter["value"] != v: counter["violations"] += 1
+                    counter["value"] = v + 1
+            finally:
+                l.release()
+
+ts = [threading.Thread(target=critical_section) for _ in range(10)]
+[t.start() for t in ts]; [t.join() for t in ts]
+print(f"final counter: {counter['value']} (expected 300)")
+print(f"mutual-exclusion violations: {counter['violations']}")
+</pre>
+<pre>
+final counter: 300 (expected 300)
+mutual-exclusion violations: 0
+</pre>
+      <p><strong>Perfect mutual exclusion on a single instance.</strong> The remaining risk is failover — async
+         replication can lose the lock — which no amount of Lua fixes, and which is why these locks are for
+         efficiency rather than correctness.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Demonstrate the blocking hazard and write a safe script.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+r.config_set("lua-time-limit", 1000)      # start replying BUSY after 1s
+</pre>
+      <p><strong>A read-only script can be killed:</strong></p>
+<pre>
+SLOW_READONLY = """
+local x = 0
+for i = 1, 500000000 do x = x + 1 end
+return x
+"""
+
+def run_slow():
+    c = redis.Redis(decode_responses=True, socket_timeout=30)
+    try: c.eval(SLOW_READONLY, 0)
+    except Exception as e: print(f"  script ended: {type(e).__name__}")
+
+t = threading.Thread(target=run_slow); t.start()
+time.sleep(1.5)
+
+probe = redis.Redis(decode_responses=True)
+try:
+    probe.ping()
+except redis.exceptions.BusyLoadingError as e:
+    print(f"  other clients see: {e}")
+except redis.ResponseError as e:
+    print(f"  other clients see: {e}")
+
+print("  SCRIPT KILL:", probe.script_kill())
+t.join()
+</pre>
+<pre>
+  other clients see: BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.
+  SCRIPT KILL: True
+  script ended: ResponseError
+</pre>
+      <p><strong>Now a script that WRITES first — and becomes unkillable:</strong></p>
+<pre>
+SLOW_WRITER = """
+redis.call('SET', KEYS[1], 'started')
+local x = 0
+for i = 1, 500000000 do x = x + 1 end
+return x
+"""
+
+t = threading.Thread(target=lambda: redis.Redis(socket_timeout=30).eval(SLOW_WRITER, 1, "flag"))
+t.start()
+time.sleep(1.5)
+try:
+    print("  SCRIPT KILL:", probe.script_kill())
+except redis.ResponseError as e:
+    print(f"  SCRIPT KILL refused: {e}")
+t.join()
+</pre>
+<pre>
+  SCRIPT KILL refused: UNKILLABLE Sorry the script already executed write commands against the dataset.
+  You can either wait the script termination or kill the server in a hard way using the SHUTDOWN NOSAVE command.
+</pre>
+      <p><strong>The only escape is <code>SHUTDOWN NOSAVE</code></strong> — a restart that loses everything since
+         the last save. That is why script runtime must be bounded by design, not by hope.</p>
+      <p><strong>Measure the impact on other clients:</strong></p>
+<pre>
+r.flushdb()
+r.eval("for i=1,200000 do redis.call('SET','k:'..i,i) end return 1", 0)
+
+latencies, stop = [], threading.Event()
+def probe_loop():
+    c = redis.Redis(decode_responses=True)
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        try: c.ping()
+        except Exception: pass
+        latencies.append((time.perf_counter()-t0)*1000)
+        time.sleep(0.002)
+
+# an unbounded script over the keyspace
+UNBOUNDED = "local ks = redis.call('KEYS', '*') local n = 0 for i,k in ipairs(ks) do n = n + 1 end return n"
+t = threading.Thread(target=probe_loop); t.start()
+time.sleep(0.3); latencies.clear()
+r.eval(UNBOUNDED, 0)
+unbounded = sorted(latencies); stop.set(); t.join()
+print(f"unbounded script: p99 {unbounded[int(len(unbounded)*0.99)]:.1f} ms, max {unbounded[-1]:.1f} ms")
+</pre>
+<pre>
+unbounded script: p99 84.2 ms, max 91.7 ms
+</pre>
+      <p><strong>The safe, chunked alternative:</strong></p>
+<pre>
+BOUNDED = r.register_script("""
+local cursor = ARGV[1]
+local count = tonumber(ARGV[2])
+local res = redis.call('SCAN', cursor, 'COUNT', count)
+return {res[1], #res[2]}
+""")
+
+latencies.clear(); stop.clear()
+t = threading.Thread(target=probe_loop); t.start()
+time.sleep(0.3); latencies.clear()
+
+cursor, total = "0", 0
+while True:
+    cursor, n = BOUNDED(args=[cursor, 200])
+    total += n
+    if cursor == "0": break
+bounded = sorted(latencies); stop.set(); t.join()
+print(f"chunked script:   p99 {bounded[int(len(bounded)*0.99)]:.1f} ms, max {bounded[-1]:.1f} ms  ({total} keys)")
+</pre>
+<pre>
+chunked script:   p99 1.4 ms, max 3.2 ms  (200000 keys)
+</pre>
+      <p><strong>Same total work, p99 of 1.4 ms instead of 84 ms</strong> — because the loop is released between
+         chunks and the caller drives the iteration.</p>
+      <p><strong>The rule this establishes:</strong> a script's runtime must be bounded by its arguments, never by
+         the size of the data it finds. Any script containing <code>KEYS</code>, an unbounded
+         <code>SMEMBERS</code>, or a loop whose count comes from the dataset is a latent outage.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><code>MULTI</code>/<code>EXEC</code> provides isolation and batching — <strong>not rollback</strong>; a failed command does not undo the others.</li>
+        <li>That is deliberate: runtime failures indicate programming errors, and undo logging would slow the common path.</li>
+        <li>Queue-time errors (unknown command) abort the whole transaction; runtime errors (wrong type) fail alone while the rest apply.</li>
+        <li>Always inspect the <code>EXEC</code> results array — assuming success writes partial state silently.</li>
+        <li><code>MULTI</code> cannot branch on values, because nothing executes until <code>EXEC</code>.</li>
+        <li><code>WATCH</code> gives optimistic locking with a mandatory retry loop — <code>EXEC</code> returning nil is otherwise a silent no-op.</li>
+        <li>Under contention <code>WATCH</code> degrades badly: 11 retries per operation at 50 threads, and throughput fell from 1,258 to 617 ops/s.</li>
+        <li>Lua runs server-side, atomically, in one round trip, and <em>can</em> branch — it stayed flat at ~5,000 ops/s regardless of concurrency, 8× faster than <code>WATCH</code> at 50 threads.</li>
+        <li>Declare every key in <code>KEYS</code>, not <code>ARGV</code> — Cluster routing depends on it, and Redis does not enforce it, so the bug only appears after migration.</li>
+        <li>Use <code>redis.call('TIME')</code> rather than Lua's clock, and seed randomness from <code>ARGV</code>, for replication determinism.</li>
+        <li><code>EVALSHA</code> avoids resending the script — 2.2× faster on a 5.5 KB script — but every client must handle <code>NOSCRIPT</code> by falling back to <code>EVAL</code>.</li>
+        <li>A safe distributed lock needs <code>SET NX PX</code> to acquire and a <strong>Lua compare-and-delete</strong> to release; a naive release deletes another client's lock, as measured.</li>
+        <li>Redis locks are for efficiency, not correctness — async replication means a failover can lose the lock regardless of the code.</li>
+        <li>A script blocks the single thread for its whole duration; atomicity and blocking are the same property.</li>
+        <li><code>lua-time-limit</code> does not terminate a script — it only starts replying <code>BUSY</code> to other clients.</li>
+        <li>Once a script has written it is <strong>unkillable</strong>; the only escape is <code>SHUTDOWN NOSAVE</code> with data loss.</li>
+        <li>Bound every script by its arguments: the chunked version had a p99 of 1.4 ms against 84 ms for the unbounded one, doing identical work.</li>
+        <li>Redis 7 Functions supersede ad-hoc scripts — named, persisted across restarts, and with no <code>NOSCRIPT</code> handling required.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="pipelining.html">← Commands, Pipelining &amp; Round Trips</a>
+      <a href="caching.html">Caching Patterns →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
