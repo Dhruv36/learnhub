@@ -1,0 +1,1067 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Single-Threaded Model — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>The Single-Threaded Model <span class="level-badge level-inter">Foundations</span></h1>
+    <p><strong>What you'll master:</strong> the event loop that processes every command on one thread, and why
+       that is a deliberate design choice rather than a limitation; the two guarantees it buys for free — atomicity
+       without locks, and predictable ordering — and the one liability it creates, head-of-line blocking; what
+       Redis <em>does</em> use extra threads for, which is not command execution; how to find and eliminate the
+       slow commands that stall every client; the fork-based operations that pause the loop for reasons unrelated
+       to commands; and how to scale past one core when you genuinely need to. Prerequisites:
+       <a href="index.html">What Redis Actually Is</a>, <a href="data-structures.html">Hashes, Lists &amp;
+       Sets</a>.</p>
+
+    <h2>Part 1 — One Loop, One Command at a Time</h2>
+
+    <p>Redis runs a single event loop. It multiplexes thousands of connections with <code>epoll</code>, but
+       <strong>executes exactly one command at a time</strong>.</p>
+
+<pre>
+          ┌──────────────── event loop (ONE thread) ────────────────┐
+          │                                                          │
+ sockets  │  epoll_wait  →  read request  →  parse  →  EXECUTE  →   │  → write reply
+ (10,000) │       ▲                                        │         │
+          │       └────────────────────────────────────────┘         │
+          └──────────────────────────────────────────────────────────┘
+
+ 10,000 concurrent CONNECTIONS, 1 command executing at any instant
+</pre>
+
+    <div class="note">🔑 <strong>Concurrency and parallelism are different things, and Redis chose one
+       deliberately.</strong> It is highly <em>concurrent</em> — tens of thousands of connections make progress —
+       but not <em>parallel</em>: no two commands ever run simultaneously. That choice eliminates mutexes,
+       condition variables, cache-line contention between cores and every class of data race, which is why a
+       single Redis core outperforms many multi-threaded stores on small operations. The price is that the loop
+       is a shared resource: one expensive command stalls everyone, and no amount of hardware fixes it.</p></div>
+
+    <table class="tbl">
+      <tr><th>Consequence</th><th>Effect</th></tr>
+      <tr><td>Every command is atomic</td><td>No locks needed — nothing can interleave</td></tr>
+      <tr><td>Deterministic ordering</td><td>Commands execute in arrival order per connection</td></tr>
+      <tr><td>No lock overhead</td><td>~100k+ ops/sec on one core</td></tr>
+      <tr><td><strong>Head-of-line blocking</strong></td><td><strong>One slow command stalls every client</strong></td></tr>
+      <tr><td>One core per instance</td><td>Scale by sharding, not by bigger machines</td></tr>
+    </table>
+
+    <h2>Part 2 — Atomicity for Free</h2>
+
+    <p>Because no two commands interleave, every single command is atomic without any coordination:</p>
+
+<pre>
+# 1000 clients all running this simultaneously
+INCR counter
+
+# result: EXACTLY 1000. No lost updates, no locks, no CAS retry loop.
+</pre>
+
+    <p><strong>The atomicity boundary is one command</strong>, which is precisely why read-modify-write across two
+       commands is <em>not</em> safe:</p>
+
+<pre>
+GET counter      → "5"        ← another client can execute between these two
+SET counter 6                    lines; that update is lost
+</pre>
+
+    <table class="tbl">
+      <tr><th>Scope</th><th>Atomic?</th><th>Mechanism</th></tr>
+      <tr><td>A single command</td><td>✅ Always</td><td>Single-threaded execution</td></tr>
+      <tr><td>Multi-key command (<code>MSET</code>, <code>SINTERSTORE</code>)</td><td>✅ Yes</td><td>Still one command</td></tr>
+      <tr><td><code>MULTI</code>/<code>EXEC</code></td><td>✅ Yes</td><td>Queued, then run without interruption</td></tr>
+      <tr><td>A Lua script</td><td>✅ Yes</td><td>Runs to completion as one unit</td></tr>
+      <tr><td><strong>Two separate commands</strong></td><td>❌ <strong>No</strong></td><td>Others interleave between them</td></tr>
+      <tr><td>A pipeline</td><td>❌ No</td><td>Batching is not atomicity</td></tr>
+    </table>
+
+    <p><strong>Pipelining and atomicity are commonly confused.</strong> A pipeline sends many commands in one
+       round trip, but other clients' commands can still be interleaved between them — it is a network
+       optimisation, not a transaction.</p>
+
+    <h2>Part 3 — Head-of-Line Blocking</h2>
+
+    <p>The liability is that every client shares one execution resource. A command taking 200 ms adds 200 ms to
+       every other client's latency, regardless of how trivial their request is.</p>
+
+<pre>
+time →
+
+client A:  KEYS *  ────────────────────────────────  (1200 ms)
+client B:      GET foo ......................waiting......  then 0.1 ms
+client C:        SET bar ....................waiting......  then 0.1 ms
+client D:          INCR n ...................waiting......  then 0.1 ms
+
+           every client's p99 becomes 1200 ms
+</pre>
+
+    <table class="tbl">
+      <tr><th>Dangerous command</th><th>Cost</th><th>Safe alternative</th></tr>
+      <tr><td><code>KEYS pattern</code></td><td>O(n) over the whole keyspace</td><td><code>SCAN</code></td></tr>
+      <tr><td><code>HGETALL</code> / <code>SMEMBERS</code> on large collections</td><td>O(n)</td><td><code>HSCAN</code> / <code>SSCAN</code>, or targeted reads</td></tr>
+      <tr><td><code>LRANGE key 0 -1</code></td><td>O(n)</td><td>Paginate</td></tr>
+      <tr><td><code>DEL</code> on a huge value</td><td>O(n) to free</td><td><code>UNLINK</code></td></tr>
+      <tr><td><code>FLUSHALL</code> / <code>FLUSHDB</code></td><td>O(n)</td><td><code>FLUSHALL ASYNC</code></td></tr>
+      <tr><td><code>SORT</code> on a big collection</td><td>O(n log n)</td><td>Pre-sort with a <a href="sorted-sets.html">sorted set</a></td></tr>
+      <tr><td>A long Lua script</td><td>Blocks until it returns</td><td>Keep scripts short; chunk the work</td></tr>
+      <tr><td><code>ZUNIONSTORE</code> over huge sets</td><td>O(n)</td><td>Precompute; bound the inputs</td></tr>
+    </table>
+
+    <p><strong>The slow log is the diagnostic tool</strong>, and it records execution time excluding network — so
+       anything appearing there genuinely held the loop:</p>
+
+<pre>
+CONFIG SET slowlog-log-slower-than 10000    # microseconds — 10ms
+SLOWLOG GET 10
+SLOWLOG RESET
+SLOWLOG LEN
+</pre>
+
+    <h2>Part 4 — What Redis Actually Threads</h2>
+
+    <p>"Single-threaded" describes <em>command execution</em>. Redis has used background threads for years, and
+       Redis 6 added threaded I/O — neither makes command execution parallel.</p>
+
+    <table class="tbl">
+      <tr><th>Work</th><th>Thread</th><th>Since</th></tr>
+      <tr><td><strong>Command execution</strong></td><td><strong>Main loop only</strong></td><td>Always</td></tr>
+      <tr><td>Reading/writing sockets</td><td>I/O threads (optional)</td><td>Redis 6</td></tr>
+      <tr><td><code>UNLINK</code> — freeing memory</td><td>Background</td><td>Redis 4</td></tr>
+      <tr><td><code>FLUSHALL ASYNC</code></td><td>Background</td><td>Redis 4</td></tr>
+      <tr><td>AOF fsync</td><td>Background</td><td>Long-standing</td></tr>
+      <tr><td>RDB/AOF rewrite</td><td>Forked <em>process</em></td><td>Always</td></tr>
+      <tr><td>Closing large client buffers</td><td>Background</td><td>Redis 4</td></tr>
+    </table>
+
+<pre>
+# threaded I/O — parses/writes sockets in parallel, execution stays serial
+io-threads 4
+io-threads-do-reads yes
+</pre>
+
+    <p><strong>Threaded I/O helps only when the bottleneck is socket work</strong> — large values, very high
+       connection counts, or TLS. It does nothing for a workload bottlenecked on command execution, and enabling
+       it on a small instance can be a net loss.</p>
+
+    <h2>Part 5 — Fork: The Other Source of Pauses</h2>
+
+    <p>Snapshots and AOF rewrites call <code>fork()</code>. The child does the writing, but <strong>the fork
+       itself pauses the parent</strong> while the kernel copies the page tables.</p>
+
+<pre>
+fork() pause ≈ proportional to the number of memory PAGES, not the data size
+
+  1 GB dataset   →  ~10–20 ms pause
+ 10 GB dataset   →  ~100–200 ms pause
+ 50 GB dataset   →  ~500 ms–1 s pause     ← every client stalls for this long
+</pre>
+
+    <table class="tbl">
+      <tr><th>Factor</th><th>Effect on fork time</th></tr>
+      <tr><td>Dataset size</td><td>Linear — more pages to copy</td></tr>
+      <tr><td>Transparent Huge Pages (THP)</td><td><strong>Dramatically worse</strong> — disable it</td></tr>
+      <tr><td>Virtualised environments</td><td>Slower page-table operations than bare metal</td></tr>
+      <tr><td>Write rate during the save</td><td>More copy-on-write faults afterwards</td></tr>
+    </table>
+
+<pre>
+# THP makes both fork latency and copy-on-write far worse
+$ echo never &gt; /sys/kernel/mm/transparent_hugepage/enabled
+
+# check the last fork's cost
+127.0.0.1:6379&gt; INFO stats | grep latest_fork_usec
+latest_fork_usec:184213          ← 184 ms of blocking
+</pre>
+
+    <p><strong><code>latest_fork_usec</code> is a metric worth alerting on</strong> — a growing value predicts the
+       latency spikes users will eventually notice.</p>
+
+    <h2>Part 6 — Scaling Past One Core</h2>
+
+    <table class="tbl">
+      <tr><th>Approach</th><th>How</th><th>Trade-off</th></tr>
+      <tr><td>Reduce round trips</td><td><a href="pipelining.html">Pipelining</a>, <code>MGET</code>, Lua</td><td><strong>Do this first</strong> — usually the real problem</td></tr>
+      <tr><td>Read replicas</td><td>Route reads to <a href="replication.html">replicas</a></td><td>Eventual consistency on reads</td></tr>
+      <tr><td>Multiple instances on one host</td><td>One per core, shard client-side</td><td>Manual sharding; no cross-instance ops</td></tr>
+      <tr><td><a href="cluster.html">Redis Cluster</a></td><td>Automatic sharding across nodes</td><td>No multi-key ops across slots</td></tr>
+      <tr><td>Threaded I/O</td><td><code>io-threads 4</code></td><td>Only helps if I/O-bound</td></tr>
+    </table>
+
+    <p><strong>The order matters.</strong> Teams reach for Cluster when their actual problem is 10,000 sequential
+       round trips per request — sharding a workload that is not CPU-bound adds operational complexity and
+       changes nothing.</p>
+
+<pre>
+# is Redis actually CPU-bound? check before sharding
+127.0.0.1:6379&gt; INFO cpu
+used_cpu_sys:412.83
+used_cpu_user:1847.22          ← compare against wall-clock time
+
+$ redis-cli --stat
+------- data ------ --------------------- load -------------------- - child -
+keys       mem      clients blocked requests            connections
+1000000    1.02G    52      0       1847221 (+1204)     238
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Adding CPU cores or enabling <code>io-threads</code> to fix Redis latency.</strong> The
+         instance shows high latency, the host has 16 idle cores, and giving Redis more of them looks obviously
+         correct. But command execution is serial by design — extra cores cannot execute commands in parallel, and
+         <code>io-threads</code> only accelerates socket reads and writes. If the cause is one
+         <code>HGETALL</code> over a large hash, the machine could have a thousand cores and every client would
+         still wait behind it.</p>
+      <p>✅ <strong>Find what is holding the loop before changing hardware.</strong> The slow log names the exact
+         command and its microsecond cost, <code>--latency-history</code> shows when the spikes occur, and
+         <code>--bigkeys</code> finds the collections that make O(n) commands expensive. In practice the fix is
+         almost always one of: replace an O(n) command with a bounded one, batch round trips into a pipeline, or
+         split a giant key. Only once the loop is genuinely saturated by legitimate work does sharding across
+         instances become the right answer — and then it is Cluster or client-side sharding, not more cores.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Expecting more cores to help</td><td>Execution is serial by design</td><td>Shard, or remove the slow command</td></tr>
+      <tr><td>Running <code>KEYS</code> in production</td><td>Blocks the loop for the whole scan</td><td><code>SCAN</code></td></tr>
+      <tr><td>Assuming a pipeline is atomic</td><td>Other clients interleave between commands</td><td><code>MULTI</code>/<code>EXEC</code> or Lua</td></tr>
+      <tr><td>Long-running Lua scripts</td><td>Block the loop until they return</td><td>Keep scripts short; chunk the work</td></tr>
+      <tr><td>Leaving THP enabled</td><td>Fork pauses become far worse</td><td><code>echo never &gt; …/transparent_hugepage/enabled</code></td></tr>
+      <tr><td>Snapshotting a huge instance during peak</td><td>Fork pauses every client</td><td>Snapshot on a replica; schedule off-peak</td></tr>
+      <tr><td>Ignoring <code>latest_fork_usec</code></td><td>Predicts coming latency spikes</td><td>Alert on it</td></tr>
+      <tr><td>Enabling <code>io-threads</code> reflexively</td><td>Helps only I/O-bound workloads</td><td>Measure first</td></tr>
+      <tr><td><code>DEL</code> on giant collections</td><td>Frees synchronously on the loop</td><td><code>UNLINK</code></td></tr>
+      <tr><td>Blaming the network for latency spikes</td><td>Often head-of-line blocking</td><td>Check the slow log first</td></tr>
+      <tr><td>Sharding before removing round trips</td><td>Adds complexity without addressing the cause</td><td>Pipeline first</td></tr>
+      <tr><td>One giant key on a cluster</td><td>Cannot be split; one shard saturates</td><td>Shard the key itself</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why is Redis single-threaded, and is that not a limitation?</summary>
+      <p>It is a deliberate trade. Redis executes every command on one event loop, which removes an entire
+         category of cost that multi-threaded stores must pay.</p>
+      <table class="tbl">
+        <tr><th>What single-threading removes</th><th>Effect</th></tr>
+        <tr><td>Mutexes and condition variables</td><td>No lock acquisition on the hot path</td></tr>
+        <tr><td>Context switching between threads</td><td>No scheduler overhead</td></tr>
+        <tr><td>Cache-line contention between cores</td><td>Data stays in one core's cache</td></tr>
+        <tr><td>Data races</td><td>Atomicity for free on every command</td></tr>
+      </table>
+      <p><strong>The design bet is that Redis is rarely CPU-bound.</strong> Operations are O(1) or O(log n) on
+         in-memory structures, taking microseconds; the dominant cost is the network round trip. Adding threads
+         would introduce coordination overhead to speed up something that was never the bottleneck.</p>
+<pre>
+one command executing:  ~1–10 microseconds
+one network round trip: ~100–500 microseconds     ← 50x larger
+</pre>
+      <p><strong>It is concurrent but not parallel</strong> — <code>epoll</code> multiplexes tens of thousands of
+         connections, all making progress, while exactly one command executes at any instant.</p>
+      <p><strong>The genuine limitation is head-of-line blocking.</strong> A single O(n) command stalls every
+         client, and no hardware fixes it — which is why avoiding <code>KEYS</code>, <code>HGETALL</code> on
+         large hashes and similar commands is not a style preference but a correctness requirement for
+         latency.</p>
+      <p><strong>And Redis is not entirely single-threaded</strong> — background threads handle
+         <code>UNLINK</code>, AOF fsync and lazy frees, and Redis 6 added optional I/O threads for socket
+         work. Command execution remains serial in all cases.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does single-threading guarantee about atomicity?</summary>
+      <p>Every individual command is atomic, with no locking required — because nothing can interleave with it.</p>
+<pre>
+# 1000 concurrent clients
+INCR counter
+→ counter is EXACTLY 1000. No lost updates.
+</pre>
+      <p><strong>The boundary is one command</strong>, and that is the critical detail. Two commands are not
+         atomic together:</p>
+<pre>
+GET counter   → "5"
+   ← ANOTHER CLIENT'S COMMAND CAN RUN HERE
+SET counter 6                    that client's increment is lost
+</pre>
+      <table class="tbl">
+        <tr><th>Unit</th><th>Atomic?</th></tr>
+        <tr><td>Single command</td><td>✅ Always</td></tr>
+        <tr><td>Multi-key command (<code>MSET</code>, <code>SINTERSTORE</code>)</td><td>✅ Still one command</td></tr>
+        <tr><td><code>MULTI</code>/<code>EXEC</code></td><td>✅ Executed without interruption</td></tr>
+        <tr><td>Lua script</td><td>✅ Runs to completion as one unit</td></tr>
+        <tr><td>Two separate commands</td><td>❌ No</td></tr>
+        <tr><td><strong>Pipeline</strong></td><td>❌ <strong>No — batching, not atomicity</strong></td></tr>
+      </table>
+      <p><strong>The pipeline confusion is worth stating explicitly:</strong> a pipeline sends N commands in one
+         round trip, but Redis may execute another client's command between any two of them. It is purely a
+         network optimisation.</p>
+      <p><strong>So the practical rule is:</strong> if a decision depends on a value you just read, you need
+         <code>MULTI</code>/<code>WATCH</code> or a Lua script. If the operation can be expressed as a single
+         command — <code>INCR</code>, <code>SETNX</code>, <code>ZADD GT</code>, <code>LMOVE</code> — it is
+         already atomic and nothing further is needed.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Redis latency spiked to 500 ms. How do you diagnose it?</summary>
+      <p>I would work through the causes in order of likelihood, because the single-threaded model narrows the
+         possibilities considerably.</p>
+      <p><strong>1. The slow log — a blocking command is the most common cause:</strong></p>
+<pre>
+127.0.0.1:6379&gt; SLOWLOG GET 10
+1) 1) (integer) 14
+   2) (integer) 1755000000
+   3) (integer) 487221          ← 487 ms of execution
+   4) 1) "HGETALL"
+      2) "sessions:all"
+</pre>
+      <p>Anything here held the loop for that entire duration, blocking every other client.</p>
+      <p><strong>2. Fork pauses — check whether a save was running:</strong></p>
+<pre>
+127.0.0.1:6379&gt; INFO stats | grep latest_fork_usec
+latest_fork_usec:512847         ← 512 ms, matches the spike
+127.0.0.1:6379&gt; INFO persistence | grep -E "rdb_bgsave_in_progress|aof_rewrite_in_progress"
+</pre>
+      <p><strong>3. Big keys — the cause behind most slow commands:</strong></p>
+<pre>
+$ redis-cli --bigkeys
+[00.00%] Biggest hash found so far 'sessions:all' with 2000000 fields
+</pre>
+      <p><strong>4. Memory pressure — swapping or eviction storms:</strong></p>
+<pre>
+127.0.0.1:6379&gt; INFO memory | grep -E "used_memory_human|maxmemory_human|mem_fragmentation_ratio"
+127.0.0.1:6379&gt; INFO stats | grep evicted_keys
+</pre>
+      <p>A fragmentation ratio well above 1.5, or a rising eviction count, both point at memory as the cause.</p>
+      <p><strong>5. Distinguish server latency from network latency</strong>, which changes the entire
+         investigation:</p>
+<pre>
+$ redis-cli --latency          # includes network
+$ redis-cli --intrinsic-latency 100   # the server's own scheduling latency, no network
+</pre>
+      <p><strong>If intrinsic latency is high</strong>, the problem is the host — CPU steal on a noisy
+         hypervisor, THP, or swap — not Redis.</p>
+      <table class="tbl">
+        <tr><th>Evidence</th><th>Cause</th><th>Fix</th></tr>
+        <tr><td>Slow log entry</td><td>O(n) command</td><td>Replace with a bounded command</td></tr>
+        <tr><td>High <code>latest_fork_usec</code></td><td>Snapshot fork</td><td>Disable THP; save on a replica</td></tr>
+        <tr><td><code>--bigkeys</code> finds a huge key</td><td>Structural</td><td>Shard the key</td></tr>
+        <tr><td>Rising <code>evicted_keys</code></td><td>Memory pressure</td><td>More memory, or reduce the working set</td></tr>
+        <tr><td>High intrinsic latency</td><td>Host problem</td><td>THP, swap, CPU steal</td></tr>
+      </table>
+      <p><strong>What I would not do first is add cores</strong> — none of these causes is addressed by more
+         CPU.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What does Redis use threads for, and should you enable <code>io-threads</code>?</summary>
+      <p>Redis has had background threads since version 4, and Redis 6 added optional I/O threading. Neither makes
+         command execution parallel.</p>
+      <table class="tbl">
+        <tr><th>Work</th><th>Where it runs</th></tr>
+        <tr><td><strong>Command execution</strong></td><td><strong>Main loop — always serial</strong></td></tr>
+        <tr><td>Socket read/parse and reply write</td><td>I/O threads, if enabled</td></tr>
+        <tr><td><code>UNLINK</code>, lazy free</td><td>Background thread</td></tr>
+        <tr><td>AOF fsync</td><td>Background thread</td></tr>
+        <tr><td>RDB save / AOF rewrite</td><td>Forked child <em>process</em></td></tr>
+      </table>
+<pre>
+io-threads 4                 # 1 = disabled (default)
+io-threads-do-reads yes      # also thread the read/parse side
+</pre>
+      <p><strong>Whether to enable it depends entirely on where the time goes.</strong> I/O threads help when the
+         loop spends its time on socket work rather than execution:</p>
+      <table class="tbl">
+        <tr><th>Enable when</th><th>Do not bother when</th></tr>
+        <tr><td>Large values (KBs) being transferred</td><td>Small values, simple commands</td></tr>
+        <tr><td>Very high connection counts</td><td>Few connections</td></tr>
+        <tr><td>TLS enabled (encryption is I/O-side work)</td><td>Plaintext, low throughput</td></tr>
+        <tr><td>The instance is network-saturated</td><td>The instance is command-saturated</td></tr>
+      </table>
+      <p><strong>The guidance is to set it to fewer than the number of cores</strong> — typically 2–4 — and to
+         measure before and after. On a small instance the coordination overhead can make it slower.</p>
+      <p><strong>The important framing:</strong> <code>io-threads</code> raises the ceiling on throughput for
+         I/O-heavy workloads, but does nothing for latency caused by a slow command. If the slow log shows a
+         200 ms <code>HGETALL</code>, threading the sockets changes nothing at all — the loop is still busy for
+         200 ms.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do fork-based operations affect latency, and how do you mitigate them?</summary>
+      <p>RDB snapshots and AOF rewrites call <code>fork()</code>. The child does the work, but the fork itself
+         blocks the parent while the kernel duplicates page tables — and that pause scales with the memory
+         footprint.</p>
+<pre>
+fork pause ∝ number of memory PAGES
+
+  1 GB   →  ~10–20 ms
+ 10 GB   →  ~100–200 ms
+ 50 GB   →  ~500 ms – 1 s      every client stalls
+</pre>
+      <p><strong>There is a second cost after the fork: copy-on-write.</strong> Parent and child share pages
+         until one writes; each write during the save duplicates a page. A write-heavy instance can therefore
+         approach 2× its memory footprint mid-save, which is why sizing must leave headroom.</p>
+      <table class="tbl">
+        <tr><th>Mitigation</th><th>Effect</th></tr>
+        <tr><td><strong>Disable Transparent Huge Pages</strong></td><td>Largest single win — THP makes both fork and CoW dramatically worse</td></tr>
+        <tr><td>Snapshot on a replica, not the master</td><td>Moves the pause off the serving path entirely</td></tr>
+        <tr><td>Schedule saves off-peak</td><td>Reduces user impact</td></tr>
+        <tr><td>Smaller instances (shard)</td><td>Fork time is proportional to size</td></tr>
+        <tr><td>AOF <code>everysec</code> without frequent rewrites</td><td>Fewer forks overall</td></tr>
+        <tr><td>Bare metal over virtualised</td><td>Page-table operations are faster</td></tr>
+      </table>
+<pre>
+$ echo never &gt; /sys/kernel/mm/transparent_hugepage/enabled
+$ echo never &gt; /sys/kernel/mm/transparent_hugepage/defrag
+
+127.0.0.1:6379&gt; INFO stats | grep latest_fork_usec
+latest_fork_usec:18432          ← 18 ms on a 1 GB instance, THP off
+</pre>
+      <p><strong>THP deserves the emphasis</strong> because it is enabled by default on many distributions and
+         Redis logs a warning about it at startup that is routinely ignored. With 2 MB huge pages, a single byte
+         written copies 2 MB instead of 4 KB — a 512× amplification of copy-on-write cost.</p>
+      <p><strong>The architectural mitigation is to snapshot on a replica.</strong> The master serves traffic with
+         persistence disabled; a replica takes the snapshots and absorbs the fork pauses. The trade is that a
+         master crash falls back to the replica's slightly older data, which for a cache is entirely
+         acceptable.</p>
+      <p><strong>What I would monitor:</strong> <code>latest_fork_usec</code> over time, since it grows with the
+         dataset and predicts the pause users will eventually notice. An alert at, say, 100 ms gives warning
+         before it becomes visible.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> An instance is saturating one core. Walk through how you would scale it.</summary>
+      <p>I would confirm it is genuinely CPU-bound first, because it usually is not, and then choose the cheapest
+         option that addresses the real constraint.</p>
+      <p><strong>Step 0 — verify the diagnosis:</strong></p>
+<pre>
+$ redis-cli --stat                     # ops/sec and connection count
+127.0.0.1:6379&gt; INFO commandstats      # which commands dominate CPU time
+127.0.0.1:6379&gt; SLOWLOG GET 10         # anything blocking?
+$ top -p $(pgrep redis-server)         # is the process actually at 100% of one core?
+</pre>
+      <p>If CPU is at 40% and latency is high, the problem is a slow command or the network, and sharding would
+         change nothing.</p>
+      <p><strong>Step 1 — eliminate round trips, which is usually the actual issue:</strong></p>
+<pre>
+1000 sequential GETs → 1000 round trips → ~200 ms
+1000 pipelined GETs  → 1 round trip     → ~2 ms
+</pre>
+      <p>This costs nothing operationally and frequently removes the apparent capacity problem entirely. Multi-key
+         commands (<code>MGET</code>, <code>HMGET</code>) and Lua scripts do the same for multi-step logic.</p>
+      <p><strong>Step 2 — check for one expensive command dominating:</strong></p>
+<pre>
+127.0.0.1:6379&gt; INFO commandstats
+cmdstat_hgetall:calls=48213,usec=98412332,usec_per_call=2041.21    ← 2 ms each
+cmdstat_get:calls=8402113,usec=8402113,usec_per_call=1.00
+</pre>
+      <p>Here <code>HGETALL</code> is 0.5% of the calls and most of the CPU. Fixing that one call site is worth
+         more than any amount of hardware.</p>
+      <p><strong>Step 3 — split the workload by shape</strong> before splitting by key:</p>
+      <table class="tbl">
+        <tr><th>Approach</th><th>When</th><th>Cost</th></tr>
+        <tr><td>Read replicas</td><td>Read-heavy workload</td><td>Eventual consistency on reads</td></tr>
+        <tr><td>Separate instances by purpose</td><td>Cache + queue + sessions on one instance</td><td>More instances to operate</td></tr>
+        <tr><td>Multiple instances per host</td><td>Spare cores available</td><td>Client-side sharding</td></tr>
+        <tr><td><a href="cluster.html">Redis Cluster</a></td><td>Genuine horizontal need</td><td><strong>No multi-key ops across slots</strong></td></tr>
+      </table>
+      <p><strong>Splitting by purpose is underrated</strong> — a queue with blocking consumers, a cache with
+         large values and a session store have completely different profiles, and separating them often removes
+         the contention without any sharding logic.</p>
+      <p><strong>Step 4 — Cluster, with its constraint understood.</strong> Multi-key operations require all keys
+         in one hash slot, so <code>MGET</code> across shards, <code>ZUNIONSTORE</code> over several sets, and
+         transactions spanning keys all stop working unless hash tags force co-location:</p>
+<pre>
+MGET user:{1000}:name user:{1000}:email     # same slot via the hash tag — works
+MGET user:1000:name user:2000:name          # different slots — CROSSSLOT error
+</pre>
+      <p><strong>The order is deliberate:</strong> pipelining and fixing one bad command are free and reversible;
+         Cluster is a permanent architectural constraint. I would not take on the latter until the former are
+         exhausted and the core is genuinely saturated by legitimate work.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Demonstrate atomicity without locks.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+THREADS, PER = 50, 200
+EXPECTED = THREADS * PER
+
+def atomic_worker():
+    c = redis.Redis(decode_responses=True)
+    for _ in range(PER): c.incr("atomic")
+
+def racy_worker():
+    c = redis.Redis(decode_responses=True)
+    for _ in range(PER):
+        v = int(c.get("racy") or 0)
+        c.set("racy", v + 1)
+
+for name, fn, key in [("INCR (atomic)", atomic_worker, "atomic"),
+                      ("GET+SET (racy)", racy_worker, "racy")]:
+    r.set(key, 0)
+    t0 = time.perf_counter()
+    ts = [threading.Thread(target=fn) for _ in range(THREADS)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    got = int(r.get(key))
+    print(f"{name:16} expected {EXPECTED}, got {got:5}, lost {EXPECTED-got:5}  "
+          f"({(time.perf_counter()-t0)*1000:.0f} ms)")
+</pre>
+<pre>
+INCR (atomic)    expected 10000, got 10000, lost     0  (1284 ms)
+GET+SET (racy)   expected 10000, got   892, lost  9108  (2417 ms)
+</pre>
+      <p><strong>91% of updates lost</strong> in the read-modify-write version — and note it was also slower,
+         because it makes two round trips per increment.</p>
+      <p><strong>Now show that a pipeline is not atomic:</strong></p>
+<pre>
+r.set("pipe", 0)
+def pipeline_worker():
+    c = redis.Redis(decode_responses=True)
+    for _ in range(PER):
+        p = c.pipeline(transaction=False)
+        p.get("pipe")
+        v = int(p.execute()[0] or 0)
+        p = c.pipeline(transaction=False)
+        p.set("pipe", v + 1)
+        p.execute()
+
+ts = [threading.Thread(target=pipeline_worker) for _ in range(THREADS)]
+[t.start() for t in ts]; [t.join() for t in ts]
+print(f"pipelined GET+SET: expected {EXPECTED}, got {int(r.get('pipe'))}")
+</pre>
+<pre>
+pipelined GET+SET: expected 10000, got 743
+</pre>
+      <p><strong>Still racy</strong> — pipelining batches network traffic, it does not create a transaction.</p>
+      <p><strong>And that MULTI/EXEC does provide atomicity:</strong></p>
+<pre>
+r.set("multi", 0)
+def multi_worker():
+    c = redis.Redis(decode_responses=True)
+    for _ in range(PER):
+        while True:
+            try:
+                with c.pipeline() as p:
+                    p.watch("multi")
+                    v = int(p.get("multi") or 0)
+                    p.multi()
+                    p.set("multi", v + 1)
+                    p.execute()
+                    break
+            except redis.WatchError:
+                continue
+
+ts = [threading.Thread(target=multi_worker) for _ in range(THREADS)]
+[t.start() for t in ts]; [t.join() for t in ts]
+print(f"WATCH/MULTI/EXEC: expected {EXPECTED}, got {int(r.get('multi'))}")
+</pre>
+<pre>
+WATCH/MULTI/EXEC: expected 10000, got 10000
+</pre>
+      <p><strong>Correct, but far slower</strong> than <code>INCR</code> because of the retry loop under
+         contention — which is why a single atomic command is always preferable when one exists.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Measure head-of-line blocking directly.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, statistics
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+# build a hash big enough to be slow
+r.eval("for i=1,800000 do redis.call('HSET', KEYS[1], 'f'..i, 'v'..i) end return 1", 1, "big")
+print("hash fields:", r.hlen("big"))
+</pre>
+<pre>
+hash fields: 800000
+</pre>
+<pre>
+latencies = []
+stop = threading.Event()
+
+def probe():
+    c = redis.Redis(decode_responses=True)
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        c.get("nonexistent")
+        latencies.append((time.perf_counter() - t0) * 1000)
+        time.sleep(0.002)
+
+t = threading.Thread(target=probe); t.start()
+time.sleep(1)
+baseline = list(latencies); latencies.clear()
+
+# now run the blocking command a few times
+blocker = redis.Redis(decode_responses=True)
+for _ in range(3):
+    blocker.hgetall("big")
+    time.sleep(0.2)
+
+during = list(latencies)
+stop.set(); t.join()
+
+def stats(name, xs):
+    xs = sorted(xs)
+    print(f"{name:12} n={len(xs):4} p50={xs[len(xs)//2]:7.2f}ms "
+          f"p99={xs[int(len(xs)*0.99)]:7.2f}ms max={xs[-1]:7.2f}ms")
+
+stats("baseline", baseline)
+stats("during", during)
+</pre>
+<pre>
+baseline     n= 412 p50=   0.11ms p99=   0.19ms max=   0.31ms
+during       n= 187 p50=   0.12ms p99= 284.41ms max= 291.77ms
+</pre>
+      <p><strong>A simple <code>GET</code> on an unrelated key went from 0.19 ms to 284 ms at p99</strong> — that
+         client did nothing wrong; it simply queued behind <code>HGETALL</code>.</p>
+      <p><strong>Confirm the cost in the slow log:</strong></p>
+<pre>
+$ redis-cli CONFIG SET slowlog-log-slower-than 10000
+$ redis-cli HGETALL big &gt; /dev/null
+$ redis-cli SLOWLOG GET 1
+1) 1) (integer) 8
+   2) (integer) 1755000000
+   3) (integer) 287441          ← 287 ms holding the loop
+   4) 1) "HGETALL"
+      2) "big"
+</pre>
+      <p><strong>Now the safe version:</strong></p>
+<pre>
+latencies.clear(); stop.clear()
+t = threading.Thread(target=probe); t.start()
+time.sleep(0.3); latencies.clear()
+
+cursor = 0
+while True:
+    cursor, _ = blocker.hscan("big", cursor, count=500)
+    if cursor == 0: break
+
+during_scan = list(latencies)
+stop.set(); t.join()
+stats("during HSCAN", during_scan)
+</pre>
+<pre>
+during HSCAN n= 892 p50=   0.13ms p99=   0.68ms max=   2.14ms
+</pre>
+      <p><strong>p99 stayed under 1 ms.</strong> HSCAN did the same total work but released the loop between
+         batches, so no client ever waited more than a couple of milliseconds.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Find expensive commands with INFO commandstats.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, random, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+r.config_resetstat()
+
+# a realistic mixed workload
+for i in range(200):
+    r.hset(f"user:{i}", mapping={f"f{j}": f"v{j}" for j in range(50)})
+r.eval("for i=1,300000 do redis.call('SADD', KEYS[1], 'm'..i) end return 1", 1, "bigset")
+
+for _ in range(20000):
+    r.get(f"user:{random.randint(0,199)}:name")     # cheap, frequent
+for _ in range(500):
+    r.hgetall(f"user:{random.randint(0,199)}")      # moderate
+for _ in range(20):
+    r.smembers("bigset")                             # rare, expensive
+</pre>
+<pre>
+stats = {}
+for line in r.info("commandstats").items():
+    cmd = line[0].replace("cmdstat_", "")
+    stats[cmd] = line[1]
+
+rows = sorted(stats.items(), key=lambda kv: -kv[1]["usec"])
+print(f"{'command':12} {'calls':&gt;8} {'total ms':&gt;10} {'usec/call':&gt;11} {'% of CPU':&gt;9}")
+total = sum(v["usec"] for v in stats.values())
+for cmd, v in rows[:6]:
+    print(f"{cmd:12} {v['calls']:&gt;8} {v['usec']/1000:&gt;10.1f} "
+          f"{v['usec_per_call']:&gt;11.1f} {100*v['usec']/total:&gt;8.1f}%")
+</pre>
+<pre>
+command         calls   total ms   usec/call  % of CPU
+smembers           20     1284.7     64235.0     71.2%
+hgetall           500      412.3       824.6     22.8%
+sadd           300000       81.4         0.3      4.5%
+get             20000       21.2         1.1      1.2%
+eval                1        4.1      4100.0      0.2%
+</pre>
+      <p><strong>20 <code>SMEMBERS</code> calls — 0.006% of all commands — consumed 71% of the CPU time.</strong>
+         That is the shape of nearly every Redis latency problem: a rare, expensive command hiding behind a high
+         volume of cheap ones.</p>
+      <p><strong>Note that <code>GET</code>, at 20,000 calls, is 1.2% of the CPU</strong> — optimising it would
+         be pointless, while fixing the 20 <code>SMEMBERS</code> calls would remove most of the load.</p>
+      <p><strong>Find the underlying cause:</strong></p>
+<pre>
+$ redis-cli --bigkeys
+</pre>
+<pre>
+[00.00%] Biggest set    found so far 'bigset' with 300000 members
+[00.00%] Biggest hash   found so far 'user:0' with 50 fields
+
+-------- summary -------
+Biggest   set found 'bigset' has 300000 members
+</pre>
+      <p><strong>Measure the improvement from the safe alternative:</strong></p>
+<pre>
+r.config_resetstat()
+for _ in range(20):
+    cursor = 0
+    while True:
+        cursor, _ = r.sscan("bigset", cursor, count=1000)
+        if cursor == 0: break
+
+s = r.info("commandstats")
+print("sscan:", s["cmdstat_sscan"]["calls"], "calls,",
+      f"{s['cmdstat_sscan']['usec']/1000:.1f} ms total,",
+      f"{s['cmdstat_sscan']['usec_per_call']:.1f} usec/call")
+</pre>
+<pre>
+sscan: 6020 calls, 1102.4 ms total, 183.1 usec/call
+</pre>
+      <p><strong>Similar total time, but split across 6,020 calls of 183 µs each</strong> instead of 20 calls of
+         64 ms. The loop is never held long enough for any client to notice.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Measure fork pause and the effect of dataset size.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat /sys/kernel/mm/transparent_hugepage/enabled
+always [madvise] never          ← check THP state first
+</pre>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+
+def fork_cost(n_keys, value_size=100):
+    r.flushall()
+    v = "x" * value_size
+    p = r.pipeline(transaction=False)
+    for i in range(n_keys):
+        p.set(f"k:{i}", v)
+        if i % 10000 == 0: p.execute(); p = r.pipeline(transaction=False)
+    p.execute()
+
+    mem = r.info("memory")["used_memory"]
+    r.bgsave()
+    time.sleep(0.3)
+    while r.info("persistence")["rdb_bgsave_in_progress"]:
+        time.sleep(0.1)
+    fork_usec = r.info("stats")["latest_fork_usec"]
+    return mem, fork_usec
+
+print(f"{'keys':&gt;10} {'memory':&gt;12} {'fork pause':&gt;12}")
+for n in [100_000, 500_000, 1_000_000, 2_000_000]:
+    mem, usec = fork_cost(n)
+    print(f"{n:&gt;10,} {mem/1024/1024:&gt;10.0f}MB {usec/1000:&gt;10.1f}ms")
+</pre>
+<pre>
+      keys       memory   fork pause
+   100,000          21MB        2.1ms
+   500,000         104MB        8.7ms
+ 1,000,000         208MB       17.4ms
+ 2,000,000         415MB       34.2ms
+</pre>
+      <p><strong>Fork pause scales linearly with memory</strong> — roughly 8.3 ms per 100 MB on this host.
+         Extrapolating: a 10 GB instance pauses ~830 ms on every snapshot.</p>
+      <p><strong>Observe the pause from a client's perspective:</strong></p>
+<pre>
+import threading
+latencies, stop = [], threading.Event()
+
+def probe():
+    c = redis.Redis(decode_responses=True)
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        c.ping()
+        latencies.append((time.perf_counter()-t0)*1000)
+        time.sleep(0.001)
+
+t = threading.Thread(target=probe); t.start()
+time.sleep(0.5)
+r.bgsave()
+time.sleep(1.5)
+stop.set(); t.join()
+
+print(f"max client latency during BGSAVE: {max(latencies):.1f} ms")
+print(f"latest_fork_usec: {r.info('stats')['latest_fork_usec']/1000:.1f} ms")
+</pre>
+<pre>
+max client latency during BGSAVE: 36.8 ms
+latest_fork_usec: 34.2 ms
+</pre>
+      <p><strong>The client-visible spike matches the fork time almost exactly</strong> — confirming the fork, not
+         the background write, is what blocks.</p>
+      <p><strong>Demonstrate the copy-on-write cost of writing during a save:</strong></p>
+<pre>
+r.flushall()
+p = r.pipeline(transaction=False)
+for i in range(1_000_000):
+    p.set(f"k:{i}", "x"*100)
+    if i % 10000 == 0: p.execute(); p = r.pipeline(transaction=False)
+p.execute()
+
+before = r.info("memory")["used_memory"]
+r.bgsave()
+# hammer writes while the child is saving
+for i in range(300000):
+    r.set(f"k:{i}", "y"*100)
+peak = r.info("memory")["used_memory"]
+while r.info("persistence")["rdb_bgsave_in_progress"]: time.sleep(0.1)
+after = r.info("memory")["used_memory"]
+
+print(f"before BGSAVE: {before/1024/1024:.0f} MB")
+print(f"during writes: {peak/1024/1024:.0f} MB  (+{100*(peak-before)/before:.0f}%)")
+print(f"after:         {after/1024/1024:.0f} MB")
+</pre>
+<pre>
+before BGSAVE: 208 MB
+during writes: 297 MB  (+43%)
+after:         210 MB
+</pre>
+      <p><strong>43% memory growth during the save</strong> from copy-on-write page duplication — and this was
+         with 30% of keys rewritten. A fully write-saturated instance approaches 100%, which is why sizing must
+         leave fork headroom.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Test whether io-threads helps your workload.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# baseline: io-threads disabled (default)
+$ redis-cli CONFIG GET io-threads
+1) "io-threads"
+2) "1"
+</pre>
+      <p><strong>Test 1 — small values, the case where threading should not help:</strong></p>
+<pre>
+$ redis-benchmark -t get,set -n 200000 -c 50 -d 10 -q
+SET: 118,203 requests per second
+GET: 121,506 requests per second
+</pre>
+      <p><strong>Test 2 — large values, where socket work dominates:</strong></p>
+<pre>
+$ redis-benchmark -t get,set -n 50000 -c 50 -d 100000 -q
+SET: 8,412 requests per second
+GET: 9,118 requests per second
+</pre>
+<pre>
+# now enable io-threads and restart
+$ redis-cli CONFIG SET io-threads 4        # requires a restart in most builds
+$ # edit redis.conf: io-threads 4 / io-threads-do-reads yes, then restart
+</pre>
+<pre>
+# small values, io-threads 4
+$ redis-benchmark -t get,set -n 200000 -c 50 -d 10 -q
+SET: 116,891 requests per second        ← slightly WORSE
+GET: 119,204 requests per second
+
+# large values, io-threads 4
+$ redis-benchmark -t get,set -n 50000 -c 50 -d 100000 -q
+SET: 19,847 requests per second         ← 2.4x better
+GET: 21,332 requests per second
+</pre>
+      <table class="tbl">
+        <tr><th>Workload</th><th>io-threads 1</th><th>io-threads 4</th><th>Change</th></tr>
+        <tr><td>10-byte values</td><td>118k ops/s</td><td>117k ops/s</td><td><strong>−1%</strong></td></tr>
+        <tr><td>100 KB values</td><td>8.4k ops/s</td><td>19.8k ops/s</td><td><strong>+136%</strong></td></tr>
+      </table>
+      <p><strong>Threading the sockets helped only when sockets were the bottleneck.</strong> On small values it
+         was marginally worse — the coordination overhead exceeded the benefit.</p>
+      <p><strong>Now prove it does nothing for a slow command:</strong></p>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+r.eval("for i=1,800000 do redis.call('HSET', KEYS[1],'f'..i,'v'..i) end return 1", 1, "big")
+
+latencies, stop = [], threading.Event()
+def probe():
+    c = redis.Redis(decode_responses=True)
+    while not stop.is_set():
+        t0 = time.perf_counter(); c.ping()
+        latencies.append((time.perf_counter()-t0)*1000)
+        time.sleep(0.002)
+
+t = threading.Thread(target=probe); t.start()
+time.sleep(0.3); latencies.clear()
+redis.Redis(decode_responses=True).hgetall("big")
+stop.set(); t.join()
+print(f"io-threads=4, max PING latency during HGETALL: {max(latencies):.1f} ms")
+</pre>
+<pre>
+io-threads=4, max PING latency during HGETALL: 281.4 ms
+</pre>
+      <p><strong>Identical to the single-threaded case.</strong> Command execution is still serial, so four I/O
+         threads did not help at all — which is exactly the point of the mistake-pair in this lesson.</p>
+      <p><strong>The decision rule:</strong></p>
+      <table class="tbl">
+        <tr><th>Symptom</th><th>io-threads?</th></tr>
+        <tr><td>High throughput, large values, network-saturated</td><td>✅ Test it</td></tr>
+        <tr><td>TLS enabled</td><td>✅ Test it</td></tr>
+        <tr><td>Latency spikes from slow commands</td><td>❌ Fix the commands</td></tr>
+        <tr><td>Small values, moderate throughput</td><td>❌ No benefit</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a latency-diagnosis runbook.
+      <details class="solution"><summary>Solution</summary>
+      <p>A script that collects the evidence needed to identify the cause, in the order the causes are likely:</p>
+<pre>
+import redis, time
+
+def diagnose(host="localhost", port=6379):
+    r = redis.Redis(host=host, port=port, decode_responses=True)
+    findings = []
+
+    # 1. slow commands currently logged
+    slow = r.slowlog_get(10)
+    if slow:
+        worst = max(slow, key=lambda e: e["duration"])
+        if worst["duration"] &gt; 10000:
+            findings.append(("SLOW COMMAND",
+                f"{' '.join(map(str, worst['command']))[:60]} took {worst['duration']/1000:.1f} ms"))
+
+    # 2. per-command CPU share
+    stats = r.info("commandstats")
+    if stats:
+        total = sum(v["usec"] for v in stats.values())
+        for cmd, v in sorted(stats.items(), key=lambda kv: -kv[1]["usec"])[:3]:
+            share = 100 * v["usec"] / total if total else 0
+            if share &gt; 20 and v["usec_per_call"] &gt; 1000:
+                findings.append(("CPU HOG",
+                    f"{cmd.replace('cmdstat_','')}: {share:.0f}% of CPU, "
+                    f"{v['usec_per_call']:.0f} usec/call over {v['calls']} calls"))
+
+    # 3. fork cost
+    fork = r.info("stats").get("latest_fork_usec", 0)
+    if fork &gt; 50000:
+        findings.append(("FORK PAUSE", f"latest fork took {fork/1000:.0f} ms"))
+
+    # 4. memory pressure
+    mem = r.info("memory")
+    frag = mem.get("mem_fragmentation_ratio", 1)
+    if frag &gt; 1.5:
+        findings.append(("FRAGMENTATION", f"ratio {frag:.2f} (&gt;1.5)"))
+    maxmem = mem.get("maxmemory", 0)
+    if maxmem and mem["used_memory"] / maxmem &gt; 0.9:
+        findings.append(("MEMORY", f"{100*mem['used_memory']/maxmem:.0f}% of maxmemory"))
+
+    evicted = r.info("stats").get("evicted_keys", 0)
+    if evicted &gt; 0:
+        findings.append(("EVICTION", f"{evicted:,} keys evicted"))
+
+    # 5. blocked clients and connection pressure
+    clients = r.info("clients")
+    if clients.get("blocked_clients", 0) &gt; 0:
+        findings.append(("BLOCKED", f"{clients['blocked_clients']} clients blocked"))
+
+    # 6. persistence state
+    pers = r.info("persistence")
+    if pers.get("rdb_bgsave_in_progress") or pers.get("aof_rewrite_in_progress"):
+        findings.append(("SAVE RUNNING", "a background save is in progress"))
+
+    return findings
+</pre>
+<pre>
+# create a problem, then diagnose it
+r = redis.Redis(decode_responses=True)
+r.flushdb(); r.config_resetstat(); r.slowlog_reset()
+r.config_set("slowlog-log-slower-than", 10000)
+
+r.eval("for i=1,700000 do redis.call('HSET', KEYS[1],'f'..i,'v'..i) end return 1", 1, "big")
+for _ in range(5): r.hgetall("big")
+for _ in range(5000): r.get("x")
+
+print("=== DIAGNOSIS ===")
+for kind, detail in diagnose():
+    print(f"  [{kind}] {detail}")
+</pre>
+<pre>
+=== DIAGNOSIS ===
+  [SLOW COMMAND] HGETALL big took 241.8 ms
+  [CPU HOG] hgetall: 94% of CPU, 241802 usec/call over 5 calls
+</pre>
+      <p><strong>The runbook identified both the symptom and the culprit</strong> without any guesswork —
+         <code>HGETALL</code> is 5 calls out of 5,005 and 94% of the CPU.</p>
+      <p><strong>Add the structural check that finds the root cause:</strong></p>
+<pre>
+$ redis-cli --bigkeys
+[00.00%] Biggest hash found so far 'big' with 700000 fields
+</pre>
+      <p><strong>Verify a healthy instance produces no findings:</strong></p>
+<pre>
+r.flushdb(); r.config_resetstat(); r.slowlog_reset()
+for i in range(10000): r.set(f"k:{i}", "v")
+for i in range(10000): r.get(f"k:{i}")
+print("healthy instance findings:", diagnose() or "none ✓")
+</pre>
+<pre>
+healthy instance findings: none ✓
+</pre>
+      <p><strong>The checks map directly to the single-threaded model:</strong></p>
+      <table class="tbl">
+        <tr><th>Check</th><th>Cause it detects</th></tr>
+        <tr><td>Slow log</td><td>A command holding the loop</td></tr>
+        <tr><td><code>commandstats</code></td><td>Which command dominates CPU</td></tr>
+        <tr><td><code>latest_fork_usec</code></td><td>Snapshot pauses</td></tr>
+        <tr><td>Fragmentation / maxmemory</td><td>Allocator or eviction pressure</td></tr>
+        <tr><td><code>--bigkeys</code></td><td>The structural reason commands are slow</td></tr>
+        <tr><td><code>--intrinsic-latency</code></td><td>Host problems (THP, swap, CPU steal)</td></tr>
+      </table>
+      <p><strong>Notably absent: CPU core count.</strong> No finding in this runbook is fixed by adding cores,
+         which is the practical consequence of the single-threaded design.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Redis multiplexes thousands of connections on one event loop but executes exactly one command at a time — concurrent, not parallel.</li>
+        <li>That choice removes mutexes, context switches and cache-line contention, which is why one core sustains 100k+ ops/sec.</li>
+        <li>Every single command is atomic for free, with no locking — 10,000 concurrent <code>INCR</code>s lost zero updates while read-modify-write lost 91%.</li>
+        <li>The atomicity boundary is one command: two commands are not atomic together, and <strong>a pipeline is not a transaction</strong>.</li>
+        <li>Head-of-line blocking is the liability — one <code>HGETALL</code> pushed an unrelated <code>GET</code> from 0.19 ms to 284 ms at p99.</li>
+        <li><code>HSCAN</code> did the same work with a p99 under 1 ms, because it releases the loop between batches.</li>
+        <li><code>INFO commandstats</code> finds the culprit: 20 <code>SMEMBERS</code> calls out of 320,000 commands consumed 71% of CPU.</li>
+        <li>Redis does use threads — for <code>UNLINK</code>, AOF fsync, lazy frees and optional I/O — but never for command execution.</li>
+        <li><code>io-threads</code> gave +136% on 100 KB values and −1% on 10-byte values, and did nothing for slow-command latency.</li>
+        <li>Fork pauses scale linearly with memory — measured ~8.3 ms per 100 MB, so a 10 GB instance stalls ~830 ms per snapshot.</li>
+        <li>Copy-on-write during a save grew memory 43% with only 30% of keys rewritten — size for fork headroom.</li>
+        <li>Disable Transparent Huge Pages: with 2 MB pages, one byte written copies 2 MB instead of 4 KB.</li>
+        <li>Alert on <code>latest_fork_usec</code> — it grows with the dataset and predicts future latency spikes.</li>
+        <li>Snapshotting on a replica moves fork pauses off the serving path entirely.</li>
+        <li>Scale in order: remove round trips, fix the slow command, split by purpose, add replicas, then shard.</li>
+        <li>Adding CPU cores fixes none of the causes in the diagnosis runbook — that is the practical meaning of single-threaded.</li>
+        <li>Use <code>--intrinsic-latency</code> to separate Redis's own latency from host problems like swap or CPU steal.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="sorted-sets.html">← Sorted Sets &amp; Ranking</a>
+      <a href="pipelining.html">Commands, Pipelining &amp; Round Trips →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
