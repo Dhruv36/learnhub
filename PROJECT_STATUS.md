@@ -6,64 +6,59 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-11)
+## ▶️ RESUME HERE (last updated 2026-08-13)
 
-**Last completed:** ✅ **Vector Databases & RAG (track 21)** — **all 15 lessons** (51–68KB, every one
-`det=12 ex=6`) + quiz bank (`10 200 0`, 0 duplicate stems). Whole track passes `validate.py` with
-0 errors; pushed & live. Sections: Foundations ×4 · Indexing & Search ×4 · The Landscape ×3 ·
-RAG in Production ×4.
+**Last completed:** ✅ **LeetCode Patterns v4 (track 18)** — **all 21 lessons** rebuilt from v3
+(~12KB) to v4 (48–59KB, every one `det=12 ex=6`) + **quiz bank retuned** (`10 200 0`, 0 duplicate
+stems). Whole track passes `python validate.py tutorials/leetcode` with **0 errors and 0 warnings**;
+pushed & live.
 
-*§1 Foundations* — `index.html` (What a Vector Database Is For) · `embeddings.html` ·
-`similarity-metrics.html` · `dimensionality.html`
-*§2 Indexing & Search* — `knn-vs-ann.html` · `hnsw.html` · `ivf-pq.html` · `tuning-recall.html`
-*§3 The Landscape* — `pgvector.html` · `dedicated-stores.html` (segments/tombstones/sharding,
-fan-out tail latency) · `hybrid-search.html` (pre/post/during-traversal filtering, BM25, RRF)
-*§4 RAG in Production* — `chunking.html` (dilution, small-to-big, contextual headers, idempotent
-ingestion) · `retrieval-reranking.html` (funnel, bi- vs cross-encoder, query rewriting, lost-in-the-middle)
-· `evaluation.html` (eval sets, recall vs nDCG, LLM judges, significance, CI gates) ·
-`scaling-ops.html` (memory sizing, cost breakdown, caching, monitoring, model migration, context poisoning)
+*§Start Here + Foundations ×4* — `index.html` (recognition vs recall, constraint→complexity table,
+the 45-minute procedure) · `big-o.html` · `arrays-strings.html` · `hashing.html`
+*§Core Patterns ×8* — `two-pointers.html` · `sliding-window.html` · `prefix-sum.html` ·
+`fast-slow-pointers.html` (Floyd's `F = kC − a` derivation, implicit sequences, Brent's) ·
+`merge-intervals.html` (sweep line, sort-by-**end** greedy, difference-array benchmark) ·
+`binary-search.html` (predicate/boundary template, search on the *answer*, monotonicity fuzzer) ·
+`monotonic-stack.html` (four variants derived, histogram width, trapping water 3 ways) ·
+`linked-list-reversal.html` (pointer order from data dependencies, k-group, structural checker)
+*§Trees & Graphs ×4* — `bfs-dfs.html` (shortest-path invariant, mark-on-push, multi-source,
+three-colour cycles) · `binary-tree-patterns.html` (information-flow direction,
+return-one-track-another, BST in-order) · `topological-sort.html` (Kahn's, DFS finishing order,
+level counting, Alien Dictionary) · `union-find.html` (α(n), weighted/bipartite variants,
+offline deletion, Kruskal)
+*§Advanced ×6* — `heaps-top-k.html` (min-heap for k largest, two heaps, k-way merge, Quickselect) ·
+`backtracking.html` (choose/explore/unchoose, the `i > start` duplicate idiom, measured pruning) ·
+`dynamic-programming.html` (state definition, knapsack loop direction, LIS, reconstruction) ·
+`greedy.html` (exchange argument, where greedy fails, hypothesis fuzzing) ·
+`trie.html` (isEnd, wildcard search, Word Search II pruning, binary trie for XOR) ·
+`bit-manipulation.html` (XOR properties, `n&(n-1)`, submasks, bitmask DP, JS 32-bit hazards)
 
-⚠️ **`quiz.html` mojibake was NOT actually fixed by the earlier scaffold pass** — it still contained
-`Â·` and `â†’` (double-encoded UTF-8) and was repaired on 2026-08-11. **Check any newly-scaffolded
-`quiz.html` for both the stale `← CSS Track` link AND mojibake before committing.**
+**Quiz-bank retune (2026-08-13):** 27 question swaps adding v4-only material (Floyd's derivation,
+Brent, exchange argument, difference arrays, predicate template, monotonicity, histogram width,
+mark-on-push, multi-source BFS, three-colour marking, α(n), offline deletion, min-heap top-k,
+Quickselect, `i > start`, knapsack direction, LIS state, canonical coin systems, isEnd, MSB-first
+tries, submasks). **Also fixed a pre-existing flaw:** 191 of 200 correct answers sat at index 1,
+making the quiz guessable — options are now deterministically shuffled (66/71/63).
 
-**🚧 IN PROGRESS: LeetCode Patterns v4 (track 18)** — `tutorials/leetcode/`, 21 lessons, rebuilding
-v3 (~12KB) → v4 (~48-54KB, `det=12 ex=6`). Its `quiz.html` is clean (no `← CSS Track`, no mojibake)
-and the bank already validates `10 200 0` with sets mapped to this curriculum — **a light retune at
-the end, not a rewrite.**
+⚠️ **Scaffolding reminder:** any newly-copied `quiz.html` must be checked for BOTH the stale
+`← CSS Track` link AND mojibake (`Â·`, `â†’` — double-encoded UTF-8) before committing.
 
-**11 of 21 done — §Foundations COMPLETE ×3, §Core Patterns COMPLETE ×8.**
-Whole track passes `python validate.py tutorials/leetcode` with **0 errors** (the 10 not-yet-rebuilt
-v3 lessons show as size/`det` warnings, which is expected until they land).
+**⏳ NEXT: the infra six** — the last remaining v3 tracks, all still at ~12–16KB per lesson with
+3 `<details>` blocks. Per the 2026-08-05 user decision this is a **FULL EXPANSION** (~20 lessons
+each, ~70 total), not a deepen-in-place:
 
-*§Start Here + Foundations — COMPLETE ×4*
-- ✅ `index.html` (54KB) — Overview: recognition vs recall, constraint→complexity table, the decision
-  procedure, running the 45 minutes, what is actually scored, 8-week plan
-- ✅ `big-o.html` (49KB) — O/Ω/Θ precision, the ladder + arithmetic, reading complexity off code,
-  recurrence shortcuts, amortised analysis, space incl. call stack, constraint inference
-- ✅ `arrays-strings.html` (48KB) — read/write pointer template, string immutability O(n²) trap,
-  prefix/suffix precomputation, ops that hide loops, rotation/Dutch-flag, Unicode traps
-- ✅ `hashing.html` (48KB) — the four roles, canonical key design, complement pattern, collisions and
-  the O(n) worst case, frequency-array vs Map, language traps
+| Track | Dir | Now | Target |
+|-------|-----|-----|--------|
+| Docker | `tutorials/docker/` | 12 lessons | ~20 at v4 |
+| Kubernetes | `tutorials/kubernetes/` | 12 | ~20 |
+| AWS | `tutorials/aws/` | 12 | ~20 |
+| CI/CD | `tutorials/cicd/` | 12 | ~20 |
+| MongoDB | `tutorials/mongodb/` | 12 | ~20 |
+| Redis | `tutorials/redis/` | 11 | ~20 |
 
-*§Core Patterns — COMPLETE ×8*
-- ✅ `two-pointers.html` (50KB) — the discard argument, converging/parallel/fixed-gap templates
-- ✅ `sliding-window.html` (52KB) — amortised O(n) proof, shrink-while vs shrink-if, at-most-k trick
-- ✅ `prefix-sum.html` (49KB) — prefix/difference arrays, the `k=0` and negative-modulo traps
-- ✅ `fast-slow-pointers.html` (51KB) — Floyd's `F = kC − a` derivation, implicit sequences
-  (Happy Number, Find the Duplicate), Brent's algorithm compared by successor-call count
-- ✅ `merge-intervals.html` (51KB) — sort-by-start proof, sweep line, the sort-by-**end** greedy
-  exception with an exchange argument, difference-array benchmark (148× on bounded timestamps)
-- ✅ `binary-search.html` (54KB) — the predicate/boundary template replacing all variants, binary
-  search on the *answer*, rotated arrays, a monotonicity fuzz-checker (21% failure when violated)
-- ✅ `monotonic-stack.html` (56KB) — all four variants derived, amortised proof, histogram width
-  formula, Trapping Rain Water three ways benchmarked, the greedy stack family (Remove K Digits)
-- ✅ `linked-list-reversal.html` (53KB) — pointer order from data dependencies, dummy nodes,
-  sublist + k-group reversal, composite problems, a structural-integrity checker
-
-**⏳ NEXT: §Trees & Graphs ×4** — `bfs-dfs.html`, `binary-tree-patterns.html`,
-`topological-sort.html`, `union-find.html`. Then §Advanced ×6 (heaps-top-k, backtracking,
-dynamic-programming, greedy, trie, bit-manipulation), then the quiz-bank retune.
+Suggested order: **Docker → Kubernetes** (they build on each other) **→ CI/CD → AWS → MongoDB →
+Redis**. Each track: write `nav.js` first, then lessons (commit every ~2), then retune the quiz bank
+to `10 200 0`, then a whole-track validate.
 
 **Format used** (matches the v4 language-track recipe): "What you'll master" intro with prerequisite
 links → Parts 1–6 → one `.mistake-pair` → Common Mistakes table (12 rows) → 6 tiered interview Qs
@@ -81,8 +76,8 @@ must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair. A forward li
 not-yet-written next lesson shows as a "broken link" error — that is expected and clears when the
 next file lands; re-run the whole-track validate at the end to confirm 0 errors.
 
-**Then, in order:** LeetCode v4 (21 lessons + bank retune) → infra six (~70 lessons: Docker,
-Kubernetes, AWS, CI/CD, MongoDB, Redis).
+**Then:** the infra six (~70 lessons: Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis) — the last
+remaining v3 tracks.
 
 **Quiz-bank recipe (per the 2026-08-05 decision — a track is not done without it):**
 sets are `{title:"Quiz N · Topic", desc, questions:[{q, options:[3], answer:<idx>, explain}×20]}`,
@@ -116,7 +111,7 @@ Validate with the node one-liner at the bottom of this file → must print `10 2
 | 15 | Angular | 12 | 200 | ✅ DONE |
 | 16 | .NET (C#) | 23 (v4) | 200 | ✅ DONE |
 | 17 | ASP.NET Core | 23 (v4) | 200 | ✅ **v4 DONE 23/23** (2026-08-04) |
-| 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | 🚧 **v4 IN PROGRESS 11/21** — Foundations + Core Patterns complete |
+| 18 | LeetCode Patterns | 21 lessons (Foundations ×3 + Core ×8 + Trees&Graphs ×4 + Advanced ×6) | 200 | ✅ **v4 DONE 21/21 + quiz retuned** (2026-08-13) |
 | 19 | System Design | 36 lessons (Fundamentals ×11 + Deep Dives ×6 + Case Studies ×12 + Senior/Staff ×7) | 200 | ✅ DONE (v4) |
 | 20 | 🆕 Database Concepts & Architecture | **15 (v4)** | 200 | ✅ **DONE 15/15 + quiz bank** (2026-08-07) |
 | 21 | 🆕 Vector Databases & RAG | **15 (v4)** | 200 | ✅ **DONE 15/15 + quiz bank** (2026-08-11) |
@@ -192,11 +187,10 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 6. ~~**Database Concepts & Architecture**~~ ✅ **COMPLETE 2026-08-07** — 15/15 lessons (50–59KB) + quiz bank `10 200 0`
 7. ~~**Unix & Linux**~~ ✅ **COMPLETE 2026-08-10** — new track, 20/20 lessons (44–59KB) + quiz bank `10 200 0`
 8. ~~🆕 **Vector Databases & RAG**~~ ✅ **COMPLETE 2026-08-11** — new track, 15/15 lessons (51–68KB) + quiz bank `10 200 0`
-9. 🚧 **LeetCode** ← **CURRENT, 11/21 done** — §Start Here + Foundations ×4 and §Core Patterns ×8 rebuilt to v4 (48–56KB, `det=12 ex=6`); whole track validates 0 errors. Remaining: §Trees & Graphs ×4, §Advanced ×6, then the bank retune.
+9. ~~**LeetCode**~~ ✅ **COMPLETE 2026-08-13** — 21/21 lessons (48–59KB, all `det=12 ex=6`) + quiz bank retuned (27 swaps, answer positions de-skewed). Whole track validates 0 errors, 0 warnings.
 10. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
 
-**Remaining: ~91 lessons across 2 tracks**
-(LeetCode 21 + infra six ~70 under the approved expansion).
+**Remaining: ~70 lessons across 6 tracks** (the infra six, under the approved full expansion).
 
 #### SQL v4 — per-lesson status (as of 2026-08-05)
 Rebuilt in place, no redirect stubs needed. Every done lesson `det=12 ex=6`, 0 validation errors.
@@ -267,7 +261,7 @@ Vector Databases & RAG finished from 9/15 → 15/15 + both quiz banks; track 21 
 2. **`validate.py` earned its keep again** — it caught `<claim>` inside a `<pre>` in `evaluation.html`
    (unescaped `<` swallows content in browsers). Prompt templates containing `<placeholder>` tokens are a
    recurring source of this; escape them as `&lt;...&gt;`.
-Next up: LeetCode Patterns v4 (track 18).
+Next up: the infra six — Docker → Kubernetes → CI/CD → AWS → MongoDB → Redis.
 
 ### Session note 2026-08-06
 SQL v4 finished (5 lessons: transactions → indexes → isolation → optimization → scaling) **and its quiz bank retuned** — the first track to satisfy the new "not done without the bank" rule. Then Database Concepts built from zero: nav.js, quiz.html, root index card, and all 15 lessons.
