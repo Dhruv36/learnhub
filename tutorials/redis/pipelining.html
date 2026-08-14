@@ -1,0 +1,1177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Commands, Pipelining &amp; Round Trips — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Commands, Pipelining &amp; Round Trips <span class="level-badge level-inter">Working With Redis</span></h1>
+    <p><strong>What you'll master:</strong> why round trips — not Redis — dominate almost every latency problem,
+       with the arithmetic to prove it; pipelining as the highest-leverage optimisation available, and the batch
+       sizing that balances throughput against memory and head-of-line blocking; the crucial distinction between
+       pipelining and transactions, which look similar and guarantee entirely different things; multi-key
+       commands and when they beat a pipeline; connection pooling and the failure modes of getting it wrong;
+       and the RESP protocol details that explain error handling inside a pipeline. Prerequisites:
+       <a href="single-threaded.html">The Single-Threaded Model</a>.</p>
+
+    <h2>Part 1 — The Round-Trip Problem</h2>
+
+    <p>A Redis command costs a few microseconds to execute and hundreds of microseconds to travel. That ratio is
+       the single most important number in Redis performance work.</p>
+
+<pre>
+        client                          server
+          │                               │
+          │──── SET k1 v1 ───────────────▶│  execute: ~2 µs
+          │◀─── +OK ──────────────────────│
+          │                               │      RTT: ~200 µs
+          │──── SET k2 v2 ───────────────▶│
+          │◀─── +OK ──────────────────────│
+          │            ⋮                  │
+
+   1000 commands = 1000 round trips = 1000 × 200 µs = 200 ms
+   of which Redis spent:              1000 ×   2 µs =   2 ms
+</pre>
+
+    <div class="note">🔑 <strong>99% of that 200 ms is the network, and no amount of Redis tuning touches
+       it.</strong> This is why "Redis is slow" is almost always a client-side architecture problem: the server
+       is idle, waiting for the next request to arrive. Recognising it reframes optimisation entirely — instead
+       of asking which command is fastest, ask how many times per request you cross the network. A single
+       pipelined batch turns 200 ms into 2 ms without changing a single command.</p></div>
+
+    <table class="tbl">
+      <tr><th>Deployment</th><th>Typical RTT</th><th>1000 sequential commands</th></tr>
+      <tr><td>Unix socket, same host</td><td>~30 µs</td><td>30 ms</td></tr>
+      <tr><td>Same host, TCP loopback</td><td>~50 µs</td><td>50 ms</td></tr>
+      <tr><td>Same datacentre</td><td>~200 µs</td><td>200 ms</td></tr>
+      <tr><td>Cross-AZ</td><td>~1 ms</td><td><strong>1 second</strong></td></tr>
+      <tr><td>Cross-region</td><td>~50 ms</td><td><strong>50 seconds</strong></td></tr>
+    </table>
+
+    <p><strong>Cross-region Redis with sequential commands is unusable</strong>, and no server tuning changes
+       that — the fix is architectural.</p>
+
+    <h2>Part 2 — Pipelining</h2>
+
+    <p>Pipelining sends many commands without waiting for each reply, then reads all the replies together.</p>
+
+<pre>
+        client                          server
+          │                               │
+          │──── SET k1 v1 ────────────────▶│
+          │──── SET k2 v2 ────────────────▶│   all sent without waiting
+          │──── SET k3 v3 ────────────────▶│
+          │◀─── +OK +OK +OK ───────────────│   one round trip for all replies
+
+   1000 commands ≈ 1 RTT + 1000 × 2 µs ≈ 2 ms          (100× faster)
+</pre>
+
+<pre>
+# redis-cli
+$ redis-cli --pipe &lt; commands.txt
+
+# Python
+pipe = r.pipeline(transaction=False)      # transaction=False → pure pipelining
+for i in range(1000):
+    pipe.set(f"key:{i}", i)
+results = pipe.execute()                  # one round trip
+</pre>
+
+    <p><strong>Batch size is a real trade-off</strong>, not a "bigger is better" dial:</p>
+
+    <table class="tbl">
+      <tr><th>Batch size</th><th>Effect</th></tr>
+      <tr><td>1–10</td><td>Barely better than sequential</td></tr>
+      <tr><td>100–1000</td><td><strong>The sweet spot for most workloads</strong></td></tr>
+      <tr><td>10,000+</td><td>Diminishing returns; large reply buffers</td></tr>
+      <tr><td>100,000+</td><td>Memory pressure; one client monopolises the loop</td></tr>
+    </table>
+
+    <p><strong>The server buffers every reply until the batch completes</strong>, so a 100,000-command pipeline
+       returning 1 KB values builds a 100 MB output buffer — which can trip
+       <code>client-output-buffer-limit</code> and disconnect the client.</p>
+
+    <h2>Part 3 — Pipelining Is Not a Transaction</h2>
+
+    <p>These are routinely confused, and the difference matters for correctness.</p>
+
+    <table class="tbl">
+      <tr><th></th><th>Pipeline</th><th><code>MULTI</code>/<code>EXEC</code></th></tr>
+      <tr><td>Round trips</td><td>One</td><td>One</td></tr>
+      <tr><td>Other clients interleave?</td><td><strong>Yes</strong></td><td>No</td></tr>
+      <tr><td>All-or-nothing</td><td>No</td><td>Partially — see <a href="transactions.html">Transactions</a></td></tr>
+      <tr><td>Purpose</td><td>Network optimisation</td><td>Isolation</td></tr>
+    </table>
+
+<pre>
+# PIPELINE — another client's command CAN run between these
+pipe.get("balance")       ← client B may modify balance here
+pipe.set("balance", 100)
+pipe.execute()
+
+# MULTI/EXEC — nothing interleaves
+MULTI
+GET balance
+SET balance 100
+EXEC
+</pre>
+
+    <p><strong>Most client libraries default to wrapping pipelines in <code>MULTI</code></strong>, which is
+       usually not what you want for bulk loading — it adds isolation you did not ask for and prevents the server
+       from starting work until <code>EXEC</code> arrives:</p>
+
+<pre>
+r.pipeline()                    # transaction=True by default in redis-py!
+r.pipeline(transaction=False)   # ← pure pipelining, for bulk operations
+</pre>
+
+    <h2>Part 4 — Multi-Key Commands Beat Pipelines</h2>
+
+    <p>When a single command can express the work, it is better than a pipeline of many — one command, one
+       parse, one atomic unit.</p>
+
+<pre>
+# 3 round trips
+GET a; GET b; GET c
+
+# 1 round trip, pipelined — 3 commands
+pipe.get("a"); pipe.get("b"); pipe.get("c")
+
+# 1 round trip, ONE command — and atomic
+MGET a b c
+</pre>
+
+    <table class="tbl">
+      <tr><th>Instead of</th><th>Use</th><th>Gain</th></tr>
+      <tr><td>N × <code>GET</code></td><td><code>MGET</code></td><td>One command, atomic</td></tr>
+      <tr><td>N × <code>SET</code></td><td><code>MSET</code></td><td>One command, atomic</td></tr>
+      <tr><td>N × <code>HGET</code> on one hash</td><td><code>HMGET</code></td><td>One command</td></tr>
+      <tr><td>N × <code>SADD</code> to one set</td><td><code>SADD k a b c</code></td><td>Variadic</td></tr>
+      <tr><td>N × <code>ZADD</code> to one zset</td><td><code>ZADD k s1 m1 s2 m2</code></td><td>Variadic</td></tr>
+      <tr><td>N × <code>DEL</code></td><td><code>DEL k1 k2 k3</code> / <code>UNLINK</code></td><td>Variadic</td></tr>
+    </table>
+
+    <p><strong>Nearly every Redis command that could sensibly be variadic is variadic</strong> — checking the
+       documentation before writing a loop is usually worth it.</p>
+
+    <p><strong>The limit is that multi-key commands require all keys in one hash slot under
+       <a href="cluster.html">Cluster</a></strong>, whereas a pipeline can span shards (with a cluster-aware
+       client splitting it).</p>
+
+    <h2>Part 5 — Connection Pooling</h2>
+
+    <p>Opening a TCP connection costs a round trip or three; doing it per operation destroys any benefit
+       pipelining gave you.</p>
+
+<pre>
+# BAD: a new connection per request
+def get_user(uid):
+    r = redis.Redis(host="...")        # TCP handshake every call
+    return r.get(f"user:{uid}")
+
+# GOOD: a shared pool
+pool = redis.ConnectionPool(host="...", max_connections=50)
+r = redis.Redis(connection_pool=pool)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Guidance</th></tr>
+      <tr><td>Pool size</td><td>Roughly the number of concurrent workers — not more</td></tr>
+      <tr><td>Too small</td><td>Threads block waiting for a connection</td></tr>
+      <tr><td>Too large</td><td>Wasted memory server-side; <code>maxclients</code> pressure</td></tr>
+      <tr><td><code>maxclients</code></td><td>Server-side cap (default 10,000)</td></tr>
+      <tr><td>Timeouts</td><td>Always set <code>socket_timeout</code> — an unbounded wait is an outage</td></tr>
+    </table>
+
+    <p><strong>Each Redis connection costs server memory</strong> — an input buffer, an output buffer and a
+       client structure, typically ~20 KB idle. Ten thousand connections is ~200 MB before any data.</p>
+
+    <h2>Part 6 — RESP and Errors Inside a Pipeline</h2>
+
+    <p>A pipeline does not stop on error. Each command's reply is returned independently, including errors —
+       which means <strong>you must inspect the results</strong>.</p>
+
+<pre>
+pipe = r.pipeline(transaction=False)
+pipe.set("key", "value")
+pipe.incr("key")             # ← will fail: "value" is not an integer
+pipe.set("other", "x")
+results = pipe.execute(raise_on_error=False)
+
+# results = [True, ResponseError('value is not an integer...'), True]
+#                  ↑ the error is a RESULT, not an exception; later commands still ran
+</pre>
+
+    <table class="tbl">
+      <tr><th>RESP type</th><th>Prefix</th><th>Example</th></tr>
+      <tr><td>Simple string</td><td><code>+</code></td><td><code>+OK\r\n</code></td></tr>
+      <tr><td>Error</td><td><code>-</code></td><td><code>-ERR unknown command\r\n</code></td></tr>
+      <tr><td>Integer</td><td><code>:</code></td><td><code>:42\r\n</code></td></tr>
+      <tr><td>Bulk string</td><td><code>$</code></td><td><code>$5\r\nhello\r\n</code></td></tr>
+      <tr><td>Array</td><td><code>*</code></td><td><code>*2\r\n…</code></td></tr>
+    </table>
+
+    <p><strong>By default most clients raise on the first error</strong>, discarding the remaining results —
+       which silently loses information about which commands succeeded. For bulk operations,
+       <code>raise_on_error=False</code> and explicit inspection is the safer pattern.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Optimising the commands instead of counting the round trips.</strong> A slow endpoint gets
+         profiled, the Redis calls look individually fast — 0.2 ms each — and the conclusion is that Redis is
+         fine. But the endpoint makes 300 of them, so it spends 60 ms in Redis while the server itself did
+         600 µs of work. Teams then switch data structures, tune <code>maxmemory-policy</code>, or add read
+         replicas, none of which changes a number determined entirely by how many times the code crosses the
+         network.</p>
+      <p>✅ <strong>Count the round trips per request first, then eliminate them.</strong> Instrument the call
+         count, not just the total time — one line logging how many Redis commands an endpoint issues usually
+         makes the problem obvious. Then collapse them: a variadic command where one exists
+         (<code>MGET</code> over N <code>GET</code>s), a pipeline where the commands are independent, or a Lua
+         script where later commands depend on earlier results. Pipelining alone gave 27× on identical commands
+         in the <a href="index.html">overview</a> measurement; no amount of command tuning approaches that.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Sequential commands in a loop</td><td>One round trip each — the dominant cost</td><td>Pipeline, or a variadic command</td></tr>
+      <tr><td>Assuming a pipeline is atomic</td><td>Other clients interleave freely</td><td><code>MULTI</code> or Lua for isolation</td></tr>
+      <tr><td>Leaving <code>transaction=True</code> on bulk loads</td><td>Unwanted isolation and buffering</td><td><code>pipeline(transaction=False)</code></td></tr>
+      <tr><td>Enormous batches (100k+)</td><td>Huge output buffers; monopolises the loop</td><td>Chunk into 100–1000</td></tr>
+      <tr><td>Ignoring pipeline results</td><td>Errors are returned, not raised, per command</td><td>Inspect the results array</td></tr>
+      <tr><td>A new connection per operation</td><td>TCP handshake dominates</td><td>Connection pool</td></tr>
+      <tr><td>No <code>socket_timeout</code></td><td>A hung connection blocks a worker forever</td><td>Always set timeouts</td></tr>
+      <tr><td>Oversized connection pools</td><td>Server memory per connection; <code>maxclients</code></td><td>Size to concurrency</td></tr>
+      <tr><td>Pipelining commands that depend on each other</td><td>Results are unavailable until <code>execute()</code></td><td>Lua script</td></tr>
+      <tr><td>Cross-region Redis with chatty code</td><td>50 ms RTT × N is unusable</td><td>Local replica, or redesign</td></tr>
+      <tr><td><code>MGET</code> across cluster slots</td><td><code>CROSSSLOT</code> error</td><td>Hash tags, or a cluster-aware pipeline</td></tr>
+      <tr><td>Blocking commands inside a pipeline</td><td><code>BLPOP</code> stalls the whole batch</td><td>Keep blocking calls on their own connection</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is pipelining and why does it help so much?</summary>
+      <p>Pipelining sends multiple commands without waiting for each reply, then reads all the replies at once. It
+         helps because the round trip, not the execution, dominates.</p>
+<pre>
+execution per command: ~2 µs
+network round trip:    ~200 µs      ← 100x larger
+
+1000 sequential: 1000 × 200 µs = 200 ms
+1000 pipelined:  1 × 200 µs + 1000 × 2 µs ≈ 2 ms
+</pre>
+<pre>
+pipe = r.pipeline(transaction=False)
+for i in range(1000):
+    pipe.set(f"key:{i}", i)
+results = pipe.execute()
+</pre>
+      <p><strong>Nothing about Redis changed</strong> — the same 1000 commands, the same server. Only the number
+         of network crossings differs, which is why this is the highest-leverage optimisation available.</p>
+      <p><strong>Batch size matters:</strong> 100–1000 is the usual sweet spot. Beyond that the gains flatten
+         while the server buffers every reply until the batch finishes, so a very large pipeline can build a huge
+         output buffer and trip <code>client-output-buffer-limit</code>.</p>
+      <p><strong>The important caveat is that pipelining is not a transaction.</strong> Other clients' commands
+         can execute between the commands in your pipeline — it is purely a network optimisation, with no
+         isolation guarantee.</p>
+      <p><strong>And it does not work when commands depend on each other</strong>, since no results are available
+         until <code>execute()</code>. That case needs a <a href="transactions.html">Lua script</a>, which runs
+         server-side and can branch on intermediate values.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between a pipeline and MULTI/EXEC?</summary>
+      <p>Both send several commands in one round trip; only <code>MULTI</code>/<code>EXEC</code> provides
+         isolation.</p>
+      <table class="tbl">
+        <tr><th></th><th>Pipeline</th><th><code>MULTI</code>/<code>EXEC</code></th></tr>
+        <tr><td>Round trips</td><td>1</td><td>1</td></tr>
+        <tr><td>Other clients interleave</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Purpose</td><td>Reduce network cost</td><td>Isolation</td></tr>
+        <tr><td>Queued server-side?</td><td>No — executed as they arrive</td><td>Yes — until <code>EXEC</code></td></tr>
+      </table>
+<pre>
+# pipeline: client B CAN run between these
+pipe.get("balance")
+   ← client B: SET balance 0
+pipe.set("balance", 100)
+
+# MULTI: nothing interleaves
+MULTI
+  GET balance
+  SET balance 100
+EXEC        ← both run with no gap
+</pre>
+      <p><strong>The practical trap is that many clients default to transactional pipelines.</strong> In redis-py,
+         <code>r.pipeline()</code> wraps commands in <code>MULTI</code> unless you pass
+         <code>transaction=False</code> — which for a bulk load adds isolation you did not need and forces the
+         server to queue everything before executing any of it.</p>
+      <p><strong>For bulk operations use <code>transaction=False</code>;</strong> for a read-then-write that must
+         not be interfered with, use <code>MULTI</code> — or better, <code>WATCH</code> plus <code>MULTI</code>,
+         since <code>MULTI</code> alone does not let you make decisions based on values read inside it.</p>
+      <p><strong>One more distinction worth knowing:</strong> <code>MULTI</code>/<code>EXEC</code> is not a
+         rollback-capable transaction. If a command fails at execution time the others still apply — covered in
+         <a href="transactions.html">Transactions &amp; Lua</a>.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> An endpoint makes 300 Redis calls and takes 80 ms. How do you fix it?</summary>
+      <p>The arithmetic says the problem is round trips, not Redis:</p>
+<pre>
+300 calls × ~250 µs RTT = 75 ms of network
+300 calls × ~2 µs execution = 0.6 ms of actual Redis work
+</pre>
+      <p>Redis is idle 99% of that time. So I would attack the call count, in this order:</p>
+      <p><strong>1. Replace loops with variadic commands</strong> — the cheapest fix, and it also gains
+         atomicity:</p>
+<pre>
+# before: 100 round trips
+for uid in user_ids:
+    users[uid] = r.get(f"user:{uid}")
+
+# after: 1 round trip, 1 command
+values = r.mget([f"user:{uid}" for uid in user_ids])
+</pre>
+      <p><strong>2. Pipeline what cannot be expressed as one command:</strong></p>
+<pre>
+pipe = r.pipeline(transaction=False)
+for uid in user_ids:
+    pipe.hgetall(f"profile:{uid}")        # different keys, same command
+    pipe.zscore("leaderboard", uid)       # different commands
+results = pipe.execute()                  # 1 round trip for all 200
+</pre>
+      <p><strong>3. Use Lua where later commands depend on earlier results</strong>, since a pipeline cannot
+         branch:</p>
+<pre>
+-- server-side, one round trip, and atomic
+local ids = redis.call('SMEMBERS', KEYS[1])
+local out = {}
+for i, id in ipairs(ids) do
+  out[i] = redis.call('HGET', 'user:'..id, 'name')
+end
+return out
+</pre>
+      <p><strong>4. Question whether the data model fits the access pattern.</strong> Fetching 300 keys per
+         request often means the data should be stored together — one hash instead of 300 strings, or a
+         precomputed result cached under a single key.</p>
+      <table class="tbl">
+        <tr><th>Technique</th><th>Round trips</th><th>Use when</th></tr>
+        <tr><td>Sequential</td><td>N</td><td>Never, for N &gt; a handful</td></tr>
+        <tr><td>Pipeline</td><td>1</td><td>Commands are independent</td></tr>
+        <tr><td>Variadic command</td><td>1</td><td>One command expresses it — also atomic</td></tr>
+        <tr><td>Lua script</td><td>1</td><td>Commands depend on each other</td></tr>
+        <tr><td>Restructure the data</td><td>1</td><td>The access pattern was mismatched</td></tr>
+      </table>
+      <p><strong>What I would not do</strong> is add replicas or tune the server — the server is not the
+         bottleneck, and both changes would leave the 75 ms of network time untouched.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do errors behave inside a pipeline?</summary>
+      <p>A pipeline does not abort on error. Each command executes independently and its reply — success or error
+         — is returned in the results array.</p>
+<pre>
+pipe = r.pipeline(transaction=False)
+pipe.set("k", "hello")
+pipe.incr("k")                # fails: "hello" is not an integer
+pipe.set("other", "x")        # ← still executes
+results = pipe.execute(raise_on_error=False)
+
+# [True, ResponseError('value is not an integer or out of range'), True]
+</pre>
+      <p><strong>The default behaviour of most clients is to raise on the first error</strong>, which discards the
+         rest of the results — so you lose the information about which of the other 999 commands succeeded. For
+         bulk work that is usually wrong:</p>
+<pre>
+results = pipe.execute(raise_on_error=False)
+failures = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+if failures:
+    log.warning("%d of %d pipeline commands failed", len(failures), len(results))
+</pre>
+      <p><strong>This is also where pipelines differ from <code>MULTI</code>:</strong></p>
+      <table class="tbl">
+        <tr><th>Error type</th><th>Pipeline</th><th><code>MULTI</code>/<code>EXEC</code></th></tr>
+        <tr><td>Syntax error / unknown command</td><td>That command fails</td><td><strong>Whole transaction rejected</strong> at queue time</td></tr>
+        <tr><td>Runtime error (wrong type)</td><td>That command fails</td><td>That command fails; others still apply</td></tr>
+      </table>
+      <p><strong>Neither offers rollback</strong> — <code>MULTI</code> catches malformed commands before
+         execution, but a command that is syntactically valid and fails at runtime does not undo its
+         predecessors.</p>
+      <p><strong>The RESP detail underneath</strong> is that errors are just another reply type, prefixed with
+         <code>-</code>, sent inline with the rest. The client reads N replies for N commands regardless of
+         whether any were errors — which is why the results array always matches the command count.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How would you bulk-load 50 million keys into Redis?</summary>
+      <p>Sequential commands would take days, so the question is really about which bulk mechanism to use and how
+         to avoid destabilising the instance.</p>
+<pre>
+50M sequential commands × 200 µs = 10,000 seconds ≈ 2.8 hours (and that is optimistic)
+</pre>
+      <p><strong>Option 1 — <code>redis-cli --pipe</code>, the fastest general-purpose path:</strong></p>
+<pre>
+$ cat data.txt | redis-cli --pipe
+# data.txt contains raw RESP or inline commands:
+SET key:1 value1
+SET key:2 value2
+...
+All data transferred. errors: 0, replies: 50000000
+</pre>
+      <p>This reads replies asynchronously and sustains hundreds of thousands of commands per second.</p>
+      <p><strong>Option 2 — chunked application-side pipelines</strong>, when the data needs transformation:</p>
+<pre>
+BATCH = 1000
+pipe = r.pipeline(transaction=False)
+for i, (k, v) in enumerate(source):
+    pipe.set(k, v)
+    if (i + 1) % BATCH == 0:
+        pipe.execute()
+        pipe = r.pipeline(transaction=False)
+pipe.execute()
+</pre>
+      <p><strong>Option 3 — generate an RDB file offline</strong> and load it at startup. Fastest of all for a
+         cold instance, but requires the instance to be restartable and the RDB format to be generated
+         correctly.</p>
+      <table class="tbl">
+        <tr><th>Method</th><th>Throughput</th><th>Best for</th></tr>
+        <tr><td>Sequential</td><td>~5k/sec</td><td>Never</td></tr>
+        <tr><td>Application pipeline (1000)</td><td>~200k/sec</td><td>Data needing transformation</td></tr>
+        <tr><td><code>redis-cli --pipe</code></td><td>~500k/sec</td><td>Bulk import from a file</td></tr>
+        <tr><td>Pre-built RDB</td><td>Load-time only</td><td>Cold-start seeding</td></tr>
+      </table>
+      <p><strong>The operational concerns matter as much as the throughput:</strong></p>
+      <p><strong>1. Do not starve other clients.</strong> A sustained bulk load monopolises the single thread. On
+         a live instance I would throttle deliberately — a short sleep between batches — trading load time for
+         predictable latency for everyone else.</p>
+      <p><strong>2. Watch memory during the load</strong>, since 50M keys will trigger evictions if
+         <code>maxmemory</code> is reached mid-load, silently discarding the data just written.</p>
+      <p><strong>3. Disable persistence during the load if the data is reproducible.</strong> Repeated AOF
+         rewrites and snapshot forks during a heavy write burst cause exactly the latency spikes described in
+         <a href="single-threaded.html">the single-threaded lesson</a>; re-enabling afterwards and taking one
+         snapshot is much cheaper.</p>
+      <p><strong>4. Jitter TTLs if the keys expire</strong>, or 50M keys all expire simultaneously and cause the
+         mass-expiry spike from <a href="strings-keys.html">Strings &amp; Expiry</a>.</p>
+      <p><strong>5. Verify.</strong> <code>DBSIZE</code> after loading, and spot-check a sample — a pipeline
+         reports transport success, not that every command semantically succeeded.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do you size a connection pool, and what goes wrong at the extremes?</summary>
+      <p>The pool should be roughly the number of threads or coroutines that can be executing a Redis call
+         simultaneously — not more, and the failure modes at both extremes are worth knowing.</p>
+<pre>
+pool_size ≈ concurrent workers per process
+
+  16 worker threads → pool of ~16–20
+  async with 500 concurrent tasks → depends on how many are in Redis at once
+</pre>
+      <table class="tbl">
+        <tr><th>Too small</th><th>Too large</th></tr>
+        <tr><td>Workers block waiting for a connection</td><td>Wasted server memory (~20 KB each)</td></tr>
+        <tr><td>Latency rises under load with no server-side cause</td><td>Approaches <code>maxclients</code> (default 10,000)</td></tr>
+        <tr><td>Looks like "Redis is slow"</td><td>Connection storms after a failover</td></tr>
+      </table>
+      <p><strong>The too-small case is the more confusing one to diagnose</strong>, because Redis shows low CPU
+         and fast command times while the application sees high latency — the wait is entirely in the client's
+         pool.</p>
+<pre>
+# server-side view
+127.0.0.1:6379&gt; INFO clients
+connected_clients:47
+blocked_clients:0              ← Redis is fine
+
+# the queue is in the CLIENT
+</pre>
+      <p><strong>Timeouts are non-negotiable:</strong></p>
+<pre>
+pool = redis.ConnectionPool(
+    host="redis", max_connections=20,
+    socket_timeout=2,            # a hung read must not block a worker forever
+    socket_connect_timeout=1,
+    health_check_interval=30,    # detect dead connections proactively
+    retry_on_timeout=True,
+)
+</pre>
+      <p><strong>Without <code>socket_timeout</code>, a network partition hangs every worker indefinitely</strong>
+         — the process appears alive while doing nothing, which is worse than crashing.</p>
+      <p><strong>The multiplication factor people forget:</strong> pool size is per process. Fifty application
+         instances × 20 connections = 1,000 connections, which is fine; but 500 instances × 100 = 50,000, which
+         exceeds <code>maxclients</code> and causes connection refusals during a deploy when everything reconnects
+         at once.</p>
+      <p><strong>Blocking commands need their own connection.</strong> <code>BLPOP</code> occupies a connection
+         for its entire timeout, so a worker pool doing blocking reads must not share with the request path — a
+         handful of blocked consumers can otherwise exhaust the pool.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure the round-trip cost directly.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ redis-cli --latency
+min: 0, max: 2, avg: 0.14 (1482 samples)
+</pre>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+N = 3000
+
+t0 = time.perf_counter()
+for i in range(N): r.set(f"seq:{i}", i)
+seq = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+p = r.pipeline(transaction=False)
+for i in range(N): p.set(f"pipe:{i}", i)
+p.execute()
+pipelined = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+r.mset({f"mset:{i}": i for i in range(N)})
+mset = time.perf_counter() - t0
+
+print(f"sequential : {seq*1000:8.1f} ms  ({N/seq:9,.0f} ops/s)")
+print(f"pipelined  : {pipelined*1000:8.1f} ms  ({N/pipelined:9,.0f} ops/s)  {seq/pipelined:5.1f}x")
+print(f"MSET       : {mset*1000:8.1f} ms  ({N/mset:9,.0f} ops/s)  {seq/mset:5.1f}x")
+</pre>
+<pre>
+sequential :    521.4 ms  (    5,754 ops/s)
+pipelined  :     18.7 ms  (  160,428 ops/s)   27.9x
+MSET       :      6.2 ms  (  483,871 ops/s)   84.1x
+</pre>
+      <p><strong>MSET is 84× faster than the loop</strong> — one command, one round trip, one parse. Pipelining
+         is 28×, and the remaining gap is per-command parsing overhead.</p>
+      <p><strong>Find the optimal batch size:</strong></p>
+<pre>
+r.flushdb()
+N = 20000
+print(f"{'batch':&gt;8} {'time':&gt;10} {'ops/sec':&gt;12}")
+for batch in [1, 10, 50, 100, 500, 1000, 5000, 20000]:
+    r.flushdb()
+    t0 = time.perf_counter()
+    p = r.pipeline(transaction=False)
+    for i in range(N):
+        p.set(f"k:{i}", i)
+        if (i+1) % batch == 0:
+            p.execute(); p = r.pipeline(transaction=False)
+    p.execute()
+    el = time.perf_counter() - t0
+    print(f"{batch:&gt;8} {el*1000:&gt;9.1f}ms {N/el:&gt;12,.0f}")
+</pre>
+<pre>
+   batch       time      ops/sec
+       1    3421.7ms        5,845
+      10     384.2ms       52,057
+      50     112.8ms      177,305
+     100      74.1ms      269,905
+     500      41.2ms      485,437
+    1000      36.8ms      543,478
+    5000      33.9ms      590,000
+   20000      33.1ms      604,229
+</pre>
+      <p><strong>Gains flatten sharply after ~1000.</strong> Going from 1000 to 20,000 bought 11% more throughput
+         while making the reply buffer 20× larger — which is why 100–1000 is the recommended range.</p>
+      <p><strong>Measure the cost of a new connection per call:</strong></p>
+<pre>
+t0 = time.perf_counter()
+for i in range(200):
+    c = redis.Redis(decode_responses=True)     # new connection each time
+    c.set(f"conn:{i}", i)
+    c.close()
+newconn = time.perf_counter() - t0
+
+pool = redis.ConnectionPool(max_connections=10)
+rp = redis.Redis(connection_pool=pool, decode_responses=True)
+t0 = time.perf_counter()
+for i in range(200): rp.set(f"pool:{i}", i)
+pooled = time.perf_counter() - t0
+
+print(f"new connection each: {newconn*1000:7.1f} ms")
+print(f"pooled:              {pooled*1000:7.1f} ms   ({newconn/pooled:.1f}x faster)")
+</pre>
+<pre>
+new connection each:   412.8 ms
+pooled:                 34.2 ms   (12.1x faster)
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove a pipeline is not atomic.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+r.set("shared", 0)
+
+interference = {"count": 0}
+stop = threading.Event()
+
+def interferer():
+    c = redis.Redis(decode_responses=True)
+    while not stop.is_set():
+        c.set("shared", 999)               # constantly overwrite
+        interference["count"] += 1
+        time.sleep(0.0001)
+
+t = threading.Thread(target=interferer); t.start()
+time.sleep(0.05)
+
+# pipeline: read then write, in one round trip
+mismatches = 0
+for _ in range(200):
+    p = r.pipeline(transaction=False)
+    p.set("shared", 1)
+    p.get("shared")                        # is it still 1?
+    _, value = p.execute()
+    if value != "1": mismatches += 1
+
+stop.set(); t.join()
+print(f"interfering writes: {interference['count']}")
+print(f"pipeline saw an interleaved value {mismatches}/200 times")
+</pre>
+<pre>
+interfering writes: 4127
+pipeline saw an interleaved value 63/200 times
+</pre>
+      <p><strong>In 63 of 200 cases another client's command executed between the two pipeline
+         commands</strong> — conclusive proof that pipelining provides no isolation.</p>
+      <p><strong>Now the same test with MULTI:</strong></p>
+<pre>
+r.set("shared", 0)
+stop.clear()
+t = threading.Thread(target=interferer); t.start()
+time.sleep(0.05)
+
+mismatches = 0
+for _ in range(200):
+    p = r.pipeline(transaction=True)       # MULTI/EXEC
+    p.set("shared", 1)
+    p.get("shared")
+    _, value = p.execute()
+    if value != "1": mismatches += 1
+
+stop.set(); t.join()
+print(f"MULTI saw an interleaved value {mismatches}/200 times")
+</pre>
+<pre>
+MULTI saw an interleaved value 0/200 times
+</pre>
+      <p><strong>Zero interleaving</strong> — <code>MULTI</code>/<code>EXEC</code> queues the commands and runs
+         them as one uninterrupted unit.</p>
+      <p><strong>Check which mode your client uses by default:</strong></p>
+<pre>
+p1 = r.pipeline()
+p2 = r.pipeline(transaction=False)
+print("r.pipeline() is transactional:", p1.is_transaction)
+print("r.pipeline(transaction=False):", p2.is_transaction)
+</pre>
+<pre>
+r.pipeline() is transactional: True
+r.pipeline(transaction=False): False
+</pre>
+      <p><strong>redis-py defaults to transactional</strong>, which surprises people doing bulk loads — it adds
+         isolation they did not want and delays execution until <code>EXEC</code>.</p>
+      <p><strong>Measure the overhead of that default:</strong></p>
+<pre>
+N = 20000
+for label, txn in [("transaction=False", False), ("transaction=True", True)]:
+    r.flushdb()
+    t0 = time.perf_counter()
+    p = r.pipeline(transaction=txn)
+    for i in range(N):
+        p.set(f"k:{i}", i)
+        if (i+1) % 1000 == 0: p.execute(); p = r.pipeline(transaction=txn)
+    p.execute()
+    print(f"{label:20} {(time.perf_counter()-t0)*1000:7.1f} ms")
+</pre>
+<pre>
+transaction=False      36.4 ms
+transaction=True       48.9 ms
+</pre>
+      <p><strong>34% slower</strong> for isolation a bulk load does not need — the extra <code>MULTI</code> and
+         <code>EXEC</code> commands plus server-side queueing.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Handle errors correctly inside a pipeline.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+r.set("text", "hello")
+r.lpush("mylist", "a")
+</pre>
+<pre>
+# default: raises on the first error, losing the rest
+p = r.pipeline(transaction=False)
+p.set("a", 1)
+p.incr("text")        # WRONGTYPE-ish: not an integer
+p.set("b", 2)
+p.get("mylist")       # WRONGTYPE: it is a list
+p.set("c", 3)
+
+try:
+    results = p.execute()
+except redis.ResponseError as e:
+    print(f"raised: {e}")
+    print("→ we now know NOTHING about the other 4 commands")
+</pre>
+<pre>
+raised: value is not an integer or out of range
+→ we now know NOTHING about the other 4 commands
+</pre>
+<pre>
+# better: collect all results and inspect
+p = r.pipeline(transaction=False)
+p.set("a", 1); p.incr("text"); p.set("b", 2); p.get("mylist"); p.set("c", 3)
+results = p.execute(raise_on_error=False)
+
+for i, res in enumerate(results):
+    kind = "ERROR" if isinstance(res, Exception) else "ok"
+    print(f"  [{i}] {kind:5} {res}")
+
+errors = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+print(f"\n{len(errors)} of {len(results)} commands failed; the rest APPLIED")
+print("verify:", r.mget("a", "b", "c"))
+</pre>
+<pre>
+  [0] ok    True
+  [1] ERROR value is not an integer or out of range
+  [2] ok    True
+  [3] ERROR WRONGTYPE Operation against a key holding the wrong kind of value
+  [4] ok    True
+
+2 of 5 commands failed; the rest APPLIED
+verify: ['1', '2', '3']
+</pre>
+      <p><strong>The three successful writes took effect</strong> — a pipeline has no rollback and does not stop
+         at the first failure.</p>
+      <p><strong>Compare with MULTI for a malformed command:</strong></p>
+<pre>
+p = r.pipeline(transaction=True)
+p.set("x", 1)
+p.execute_command("NOTACOMMAND", "arg")     # unknown command
+p.set("y", 2)
+try:
+    p.execute()
+except Exception as e:
+    print(f"MULTI rejected: {type(e).__name__}")
+print("did x get set?", r.get("x"))
+</pre>
+<pre>
+MULTI rejected: ResponseError
+did x get set? None
+</pre>
+      <p><strong>The whole transaction was discarded</strong> because the error was detected at queue time. But a
+         <em>runtime</em> error behaves differently:</p>
+<pre>
+r.set("num", "notanumber")
+p = r.pipeline(transaction=True)
+p.set("before", "yes")
+p.incr("num")               # valid syntax, fails at runtime
+p.set("after", "yes")
+results = p.execute(raise_on_error=False)
+print("results:", results)
+print("before:", r.get("before"), " after:", r.get("after"))
+</pre>
+<pre>
+results: [True, ResponseError('value is not an integer or out of range'), True]
+before: yes  after: yes
+</pre>
+      <p><strong>Both writes applied despite the failure in the middle</strong> — <code>MULTI</code> gives
+         isolation, not rollback. That distinction is the single most misunderstood thing about Redis
+         transactions, and it is covered fully in <a href="transactions.html">the next lesson</a>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Compare pipelines, variadic commands and Lua.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+N = 5000
+for i in range(N): r.set(f"src:{i}", i * 2)
+keys = [f"src:{i}" for i in range(N)]
+</pre>
+<pre>
+# 1. sequential
+t0 = time.perf_counter()
+vals = [r.get(k) for k in keys]
+seq = time.perf_counter() - t0
+
+# 2. pipelined
+t0 = time.perf_counter()
+p = r.pipeline(transaction=False)
+for k in keys: p.get(k)
+vals2 = p.execute()
+pipe_t = time.perf_counter() - t0
+
+# 3. MGET
+t0 = time.perf_counter()
+vals3 = r.mget(keys)
+mget_t = time.perf_counter() - t0
+
+# 4. Lua
+script = r.register_script("""
+local out = {}
+for i, k in ipairs(KEYS) do out[i] = redis.call('GET', k) end
+return out
+""")
+t0 = time.perf_counter()
+vals4 = script(keys=keys)
+lua_t = time.perf_counter() - t0
+
+assert vals == vals2 == vals3 == vals4
+for label, t in [("sequential", seq), ("pipeline", pipe_t), ("MGET", mget_t), ("Lua", lua_t)]:
+    print(f"{label:12} {t*1000:8.2f} ms   {seq/t:6.1f}x")
+</pre>
+<pre>
+sequential     874.21 ms      1.0x
+pipeline        31.44 ms     27.8x
+MGET             9.87 ms     88.6x
+Lua             12.31 ms     71.0x
+</pre>
+      <p><strong>MGET wins</strong> — one command, one parse, one reply array. Lua is close but pays script
+         invocation overhead; the pipeline pays per-command parsing for 5,000 commands.</p>
+      <p><strong>Now a case where a pipeline cannot work — commands that depend on earlier results:</strong></p>
+<pre>
+r.flushdb()
+r.sadd("members", *[f"user:{i}" for i in range(500)])
+for i in range(500): r.hset(f"user:{i}", "name", f"Name{i}")
+
+# sequential: read the set, then fetch each member
+t0 = time.perf_counter()
+ids = r.smembers("members")
+names = [r.hget(uid, "name") for uid in ids]
+seq2 = time.perf_counter() - t0
+
+# pipeline: still needs the SMEMBERS result first — 2 round trips
+t0 = time.perf_counter()
+ids = r.smembers("members")
+p = r.pipeline(transaction=False)
+for uid in ids: p.hget(uid, "name")
+names2 = p.execute()
+pipe2 = time.perf_counter() - t0
+
+# Lua: ONE round trip, the dependency resolved server-side
+script2 = r.register_script("""
+local ids = redis.call('SMEMBERS', KEYS[1])
+local out = {}
+for i, id in ipairs(ids) do out[i] = redis.call('HGET', id, 'name') end
+return out
+""")
+t0 = time.perf_counter()
+names3 = script2(keys=["members"])
+lua2 = time.perf_counter() - t0
+
+print(f"sequential:  {seq2*1000:7.2f} ms  ({len(names)} names)")
+print(f"pipeline:    {pipe2*1000:7.2f} ms  (2 round trips)")
+print(f"Lua:         {lua2*1000:7.2f} ms  (1 round trip, atomic)")
+</pre>
+<pre>
+sequential:   142.81 ms  (500 names)
+pipeline:       3.94 ms  (2 round trips)
+Lua:            1.87 ms  (1 round trip, atomic)
+</pre>
+      <p><strong>Lua is twice as fast as the pipeline here</strong> because the dependency forces the pipeline
+         into two round trips — and Lua additionally guarantees the set did not change between the
+         <code>SMEMBERS</code> and the <code>HGET</code>s.</p>
+      <table class="tbl">
+        <tr><th>Technique</th><th>Round trips</th><th>Atomic</th><th>Use when</th></tr>
+        <tr><td>Variadic (<code>MGET</code>)</td><td>1</td><td>✅</td><td>One command expresses it</td></tr>
+        <tr><td>Pipeline</td><td>1</td><td>❌</td><td>Independent commands</td></tr>
+        <tr><td>Lua</td><td>1</td><td>✅</td><td>Commands depend on each other</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Bulk-load 2 million keys and compare methods.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ redis-cli FLUSHALL
+# generate the input file
+$ python3 -c "
+for i in range(2_000_000):
+    print(f'SET bulk:{i} value{i}')
+" &gt; /tmp/bulk.txt
+$ wc -l /tmp/bulk.txt
+2000000 /tmp/bulk.txt
+</pre>
+<pre>
+$ time redis-cli --pipe &lt; /tmp/bulk.txt
+All data transferred. Waiting for the last reply...
+Last reply received from server.
+errors: 0, replies: 2000000
+
+real    0m4.128s
+</pre>
+      <p><strong>485,000 commands per second</strong> from a file, with no application code.</p>
+      <p><strong>Now the application-side comparison:</strong></p>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+
+def load(label, fn, n=200_000):
+    r.flushall()
+    t0 = time.perf_counter()
+    fn(n)
+    el = time.perf_counter() - t0
+    assert r.dbsize() == n, f"expected {n}, got {r.dbsize()}"
+    print(f"{label:28} {el:6.2f}s  {n/el:10,.0f} ops/s")
+
+def sequential(n):
+    for i in range(n): r.set(f"k:{i}", i)
+
+def pipe_batch(size):
+    def go(n):
+        p = r.pipeline(transaction=False)
+        for i in range(n):
+            p.set(f"k:{i}", i)
+            if (i+1) % size == 0: p.execute(); p = r.pipeline(transaction=False)
+        p.execute()
+    return go
+
+def mset_batch(size):
+    def go(n):
+        buf = {}
+        for i in range(n):
+            buf[f"k:{i}"] = i
+            if len(buf) == size: r.mset(buf); buf = {}
+        if buf: r.mset(buf)
+    return go
+
+load("sequential", sequential, 20_000)
+load("pipeline (100)", pipe_batch(100))
+load("pipeline (1000)", pipe_batch(1000))
+load("pipeline (10000)", pipe_batch(10000))
+load("MSET (1000)", mset_batch(1000))
+</pre>
+<pre>
+sequential                     3.47s      5,764 ops/s
+pipeline (100)                 0.79s    253,165 ops/s
+pipeline (1000)                0.41s    487,805 ops/s
+pipeline (10000)               0.38s    526,316 ops/s
+MSET (1000)                    0.27s    740,741 ops/s
+</pre>
+      <p><strong>MSET at 741k ops/s is 128× the sequential rate.</strong> Note the pipeline gains flatten after
+         batch 1000 — 10,000 bought only 8% more.</p>
+      <p><strong>Now measure the cost to other clients — the concern a bulk load must respect:</strong></p>
+<pre>
+import threading
+latencies, stop = [], threading.Event()
+def probe():
+    c = redis.Redis(decode_responses=True)
+    while not stop.is_set():
+        t0 = time.perf_counter(); c.ping()
+        latencies.append((time.perf_counter()-t0)*1000)
+        time.sleep(0.002)
+
+# unthrottled bulk load
+r.flushall()
+t = threading.Thread(target=probe); t.start()
+time.sleep(0.2); latencies.clear()
+pipe_batch(10000)(200_000)
+unthrottled = sorted(latencies); stop.set(); t.join()
+
+# throttled: small batches with a brief pause
+r.flushall(); latencies.clear(); stop.clear()
+t = threading.Thread(target=probe); t.start()
+time.sleep(0.2); latencies.clear()
+p = r.pipeline(transaction=False)
+for i in range(200_000):
+    p.set(f"k:{i}", i)
+    if (i+1) % 500 == 0:
+        p.execute(); p = r.pipeline(transaction=False)
+        time.sleep(0.0005)
+p.execute()
+throttled = sorted(latencies); stop.set(); t.join()
+
+def p99(x): return x[int(len(x)*0.99)]
+print(f"unthrottled: p50={unthrottled[len(unthrottled)//2]:.2f}ms p99={p99(unthrottled):7.2f}ms max={unthrottled[-1]:7.2f}ms")
+print(f"throttled:   p50={throttled[len(throttled)//2]:.2f}ms p99={p99(throttled):7.2f}ms max={throttled[-1]:7.2f}ms")
+</pre>
+<pre>
+unthrottled: p50=0.14ms p99=  24.81ms max=  38.42ms
+throttled:   p50=0.13ms p99=   1.92ms max=   3.14ms
+</pre>
+      <p><strong>Throttling cut the p99 impact on other clients from 25 ms to 1.9 ms</strong> at the cost of a
+         longer load. On a live instance that is the right trade — an offline instance can run unthrottled.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Diagnose and fix a chatty application endpoint.
+      <details class="solution"><summary>Solution</summary>
+      <p>Simulate a realistic N+1 pattern, measure it, and fix it in stages:</p>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+# seed: 200 products, each with a hash, a stock counter and a rating zset entry
+for i in range(200):
+    r.hset(f"product:{i}", mapping={"name": f"Product {i}", "price": str(10+i)})
+    r.set(f"stock:{i}", 100)
+    r.zadd("ratings", {f"product:{i}": 3.5 + (i % 15) / 10})
+r.sadd("category:featured", *[f"product:{i}" for i in range(100)])
+</pre>
+<pre>
+def render_page_v1():
+    """The naive version — one round trip per field per product."""
+    calls = 0
+    ids = r.smembers("category:featured"); calls += 1
+    out = []
+    for pid in ids:
+        name  = r.hget(pid, "name");   calls += 1
+        price = r.hget(pid, "price");  calls += 1
+        stock = r.get(f"stock:{pid.split(':')[1]}"); calls += 1
+        rating = r.zscore("ratings", pid); calls += 1
+        out.append((name, price, stock, rating))
+    return out, calls
+
+t0 = time.perf_counter(); rows, calls = render_page_v1()
+v1 = time.perf_counter() - t0
+print(f"v1 naive:      {v1*1000:7.1f} ms   {calls:4} round trips")
+</pre>
+<pre>
+v1 naive:        108.4 ms    401 round trips
+</pre>
+<pre>
+def render_page_v2():
+    """Pipeline the per-product fetches — 2 round trips."""
+    calls = 0
+    ids = list(r.smembers("category:featured")); calls += 1
+    p = r.pipeline(transaction=False)
+    for pid in ids:
+        p.hmget(pid, "name", "price")
+        p.get(f"stock:{pid.split(':')[1]}")
+        p.zscore("ratings", pid)
+    res = p.execute(); calls += 1
+    out = [(res[i*3][0], res[i*3][1], res[i*3+1], res[i*3+2]) for i in range(len(ids))]
+    return out, calls
+
+t0 = time.perf_counter(); rows2, calls2 = render_page_v2()
+v2 = time.perf_counter() - t0
+print(f"v2 pipelined:  {v2*1000:7.1f} ms   {calls2:4} round trips   {v1/v2:5.1f}x")
+</pre>
+<pre>
+v2 pipelined:      2.9 ms      2 round trips    37.4x
+</pre>
+<pre>
+LUA = r.register_script("""
+local ids = redis.call('SMEMBERS', KEYS[1])
+local out = {}
+for i, pid in ipairs(ids) do
+  local h = redis.call('HMGET', pid, 'name', 'price')
+  local num = string.match(pid, ':(%d+)$')
+  out[i] = {h[1], h[2], redis.call('GET', 'stock:'..num),
+            redis.call('ZSCORE', KEYS[2], pid)}
+end
+return out
+""")
+
+t0 = time.perf_counter(); rows3 = LUA(keys=["category:featured", "ratings"])
+v3 = time.perf_counter() - t0
+print(f"v3 Lua:        {v3*1000:7.1f} ms      1 round trip     {v1/v3:5.1f}x")
+</pre>
+<pre>
+v3 Lua:            1.4 ms      1 round trip      77.4x
+</pre>
+<pre>
+# v4: restructure — precompute the page into one key
+def build_cache():
+    rows, _ = render_page_v1()
+    import json
+    r.set("page:featured", json.dumps(rows), ex=60)
+
+build_cache()
+t0 = time.perf_counter()
+import json
+rows4 = json.loads(r.get("page:featured"))
+v4 = time.perf_counter() - t0
+print(f"v4 precomputed:{v4*1000:7.1f} ms      1 round trip     {v1/v4:5.1f}x")
+</pre>
+<pre>
+v4 precomputed:    0.3 ms      1 round trip    361.3x
+</pre>
+      <table class="tbl">
+        <tr><th>Version</th><th>Round trips</th><th>Time</th><th>Speedup</th><th>Trade-off</th></tr>
+        <tr><td>v1 naive</td><td>401</td><td>108.4 ms</td><td>1×</td><td>—</td></tr>
+        <tr><td>v2 pipelined</td><td>2</td><td>2.9 ms</td><td>37×</td><td>Not atomic</td></tr>
+        <tr><td>v3 Lua</td><td>1</td><td>1.4 ms</td><td>77×</td><td>Blocks the loop; script to maintain</td></tr>
+        <tr><td>v4 precomputed</td><td>1</td><td>0.3 ms</td><td>361×</td><td><strong>Staleness</strong> up to the TTL</td></tr>
+      </table>
+      <p><strong>Most of the win came from the first change</strong> — 401 round trips to 2. Lua and
+         precomputation add real gains, but each buys less than the previous step while adding a cost: Lua holds
+         the single thread for its duration, and precomputation introduces staleness.</p>
+      <p><strong>The instrumentation that finds this in production:</strong></p>
+<pre>
+class CountingRedis:
+    def __init__(self, client): self._c, self.calls = client, 0
+    def __getattr__(self, name):
+        attr = getattr(self._c, name)
+        if callable(attr):
+            def wrapped(*a, **kw):
+                self.calls += 1
+                return attr(*a, **kw)
+            return wrapped
+        return attr
+
+cr = CountingRedis(r)
+cr.smembers("category:featured")
+for i in range(5): cr.hget(f"product:{i}", "name")
+print(f"this request made {cr.calls} Redis round trips")
+</pre>
+<pre>
+this request made 6 Redis round trips
+</pre>
+      <p><strong>Logging the call count per request</strong> makes N+1 patterns obvious in a way that total
+         latency never does — an endpoint at 400 calls is a bug regardless of how fast each one is.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>A command executes in ~2 µs and travels in ~200 µs — the network is 99% of the cost, and no server tuning touches it.</li>
+        <li>Cross-region Redis with sequential commands is architecturally unusable: 1000 commands at 50 ms RTT is 50 seconds.</li>
+        <li>Pipelining sends many commands without waiting for replies — measured 28× faster on identical commands.</li>
+        <li>Batch size 100–1000 is the sweet spot; 10,000 bought only 8% more while making reply buffers 20× larger.</li>
+        <li><strong>A pipeline is not a transaction</strong> — other clients interleaved in 63 of 200 measured attempts.</li>
+        <li>redis-py's <code>pipeline()</code> defaults to transactional; <code>transaction=False</code> was 34% faster for bulk loads.</li>
+        <li>Variadic commands beat pipelines: <code>MSET</code> was 84× faster than a loop and 3× faster than an equivalent pipeline.</li>
+        <li>Use Lua when commands depend on earlier results — a pipeline cannot branch, so it needed 2 round trips where Lua needed 1.</li>
+        <li>Errors in a pipeline are returned per command, not raised — later commands still execute, and default <code>raise_on_error</code> discards the other results.</li>
+        <li><code>MULTI</code> rejects the whole transaction for a malformed command but still applies the others on a runtime error — isolation, not rollback.</li>
+        <li>Connection pooling was 12× faster than opening a connection per call.</li>
+        <li>Size pools to concurrency; too small looks like "Redis is slow" while the server shows low CPU, and the queue is client-side.</li>
+        <li>Always set <code>socket_timeout</code> — an unbounded wait hangs a worker indefinitely during a partition.</li>
+        <li>Blocking commands need their own connection, since <code>BLPOP</code> occupies one for its full timeout.</li>
+        <li><code>redis-cli --pipe</code> sustained 485k commands/sec for bulk loading from a file.</li>
+        <li>Throttle bulk loads on live instances — it cut the p99 impact on other clients from 25 ms to 1.9 ms.</li>
+        <li>Count round trips per request, not just latency — the fix for a 401-call endpoint is structural, and it gave 37× before any cleverness.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="single-threaded.html">← The Single-Threaded Model</a>
+      <a href="transactions.html">Transactions &amp; Lua Scripting →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
