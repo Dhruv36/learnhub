@@ -1,20 +1,31 @@
 // Redis track curriculum — single source of truth for every page's sidebar.
 renderSidebar([
-  { title: "1. Basics", items: [
-    ["Introduction & Data Model", "index.html"],
-    ["Strings, Keys & TTL", "strings-keys.html"],
-    ["Hashes, Lists, Sets & Sorted Sets", "data-structures.html"]] },
-  { title: "2. Intermediate", items: [
+  { title: "1. Foundations", items: [
+    ["What Redis Actually Is", "index.html"],
+    ["Strings, Keys & Expiry", "strings-keys.html"],
+    ["Hashes, Lists & Sets", "data-structures.html"],
+    ["Sorted Sets & Ranking", "sorted-sets.html"],
+    ["The Single-Threaded Model", "single-threaded.html"]] },
+  { title: "2. Working With Redis", items: [
+    ["Commands, Pipelining & Round Trips", "pipelining.html"],
+    ["Transactions & Lua Scripting", "transactions.html"],
     ["Caching Patterns", "caching.html"],
-    ["Pub/Sub & Streams", "pubsub-streams.html"],
-    ["Persistence: RDB & AOF", "persistence.html"]] },
-  { title: "3. Advanced", items: [
-    ["Replication & Sentinel", "replication.html"],
-    ["Distributed Locks", "locks.html"],
-    ["Redis Cluster", "cluster.html"]] },
-  { title: "4. Ultra-Advanced (Production)", items: [
-    ["Production Use Cases", "use-cases.html"],
-    ["Memory Optimization & Eviction", "memory.html"]] },
+    ["Cache Invalidation & Stampedes", "cache-invalidation.html"]] },
+  { title: "3. Messaging & Data Flow", items: [
+    ["Pub/Sub", "pubsub.html"],
+    ["Streams & Consumer Groups", "streams.html"],
+    ["Rate Limiting", "rate-limiting.html"]] },
+  { title: "4. Durability & Distribution", items: [
+    ["Persistence: RDB & AOF", "persistence.html"],
+    ["Replication & Failover", "replication.html"],
+    ["Redis Cluster", "cluster.html"],
+    ["Distributed Locks", "locks.html"]] },
+  { title: "5. Production", items: [
+    ["Memory & Eviction", "memory.html"],
+    ["Performance & Latency", "performance.html"],
+    ["Observability & Debugging", "observability.html"],
+    ["Security & Operations", "security-ops.html"],
+    ["Production Use Cases", "use-cases.html"]] },
   { title: "Practice", items: [
     ["📝 Quizzes (10 sets × 20 Qs)", "quiz.html"]] }
 ]);
