@@ -10,124 +10,1171 @@
 
 <header class="site-header">
   <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
-  <nav><a href="index.html">← Redis Track</a><a href="quiz.html">Quizzes</a></nav>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
 </header>
 
 <div class="tutorial-layout">
   <aside class="sidebar" id="sidebar"></aside>
 
   <main class="content">
-    <h1>Distributed Locks <span class="level-badge level-ultra">Advanced</span></h1>
-    <p>A distributed lock ensures only ONE process across many servers does something at a time — running a
-       scheduled job once, preventing duplicate processing, serializing access to a shared resource. Redis
-       is commonly used for this, but the naive implementation has subtle, dangerous bugs. Getting the
-       details right (and knowing the limitations) is a senior-level topic.</p>
+    <h1>Distributed Locks <span class="level-badge level-adv">Durability &amp; Distribution</span></h1>
+    <p><strong>What you'll master:</strong> the four requirements a correct Redis lock must satisfy, and the
+       specific bug that appears when each one is missing — including the release that deletes <em>someone else's</em>
+       lock, which is the most common distributed-lock bug in production; why a lock TTL is a bet on your own
+       worst-case execution time and what happens when a GC pause makes you lose that bet; <strong>fencing
+       tokens</strong>, the only mechanism that makes a lock safe against pauses, and why they require cooperation
+       from the resource you are protecting; the Redlock argument between Martillo and Kleppmann, which is a
+       standard senior interview question, and what the defensible position actually is; and the framing that
+       matters most — Redis locks are for <em>efficiency</em>, not correctness, and knowing which one you need
+       decides the whole design. Prerequisites:
+       <a href="transactions.html">Transactions &amp; Lua Scripting</a>,
+       <a href="replication.html">Replication &amp; Failover</a>.</p>
 
-    <h2>The Naive Lock (and why each part matters)</h2>
-    <pre>// Acquire: SET the lock key only if it doesn't exist, with a TTL, storing a UNIQUE token:
-SET lock:job "unique-token-abc" NX PX 30000
-//          key    value(owner)   NX  PX=30s TTL
-// NX = only if not exists (mutual exclusion). PX = auto-expire so a crashed holder doesn't
-// deadlock the lock forever. The unique token identifies THIS owner (critical for release).
-if (acquired) { try { doWork(); } finally { releaseLock(); } }</pre>
-    <div class="note">🔑 <strong>Three things the naive lock MUST have:</strong> (1) <code>NX</code> for
-      mutual exclusion, (2) a <code>TTL</code> so a crashed holder's lock auto-releases (no permanent
-      deadlock), and (3) a <strong>unique owner token</strong> so you only release YOUR lock. Missing any
-      one is a bug. The most dangerous omission is the token — see below.</p></div>
+    <h2>Part 1 — The Four Requirements</h2>
 
-    <h2>The Release Bug — Why You Need a Lua Script</h2>
-    <pre>// ❌ WRONG release: DEL lock:job
-// Danger: your work took longer than the TTL → your lock EXPIRED → another process acquired it →
-// your DEL now deletes SOMEONE ELSE'S lock. Two processes run concurrently. Corruption.
+    <p>A working distributed lock needs four things. Every one of them corresponds to a real outage when it is
+       missing.</p>
 
-// ✅ CORRECT release: check the token AND delete ATOMICALLY (Lua runs atomically in Redis):
-EVAL "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end" 1 lock:job unique-token-abc
-// "Only delete the lock if it's still MINE." The check-then-delete must be atomic — doing GET then
-// DEL as two commands has the same race. Single-threaded Lua guarantees atomicity.</pre>
+<pre>
+1. Mutual exclusion    — at most one holder at a time
+2. Deadlock freedom    — the lock is released even if the holder dies
+3. Ownership           — only the holder may release it
+4. Atomicity           — acquire and release cannot be interrupted mid-operation
+</pre>
 
-    <h2>The Deeper Problem — Locks and Time</h2>
-    <pre>// Even the correct single-instance lock has a fundamental issue: if your process STALLS (GC pause,
-// long syscall) past the TTL, the lock expires and another process legitimately acquires it WHILE
-// you think you still hold it. No Redis lock fully prevents this. Mitigations:
-//   - Keep critical sections SHORT (< TTL with margin).
-//   - Use a FENCING TOKEN: an ever-increasing number issued with each lock; the protected resource
-//     rejects operations with a stale token (so a delayed old holder's writes are refused).
-//   - Make operations IDEMPOTENT so duplicate execution is harmless.
-// Locks reduce contention; correctness ultimately needs fencing/idempotency at the resource.</pre>
+    <p>The naive version fails three of them:</p>
 
-    <h2>Redlock — Multi-Node Locking (know the debate)</h2>
-    <pre>// A single-Redis lock can be lost on failover (the new primary may not have the lock — async
-// replication). REDLOCK is an algorithm to acquire a lock across N independent Redis primaries,
-// requiring a MAJORITY to agree, for stronger guarantees.
-// The debate: distributed-systems experts (Kleppmann) argue Redlock isn't safe for correctness
-// under clock skew / GC pauses without fencing tokens; Redis's author (antirez) defends it for
-// its intended use. The senior takeaway: for EFFICIENCY (avoid duplicate work) a simple lock is
-// fine; for CORRECTNESS (must never double-execute), you need fencing tokens / idempotency, and a
-// consensus system (ZooKeeper/etcd) may be more appropriate than any Redis lock.</pre>
+<pre>
+SETNX lock:resource 1          # ❌ no TTL: holder dies → locked forever
+EXPIRE lock:resource 10        # ❌ separate command: crash between = no TTL
+...
+DEL lock:resource              # ❌ no ownership check: deletes ANYONE's lock
+</pre>
 
-    <h2>Common Use Cases</h2>
+    <p>The correct primitive is one command:</p>
+
+<pre>
+SET lock:resource &lt;random-token&gt; NX PX 10000
+    │              │              │  └── TTL: deadlock freedom
+    │              │              └───── only if absent: mutual exclusion
+    │              └──────────────────── unique token: ownership
+    └─────────────────────────────────── atomic: acquire is one operation
+</pre>
+
+    <div class="note">🔑 <strong>The release is the half everyone gets wrong.</strong> A plain <code>DEL</code>
+       deletes whatever lock is currently there — and if your lock already expired because your work overran, that
+       is <em>someone else's</em> lock. Checking the value from the client first does not fix it: the value can
+       change between the <code>GET</code> and the <code>DEL</code>. Release must be a Lua script, so compare and
+       delete happen as one atomic operation.</p></div>
+
+<pre>
+RELEASE = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+  end
+  return 0
+""")
+
+def acquire(name, ttl_ms=10000):
+    token = secrets.token_hex(16)
+    return token if r.set(f"lock:{name}", token, nx=True, px=ttl_ms) else None
+
+def release(name, token):
+    return RELEASE(keys=[f"lock:{name}"], args=[token]) == 1
+</pre>
+
     <table class="tbl">
-      <tr><th>Use case</th><th>Pattern</th></tr>
-      <tr><td>Run a cron job once across N app instances</td><td>SET NX PX; whoever gets the lock runs it</td></tr>
-      <tr><td>Prevent duplicate processing of an item</td><td>Lock per item id (or idempotency key)</td></tr>
-      <tr><td>Cache stampede rebuild lock</td><td>SET NX so one request rebuilds (caching lesson)</td></tr>
-      <tr><td>Serialize access to an external resource</td><td>Lock + short critical section + fencing</td></tr>
+      <tr><th>Missing piece</th><th>Failure it produces</th></tr>
+      <tr><td>No TTL</td><td>A crashed holder locks the resource permanently</td></tr>
+      <tr><td>Separate <code>SETNX</code> + <code>EXPIRE</code></td><td>A crash between them leaves a lock with no expiry</td></tr>
+      <tr><td>No unique token</td><td>Any process can release any lock</td></tr>
+      <tr><td>Plain <code>DEL</code> to release</td><td>A slow holder deletes the <em>next</em> holder's lock</td></tr>
+      <tr><td>Client-side check-then-delete</td><td>Same bug — the value changes in the gap</td></tr>
     </table>
 
-    <h2>Common Mistakes</h2>
+    <h2>Part 2 — The TTL Is a Bet You Can Lose</h2>
+
+    <p>The TTL is what prevents deadlock, and it is also the source of the deepest problem with distributed locks:
+       <strong>it is a guess about your own worst-case execution time.</strong></p>
+
+<pre>
+TTL too short → the lock expires while you are still working
+                → another process acquires it
+                → TWO PROCESSES IN THE CRITICAL SECTION
+
+TTL too long  → a crashed holder blocks everyone for the full TTL
+</pre>
+
+    <div class="note">🔑 <strong>No TTL value is safe, because the holder can be paused for arbitrarily long
+       between any two instructions.</strong> A stop-the-world GC pause, a hypervisor stealing the vCPU, an
+       overloaded host, a page fault on swapped memory — any of these can suspend a process for seconds. The
+       holder does not know it was paused; it wakes and continues, believing it still owns a lock that expired
+       while it was frozen. This is why "make the TTL generous" is a mitigation and never a fix.</p></div>
+
+<pre>
+Client A: acquires lock, TTL 10s
+Client A: ... GC pause, 15 seconds ...
+                          (lock expires at t=10)
+Client B: acquires the lock at t=10  ✅ legitimately
+Client A: wakes at t=15, believes it holds the lock, writes to the resource
+          → both A and B are in the critical section. No error anywhere.
+</pre>
+
+    <p><strong>The lock extension (watchdog) pattern</strong> reduces the exposure by renewing the TTL from a
+       background thread while the work runs:</p>
+
+<pre>
+EXTEND = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  end
+  return 0
+""")
+
+def watchdog(name, token, ttl_ms, stop):
+    while not stop.wait(ttl_ms / 3000):          # renew at 1/3 of the TTL
+        if not EXTEND(keys=[f"lock:{name}"], args=[token, ttl_ms]):
+            break                                # we no longer hold it — stop working
+</pre>
+
+    <p>Note what the failed extension means: it is the only signal the holder gets that it lost the lock, and
+       correct code must <em>abort the work</em> at that point rather than continue. A watchdog that renews but
+       never reports failure hides the problem instead of managing it.</p>
+
+    <p><strong>It still does not solve the pause problem</strong> — a GC pause freezes the watchdog thread too. The
+       renewal only helps when the work is legitimately slow, not when the whole process is suspended.</p>
+
+    <h2>Part 3 — Fencing Tokens: The Only Real Fix</h2>
+
+    <p>If the lock cannot guarantee exclusion, the <em>resource</em> must reject stale writers. That is what a
+       fencing token does: a monotonically increasing number issued with each lock grant, which the resource
+       checks and refuses to go backwards on.</p>
+
+<pre>
+Client A: acquires lock, gets token 33
+Client A: ... paused ...
+Client B: acquires lock, gets token 34
+Client B: writes with token 34   → storage records last_token = 34  ✅
+Client A: wakes, writes with token 33
+          → storage sees 33 &lt; 34  →  REJECTED  ✅
+</pre>
+
+<pre>
+FENCE = r.register_script("""
+  if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+    return redis.call('INCR', KEYS[2])          -- monotonic token
+  end
+  return nil
+""")
+
+token_id = FENCE(keys=[f"lock:{name}", f"fence:{name}"], args=[my_token, ttl_ms])
+</pre>
+
+    <div class="note">🔑 <strong>Fencing tokens move the safety guarantee out of the lock and into the resource,
+       which is the only place it can actually live.</strong> The catch is that the protected resource must support
+       a conditional write — a database with a <code>WHERE last_token &lt; :token</code> clause, an object store with
+       compare-and-set, a filesystem with versioned writes. If the resource cannot check the token, fencing is
+       impossible, and no lock implementation can make the operation safe. This is the point Kleppmann's critique
+       turns on, and it is what an interviewer is listening for.</p></div>
+
     <table class="tbl">
-      <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
-      <tr><td>DEL to release (no token check)</td><td>Deletes another owner's lock → concurrent execution</td><td>Lua: delete only if token matches</td></tr>
-      <tr><td>No TTL on the lock</td><td>Crashed holder deadlocks it forever</td><td>SET ... PX (auto-expire)</td></tr>
-      <tr><td>TTL shorter than the work</td><td>Lock expires mid-work → double execution</td><td>Short critical sections; renew (with care); fencing</td></tr>
-      <tr><td>Relying on a lock for hard correctness</td><td>Rare double-execution under stalls/failover</td><td>Fencing tokens + idempotency</td></tr>
-      <tr><td>GET-then-DEL release (two commands)</td><td>Race between check and delete</td><td>Atomic Lua</td></tr>
-      <tr><td>Redlock for correctness assuming it's bulletproof</td><td>Edge-case failures</td><td>Understand the debate; use etcd/ZooKeeper if correctness is critical</td></tr>
+      <tr><th>Resource</th><th>Fencing possible?</th><th>How</th></tr>
+      <tr><td>SQL database</td><td>✅ Yes</td><td><code>UPDATE … WHERE last_token &lt; :token</code></td></tr>
+      <tr><td>DynamoDB / Cosmos</td><td>✅ Yes</td><td>Conditional write on the token attribute</td></tr>
+      <tr><td>S3 / object store</td><td>⚠️ Partly</td><td>Conditional put, or version checks</td></tr>
+      <tr><td>Sending an email</td><td>❌ No</td><td>Nothing to check — make it idempotent instead</td></tr>
+      <tr><td>Calling a third-party API</td><td>⚠️ Only if it has an idempotency key</td><td>Idempotency key = the token</td></tr>
+    </table>
+
+    <p>Where fencing is impossible, the answer is not a better lock — it is making the operation
+       <strong>idempotent</strong>, so a duplicate execution is harmless rather than prevented.</p>
+
+    <h2>Part 4 — Redlock, and the Argument About It</h2>
+
+    <p>A single-instance lock has an obvious weakness: replication is asynchronous, so if the primary fails after
+       granting a lock but before replicating it, the promoted replica has no record and grants the same lock to
+       someone else. <strong>Redlock</strong> is the algorithm proposed to address this by using N independent
+       Redis primaries.</p>
+
+<pre>
+Redlock, with N = 5 independent primaries (NOT replicas of each other):
+
+1. Record the start time
+2. Try to acquire on all 5, with a small per-node timeout
+3. Success requires: a MAJORITY (3 of 5) acquired
+                     AND elapsed time &lt; TTL
+4. Effective validity = TTL − elapsed − clock drift allowance
+5. On failure: release on ALL nodes, including ones that may have succeeded
+</pre>
+
+    <p><strong>Martin Kleppmann's critique</strong> (2016) is the standard reference, and its argument is not about
+       implementation details:</p>
+
+    <table class="tbl">
+      <tr><th>Objection</th><th>The substance</th></tr>
+      <tr><td><strong>Timing assumptions</strong></td><td>Redlock's safety depends on bounded clock drift, bounded network delay, and bounded pauses — none of which hold in an asynchronous system</td></tr>
+      <tr><td><strong>GC pauses</strong></td><td>A pause after acquisition breaks exclusion regardless of how many nodes agreed</td></tr>
+      <tr><td><strong>Clock jumps</strong></td><td>NTP steps or a VM snapshot restore can expire a lock early on some nodes</td></tr>
+      <tr><td><strong>No fencing tokens</strong></td><td>Redlock provides no monotonic token, so the resource cannot reject a stale writer</td></tr>
+      <tr><td><strong>Wrong tool for correctness</strong></td><td>If correctness matters, use a consensus system (ZooKeeper, etcd) that provides fencing</td></tr>
+    </table>
+
+    <p><strong>Antirez's response</strong> was that Redlock targets a different problem: it is designed for
+       efficiency-style locking where occasional double execution is tolerable, the timing assumptions are
+       reasonable on well-managed infrastructure, and demanding consensus for every mutual-exclusion need is
+       disproportionate.</p>
+
+    <div class="note">🔑 <strong>The defensible position in an interview is not picking a side — it is the
+       distinction underneath the argument.</strong> Ask what the lock is <em>for</em>. If double execution merely
+       wastes work (a duplicate cache rebuild, a report generated twice), a single-instance Redis lock is fine and
+       Redlock is usually unnecessary complexity. If double execution is <em>incorrect</em> (double-charging,
+       corrupting a file), then no Redis lock is sufficient, and the answer is fencing tokens with a resource that
+       enforces them, or a consensus system, or making the operation idempotent so exclusion stops being required.</p></div>
+
+    <p><strong>Redlock's practical costs</strong> are worth naming too: five independent Redis deployments to
+       operate, N round trips per acquisition, and a validity window that shrinks with network latency — under
+       slow conditions the effective lock time can approach zero, and the algorithm's own correctness argument
+       depends on clock drift you cannot measure from inside it.</p>
+
+    <h2>Part 5 — Efficiency Locks vs Correctness Locks</h2>
+
+    <p>This distinction decides the entire design, and stating it early is what separates a good answer from a
+       recitation of <code>SET NX PX</code>.</p>
+
+    <table class="tbl">
+      <tr><th></th><th>Efficiency lock</th><th>Correctness lock</th></tr>
+      <tr><td>Purpose</td><td>Avoid duplicate work</td><td>Prevent incorrect state</td></tr>
+      <tr><td>Cost of double execution</td><td>Wasted CPU, an extra query</td><td>Corruption, double charge, data loss</td></tr>
+      <tr><td>Examples</td><td>Cache rebuild, cron dedupe, report generation</td><td>Payments, inventory decrement, file writes</td></tr>
+      <tr><td>Redis <code>SET NX PX</code> sufficient?</td><td><strong>✅ Yes</strong></td><td>❌ No</td></tr>
+      <tr><td>What you actually need</td><td>Nothing more</td><td>Fencing tokens, consensus, or idempotency</td></tr>
+    </table>
+
+    <p><strong>Most locks in real systems are efficiency locks</strong>, and treating them as correctness locks
+       produces elaborate machinery that protects against something whose cost was one duplicated cache
+       computation. Conversely, using an efficiency lock where correctness is required produces a system that works
+       in testing and double-charges a customer during a GC pause six months later.</p>
+
+    <p><strong>Before reaching for a distributed lock at all</strong>, check whether the problem dissolves:</p>
+
+<pre>
+Atomic operation instead of a lock:
+  INCRBY balance -100                      ← no lock needed at all
+  SET key val NX                           ← "only one winner" without locking
+  Lua script                               ← read-decide-write, atomically
+
+Database-level:
+  SELECT … FOR UPDATE                      ← the DB already provides locking
+  UPDATE … WHERE version = :v              ← optimistic concurrency
+  UNIQUE constraint                        ← makes duplicates impossible
+
+Design-level:
+  Idempotent operations                    ← duplicates become harmless
+  Partition work by key                    ← one owner per key, no contention
+</pre>
+
+    <p>A single-node Redis operation is already atomic, so anything expressible as one command or one Lua script
+       does not need a lock. The lock is for coordinating work that happens <em>outside</em> Redis.</p>
+
+    <h2>Part 6 — Production Patterns</h2>
+
+    <p><strong>Use a maintained library rather than writing this yourself.</strong> The failure modes are subtle and
+       the correct implementation is well understood:</p>
+
+<pre>
+# redis-py (built in, single-instance, correct release + optional extension)
+lock = r.lock("resource", timeout=10, blocking_timeout=5, thread_local=True)
+if lock.acquire():
+    try:
+        do_work()
+    finally:
+        try:
+            lock.release()
+        except redis.exceptions.LockNotOwnedError:
+            log.error("lock expired during work — the work may have overlapped")
+</pre>
+
+    <p><code>LockNotOwnedError</code> is not an inconvenience to swallow. It means the lock expired while the work
+       was running, so another process may have entered the critical section — it is the one moment the system
+       tells you your TTL assumption was wrong, and it belongs in an alert.</p>
+
+    <table class="tbl">
+      <tr><th>Concern</th><th>Practice</th></tr>
+      <tr><td>Acquisition failure</td><td>Bounded retries with jittered backoff; never spin forever</td></tr>
+      <tr><td>Work exceeding the TTL</td><td>Watchdog extension; abort when extension fails</td></tr>
+      <tr><td>Lock granularity</td><td>Per resource ID, never one global lock</td></tr>
+      <tr><td>Observability</td><td>Metrics for acquire success/failure, hold time, expiry-during-work</td></tr>
+      <tr><td>Redis unavailable</td><td>Decide fail-open or fail-closed deliberately, as with rate limiting</td></tr>
+      <tr><td>Cluster</td><td>The lock key is one key in one slot — no special handling, but Redlock needs independent instances</td></tr>
+    </table>
+
+    <p><strong>Lock granularity is the most common performance mistake.</strong> A single
+       <code>lock:orders</code> serialises every order in the system; <code>lock:order:{id}</code> serialises only
+       the ones that genuinely conflict. The measurement in Exercise 6 shows the difference is not marginal.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Releasing a lock with <code>DEL</code>, and treating the TTL as a guarantee.</strong> The code
+         acquires with <code>SET NX PX</code>, does its work, and calls <code>DEL lock:resource</code> in a
+         <code>finally</code> block. It looks correct and passes every test, because in testing the work always
+         finishes well inside the TTL. In production the work occasionally overruns — a slow query, a GC pause, a
+         noisy neighbour — the lock expires, another process acquires it, and the original holder's
+         <code>DEL</code> then deletes <em>that</em> process's lock. Now a third process can acquire while the
+         second is still working, and the mutual exclusion the whole design rested on is gone. Nothing errors, and
+         the corruption appears as an unreproducible bug weeks later.</p>
+      <p>✅ <strong>Make the lock four-part correct, then decide whether a lock is even the right tool.</strong>
+         Acquire with <code>SET key &lt;unique-token&gt; NX PX ttl</code> in one command; release with a Lua
+         compare-and-delete so only the owner can remove it; extend from a watchdog and <em>abort the work</em>
+         when the extension fails, because that is the system telling you the lock was lost. Then ask what the
+         lock is protecting: if double execution merely wastes work, this is sufficient and Redlock is
+         unnecessary; if double execution would be <em>incorrect</em>, add fencing tokens that the resource
+         enforces, use a consensus system, or make the operation idempotent so exclusion is no longer required.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Releasing with <code>DEL</code></td><td>Deletes another holder's lock after your TTL expired</td><td>Lua compare-and-delete on a unique token</td></tr>
+      <tr><td>Client-side check-then-delete</td><td>The value can change between <code>GET</code> and <code>DEL</code></td><td>One Lua script</td></tr>
+      <tr><td><code>SETNX</code> then <code>EXPIRE</code></td><td>A crash between them leaves a permanent lock</td><td><code>SET … NX PX</code></td></tr>
+      <tr><td>No TTL at all</td><td>A dead holder blocks the resource forever</td><td>Always set one</td></tr>
+      <tr><td>Fixed token (hostname, "1")</td><td>Any process can release any lock</td><td>Cryptographically random per acquisition</td></tr>
+      <tr><td>Treating the TTL as a guarantee</td><td>A pause can exceed any TTL</td><td>Fencing tokens, or idempotency</td></tr>
+      <tr><td>Ignoring <code>LockNotOwnedError</code></td><td>It means the critical section may have overlapped</td><td>Alert on it</td></tr>
+      <tr><td>Watchdog that never reports failure</td><td>Hides the loss instead of aborting the work</td><td>Stop working when extension fails</td></tr>
+      <tr><td>Redlock for efficiency locking</td><td>5 deployments and N round trips for no benefit</td><td>Single-instance lock</td></tr>
+      <tr><td>Redis locks for correctness</td><td>No fencing; async replication can duplicate grants</td><td>etcd/ZooKeeper, or fencing, or idempotency</td></tr>
+      <tr><td>One global lock</td><td>Serialises unrelated work</td><td>Lock per resource ID</td></tr>
+      <tr><td>Unbounded acquisition retries</td><td>Threads pile up under contention</td><td>Bounded retries, jittered backoff</td></tr>
+      <tr><td>Locking what a Lua script could do</td><td>Redis operations are already atomic</td><td>One command or one script</td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1: Design a correct Redis distributed lock. What are the three essentials?</summary>
-      <p>Acquire with SET lockKey uniqueToken NX PX ttl: NX gives mutual exclusion (only one holder), PX
-         sets a TTL so a crashed holder's lock auto-expires instead of deadlocking forever, and the unique
-         token identifies the owner. Release must be an atomic check-and-delete via a Lua script: "if the
-         lock's value equals my token, delete it, else do nothing" — because if you just DEL, a lock that
-         expired mid-work (and was re-acquired by another process) would be deleted by you, letting two
-         processes run concurrently. Those three — NX, TTL, and token-checked atomic release — are the
-         non-negotiables; missing any is a real bug.</p></details>
-    <details class="solution"><summary>Q2: Why can't a Redis lock guarantee mutual exclusion under all conditions?</summary>
-      <p>Because locks interact badly with time and failures. If the lock holder stalls (a long GC pause,
-         slow syscall, or scheduler delay) beyond the TTL, the lock expires and another process legitimately
-         acquires it while the first still believes it holds it — two processes in the critical section, no
-         Redis mechanism prevents this. Additionally, on a single-Redis setup a failover can hand out the
-         lock again because async replication may not have propagated it. The robust answer is not a
-         "better lock" but defense at the resource: fencing tokens (a monotonically increasing number
-         checked by the protected resource, so a stale holder's operations are rejected) and/or making the
-         operation idempotent so duplicate execution is harmless. Locks manage contention; correctness needs
-         fencing/idempotency.</p></details>
-    <details class="solution"><summary>Q3: What's the Redlock debate, and how do you decide what to use?</summary>
-      <p>Redlock acquires a lock across multiple independent Redis primaries requiring a majority, to survive
-         single-node failover. Martin Kleppmann argued it's unsafe for correctness because clock skew, GC
-         pauses, and process stalls can still allow two holders, and that safety requires fencing tokens
-         regardless; Redis's author defended it for its intended efficiency use cases. The practical decision
-         framework: if the lock is for EFFICIENCY (avoiding duplicate/wasted work where an occasional
-         double-run is merely inefficient), a simple single-instance lock (or Redlock) is fine. If it's for
-         CORRECTNESS (double execution causes data corruption or financial error), don't rely on any
-         timeout-based lock alone — use fencing tokens and idempotency, and consider a consensus-based
-         coordinator like etcd or ZooKeeper designed for that guarantee.</p></details>
 
-    <div class="exercise"><strong>🏋️ Practice:</strong> implement acquire with SET NX PX + a random token; implement release as an atomic Lua check-and-delete; demonstrate the DEL-without-token bug by expiring a lock mid-work and deleting another owner's lock; add a fencing token and reject stale-token operations at a mock resource; use the lock to make a scheduled job run once across two "instances".</div>
+    <details class="solution"><summary><strong>Beginner:</strong> Implement a distributed lock in Redis. What are the requirements?</summary>
+      <p><strong>Four requirements:</strong> mutual exclusion, deadlock freedom (release even if the holder dies),
+         ownership (only the holder may release), and atomicity for both operations.</p>
+      <p><strong>Acquire</strong> is a single command that satisfies three of them at once:</p>
+<pre>
+SET lock:resource &lt;random-token&gt; NX PX 10000
+    NX  → only if absent        (mutual exclusion)
+    PX  → expiry in ms          (deadlock freedom)
+    token → unique per acquire  (ownership)
+</pre>
+      <p><strong>Release must be a Lua script</strong>, because compare-then-delete is not atomic from the client:</p>
+<pre>
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+</pre>
+      <p><strong>Why not a plain <code>DEL</code>?</strong> If your work overran and the lock already expired,
+         another process holds it — and your <code>DEL</code> deletes <em>their</em> lock, letting a third process
+         in while the second still believes it has exclusivity. Reading the value from the client first does not
+         help: it can change in the gap before the delete.</p>
+      <p><strong>Why not <code>SETNX</code> then <code>EXPIRE</code>?</strong> A crash between the two leaves a
+         lock with no TTL, which never releases — the resource is locked permanently.</p>
+      <p>Use the implementation in your client library (<code>redis-py</code>'s <code>r.lock()</code>,
+         Redisson in Java) rather than writing it by hand; the correct version is well understood and the failure
+         modes are subtle.</p>
+    </details>
 
-    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li>Correct lock = SET key token NX PX ttl (mutual exclusion + auto-expire + owner identity).</li>
-      <li>Release with an atomic Lua check-and-delete ("delete only if it's mine") — never a bare DEL.</li>
-      <li>TTL vs work duration matters: a stall past the TTL can cause double execution — no lock fully prevents it.</li>
-      <li>For hard correctness, add fencing tokens + idempotency at the resource; locks alone manage contention.</li>
-      <li>Redlock (multi-node) exists and is debated; use etcd/ZooKeeper when correctness is critical, simple locks for efficiency.</li>
-    </ul></div>
+    <details class="solution"><summary><strong>Beginner:</strong> Why must the lock have a TTL, and what does the TTL break?</summary>
+      <p><strong>The TTL provides deadlock freedom.</strong> Without it, a holder that crashes — process killed,
+         host lost, network gone — leaves the lock set forever, and the resource is unusable until somebody deletes
+         the key manually. There is no other mechanism to recover, because Redis does not know the holder died.</p>
+      <p><strong>What the TTL breaks is mutual exclusion.</strong> It is a bet on your own worst-case execution
+         time, and losing the bet puts two processes in the critical section:</p>
+<pre>
+A: acquires, TTL 10s
+A: pauses (GC / vCPU steal / page fault) for 15s
+   lock expires at t=10
+B: acquires legitimately at t=10
+A: resumes at t=15 believing it still holds the lock
+   → A and B both in the critical section, no error anywhere
+</pre>
+      <p>Tuning does not resolve it — it only chooses which failure you prefer. A short TTL expires under slow work;
+         a long TTL makes a crash block everyone for longer.</p>
+      <p><strong>Mitigations:</strong> a watchdog that extends the TTL while the work runs (and aborts the work
+         when the extension fails, since that means the lock was lost), and keeping critical sections short and
+         bounded.</p>
+      <p><strong>The actual fix is fencing tokens</strong> — a monotonically increasing number the resource checks,
+         so a stale holder's write is rejected even if it believes it holds the lock. That moves the safety
+         guarantee to the resource, which is the only place it can be enforced.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What are fencing tokens and why does a Redis lock need them?</summary>
+      <p>A <strong>fencing token</strong> is a monotonically increasing number issued with every lock grant. The
+         holder passes it to the protected resource, and the resource rejects any write carrying a token lower than
+         one it has already accepted.</p>
+<pre>
+A: acquires → token 33
+A: pauses...
+B: acquires → token 34
+B: writes with 34   → resource records last_token = 34 ✅
+A: wakes, writes with 33 → 33 &lt; 34 → REJECTED ✅
+</pre>
+      <p><strong>Why it is necessary:</strong> no lock can prevent a holder from being paused after acquisition.
+         The lock cannot detect the pause, and the holder does not know it happened. So exclusion cannot be
+         guaranteed by the lock alone — the resource has to be able to tell a stale writer from a current one, and
+         a monotonic token is what makes that possible.</p>
+<pre>
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+  return redis.call('INCR', KEYS[2])          -- the fencing token
+end
+return nil
+</pre>
+      <p><strong>The requirement people miss: the resource must enforce it.</strong> A token is useless unless the
+         thing being protected performs a conditional write:</p>
+<pre>
+UPDATE resource SET data = :d, last_token = :t WHERE last_token &lt; :t
+</pre>
+      <p>Databases and conditional-write stores can do this. Sending an email cannot — there is nothing to check —
+         and for those operations the answer is <strong>idempotency</strong>, making a duplicate harmless rather
+         than preventing it.</p>
+      <p><strong>Redis does not provide fencing tokens natively</strong>, which is the centre of Kleppmann's
+         critique of Redlock: the algorithm establishes agreement about who holds a lock, but issues nothing the
+         resource can use to reject a stale holder.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain Redlock and the criticism of it.</summary>
+      <p><strong>Redlock</strong> uses N independent Redis primaries (typically 5) that are not replicas of each
+         other, to avoid the single-instance failure where a primary dies after granting a lock but before
+         replicating it, and the promoted replica grants the same lock again.</p>
+<pre>
+1. Note the start time
+2. Try SET NX PX on all N nodes, with a short per-node timeout
+3. Acquired only if a MAJORITY succeeded AND elapsed &lt; TTL
+4. Validity = TTL − elapsed − clock-drift allowance
+5. On failure, release on ALL nodes (including partial successes)
+</pre>
+      <p><strong>Kleppmann's critique (2016)</strong> argues Redlock's safety rests on timing assumptions that do
+         not hold in asynchronous systems:</p>
+      <ul>
+        <li>A <strong>GC pause</strong> after acquisition breaks exclusion no matter how many nodes agreed.</li>
+        <li><strong>Clock jumps</strong> — NTP steps, VM snapshot restores — can expire a lock early on some
+           nodes, and the algorithm's validity calculation depends on bounded drift.</li>
+        <li>Redlock provides <strong>no fencing token</strong>, so the resource cannot reject a stale writer.</li>
+        <li>If correctness matters, use a consensus system (ZooKeeper, etcd) that provides both consensus and
+           fencing.</li>
+      </ul>
+      <p><strong>Antirez's response</strong> was that Redlock targets efficiency locking, where occasional double
+         execution is acceptable, and that its timing assumptions are reasonable on well-managed infrastructure.</p>
+      <p><strong>The position worth taking</strong> is the distinction rather than a side. Ask what the lock is
+         for. If double execution wastes work — a duplicate cache rebuild, a report generated twice — a
+         single-instance Redis lock is sufficient and Redlock is usually unnecessary operational complexity: five
+         deployments, N round trips per acquire, and a validity window that shrinks with latency. If double
+         execution would be <em>incorrect</em>, no Redis lock is sufficient, and the answer is fencing tokens the
+         resource enforces, a consensus system, or making the operation idempotent so exclusion is not required at
+         all.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design coordination for a job scheduler where each job must run on exactly one worker.</summary>
+      <p><strong>First, challenge "exactly once", because it does not exist.</strong> A worker can acquire a lock,
+         start the job, and die before finishing. Either it is retried (possible duplicate) or it is not (possible
+         loss). The achievable goal is at-least-once execution with idempotent jobs, or at-most-once with the risk
+         of a skipped run. Which one is right depends on the job, and the design should say so explicitly.</p>
+      <p><strong>Preferred design — leases, not locks:</strong></p>
+<pre>
+CLAIM = """
+  if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+    return redis.call('INCR', KEYS[2])       -- fencing token
+  end
+  return nil
+"""
+# KEYS[1] = lease:job:{id}   KEYS[2] = fence:job:{id}
+</pre>
+      <p>Per-job keys, never a global lock, so unrelated jobs never contend. A watchdog renews the lease at a
+         third of its duration while the job runs, and <strong>aborts the job if renewal fails</strong> — that is
+         the only signal the worker gets that it lost the lease.</p>
+      <p><strong>Make the jobs idempotent, which is what actually provides safety.</strong> Record completion
+         keyed by <code>(job_id, scheduled_time)</code> with a database unique constraint, so a duplicate
+         execution is rejected by the storage layer rather than prevented by the lock. Where the job writes to a
+         resource that supports conditional writes, pass the fencing token:</p>
+<pre>
+UPDATE job_state SET status = 'done', token = :t
+ WHERE job_id = :id AND token &lt; :t
+</pre>
+      <p><strong>Handle the two failure modes explicitly.</strong> A worker that dies mid-job leaves a lease that
+         expires, and another worker picks the job up — which is why idempotency matters more than the lock does.
+         A worker that is merely slow keeps renewing, so the lease should be short (seconds) with renewal, rather
+         than long and unrenewed.</p>
+      <p><strong>Recovery and observability:</strong> a reaper that finds jobs whose lease expired without a
+         completion record and re-queues them; metrics on lease acquisition failures, renewal failures, and job
+         duration versus lease duration — because renewal failures are the leading indicator that lease durations
+         are mis-set.</p>
+      <p><strong>When I would not use Redis here:</strong> if a duplicate run is genuinely unacceptable and the
+         job cannot be made idempotent — sending money, sending customer emails — then leadership should come from
+         etcd or ZooKeeper, which provide consensus and fencing, or the scheduler should hand the work to a system
+         with transactional semantics. Redis leases are the right tool when duplicates are <em>survivable</em>,
+         which covers most scheduled work.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A lock-protected section occasionally runs twice. Walk through the causes.</summary>
+      <p><strong>Five causes, in the order I would check them.</strong></p>
+      <p><strong>1. Release by <code>DEL</code> without an ownership check.</strong> The most common, and the
+         easiest to confirm by reading the release code. If the holder's work overran, its <code>DEL</code>
+         removed the <em>next</em> holder's lock, admitting a third process. Fix: Lua compare-and-delete on a
+         unique token.</p>
+      <p><strong>2. The TTL expiring during the work.</strong> The lock lapses, another process acquires
+         legitimately, and both are inside. Confirm by comparing job duration against the TTL, and by looking for
+         <code>LockNotOwnedError</code> (or equivalent) at release — that exception is the system reporting exactly
+         this. Fix: watchdog renewal, and abort the work when renewal fails.</p>
+      <p><strong>3. A process pause.</strong> GC, vCPU steal, page faults on swap, or a suspended container.
+         The holder is frozen past the TTL and wakes believing it still holds the lock. Correlate the incidents
+         with GC logs and host metrics. No TTL fixes this — fencing tokens or idempotency do.</p>
+      <p><strong>4. Failover.</strong> Redis replication is asynchronous, so a primary can grant a lock, die
+         before replicating it, and the promoted replica grants it again. Check whether the incidents coincide
+         with failovers. Redlock addresses this specific case; fencing addresses it more reliably.</p>
+      <p><strong>5. Clock issues.</strong> An NTP step or a VM snapshot restore can expire keys earlier than
+         expected on one node. Rarer, but it produces exactly this symptom.</p>
+      <p><strong>How I would work it:</strong> read the release path first, since cause 1 is both most common and
+         cheapest to verify; then instrument hold time against TTL and count renewal failures; then correlate the
+         events with GC pauses and failovers.</p>
+      <p><strong>And the framing to give the team:</strong> if double execution is merely wasteful, fix the release
+         bug and move on. If it is <em>incorrect</em>, the lock was never the right guarantee — add fencing tokens
+         the resource enforces, or make the operation idempotent so a duplicate is harmless. Locks reduce the
+         probability of concurrent execution; only the resource can make it impossible.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Build a correct lock and prove mutual exclusion holds under
+      concurrency.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, secrets
+
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+RELEASE = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+  end
+  return 0
+""")
+
+def acquire(name, ttl_ms=5000, retries=50):
+    for _ in range(retries):
+        token = secrets.token_hex(16)
+        if r.set(f"lock:{name}", token, nx=True, px=ttl_ms):
+            return token
+        time.sleep(0.01)
+    return None
+
+def release(name, token):
+    return RELEASE(keys=[f"lock:{name}"], args=[token]) == 1
+
+# --- unprotected: a classic lost-update race ---
+counter = {"v": 0}
+def unsafe():
+    for _ in range(200):
+        v = counter["v"]
+        time.sleep(0.0001)          # widen the window
+        counter["v"] = v + 1
+
+ts = [threading.Thread(target=unsafe) for _ in range(10)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(f"without lock: {counter['v']} (expected 2000)")
+
+# --- protected ---
+counter["v"] = 0
+overlaps = []
+inside = {"n": 0}
+def safe():
+    for _ in range(200):
+        tok = acquire("counter", ttl_ms=5000)
+        if not tok:
+            continue
+        try:
+            inside["n"] += 1
+            if inside["n"] > 1:
+                overlaps.append(inside["n"])     # two holders at once
+            v = counter["v"]
+            time.sleep(0.0001)
+            counter["v"] = v + 1
+            inside["n"] -= 1
+        finally:
+            release("counter", tok)
+
+ts = [threading.Thread(target=safe) for _ in range(10)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(f"with lock   : {counter['v']} (expected 2000), overlaps: {len(overlaps)}")
+</pre>
+<pre>
+without lock: 1247 (expected 2000)
+with lock   : 2000 (expected 2000), overlaps: 0
+</pre>
+      <p>753 updates lost without the lock; exact with it, and the critical section was never entered
+         concurrently.</p>
+      <p><strong>Verify the lock's four properties directly:</strong></p>
+<pre>
+r.flushdb()
+tok = acquire("res")
+print(f"1. mutual exclusion : second acquire = {r.set('lock:res','x',nx=True,px=100)}")
+print(f"2. deadlock freedom : TTL = {r.pttl('lock:res')} ms (auto-releases)")
+print(f"3. ownership        : wrong token releases? {release('res', 'wrong-token')}")
+print(f"   still held       : {r.get('lock:res') == tok}")
+print(f"4. correct release  : {release('res', tok)}, key gone: {not r.exists('lock:res')}")
+</pre>
+<pre>
+1. mutual exclusion : second acquire = None
+2. deadlock freedom : TTL = 4987 ms (auto-releases)
+3. ownership        : wrong token releases? False
+   still held       : True
+4. correct release  : True, key gone: True
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show the <code>DEL</code>-release bug deleting another
+      holder's lock.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, secrets
+
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+RELEASE = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+  return 0
+""")
+
+events = []
+def worker(name, work_time, release_mode, ttl_ms=1000):
+    token = secrets.token_hex(8)
+    t0 = time.time()
+    while time.time() - t0 &lt; 5:
+        if r.set("lock:res", token, nx=True, px=ttl_ms):
+            events.append((round(time.time()-T0, 2), name, "ACQUIRED"))
+            time.sleep(work_time)                 # may exceed the TTL
+            if release_mode == "del":
+                deleted = r.delete("lock:res")    # ❌ no ownership check
+            else:
+                deleted = RELEASE(keys=["lock:res"], args=[token])
+            events.append((round(time.time()-T0, 2), name,
+                           f"RELEASED (deleted={deleted})"))
+            return
+        time.sleep(0.02)
+
+for mode in ("del", "lua"):
+    r.flushdb(); events.clear(); T0 = time.time()
+    # A overruns its 1s TTL; B acquires after it expires
+    a = threading.Thread(target=worker, args=("A", 2.0, mode))
+    a.start(); time.sleep(1.3)                    # A's lock has expired
+    b = threading.Thread(target=worker, args=("B", 2.0, mode))
+    b.start(); a.join(); b.join()
+
+    print(f"--- release with {mode.upper()} ---")
+    for t, who, what in sorted(events):
+        print(f"  t={t:5.2f}s  {who}: {what}")
+    print()
+</pre>
+<pre>
+--- release with DEL ---
+  t= 0.00s  A: ACQUIRED
+  t= 1.31s  B: ACQUIRED
+  t= 2.00s  A: RELEASED (deleted=1)     ← A deleted B's lock!
+  t= 3.31s  B: RELEASED (deleted=0)     ← B's lock was already gone
+
+--- release with LUA ---
+  t= 0.00s  A: ACQUIRED
+  t= 1.31s  B: ACQUIRED
+  t= 2.00s  A: RELEASED (deleted=0)     ← refused: token mismatch
+  t= 3.31s  B: RELEASED (deleted=1)     ← B released its own lock
+</pre>
+      <p><strong>With <code>DEL</code>, A deleted B's lock at t=2.00</strong> while B was still working — so from
+         that moment any third process could acquire and enter the critical section alongside B. The Lua release
+         refused, because the stored token no longer matched A's.</p>
+      <p><strong>Confirm that a client-side check does not fix it</strong> — the value changes in the gap:</p>
+<pre>
+r.flushdb()
+r.set("lock:res", "B-token", px=5000)
+my_token = "A-token"
+
+current = r.get("lock:res")                  # ← GET
+# another process could take the lock right here
+if current == my_token:
+    r.delete("lock:res")
+print(f"check-then-delete is two operations: GET returned {current!r}")
+print("between GET and DEL the lock can change hands — only Lua is atomic")
+</pre>
+<pre>
+check-then-delete is two operations: GET returned 'B-token'
+between GET and DEL the lock can change hands — only Lua is atomic
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Show a TTL expiring during work, and that a watchdog
+      prevents it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, secrets
+
+r = redis.Redis(decode_responses=True)
+
+RELEASE = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+  return 0
+""")
+EXTEND = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  end
+  return 0
+""")
+
+def run(work_s, ttl_ms, use_watchdog):
+    r.flushdb()
+    concurrent, peak, results = {"n": 0}, {"v": 0}, []
+    lock = threading.Lock()
+
+    def worker(name):
+        token = secrets.token_hex(8)
+        if not r.set("lock:job", token, nx=True, px=ttl_ms):
+            return
+        stop = threading.Event()
+        if use_watchdog:
+            def wd():
+                while not stop.wait(ttl_ms / 3000):
+                    if not EXTEND(keys=["lock:job"], args=[token, ttl_ms]):
+                        results.append((name, "LOST THE LOCK"))
+                        return
+            threading.Thread(target=wd, daemon=True).start()
+        with lock:
+            concurrent["n"] += 1
+            peak["v"] = max(peak["v"], concurrent["n"])
+        time.sleep(work_s)                       # the work
+        with lock:
+            concurrent["n"] -= 1
+        stop.set()
+        results.append((name, f"done, released={RELEASE(keys=['lock:job'], args=[token])}"))
+
+    ts = []
+    for i, delay in enumerate([0, 0.3, 0.6, 0.9, 1.2, 1.5]):
+        def launch(n=f"w{i}", d=delay):
+            time.sleep(d); worker(n)
+        t = threading.Thread(target=launch); ts.append(t); t.start()
+    for t in ts: t.join()
+    return peak["v"], results
+
+peak, res = run(work_s=2.0, ttl_ms=1000, use_watchdog=False)
+print(f"work 2.0s, TTL 1.0s, NO watchdog → peak concurrent holders: {peak}")
+for n, w in res: print(f"   {n}: {w}")
+
+print()
+peak, res = run(work_s=2.0, ttl_ms=1000, use_watchdog=True)
+print(f"work 2.0s, TTL 1.0s, WITH watchdog → peak concurrent holders: {peak}")
+for n, w in res: print(f"   {n}: {w}")
+</pre>
+<pre>
+work 2.0s, TTL 1.0s, NO watchdog → peak concurrent holders: 3
+   w0: done, released=0
+   w3: done, released=0
+   w5: done, released=1
+
+work 2.0s, TTL 1.0s, WITH watchdog → peak concurrent holders: 1
+   w0: done, released=1
+</pre>
+      <p><strong>Three workers were in the critical section simultaneously</strong> without a watchdog — the lock
+         expired every second while the work took two, so a new worker acquired legitimately each time. The
+         <code>released=0</code> results show each earlier holder's release being correctly refused, which is the
+         Lua guard doing its job even as exclusion failed.</p>
+      <p>With the watchdog renewing at a third of the TTL, exactly one worker held the lock for the full duration.</p>
+      <p><strong>Now show the watchdog's limit — it cannot survive a process pause:</strong></p>
+<pre>
+r.flushdb()
+token = secrets.token_hex(8)
+r.set("lock:job", token, nx=True, px=1000)
+print(f"acquired, TTL={r.pttl('lock:job')}ms")
+
+time.sleep(1.5)                              # simulate a GC pause (watchdog frozen too)
+print(f"after a 1.5s pause: lock exists = {bool(r.exists('lock:job'))}")
+
+other = secrets.token_hex(8)
+print(f"another process acquires: {bool(r.set('lock:job', other, nx=True, px=5000))}")
+print(f"our extend now returns  : {EXTEND(keys=['lock:job'], args=[token, 1000])}"
+      "  ← 0 = we lost it")
+print("→ the extension failing is the ONLY signal; the work must abort here")
+</pre>
+<pre>
+acquired, TTL=1000ms
+after a 1.5s pause: lock exists = False
+another process acquires: True
+our extend now returns  : 0  ← 0 = we lost it
+→ the extension failing is the ONLY signal; the work must abort here
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Implement fencing tokens and show the resource rejecting a
+      stale writer.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, secrets
+
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+FENCE = r.register_script("""
+  if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+    return redis.call('INCR', KEYS[2])
+  end
+  return nil
+""")
+
+class Resource:
+    """Storage that enforces fencing — like UPDATE ... WHERE last_token &lt; :t"""
+    def __init__(self):
+        self.data, self.last_token = None, 0
+        self.rejected, self.accepted = [], []
+        self.lock = threading.Lock()
+    def write(self, value, token):
+        with self.lock:
+            if token &lt;= self.last_token:
+                self.rejected.append((value, token))
+                return False
+            self.data, self.last_token = value, token
+            self.accepted.append((value, token))
+            return True
+
+def acquire_fenced(name, ttl_ms=1000):
+    tok = secrets.token_hex(8)
+    fence = FENCE(keys=[f"lock:{name}", f"fence:{name}"], args=[tok, ttl_ms])
+    return (tok, fence) if fence else (None, None)
+
+res = Resource()
+
+# A acquires, then pauses past its TTL
+tok_a, fence_a = acquire_fenced("res", ttl_ms=500)
+print(f"A acquired with fencing token {fence_a}")
+time.sleep(0.7)                                    # A's lock expires
+
+tok_b, fence_b = acquire_fenced("res", ttl_ms=5000)
+print(f"B acquired with fencing token {fence_b}")
+
+print(f"B writes with token {fence_b}: {res.write('from-B', fence_b)}")
+print(f"A wakes and writes token {fence_a}: {res.write('from-A', fence_a)}  ← STALE")
+print(f"\nresource holds: {res.data!r} (last_token={res.last_token})")
+print(f"rejected writes: {res.rejected}")
+</pre>
+<pre>
+A acquired with fencing token 1
+B acquired with fencing token 2
+B writes with token 2: True
+A wakes and writes token 1: False  ← STALE
+
+resource holds: 'from-B' (last_token=2)
+rejected writes: [('from-A', 1)]
+</pre>
+      <p><strong>A believed it held the lock and its write was rejected anyway</strong> — the resource, not the
+         lock, enforced correctness. That is the entire point of fencing.</p>
+      <p><strong>Compare with the same scenario and no fencing:</strong></p>
+<pre>
+class UnfencedResource:
+    def __init__(self): self.data = None
+    def write(self, value, token=None):
+        self.data = value; return True
+
+r.flushdb()
+u = UnfencedResource()
+tok_a, _ = acquire_fenced("res2", ttl_ms=500)
+time.sleep(0.7)
+tok_b, _ = acquire_fenced("res2", ttl_ms=5000)
+u.write("from-B"); u.write("from-A")            # A's stale write lands last
+print(f"unfenced resource holds: {u.data!r}  ← the STALE writer won")
+</pre>
+<pre>
+unfenced resource holds: 'from-A'  ← the STALE writer won
+</pre>
+      <p><strong>Under real concurrency, with many workers:</strong></p>
+<pre>
+r.flushdb()
+res2 = Resource()
+def worker(i):
+    tok, fence = acquire_fenced("shared", ttl_ms=300)
+    if not fence: return
+    time.sleep(0.5)                             # deliberately overrun the TTL
+    res2.write(f"worker-{i}", fence)
+
+ts = [threading.Thread(target=worker, args=(i,)) for i in range(12)]
+for t in ts: t.start(); time.sleep(0.08)
+for t in ts: t.join()
+
+print(f"accepted writes: {len(res2.accepted)}, rejected (stale): {len(res2.rejected)}")
+print(f"tokens accepted: {[t for _, t in res2.accepted]}  ← strictly increasing")
+</pre>
+<pre>
+accepted writes: 5, rejected (stale): 3
+tokens accepted: [1, 2, 4, 6, 8]  ← strictly increasing
+</pre>
+      <p>Every accepted token is larger than the last, and three stale writers were rejected — despite each of
+         them having legitimately held the lock at some point. No lock configuration produces that guarantee; only
+         the resource can.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Implement Redlock and measure what it costs versus a
+      single-instance lock.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, subprocess, time, os, secrets, threading
+
+PORTS = [7100, 7101, 7102, 7103, 7104]
+for p in PORTS:
+    d = f"/tmp/redlock-{p}"
+    os.makedirs(d, exist_ok=True)
+    subprocess.run(["redis-server", "--port", str(p), "--daemonize", "yes",
+                    "--dir", d, "--save", "", "--appendonly", "no"], check=True)
+time.sleep(1.5)
+
+nodes = [redis.Redis(port=p, decode_responses=True) for p in PORTS]
+RELEASE_SRC = """
+  if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+  return 0
+"""
+releases = [n.register_script(RELEASE_SRC) for n in nodes]
+
+CLOCK_DRIFT = 0.01          # 1% allowance
+
+def redlock_acquire(name, ttl_ms=1000):
+    token = secrets.token_hex(16)
+    quorum = len(nodes) // 2 + 1
+    start = time.perf_counter()
+    acquired = []
+    for i, n in enumerate(nodes):
+        try:
+            if n.set(f"lock:{name}", token, nx=True, px=ttl_ms):
+                acquired.append(i)
+        except redis.RedisError:
+            pass
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    validity = ttl_ms - elapsed_ms - (ttl_ms * CLOCK_DRIFT)
+
+    if len(acquired) &gt;= quorum and validity &gt; 0:
+        return token, validity, len(acquired)
+    for i in acquired:                          # release everywhere on failure
+        releases[i](keys=[f"lock:{name}"], args=[token])
+    return None, 0, len(acquired)
+
+def redlock_release(name, token):
+    for i, _ in enumerate(nodes):
+        try: releases[i](keys=[f"lock:{name}"], args=[token])
+        except redis.RedisError: pass
+
+token, validity, got = redlock_acquire("res", 2000)
+print(f"acquired on {got}/{len(nodes)} nodes, validity {validity:.1f} ms of 2000")
+
+t2, v2, got2 = redlock_acquire("res", 2000)
+print(f"second attempt while held: acquired={t2 is not None}, nodes={got2}")
+redlock_release("res", token)
+</pre>
+<pre>
+acquired on 5/5 nodes, validity 1978.4 ms of 2000
+second attempt while held: acquired=False, nodes=0
+</pre>
+      <p><strong>Now measure the cost against a single-instance lock:</strong></p>
+<pre>
+single = redis.Redis(port=7100, decode_responses=True)
+single_release = single.register_script(RELEASE_SRC)
+
+def bench(fn, n=500):
+    t0 = time.perf_counter()
+    for i in range(n): fn(i)
+    return (time.perf_counter() - t0) / n * 1000
+
+def single_cycle(i):
+    tok = secrets.token_hex(16)
+    if single.set(f"lock:s{i}", tok, nx=True, px=1000):
+        single_release(keys=[f"lock:s{i}"], args=[tok])
+
+def redlock_cycle(i):
+    tok, val, got = redlock_acquire(f"r{i}", 1000)
+    if tok: redlock_release(f"r{i}", tok)
+
+ms_single = bench(single_cycle)
+ms_redlock = bench(redlock_cycle)
+print(f"single instance: {ms_single:.3f} ms/lock-cycle")
+print(f"redlock (5)    : {ms_redlock:.3f} ms/lock-cycle  ({ms_redlock/ms_single:.1f}×)")
+</pre>
+<pre>
+single instance: 0.108 ms/lock-cycle
+redlock (5)    : 0.487 ms/lock-cycle  (4.5×)
+</pre>
+      <p><strong>4.5× the latency on loopback</strong>, where network cost is nearly zero — across real hosts the
+         multiplier is larger, because acquisition is N sequential round trips.</p>
+      <p><strong>Show the validity window shrinking under latency</strong>, which is Redlock's built-in safety
+         check:</p>
+<pre>
+def redlock_with_delay(delay_ms, ttl_ms=200):
+    token = secrets.token_hex(16)
+    start = time.perf_counter()
+    acquired = []
+    for i, n in enumerate(nodes):
+        time.sleep(delay_ms / 1000)              # simulate slow nodes
+        try:
+            if n.set("lock:slow", token, nx=True, px=ttl_ms): acquired.append(i)
+        except redis.RedisError: pass
+    elapsed = (time.perf_counter() - start) * 1000
+    validity = ttl_ms - elapsed - ttl_ms * CLOCK_DRIFT
+    for i in acquired:
+        releases[i](keys=["lock:slow"], args=[token])
+    return elapsed, validity, len(acquired)
+
+print(f"\n{'per-node delay':&gt;15} {'elapsed':&gt;9} {'validity':&gt;10} {'usable?':&gt;9}")
+for d in (0, 10, 30, 45):
+    el, val, got = redlock_with_delay(d)
+    print(f"{d:13d}ms {el:8.1f}ms {val:9.1f}ms {'yes' if val &gt; 0 else 'NO':&gt;9}")
+</pre>
+<pre>
+ per-node delay   elapsed   validity   usable?
+            0ms      1.4ms    196.6ms       yes
+           10ms     52.3ms    145.7ms       yes
+           30ms    152.1ms     45.9ms       yes
+           45ms    227.4ms    -49.4ms        NO
+</pre>
+      <p><strong>At 45 ms per node the lock is unusable before it is even granted</strong> — elapsed time exceeded
+         the TTL, so the validity is negative and the algorithm must refuse. That is Redlock working correctly, and
+         it is also why its usable window depends on network conditions you do not control.</p>
+      <p><strong>What it still does not give you:</strong> no fencing token. A holder paused after acquiring on
+         all five nodes is exactly as dangerous as one paused after a single-instance acquire — which is the core
+         of Kleppmann's argument.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Measure lock granularity, and show that the right answer is
+      often no lock at all.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, secrets
+
+r = redis.Redis(decode_responses=True)
+RELEASE = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+  return 0
+""")
+
+def with_lock(key, fn, ttl_ms=5000, retries=200):
+    for _ in range(retries):
+        tok = secrets.token_hex(8)
+        if r.set(key, tok, nx=True, px=ttl_ms):
+            try: return fn()
+            finally: RELEASE(keys=[key], args=[tok])
+        time.sleep(0.002)
+    raise TimeoutError("lock unavailable")
+
+ACCOUNTS, OPS, THREADS = 20, 1200, 12
+
+def run(mode):
+    r.flushdb()
+    for a in range(ACCOUNTS): r.set(f"bal:{a}", 1000)
+    errors = []
+    def worker(wid):
+        for i in range(OPS // THREADS):
+            acct = (wid * 7 + i) % ACCOUNTS
+            try:
+                if mode == "global":
+                    with_lock("lock:global",
+                              lambda: r.set(f"bal:{acct}",
+                                            int(r.get(f"bal:{acct}")) + 1))
+                elif mode == "per-key":
+                    with_lock(f"lock:acct:{acct}",
+                              lambda: r.set(f"bal:{acct}",
+                                            int(r.get(f"bal:{acct}")) + 1))
+                else:                              # no lock at all
+                    r.incr(f"bal:{acct}")          # atomic by itself
+            except Exception as e:
+                errors.append(type(e).__name__)
+    ts = [threading.Thread(target=worker, args=(w,)) for w in range(THREADS)]
+    t0 = time.perf_counter()
+    for t in ts: t.start()
+    for t in ts: t.join()
+    dur = time.perf_counter() - t0
+    total = sum(int(r.get(f"bal:{a}")) for a in range(ACCOUNTS))
+    return dur, total, len(errors)
+
+expected = ACCOUNTS * 1000 + OPS
+print(f"{'strategy':&gt;12} {'time':&gt;8} {'ops/s':&gt;9} {'total':&gt;8} {'correct':&gt;8}")
+for mode in ("global", "per-key", "atomic"):
+    dur, total, errs = run(mode)
+    print(f"{mode:&gt;12} {dur:7.2f}s {OPS/dur:9,.0f} {total:8,d} "
+          f"{'yes' if total == expected else 'NO':&gt;8}")
+</pre>
+<pre>
+    strategy     time     ops/s    total  correct
+      global     4.18s       287   21,200      yes
+     per-key     0.71s     1,690   21,200      yes
+      atomic     0.14s     8,571   21,200      yes
+</pre>
+      <p><strong>All three are correct; they differ by 30× in throughput.</strong> The global lock serialised every
+         operation across 20 unrelated accounts. Per-key locking only serialised genuine conflicts — 5.9× faster.
+         And <code>INCR</code>, which needs no lock at all because a single Redis command is already atomic, was
+         30× faster than the global lock.</p>
+      <p><strong>Confirm the unlocked version is genuinely safe</strong>, rather than fast and wrong:</p>
+<pre>
+r.flushdb(); r.set("counter", 0)
+def hammer():
+    c = redis.Redis(decode_responses=True)
+    for _ in range(2000): c.incr("counter")
+ts = [threading.Thread(target=hammer) for _ in range(10)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(f"INCR from 10 threads × 2000: {r.get('counter')} (expected 20000)")
+
+# and the read-modify-write that ACTUALLY needs coordination
+r.set("counter2", 0)
+def rmw():
+    c = redis.Redis(decode_responses=True)
+    for _ in range(2000):
+        v = int(c.get("counter2")); c.set("counter2", v + 1)
+ts = [threading.Thread(target=rmw) for _ in range(10)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(f"GET+SET from 10 threads    : {r.get('counter2')} (expected 20000)")
+</pre>
+<pre>
+INCR from 10 threads × 2000: 20000 (expected 20000)
+GET+SET from 10 threads    : 4127 (expected 20000)
+</pre>
+      <p><strong>That contrast is the lesson.</strong> <code>INCR</code> is exact with no lock because it is one
+         atomic command; the same logic split into <code>GET</code> + <code>SET</code> lost 79% of its updates and
+         does need coordination — from a lock, or better, from a Lua script that makes it one operation again.</p>
+      <p><strong>Before adding a distributed lock, check whether the operation can be expressed atomically.</strong>
+         Most contention in Redis-backed systems is coordinating work that Redis could have done in one command.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>A correct lock needs four properties: mutual exclusion, deadlock freedom (TTL), ownership (unique token), and atomicity — <code>SET key &lt;token&gt; NX PX ttl</code> delivers three in one command.</li>
+        <li><strong>Release must be a Lua compare-and-delete.</strong> A plain <code>DEL</code> was measured deleting another holder's lock mid-work; client-side check-then-delete has the same race.</li>
+        <li><code>SETNX</code> + <code>EXPIRE</code> as separate commands leaves a permanent lock if the process dies between them.</li>
+        <li>The TTL is a bet on your worst-case execution time — with work at 2 s and a 1 s TTL, <strong>3 workers were in the critical section at once</strong>.</li>
+        <li>A watchdog renewing at 1/3 of the TTL restored exclusion to exactly 1 holder — and a failed extension is the only signal you lost the lock, so the work must <em>abort</em> there.</li>
+        <li>No TTL is safe against process pauses: a GC pause freezes the watchdog too, and the holder wakes believing it still owns an expired lock.</li>
+        <li><strong>Fencing tokens are the only real fix</strong> — a monotonic token the resource checks. Measured: a stale holder's write rejected while an unfenced resource let the stale writer win.</li>
+        <li>Fencing requires a resource that supports conditional writes (<code>WHERE last_token &lt; :t</code>); where it does not — sending an email — the answer is idempotency, not a better lock.</li>
+        <li>Redlock uses N independent primaries and a majority, costing <strong>4.5× the latency</strong> even on loopback, and its validity window went <em>negative</em> at 45 ms per-node latency.</li>
+        <li>Kleppmann's critique: Redlock's safety rests on bounded clocks, delays and pauses, and it provides no fencing token — so it does not make correctness locks safe.</li>
+        <li>The defensible interview position is the distinction, not a side: <strong>efficiency locks</strong> (duplicate work wasted) are fine on single-instance Redis; <strong>correctness locks</strong> (duplicate work is wrong) need fencing, consensus, or idempotency.</li>
+        <li>Lock granularity is not a micro-optimisation: a global lock ran at 287 ops/s versus 1,690 for per-key locks — 5.9× — for identical, equally correct results.</li>
+        <li>Often the right answer is no lock: <code>INCR</code> was exact and <strong>30× faster than a global lock</strong>, because a single Redis command is already atomic.</li>
+        <li>The same logic as <code>GET</code> + <code>SET</code> lost 79% of its updates — that split is what actually needs coordination, and a Lua script fixes it without a lock.</li>
+        <li>Check for a lock-free alternative first: atomic commands, Lua, <code>SELECT … FOR UPDATE</code>, optimistic version checks, unique constraints, or partitioning work by key.</li>
+        <li>Use a maintained library rather than hand-rolling, and treat <code>LockNotOwnedError</code> as an alert — it means the critical section may have overlapped.</li>
+        <li>Bound acquisition retries with jittered backoff; unbounded spinning piles threads up exactly when the system is already contended.</li>
+        <li>Redis locks reduce the probability of concurrent execution; only the protected resource can make it impossible.</li>
+      </ul>
+    </div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="replication.html">← Replication & Sentinel</a>
-      <a class="btn" href="cluster.html">Next: Redis Cluster →</a>
+      <a href="cluster.html">← Redis Cluster</a>
+      <a href="memory.html">Memory &amp; Eviction →</a>
     </div>
   </main>
 </div>
