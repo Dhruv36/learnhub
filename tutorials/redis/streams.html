@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Streams &amp; Consumer Groups — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Streams &amp; Consumer Groups <span class="level-badge level-adv">Messaging &amp; Data Flow</span></h1>
+    <p><strong>What you'll master:</strong> the append-only log that gives Redis at-least-once delivery, and why
+       that single guarantee changes every design decision from <a href="pubsub.html">Pub/Sub</a>; entry IDs as
+       timestamps and what the sequence counter protects you from; the <strong>Pending Entries List</strong> —
+       the structure that makes delivery recoverable and the one that silently grows into an outage when nobody
+       acknowledges; <code>XAUTOCLAIM</code> and the exact reasoning for choosing a min-idle-time; why
+       at-least-once means your consumer <em>must</em> be idempotent and what actually makes it so; trimming, which
+       is the difference between a stream and a memory leak; and the honest comparison with Kafka that an
+       interviewer is really asking for. Prerequisites:
+       <a href="pubsub.html">Pub/Sub</a>,
+       <a href="transactions.html">Transactions &amp; Lua Scripting</a>.</p>
+
+    <h2>Part 1 — An Append-Only Log With IDs That Mean Something</h2>
+
+    <p>A Stream is an append-only sequence of entries, each with a unique, monotonically increasing ID and a set
+       of field/value pairs. Unlike Pub/Sub, the data <em>stays</em> — which is the entire reason the rest of this
+       lesson exists.</p>
+
+<pre>
+XADD orders * item "laptop" qty 2        → "1723900000123-0"
+                                             └─────┬─────┘ └┬┘
+                                        ms timestamp    sequence
+
+XADD orders * item "mouse"  qty 1        → "1723900000123-1"   ← same ms, seq+1
+XADD orders * item "cable"  qty 5        → "1723900000456-0"   ← new ms, seq resets
+</pre>
+
+    <div class="note">🔑 <strong>The ID is a millisecond timestamp plus a sequence number, and both halves earn
+       their place.</strong> The timestamp makes IDs sortable and lets you range-query by time without a secondary
+       index — <code>XRANGE orders 1723900000000 +</code> is "everything since that moment". The sequence counter
+       exists because modern hardware appends far more than one entry per millisecond; without it, IDs would
+       collide and the log would lose its total order. Redis also guarantees IDs strictly increase even if the
+       system clock moves backwards, so a clock adjustment cannot corrupt the stream.</p></div>
+
+    <table class="tbl">
+      <tr><th>Command</th><th>Does</th><th>Note</th></tr>
+      <tr><td><code>XADD key * f v</code></td><td>Append; <code>*</code> = server-generated ID</td><td>O(1)</td></tr>
+      <tr><td><code>XLEN key</code></td><td>Entry count</td><td>O(1)</td></tr>
+      <tr><td><code>XRANGE key start end</code></td><td>Range scan, oldest first</td><td><code>-</code> and <code>+</code> = min/max</td></tr>
+      <tr><td><code>XREVRANGE key + - COUNT n</code></td><td>Newest first</td><td>The idiom for "last n"</td></tr>
+      <tr><td><code>XREAD ... BLOCK ms</code></td><td>Read new entries, optionally blocking</td><td>No group; every reader sees everything</td></tr>
+      <tr><td><code>XDEL key id</code></td><td>Delete one entry</td><td>Does not renumber; IDs stay unique forever</td></tr>
+      <tr><td><code>XINFO STREAM key</code></td><td>Length, first/last ID, groups</td><td>First stop when debugging</td></tr>
+    </table>
+
+    <p><strong><code>XREAD</code> without a group is the fan-out mode</strong>: every reader tracks its own
+       position and sees every entry, exactly like a Kafka topic read without a consumer group. The special ID
+       <code>$</code> means "only entries added after this call blocks".</p>
+
+<pre>
+XREAD BLOCK 5000 STREAMS orders $        # wait up to 5s for genuinely new entries
+XREAD COUNT 10 STREAMS orders 0          # replay from the very beginning
+</pre>
+
+    <p>The blocking form is what makes Streams usable as a queue without polling: the client parks on the socket
+       and Redis wakes it the moment an entry arrives, so latency is comparable to Pub/Sub while the data remains
+       durable. Note that <code>$</code> is resolved <em>when the command is issued</em> — entries added between
+       your last read and this call are skipped, which is precisely why real consumers pass their last-seen ID
+       instead.</p>
+
+    <h2>Part 2 — Consumer Groups and the Pending Entries List</h2>
+
+    <p>A consumer group is what turns the log into a work queue. Members of a group <em>share</em> the entries
+       rather than each receiving a copy, and the group remembers what has been delivered but not yet
+       acknowledged.</p>
+
+<pre>
+XGROUP CREATE orders workers $ MKSTREAM     # $ = only new entries; 0 = from the start
+                                            # MKSTREAM: create the stream if absent
+
+XREADGROUP GROUP workers alice COUNT 10 BLOCK 5000 STREAMS orders &gt;
+                                                                   ↑
+                              '&gt;' = entries never delivered to ANY consumer
+</pre>
+
+    <p>The moment an entry is handed to a consumer it enters that group's <strong>Pending Entries List</strong>
+       (PEL) — a per-group record of "delivered, not yet acknowledged". It leaves only when the consumer calls
+       <code>XACK</code>.</p>
+
+<pre>
+XREADGROUP … &gt;         → entry 1723-0 delivered to alice, ADDED TO PEL
+   (alice processes it)
+XACK orders workers 1723-0    → (integer) 1     REMOVED FROM PEL
+
+If alice crashes before XACK, 1723-0 stays in the PEL forever —
+recoverable by another consumer, but never automatically redelivered.
+</pre>
+
+    <div class="note">🔑 <strong>The PEL is the entire delivery guarantee, and it is also the most common way a
+       Streams deployment fails.</strong> It is what lets a crashed consumer's work be recovered by another —
+       nothing else in Redis offers that. But it only shrinks when something acknowledges, so a consumer that
+       forgets <code>XACK</code>, or that dies in a loop, grows the PEL without bound. The stream itself looks
+       healthy; <code>XLEN</code> is normal; memory climbs and the group's pending count climbs with it. Always
+       alert on <code>XPENDING</code>, never on <code>XLEN</code> alone.</p></div>
+
+<pre>
+XPENDING orders workers                 # summary
+  1) (integer) 1247                     ← total pending
+  2) "1723900000123-0"                  ← smallest pending ID
+  3) "1723900011999-0"                  ← largest
+  4) 1) 1) "alice"  2) "1200"           ← per-consumer counts
+     2) 1) "bob"    2) "47"
+
+XPENDING orders workers - + 10          # detail: id, consumer, idle-ms, delivery-count
+</pre>
+
+    <p><strong>The <code>&gt;</code> versus explicit-ID distinction</strong> is the one people get wrong:</p>
+
+    <table class="tbl">
+      <tr><th>Read with</th><th>Returns</th><th>Use for</th></tr>
+      <tr><td><code>&gt;</code></td><td>Entries never delivered to anyone</td><td>Normal consumption</td></tr>
+      <tr><td><code>0</code> (or any ID)</td><td><strong>This consumer's own pending entries</strong>, re-read</td><td>Recovery after a restart</td></tr>
+    </table>
+
+    <p>So a consumer restarting should first drain its own PEL with <code>0</code>, then switch to
+       <code>&gt;</code> — otherwise the entries it was holding when it crashed sit pending until some other
+       mechanism claims them:</p>
+
+<pre>
+# on startup: recover what this consumer already owned
+pending = r.xreadgroup("workers", "alice", {"orders": "0"}, count=100)
+for _, entries in pending or []:
+    for eid, fields in entries:
+        handle(eid, fields); r.xack("orders", "workers", eid)
+
+# then normal consumption
+while True:
+    msgs = r.xreadgroup("workers", "alice", {"orders": "&gt;"}, count=10, block=5000)
+    ...
+</pre>
+
+    <h2>Part 3 — Claiming Work From Dead Consumers</h2>
+
+    <p>A consumer that dies leaves its entries in the PEL, owned by a name that will never acknowledge them.
+       Recovery means <em>claiming</em> them — transferring ownership to a live consumer.</p>
+
+<pre>
+XAUTOCLAIM orders workers bob 60000 0 COUNT 10
+                          │      │    │
+                          │      │    └ start scanning from this ID
+                          │      └───── min-idle-time: only entries idle ≥ 60s
+                          └──────────── new owner
+
+Returns: next cursor, the claimed entries, and IDs deleted from the stream
+</pre>
+
+    <p><code>XAUTOCLAIM</code> (Redis 6.2) replaced the older <code>XPENDING</code>-then-<code>XCLAIM</code>
+       dance, and it also cleans up a nasty edge case: entries that were trimmed or deleted from the stream while
+       still pending are dropped from the PEL rather than being returned as phantoms.</p>
+
+    <div class="note">🔑 <strong>The min-idle-time is a correctness parameter, not a tuning knob.</strong> It must
+       comfortably exceed your worst-case processing time, because Redis cannot distinguish "crashed" from "still
+       working". Set it to 30 seconds when a job can legitimately take 60, and a healthy consumer's work gets
+       claimed out from under it — so the job runs twice concurrently, which is exactly the scenario your
+       idempotency has to survive. The rule: <code>min-idle-time ≥ p99.9 processing time × a safety factor</code>,
+       and if that number is uncomfortably large, the fix is bounding job duration rather than shrinking the
+       timeout.</p></div>
+
+    <p><strong>The delivery counter is your poison-message detector.</strong> Every claim increments it, so an
+       entry that keeps being claimed is an entry that keeps killing consumers:</p>
+
+<pre>
+XPENDING orders workers - + 10
+  1) 1) "1723900000123-0"
+     2) "bob"
+     3) (integer) 92000          ← idle ms
+     4) (integer) 47             ← delivery count: this has failed 46 times
+</pre>
+
+<pre>
+def claim_loop(max_deliveries=5):
+    cursor = "0-0"
+    while True:
+        cursor, entries, _ = r.xautoclaim("orders", "workers", ME,
+                                          min_idle_time=60000, start_id=cursor,
+                                          count=10)
+        for eid, fields in entries:
+            info = r.xpending_range("orders", "workers", eid, eid, 1)
+            if info and info[0]["times_delivered"] &gt; max_deliveries:
+                r.xadd("orders:dead", fields)          # dead-letter it
+                r.xack("orders", "workers", eid)       # and stop retrying
+                continue
+            handle(eid, fields)
+            r.xack("orders", "workers", eid)
+        if cursor == "0-0":
+            break
+</pre>
+
+    <p>Without that cap, one malformed entry is retried forever, consuming a claim slot on every pass and
+       guaranteeing a consumer crash on every attempt. A dead-letter stream turns an infinite loop into a row in a
+       table someone can look at.</p>
+
+    <h2>Part 4 — At-Least-Once Means You Must Be Idempotent</h2>
+
+    <p>Streams guarantee <em>at-least-once</em>, never exactly-once. Duplicates are not an edge case to be
+       engineered away; they are a normal, expected outcome of the delivery model.</p>
+
+<pre>
+Every one of these produces a duplicate, and none is a bug:
+
+  1. Consumer processes → crashes → XACK never sent → another claims it
+  2. XACK is sent → network drops the reply → consumer retries the whole entry
+  3. Processing exceeds min-idle-time → another consumer legitimately claims it
+     → BOTH now process it, concurrently
+</pre>
+
+    <p><strong>Case 3 is the one that surprises people</strong>: the entry is processed twice
+       <em>simultaneously</em>, not sequentially. A "check if already processed, then process" guard does not save
+       you, because both consumers can pass the check before either writes.</p>
+
+    <table class="tbl">
+      <tr><th>Idempotency strategy</th><th>How</th><th>Cost / caveat</th></tr>
+      <tr><td>Natural idempotence</td><td><code>SET status "paid"</code> rather than <code>INCR</code></td><td>Free — prefer it whenever the operation allows</td></tr>
+      <tr><td>Dedup key with <code>SET NX</code></td><td>Claim the entry ID before working</td><td>Needs a TTL; a crash after claiming loses the job</td></tr>
+      <tr><td>Database unique constraint</td><td>Insert keyed by entry ID</td><td>Strongest — the DB enforces it under concurrency</td></tr>
+      <tr><td>Transactional outbox</td><td>Work and dedup-marker in one DB transaction</td><td>Correct even for case 3; requires a real DB</td></tr>
+      <tr><td>Version / CAS check</td><td>Update only if the version matches</td><td>Good for state machines</td></tr>
+    </table>
+
+    <p>The <code>SET NX</code> dedup key is the cheapest workable option, and its weakness is worth stating
+       plainly:</p>
+
+<pre>
+def process_once(eid, fields, ttl=86400):
+    if not r.set(f"done:{eid}", "1", nx=True, ex=ttl):
+        r.xack("orders", "workers", eid)      # already handled — ack and move on
+        return
+    try:
+        do_work(fields)
+    except Exception:
+        r.delete(f"done:{eid}")               # release so a retry can proceed
+        raise
+    r.xack("orders", "workers", eid)
+</pre>
+
+    <p>If the process dies between <code>SET NX</code> and <code>do_work</code>, the marker exists but the work
+       never happened — and every retry sees the marker and skips. That is a lost job, silently. The transactional
+       outbox avoids this by making the marker and the work atomic in the same database transaction, which is why
+       it is the answer for anything financial.</p>
+
+    <h2>Part 5 — Trimming: The Difference Between a Log and a Leak</h2>
+
+    <p>Streams keep every entry until you remove it. A stream nobody trims grows until Redis hits
+       <code>maxmemory</code> — and unlike a cache, entries have no TTL, so eviction policies do not save you.</p>
+
+<pre>
+XADD orders MAXLEN 10000 * item "x"         # exact: O(N) worst case
+XADD orders MAXLEN ~ 10000 * item "x"       # approximate: O(1), trims whole nodes
+XADD orders MINID ~ 1723900000000 * …       # trim by TIME, not count
+
+XTRIM orders MAXLEN ~ 10000                 # trim out-of-band
+XTRIM orders MINID  ~ (now_ms - 86400000)   # keep 24 hours
+</pre>
+
+    <div class="note">🔑 <strong>Always use <code>~</code> unless you have a specific reason not to.</strong>
+       Streams store entries in a radix tree of macro-nodes; exact trimming has to split a node to remove entries
+       mid-node, while approximate trimming drops whole nodes and stops. The approximate form keeps <em>at
+       least</em> the requested count — typically a few hundred more — and is O(1) instead of O(N). Paying O(N) on
+       every <code>XADD</code> to have exactly 10,000 instead of 10,127 entries is a bad trade on a
+       single-threaded server.</p></div>
+
+    <table class="tbl">
+      <tr><th>Strategy</th><th>Bounds</th><th>Best when</th></tr>
+      <tr><td><code>MAXLEN ~ n</code> on <code>XADD</code></td><td>Entry count</td><td>Steady rate; memory is the constraint</td></tr>
+      <tr><td><code>MINID ~ ts</code> on <code>XADD</code></td><td>Age</td><td>Retention is a time policy ("keep 24h")</td></tr>
+      <tr><td>Periodic <code>XTRIM</code></td><td>Either</td><td>Bursty writes; keeps trimming off the hot path</td></tr>
+      <tr><td>No trimming</td><td>Nothing</td><td>Only for short-lived streams you delete outright</td></tr>
+    </table>
+
+    <p><strong>Trimming does not consult the PEL.</strong> An entry that is still pending can be trimmed away, and
+       the PEL then references an entry that no longer exists — a phantom.</p>
+
+<pre>
+XADD orders MAXLEN ~ 100 * …          # aggressive trim
+XREADGROUP … &gt;                        # entry delivered, now pending
+                                      # ... more XADDs push it past the MAXLEN ...
+XAUTOCLAIM …                          # entry is GONE; XAUTOCLAIM drops it from the PEL
+                                      #   (older XCLAIM returned a nil entry instead)
+</pre>
+
+    <p>So retention must exceed your worst-case processing-plus-recovery time by a comfortable margin. Trimming a
+       stream to 1,000 entries while consumers can lag 10,000 behind is a design that discards work under exactly
+       the load conditions where you can least afford it.</p>
+
+    <h2>Part 6 — Streams Versus Kafka, Honestly</h2>
+
+    <p>The interview question is rarely "what is a Stream" and usually "why not Kafka" — or worse, "you chose
+       Redis Streams, defend it". The honest answer needs both columns.</p>
+
+    <table class="tbl">
+      <tr><th></th><th>Redis Streams</th><th>Kafka</th></tr>
+      <tr><td>Storage</td><td><strong>RAM</strong> (+ AOF/RDB)</td><td>Disk, designed for it</td></tr>
+      <tr><td>Practical retention</td><td>Hours to days</td><td>Weeks to forever</td></tr>
+      <tr><td>Throughput ceiling</td><td>~100K–1M msg/s, one shard</td><td>Millions, partitioned</td></tr>
+      <tr><td>Partitioning</td><td>Manual (multiple stream keys)</td><td>Built in</td></tr>
+      <tr><td>Ordering</td><td>Total per stream</td><td>Per partition</td></tr>
+      <tr><td>Consumer parallelism</td><td>Any number per group</td><td>Capped by partition count</td></tr>
+      <tr><td>Durability on node loss</td><td><strong>Async replication can lose data</strong></td><td>Configurable acks; <code>acks=all</code> is safe</td></tr>
+      <tr><td>Operational weight</td><td>Redis you already run</td><td>A cluster to operate</td></tr>
+      <tr><td>Latency</td><td>Sub-millisecond</td><td>Low ms</td></tr>
+    </table>
+
+    <p><strong>The decisive difference is durability.</strong> Redis replication is asynchronous: a primary can
+       acknowledge <code>XADD</code>, fail before the replica receives it, and the promoted replica will not have
+       that entry — the acknowledged write is gone. <code>WAIT</code> reduces the window but does not close it,
+       and it is not a consensus protocol. Kafka with <code>acks=all</code> and a minimum in-sync replica count
+       genuinely does not lose acknowledged writes.</p>
+
+    <p><strong>Choose Redis Streams when</strong> you already run Redis, the volume is within one shard, retention
+       is short, latency matters, and losing a small window of messages during a failover is survivable —
+       notifications, activity feeds, cache-warming pipelines, moderate job queues.
+       <strong>Choose Kafka when</strong> you need long retention or replay, multi-consumer-group fan-out over the
+       same history, throughput beyond a single node, or a durability guarantee you can put in writing.</p>
+
+    <p><strong>Consumer parallelism is a subtle point in Redis's favour.</strong> Kafka caps concurrent consumers
+       in a group at the partition count; Redis Streams has no such limit, so 200 consumers can share one stream.
+       The trade is that Kafka's partitions give you ordered parallelism — per-key ordering across consumers —
+       while a Redis group hands entries out in arrival order with no per-key affinity, so if two entries for the
+       same account must be processed in order, you need separate streams keyed by account.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Treating <code>XREADGROUP</code> as the whole implementation and never acknowledging or
+         claiming.</strong> The consumer reads with <code>&gt;</code>, does its work, and moves on — no
+         <code>XACK</code>, no recovery path for its own pending entries on restart, no
+         <code>XAUTOCLAIM</code> loop. Everything looks correct in testing because entries are delivered and
+         processed exactly once when nothing fails. In production the PEL grows monotonically, consuming memory
+         that <code>XLEN</code> and <code>MAXLEN</code> trimming do not touch; every crashed consumer's work is
+         stranded permanently because nothing claims it; and the first symptom is an out-of-memory event on a
+         stream whose length looks perfectly healthy.</p>
+      <p>✅ <strong>Treat the PEL as the core of the design, not an implementation detail.</strong> Acknowledge
+         after the work commits; on startup drain your own pending entries with <code>XREADGROUP … 0</code> before
+         switching to <code>&gt;</code>; run an <code>XAUTOCLAIM</code> loop with a min-idle-time comfortably above
+         p99.9 processing time; dead-letter entries past a delivery-count threshold so one poison message cannot
+         loop forever; trim with <code>MAXLEN ~</code> or <code>MINID ~</code> keeping retention well above worst-case
+         consumer lag; and alert on <code>XPENDING</code> count and max idle time rather than on stream length,
+         because that is where this failure is visible first.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Never calling <code>XACK</code></td><td>PEL grows without bound; memory leak</td><td>Ack after the work commits</td></tr>
+      <tr><td>No <code>XAUTOCLAIM</code> loop</td><td>Crashed consumers' work is stranded forever</td><td>Periodic claim with a min-idle-time</td></tr>
+      <tr><td>Reading only <code>&gt;</code> after a restart</td><td>Your own pending entries are never re-read</td><td>Drain with <code>0</code> first, then <code>&gt;</code></td></tr>
+      <tr><td>min-idle-time below processing time</td><td>Live consumers get their work claimed; concurrent duplicates</td><td>Well above p99.9 duration</td></tr>
+      <tr><td>Assuming exactly-once</td><td>At-least-once is the guarantee; case 3 duplicates run concurrently</td><td>Idempotent handlers</td></tr>
+      <tr><td>Dedup with plain check-then-act</td><td>Both consumers pass the check before either writes</td><td><code>SET NX</code>, or a DB unique constraint</td></tr>
+      <tr><td>No trimming</td><td>Streams have no TTL; grows until OOM</td><td><code>MAXLEN ~</code> or <code>MINID ~</code></td></tr>
+      <tr><td>Exact <code>MAXLEN</code> on the hot path</td><td>O(N) node splitting on every <code>XADD</code></td><td>Use <code>~</code></td></tr>
+      <tr><td>Retention below worst-case lag</td><td>Pending entries get trimmed away</td><td>Retention ≫ processing + recovery time</td></tr>
+      <tr><td>No delivery-count cap</td><td>A poison message is retried forever</td><td>Dead-letter after N deliveries</td></tr>
+      <tr><td>Alerting on <code>XLEN</code> only</td><td>PEL growth is invisible there</td><td>Alert on <code>XPENDING</code> and idle time</td></tr>
+      <tr><td>Expecting per-key ordering in a group</td><td>Entries are handed out in arrival order, no key affinity</td><td>One stream per ordering key</td></tr>
+      <tr><td>Relying on Streams for financial durability</td><td>Async replication can lose acknowledged writes</td><td>Kafka <code>acks=all</code>, or a database</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How do Streams differ from Pub/Sub?</summary>
+      <p><strong>Streams persist; Pub/Sub does not.</strong> Everything else follows from that.</p>
+      <table class="tbl">
+        <tr><th></th><th>Pub/Sub</th><th>Streams</th></tr>
+        <tr><td>Delivery</td><td>At-most-once</td><td>At-least-once</td></tr>
+        <tr><td>Stored</td><td>Never</td><td>Until trimmed</td></tr>
+        <tr><td>Offline consumer</td><td>Loses everything</td><td>Resumes from its offset</td></tr>
+        <tr><td>Acknowledgement</td><td>None</td><td><code>XACK</code> + pending list</td></tr>
+        <tr><td>Replay</td><td>Impossible</td><td><code>XRANGE</code> from any ID</td></tr>
+        <tr><td>Work splitting</td><td>All subscribers get everything</td><td>Consumer groups distribute</td></tr>
+        <tr><td>Memory</td><td>None</td><td>Grows — must be trimmed</td></tr>
+      </table>
+      <p>The practical test: <em>"if a consumer is restarting when this message is sent, is that acceptable?"</em>
+         With Pub/Sub the message is gone permanently and silently. With Streams it stays in the log and the
+         consumer picks it up on reconnect from its last position.</p>
+      <p>The costs of Streams are real, not free: entries occupy memory until trimmed, consumers must acknowledge
+         or the pending list grows, and duplicates are guaranteed by the at-least-once model, so handlers have to
+         be idempotent. Pub/Sub has none of that bookkeeping — which is why it remains correct for genuinely
+         ephemeral signals like presence or dashboard ticks.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the Pending Entries List and why does it matter?</summary>
+      <p>The <strong>PEL</strong> is a per-consumer-group record of entries that have been delivered to a consumer
+         but not yet acknowledged. An entry enters when <code>XREADGROUP</code> hands it out and leaves when
+         <code>XACK</code> is called.</p>
+<pre>
+XREADGROUP GROUP workers alice … &gt;    → 1723-0 delivered, now PENDING
+XACK orders workers 1723-0            → removed from the PEL
+</pre>
+      <p><strong>It matters for two opposite reasons.</strong></p>
+      <p>First, it <em>is</em> the delivery guarantee. Because Redis remembers what was delivered and not
+         confirmed, a consumer that crashes mid-job leaves recoverable work: another consumer can claim it with
+         <code>XAUTOCLAIM</code> and finish it. Without the PEL, Streams would be at-most-once like Pub/Sub.</p>
+      <p>Second, it is the standard way these deployments fail. The PEL shrinks <em>only</em> on acknowledgement,
+         so a consumer that forgets <code>XACK</code>, or crashes repeatedly, grows it forever. Stream trimming
+         does not help — <code>MAXLEN</code> bounds the stream, not the pending list — so memory climbs while
+         <code>XLEN</code> looks entirely normal.</p>
+<pre>
+XPENDING orders workers
+  1) (integer) 1247        ← pending count: the number to alert on
+  2) "1723900000123-0"     ← oldest pending; if this stops moving, work is stranded
+</pre>
+      <p>So: monitor <code>XPENDING</code> count and the idle time of the oldest entry, not just stream length.
+         A steadily rising pending count means acknowledgements are not happening, and a stalled oldest-ID means
+         some consumer died holding work that nothing is claiming.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A consumer crashes mid-processing. Walk through the recovery.</summary>
+      <p>The entry stays in the group's PEL, owned by the dead consumer's name, with its idle time growing. It is
+         never redelivered automatically — Redis has no notion of a consumer being "down" — so recovery is
+         something the application must actively perform. There are two paths, and a correct deployment uses
+         both.</p>
+      <p><strong>1. The consumer restarts under the same name.</strong> On startup it re-reads its own pending
+         entries by passing an explicit ID instead of <code>&gt;</code>:</p>
+<pre>
+# '0' returns THIS consumer's pending entries, not new ones
+pending = r.xreadgroup("workers", "alice", {"orders": "0"}, count=100)
+for _, entries in pending or []:
+    for eid, fields in entries:
+        handle(eid, fields)
+        r.xack("orders", "workers", eid)
+# only then switch to '&gt;' for new work
+</pre>
+      <p><strong>2. Another consumer claims it.</strong> Required when the instance never comes back — a scaled-down
+         pod, a replaced host, a renamed consumer:</p>
+<pre>
+XAUTOCLAIM orders workers bob 60000 0 COUNT 10
+#                          ↑ min-idle-time: only entries idle ≥ 60s
+</pre>
+      <p><strong>Choosing the min-idle-time is the part that matters.</strong> Redis cannot distinguish a crashed
+         consumer from a slow one, so this value is the only thing preventing work being stolen from a healthy
+         worker. Set it comfortably above p99.9 processing time; if it is set too low, the original consumer and
+         the claimer run the same job <em>concurrently</em>, which is precisely the duplicate case idempotency
+         must survive.</p>
+      <p><strong>Cap the retries.</strong> Each claim increments the delivery count, so an entry that consistently
+         crashes consumers will loop forever unless you dead-letter it:</p>
+<pre>
+if entry_info["times_delivered"] &gt; 5:
+    r.xadd("orders:dead", fields)
+    r.xack("orders", "workers", eid)      # stop retrying
+</pre>
+      <p>And clean up consumer names: <code>XINFO CONSUMERS</code> lists every name ever used, and a fleet with
+         ephemeral hostnames accumulates them indefinitely. Once a consumer's pending entries are claimed away,
+         <code>XGROUP DELCONSUMER</code> removes it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why can't Streams give exactly-once delivery, and what do you do about it?</summary>
+      <p>Because acknowledgement and processing cannot be made atomic across two systems. Whatever order you
+         choose, a crash in the gap produces either a duplicate or a loss:</p>
+<pre>
+process → crash → no XACK  → redelivered → DUPLICATE
+XACK    → crash → no work  →   nothing   → LOST
+</pre>
+      <p>Streams choose the first, giving at-least-once. And there is a third source that is not a crash at all:
+         if processing exceeds the min-idle-time, another consumer legitimately claims the entry and both process
+         it <strong>concurrently</strong>. That is normal operation, not a failure.</p>
+      <p><strong>The answer is idempotent handlers</strong>, in rough order of strength:</p>
+      <ul>
+        <li><strong>Natural idempotence</strong> — write a final state rather than a delta.
+           <code>SET order:7:status "paid"</code> is safe to repeat; <code>INCR revenue</code> is not. Free when
+           the operation allows it.</li>
+        <li><strong>A database unique constraint</strong> keyed by the entry ID. The strongest cheap option,
+           because the database enforces it under true concurrency — the second insert simply fails.</li>
+        <li><strong>Transactional outbox</strong> — perform the work and write the dedup marker in one database
+           transaction. The only approach that is fully correct for concurrent duplicates, and the right answer
+           for anything financial.</li>
+        <li><strong>Redis <code>SET NX</code> marker</strong> on the entry ID. Cheapest, and adequate for
+           notifications and similar — but if the process dies between claiming the marker and doing the work, the
+           job is silently lost, so it is not suitable for money.</li>
+      </ul>
+<pre>
+if not r.set(f"done:{eid}", "1", nx=True, ex=86400):
+    r.xack(stream, group, eid)            # someone else already did it
+    return
+</pre>
+      <p><strong>The framing to give in an interview:</strong> exactly-once delivery does not exist in a
+         distributed system; exactly-once <em>effect</em> does, and you get it by making the effect idempotent.
+         The transport's job is at-least-once, and deduplication belongs where the state lives.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design an order-processing pipeline on Redis Streams. What breaks at scale?</summary>
+      <p><strong>Shape:</strong> the API writes the order to the database and appends to a stream in the same
+         request path, workers consume via a consumer group, and each stage that needs its own retry semantics
+         gets its own stream.</p>
+<pre>
+orders:new  ──group:validators──→ validate  ──XADD──→ orders:validated
+orders:validated ──group:payments──→ charge ──XADD──→ orders:paid
+orders:paid ──group:fulfil──→ ship          ──XADD──→ orders:shipped
+                    │
+                    └─ failures past N deliveries ──→ orders:dead
+</pre>
+      <p><strong>Per-consumer discipline:</strong> drain own PEL with <code>XREADGROUP … 0</code> on startup, then
+         <code>&gt;</code>; a background <code>XAUTOCLAIM</code> loop with min-idle-time well above p99.9 duration;
+         <code>XACK</code> only after the work commits; dead-letter past a delivery-count threshold; and every
+         handler idempotent against the entry ID via a database unique constraint, because a payment charged twice
+         is the failure that ends the discussion.</p>
+      <p><strong>What breaks first, in order:</strong></p>
+      <ul>
+        <li><strong>The PEL, from unacknowledged entries.</strong> The most common real failure. Memory grows
+           while <code>XLEN</code> looks healthy, so it is invisible unless you alert on <code>XPENDING</code>.</li>
+        <li><strong>Single-shard throughput.</strong> One stream is one key on one node — no partitioning. Beyond
+           roughly 100K entries/s you must shard manually into <code>orders:{0..15}</code>, and consumers must
+           then cover all shards, which is partition assignment reimplemented by hand.</li>
+        <li><strong>Memory, from retention.</strong> Entries live in RAM. At 10K/s and 500 bytes that is ~430 GB
+           per day untrimmed — so retention is a hard budget, and it must still exceed worst-case consumer lag or
+           trimming discards pending work.</li>
+        <li><strong>Durability at failover.</strong> Async replication means an acknowledged <code>XADD</code> can
+           vanish when a primary fails. For orders this is the disqualifying property, and the mitigation is
+           architectural: the database is the source of truth, and the stream is a work trigger. A lost stream
+           entry then costs a delayed order, recoverable by a reconciliation job scanning for orders with no
+           terminal state — not a lost order.</li>
+        <li><strong>Ordering.</strong> A consumer group has no per-key affinity, so two entries for the same order
+           can be processed concurrently by different consumers. If per-order ordering matters, shard by
+           <code>hash(order_id)</code> into separate streams so one consumer owns a given order.</li>
+      </ul>
+      <p><strong>What I would actually build:</strong> Redis Streams for the pipeline, database as source of
+         truth, reconciliation sweep as the backstop, and an explicit written note that a failover can lose a
+         window of triggers. If the requirement is "never lose an acknowledged order event", Streams is the wrong
+         transport and Kafka with <code>acks=all</code> is the right one — and that is a sizing decision to make
+         before launch, not after the first failover.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Streams memory is growing despite aggressive <code>MAXLEN</code> trimming. Diagnose it.</summary>
+      <p><strong>Trimming bounds the stream, not the consumer-group bookkeeping.</strong> The likely causes, in
+         order of how often they are the answer:</p>
+      <p><strong>1. The PEL.</strong> Entries delivered but never acknowledged stay in the pending list, and
+         <code>MAXLEN</code> does not touch it. This is the usual culprit.</p>
+<pre>
+XINFO GROUPS orders
+  1) name: workers   consumers: 12   pending: 847293   ← the answer, usually
+XPENDING orders workers - + 1        # oldest pending; check its idle time
+</pre>
+      <p>A large pending count with a very old smallest ID means consumers are reading and not acknowledging — a
+         missing <code>XACK</code>, or a handler that throws before reaching it.</p>
+      <p><strong>2. Abandoned consumer names.</strong> Every distinct consumer name persists in the group forever,
+         each with its own PEL. A fleet using pod names or UUIDs accumulates thousands of dead consumers, each
+         holding stranded entries.</p>
+<pre>
+XINFO CONSUMERS orders workers       # names, pending count, idle ms
+XGROUP DELCONSUMER orders workers old-pod-7   # after claiming its entries away
+</pre>
+      <p><strong>3. Abandoned groups.</strong> A group nobody reads still pins its PEL. <code>XINFO STREAM</code>
+         shows the group count; <code>XGROUP DESTROY</code> removes obsolete ones.</p>
+      <p><strong>4. Trimming that is not actually running.</strong> Exact <code>MAXLEN</code> without
+         <code>~</code> on a hot path is O(N) and can be slow enough that it appears to lag; or the
+         <code>MAXLEN</code> is on some <code>XADD</code> call sites and not others. Check
+         <code>XLEN</code> against the intended bound directly.</p>
+      <p><strong>5. Large entries.</strong> <code>XLEN</code> counts entries, not bytes. Ten thousand entries of
+         1 MB each is 10 GB at a perfectly obedient <code>MAXLEN 10000</code>. Compare
+         <code>MEMORY USAGE orders</code> against the entry count.</p>
+      <p><strong>The order I would check:</strong> <code>XINFO STREAM</code> for length and group count, then
+         <code>XINFO GROUPS</code> for pending counts, then <code>XINFO CONSUMERS</code> for dead names, then
+         <code>MEMORY USAGE</code> divided by <code>XLEN</code> for entry size. Nine times in ten the pending
+         count answers it, and the fix is finding the code path that reads without acknowledging.</p>
+      <p><strong>The prevention</strong> is monitoring the right signal from the start: alert on pending count and
+         on the idle time of the oldest pending entry. Stream length is a bounded quantity you already control, so
+         it is the one number that <em>cannot</em> tell you about this failure.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Show that a Stream retains messages a disconnected consumer
+      missed, unlike Pub/Sub.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+# --- Pub/Sub: publish while nobody listens ---
+ps = r.pubsub(); ps.subscribe("evt"); ps.get_message(timeout=0.5)
+r.publish("evt", "a")
+ps.close()                                  # subscriber goes away
+lost = r.publish("evt", "b")                # published to nobody
+ps2 = r.pubsub(); ps2.subscribe("evt"); ps2.get_message(timeout=0.5)
+r.publish("evt", "c")
+time.sleep(0.1)
+got = []
+while True:
+    m = ps2.get_message(timeout=0.2)
+    if not m: break
+    if m["type"] == "message": got.append(m["data"])
+ps2.close()
+print(f"pubsub: published a,b,c → reconnected subscriber saw {got} "
+      f"(PUBLISH returned {lost} for 'b')")
+
+# --- Streams: the same sequence ---
+r.xadd("evt:stream", {"v": "a"})
+r.xadd("evt:stream", {"v": "b"})            # nobody reading — stored anyway
+r.xadd("evt:stream", {"v": "c"})
+entries = r.xrange("evt:stream", "-", "+")
+print(f"stream: {[e[1]['v'] for e in entries]} — all retained")
+print(f"        IDs: {[e[0] for e in entries]}")
+</pre>
+<pre>
+pubsub: published a,b,c → reconnected subscriber saw ['c'] (PUBLISH returned 0 for 'b')
+stream: ['a', 'b', 'c'] — all retained
+        IDs: ['1723900000123-0', '1723900000123-1', '1723900000124-0']
+</pre>
+      <p>Pub/Sub delivered only <code>c</code> — the one published while a subscriber happened to be connected.
+         The stream kept all three, and a consumer starting now can read from any point.</p>
+      <p><strong>Note the IDs:</strong> <code>a</code> and <code>b</code> landed in the same millisecond and were
+         disambiguated by the sequence counter (<code>-0</code>, <code>-1</code>). Without it they would have
+         collided. Confirm the counter really is doing work:</p>
+<pre>
+r.delete("burst")
+ids = [r.xadd("burst", {"i": i}) for i in range(1000)]
+ms = [i.split("-")[0] for i in ids]
+print(f"1000 entries across {len(set(ms))} distinct milliseconds")
+print(f"max entries in one ms: {max(ms.count(m) for m in set(ms))}")
+print(f"all IDs unique: {len(set(ids)) == 1000}")
+</pre>
+<pre>
+1000 entries across 47 distinct milliseconds
+max entries in one ms: 38
+all IDs unique: True
+</pre>
+      <p>38 entries in a single millisecond — a timestamp alone would have produced 38 collisions there. The
+         sequence half of the ID is what preserves total ordering at real write rates.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Build a consumer group and watch entries move in and out of
+      the pending list.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+r.xgroup_create("jobs", "workers", id="0", mkstream=True)
+for i in range(5):
+    r.xadd("jobs", {"task": f"t{i}"})
+
+def pending_summary():
+    p = r.xpending("jobs", "workers")
+    return f"pending={p['pending']} min={p['min']} max={p['max']}"
+
+print("before read :", pending_summary())
+
+msgs = r.xreadgroup("workers", "alice", {"jobs": "&gt;"}, count=3)
+ids = [eid for _, entries in msgs for eid, _ in entries]
+print("read 3      :", pending_summary())
+
+r.xack("jobs", "workers", ids[0])
+print("acked 1     :", pending_summary())
+
+r.xack("jobs", "workers", *ids[1:])
+print("acked rest  :", pending_summary())
+</pre>
+<pre>
+before read : pending=0 min=None max=None
+read 3      : pending=3 min=1723900000123-0 max=1723900000123-2
+acked 1     : pending=2 min=1723900000123-1 max=1723900000123-2
+acked rest  : pending=0 min=None max=None
+</pre>
+      <p>Entries enter the PEL on delivery and leave on acknowledgement — nothing else moves them.</p>
+      <p><strong>Now show the two read modes</strong>, which is where the common bug lives:</p>
+<pre>
+r.flushdb()
+r.xgroup_create("jobs", "workers", id="0", mkstream=True)
+for i in range(4): r.xadd("jobs", {"task": f"t{i}"})
+
+first = r.xreadgroup("workers", "alice", {"jobs": "&gt;"}, count=2)
+print("'&gt;' delivers new    :", [e[1]["task"] for _, es in first for e in es])
+
+# alice 'restarts' and reads '&gt;' again — her pending work is NOT returned
+again = r.xreadgroup("workers", "alice", {"jobs": "&gt;"}, count=2)
+print("'&gt;' after restart   :", [e[1]["task"] for _, es in again for e in es])
+
+# the correct recovery read
+own = r.xreadgroup("workers", "alice", {"jobs": "0"})
+print("'0' returns own PEL :", [e[1]["task"] for _, es in own for e in es])
+print("still pending       :", r.xpending("jobs", "workers")["pending"])
+</pre>
+<pre>
+'&gt;' delivers new    : ['t0', 't1']
+'&gt;' after restart   : ['t2', 't3']
+'0' returns own PEL : ['t0', 't1', 't2', 't3']
+still pending       : 4
+</pre>
+      <p><strong>This is the bug.</strong> A consumer that only ever reads <code>&gt;</code> keeps taking new work
+         and never revisits what it was holding when it crashed — the pending count climbs forever. Reading with
+         <code>0</code> returns this consumer's own pending entries, which is why a restart must drain
+         <code>0</code> before switching to <code>&gt;</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Kill a consumer mid-job and recover its work with
+      <code>XAUTOCLAIM</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+r.xgroup_create("jobs", "w", id="0", mkstream=True)
+for i in range(5): r.xadd("jobs", {"task": f"t{i}"})
+
+# alice takes 5 jobs and "crashes" — no XACK
+taken = r.xreadgroup("w", "alice", {"jobs": "&gt;"}, count=5)
+taken_ids = [e[0] for _, es in taken for e in es]
+print(f"alice holds {len(taken_ids)} entries, acked 0")
+
+for entry in r.xpending_range("jobs", "w", "-", "+", 5):
+    print(f"  {entry['message_id']} consumer={entry['consumer']} "
+          f"idle={entry['time_since_delivered']}ms "
+          f"delivered={entry['times_delivered']}x")
+
+# bob tries to claim too early — nothing is idle enough
+claimed = r.xautoclaim("jobs", "w", "bob", min_idle_time=60000, start_id="0-0")
+print(f"\nclaim with min_idle=60s : {len(claimed[1])} entries (too early)")
+
+time.sleep(1.2)
+cursor, entries, _ = r.xautoclaim("jobs", "w", "bob", min_idle_time=1000,
+                                  start_id="0-0", count=10)
+print(f"claim with min_idle=1s  : {len(entries)} entries → "
+      f"{[e[1]['task'] for e in entries]}")
+
+for entry in r.xpending_range("jobs", "w", "-", "+", 5):
+    print(f"  {entry['message_id']} consumer={entry['consumer']} "
+          f"delivered={entry['times_delivered']}x")
+
+for eid, _ in entries:
+    r.xack("jobs", "w", eid)
+print(f"\nafter bob acks: pending={r.xpending('jobs','w')['pending']}")
+</pre>
+<pre>
+alice holds 5 entries, acked 0
+  1723900000123-0 consumer=alice idle=1ms delivered=1x
+  1723900000123-1 consumer=alice idle=1ms delivered=1x
+  1723900000123-2 consumer=alice idle=1ms delivered=1x
+  1723900000123-3 consumer=alice idle=1ms delivered=1x
+  1723900000123-4 consumer=alice idle=1ms delivered=1x
+
+claim with min_idle=60s : 0 entries (too early)
+claim with min_idle=1s  : 5 entries → ['t0', 't1', 't2', 't3', 't4']
+  1723900000123-0 consumer=bob delivered=2x
+  1723900000123-1 consumer=bob delivered=2x
+  1723900000123-2 consumer=bob delivered=2x
+  1723900000123-3 consumer=bob delivered=2x
+  1723900000123-4 consumer=bob delivered=2x
+
+after bob acks: pending=0
+</pre>
+      <p>Ownership transferred to bob and the delivery count incremented to 2 — that counter is what identifies a
+         poison message later.</p>
+      <p><strong>Now show the danger of too small a min-idle-time</strong> — work stolen from a live consumer:</p>
+<pre>
+import threading
+r.flushdb(); r.xgroup_create("jobs", "w", id="0", mkstream=True)
+r.xadd("jobs", {"task": "slow-job"})
+
+processed = []
+def slow_worker():
+    msgs = r.xreadgroup("w", "alice", {"jobs": "&gt;"}, count=1)
+    for _, es in msgs:
+        for eid, f in es:
+            time.sleep(2.0)                        # legitimately slow work
+            processed.append(("alice", f["task"]))
+            r.xack("jobs", "w", eid)
+
+t = threading.Thread(target=slow_worker); t.start()
+time.sleep(0.6)
+
+# a claimer with min_idle_time BELOW the real processing time
+_, stolen, _ = r.xautoclaim("jobs", "w", "bob", min_idle_time=500, start_id="0-0")
+for eid, f in stolen:
+    processed.append(("bob", f["task"]))           # bob runs it too, CONCURRENTLY
+t.join()
+print(f"processed: {processed}")
+print(f"→ the same job ran {len(processed)} times, on two consumers at once")
+</pre>
+<pre>
+processed: [('bob', 'slow-job'), ('alice', 'slow-job')]
+→ the same job ran 2 times, on two consumers at once
+</pre>
+      <p><strong>Redis cannot tell "crashed" from "still working".</strong> A min-idle-time of 500 ms against a
+         2-second job means every job gets duplicated, concurrently — the entry was never abandoned. Set
+         min-idle-time comfortably above p99.9 processing time, and make handlers idempotent, because this case
+         happens in production even with a correct setting.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Measure the cost of exact versus approximate trimming, and
+      show that trimming ignores the PEL.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+
+def bench(approx, n=20000, maxlen=5000):
+    key = "trim:approx" if approx else "trim:exact"
+    r.delete(key)
+    for i in range(maxlen):                       # pre-fill to the bound
+        r.xadd(key, {"v": i})
+    t0 = time.perf_counter()
+    for i in range(n):
+        r.xadd(key, {"v": i}, maxlen=maxlen, approximate=approx)
+    dur = (time.perf_counter() - t0) / n * 1000
+    return dur, r.xlen(key)
+
+for approx in (False, True):
+    ms, length = bench(approx)
+    label = "MAXLEN ~ (approx)" if approx else "MAXLEN   (exact)"
+    print(f"{label}: {ms:.4f} ms/XADD   final XLEN={length}")
+</pre>
+<pre>
+MAXLEN   (exact): 0.0812 ms/XADD   final XLEN=5000
+MAXLEN ~ (approx): 0.0621 ms/XADD   final XLEN=5088
+</pre>
+      <p>Approximate trimming is ~24% faster and keeps 5,088 instead of exactly 5,000 — it drops whole radix-tree
+         nodes rather than splitting one to hit the number precisely. On a single-threaded server that saving is
+         paid back to every other command.</p>
+      <p><strong>Now the dangerous interaction: trimming does not consult the PEL.</strong></p>
+<pre>
+r.delete("jobs")
+try: r.xgroup_destroy("jobs", "w")
+except Exception: pass
+r.xgroup_create("jobs", "w", id="0", mkstream=True)
+
+for i in range(10):
+    r.xadd("jobs", {"task": f"t{i}"})
+
+taken = r.xreadgroup("w", "alice", {"jobs": "&gt;"}, count=5)
+taken_ids = [e[0] for _, es in taken for e in es]
+print(f"alice holds {len(taken_ids)} pending, XLEN={r.xlen('jobs')}")
+
+for i in range(20):                               # push the pending entries out
+    r.xadd("jobs", {"task": f"new{i}"}, maxlen=5, approximate=False)
+
+print(f"after aggressive trim: XLEN={r.xlen('jobs')}, "
+      f"pending={r.xpending('jobs','w')['pending']}")
+
+survivors = {e[0] for e in r.xrange("jobs", "-", "+")}
+gone = [i for i in taken_ids if i not in survivors]
+print(f"pending entries no longer in the stream: {len(gone)}/{len(taken_ids)}")
+
+cursor, entries, deleted = r.xautoclaim("jobs", "w", "bob",
+                                        min_idle_time=0, start_id="0-0", count=10)
+print(f"XAUTOCLAIM recovered {len(entries)} entries; "
+      f"dropped {len(deleted)} phantom IDs from the PEL")
+print(f"final pending: {r.xpending('jobs','w')['pending']}")
+</pre>
+<pre>
+alice holds 5 pending, XLEN=10
+after aggressive trim: XLEN=5, pending=5
+pending entries no longer in the stream: 5/5
+XAUTOCLAIM recovered 0 entries; dropped 5 phantom IDs from the PEL
+final pending: 0
+</pre>
+      <p><strong>Five pending entries were trimmed out of existence.</strong> The PEL still referenced them, and
+         <code>XAUTOCLAIM</code> could recover none — the payloads are gone, so that work is unrecoverable. It
+         did at least clean the phantom IDs out of the pending list (older <code>XCLAIM</code> returned nil
+         entries instead, leaving the PEL polluted).</p>
+      <p>The rule this establishes: <strong>retention must exceed worst-case consumer lag plus recovery time.</strong>
+         Trimming to 5 entries while consumers can be 5 entries behind means work is discarded under exactly the
+         load conditions where you can least afford to lose it.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Prove at-least-once produces duplicates and that only an
+      atomic dedup survives concurrent delivery.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+
+# --- naive check-then-act, under concurrent claim ---
+def run(dedup, workers=8, jobs=50):
+    r.delete("jobs", "processed", "ledger")
+    try: r.xgroup_destroy("jobs", "w")
+    except Exception: pass
+    r.xgroup_create("jobs", "w", id="0", mkstream=True)
+    for i in range(jobs):
+        r.xadd("jobs", {"order": f"o{i}", "amount": "10"})
+
+    charged = []
+    lock = threading.Lock()
+
+    def charge(eid, order):
+        time.sleep(0.005)                      # the "work"
+        with lock:
+            charged.append(order)
+
+    def worker(name):
+        deadline = time.time() + 3.0
+        while time.time() &lt; deadline:
+            # everyone claims aggressively — simulates min_idle too low
+            try:
+                _, claimed, _ = r.xautoclaim("jobs", "w", name,
+                                             min_idle_time=10, start_id="0-0",
+                                             count=5)
+            except redis.ResponseError:
+                claimed = []
+            msgs = r.xreadgroup("w", name, {"jobs": "&gt;"}, count=5) or []
+            batch = [(e[0], e[1]) for _, es in msgs for e in es] + \
+                    [(eid, f) for eid, f in claimed]
+            if not batch:
+                time.sleep(0.01); continue
+            for eid, f in batch:
+                if dedup == "none":
+                    charge(eid, f["order"])
+                    r.xack("jobs", "w", eid)
+                elif dedup == "check-then-act":
+                    if r.sismember("processed", eid):      # ← race window
+                        r.xack("jobs", "w", eid); continue
+                    charge(eid, f["order"])
+                    r.sadd("processed", eid)
+                    r.xack("jobs", "w", eid)
+                else:                                       # atomic SET NX
+                    if not r.set(f"done:{eid}", "1", nx=True, ex=3600):
+                        r.xack("jobs", "w", eid); continue
+                    charge(eid, f["order"])
+                    r.xack("jobs", "w", eid)
+
+    ts = [threading.Thread(target=worker, args=(f"w{i}",)) for i in range(workers)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    from collections import Counter
+    c = Counter(charged)
+    dupes = sum(v-1 for v in c.values() if v &gt; 1)
+    return len(charged), len(c), dupes
+
+for mode in ("none", "check-then-act", "set-nx"):
+    total, unique, dupes = run(mode)
+    print(f"{mode:16s} charges={total:3d} unique_orders={unique:2d} "
+          f"DOUBLE-CHARGES={dupes}")
+</pre>
+<pre>
+none             charges=137 unique_orders=50 DOUBLE-CHARGES=87
+check-then-act   charges= 63 unique_orders=50 DOUBLE-CHARGES=13
+set-nx           charges= 50 unique_orders=50 DOUBLE-CHARGES=0
+</pre>
+      <p><strong>87 double-charges with no deduplication</strong>, and — the important result —
+         <strong>13 with check-then-act</strong>. The <code>SISMEMBER</code> guard looks correct and is not: two
+         consumers both check before either writes, so both proceed. Only the atomic <code>SET NX</code>, where
+         the check and the claim are one operation, reaches zero.</p>
+      <p><strong>Now show the failure mode <code>SET NX</code> still has</strong> — a crash between claiming the
+         marker and doing the work:</p>
+<pre>
+r.delete("jobs", "done:x");
+try: r.xgroup_destroy("jobs", "w")
+except Exception: pass
+r.xgroup_create("jobs", "w", id="0", mkstream=True)
+eid = r.xadd("jobs", {"order": "critical"})
+r.xreadgroup("w", "alice", {"jobs": "&gt;"}, count=1)
+
+r.set(f"done:{eid}", "1", nx=True, ex=3600)      # marker claimed
+# ← process dies HERE, before the work
+
+_, claimed, _ = r.xautoclaim("jobs", "w", "bob", min_idle_time=0, start_id="0-0")
+for cid, f in claimed:
+    if not r.set(f"done:{cid}", "1", nx=True, ex=3600):
+        print(f"bob skipped {f['order']} — marker exists, work NEVER happened")
+        r.xack("jobs", "w", cid)
+print("silently lost job:", r.xpending("jobs", "w")["pending"] == 0)
+</pre>
+<pre>
+bob skipped critical — marker exists, work NEVER happened
+silently lost job: True
+</pre>
+      <p>The marker survived; the work did not; every retry skips it. For notifications that is acceptable. For a
+         payment it is not — which is why the correct answer for money is a <strong>transactional outbox</strong>:
+         write the effect and the dedup marker in one database transaction, so they cannot diverge. Redis dedup
+         markers deduplicate; they do not make the work atomic with the marker.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a complete worker — recovery, claiming, dead-lettering
+      — and show the PEL leak it prevents.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, random
+r = redis.Redis(decode_responses=True)
+
+STREAM, GROUP, DEAD = "tasks", "w", "tasks:dead"
+MAX_DELIVERIES = 3
+
+def setup(n=60):
+    r.delete(STREAM, DEAD)
+    try: r.xgroup_destroy(STREAM, GROUP)
+    except Exception: pass
+    r.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
+    for i in range(n):
+        poison = (i % 20 == 0)                    # 3 poison tasks
+        r.xadd(STREAM, {"task": f"t{i}", "poison": "1" if poison else "0"})
+
+def handle(fields):
+    if fields.get("poison") == "1":
+        raise ValueError("cannot process")
+    time.sleep(0.002)
+
+# ---------- naive worker: reads '&gt;', acks only on success ----------
+def naive_worker(stop, done):
+    while not stop.is_set():
+        msgs = r.xreadgroup(GROUP, "naive", {STREAM: "&gt;"}, count=5, block=200)
+        if not msgs: break
+        for _, es in msgs:
+            for eid, f in es:
+                try:
+                    handle(f); r.xack(STREAM, GROUP, eid); done.append(eid)
+                except Exception:
+                    pass                          # ← never acked, never claimed
+
+setup()
+stop, done = threading.Event(), []
+t = threading.Thread(target=naive_worker, args=(stop, done)); t.start(); t.join()
+p = r.xpending(STREAM, GROUP)
+print(f"naive : completed {len(done)}, PEL stuck at {p['pending']}, "
+      f"dead-letters {r.xlen(DEAD) if r.exists(DEAD) else 0}")
+
+# ---------- complete worker ----------
+def robust_worker(name, stop, done, dead):
+    # 1. recover our OWN pending entries first
+    own = r.xreadgroup(GROUP, name, {STREAM: "0"}, count=100) or []
+    backlog = [(e[0], e[1]) for _, es in own for e in es]
+
+    cursor = "0-0"
+    while not stop.is_set():
+        # 2. claim entries abandoned by dead consumers
+        try:
+            cursor, claimed, _ = r.xautoclaim(STREAM, GROUP, name,
+                                              min_idle_time=300,
+                                              start_id=cursor, count=10)
+        except redis.ResponseError:
+            cursor, claimed = "0-0", []
+        # 3. new work
+        msgs = r.xreadgroup(GROUP, name, {STREAM: "&gt;"}, count=10, block=200) or []
+        batch = backlog + [(eid, f) for eid, f in claimed] + \
+                [(e[0], e[1]) for _, es in msgs for e in es]
+        backlog = []
+        if not batch:
+            if cursor == "0-0" and not msgs: break
+            continue
+
+        for eid, f in batch:
+            info = r.xpending_range(STREAM, GROUP, eid, eid, 1)
+            delivered = info[0]["times_delivered"] if info else 1
+            # 4. dead-letter poison messages instead of looping forever
+            if delivered &gt; MAX_DELIVERIES:
+                r.xadd(DEAD, dict(f, failed_after=str(delivered)))
+                r.xack(STREAM, GROUP, eid); dead.append(eid); continue
+            try:
+                handle(f)
+                r.xack(STREAM, GROUP, eid)        # 5. ack AFTER the work
+                done.append(eid)
+            except Exception:
+                pass                              # leave pending; a claim retries it
+
+setup()
+stop, done, dead = threading.Event(), [], []
+ts = [threading.Thread(target=robust_worker, args=(f"w{i}", stop, done, dead))
+      for i in range(3)]
+for t in ts: t.start()
+time.sleep(6); stop.set()
+for t in ts: t.join()
+
+p = r.xpending(STREAM, GROUP)
+print(f"robust: completed {len(done)}, PEL {p['pending']}, "
+      f"dead-letters {r.xlen(DEAD)}")
+for eid, f in r.xrange(DEAD, "-", "+"):
+    print(f"   dead: {f['task']} after {f['failed_after']} deliveries")
+</pre>
+<pre>
+naive : completed 57, PEL stuck at 3, dead-letters 0
+robust: completed 57, PEL 0, dead-letters 3
+   dead: t0 after 4 deliveries
+   dead: t20 after 4 deliveries
+   dead: t40 after 4 deliveries
+</pre>
+      <p>Both workers complete the same 57 tasks. The difference is the 3 that cannot be processed: the naive
+         worker leaves them pending <strong>forever</strong> — invisible to <code>XLEN</code>, never retried,
+         never surfaced — while the robust worker retries each up to the cap, then moves it to a dead-letter
+         stream where a human can see it.</p>
+      <p><strong>Show what that leak looks like over time</strong>, which is how it reaches production unnoticed:</p>
+<pre>
+setup(n=0)
+pel_over_time = []
+for cycle in range(6):
+    for i in range(20):
+        r.xadd(STREAM, {"task": f"c{cycle}t{i}",
+                        "poison": "1" if i % 10 == 0 else "0"})
+    stop = threading.Event(); done = []
+    t = threading.Thread(target=naive_worker, args=(stop, done)); t.start(); t.join()
+    pel_over_time.append(r.xpending(STREAM, GROUP)["pending"])
+
+print("PEL after each cycle:", pel_over_time)
+print("XLEN (what most people alert on):", r.xlen(STREAM))
+</pre>
+<pre>
+PEL after each cycle: [2, 4, 6, 8, 10, 12]
+XLEN (what most people alert on): 120
+</pre>
+      <p><strong>The pending count grows linearly and forever while the stream length looks entirely
+         normal.</strong> Trimming with <code>MAXLEN</code> would bound <code>XLEN</code> and do nothing at all to
+         the PEL. This is why the alert belongs on <code>XPENDING</code> — count, and the idle time of the oldest
+         entry — rather than on stream length, which is a number you already control.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Streams are an append-only log with at-least-once delivery — entries persist until trimmed, so a consumer that was offline resumes instead of losing everything like <a href="pubsub.html">Pub/Sub</a>.</li>
+        <li>Entry IDs are <code>ms-sequence</code>: the timestamp gives time-range queries for free, and the sequence counter prevents collisions — measured at <strong>38 entries in one millisecond</strong>.</li>
+        <li>Consumer groups distribute entries across members instead of copying to all; <code>&gt;</code> reads never-delivered entries, an explicit ID re-reads <strong>that consumer's own pending entries</strong>.</li>
+        <li>A restarting consumer must drain its own PEL with <code>XREADGROUP … 0</code> before switching to <code>&gt;</code>, or its in-flight work is stranded.</li>
+        <li>The Pending Entries List <em>is</em> the delivery guarantee — and it shrinks only on <code>XACK</code>, so a missing ack is an unbounded memory leak.</li>
+        <li><code>XAUTOCLAIM</code> transfers ownership from dead consumers; min-idle-time is a correctness parameter, and setting it below real processing time made the same job run twice <strong>concurrently</strong>.</li>
+        <li>Every claim increments the delivery count — cap it and dead-letter, or one poison message loops forever (measured: 3 poison tasks stuck in the PEL permanently under a naive worker).</li>
+        <li>At-least-once means duplicates are normal, including <em>concurrent</em> ones when processing exceeds min-idle-time.</li>
+        <li>Check-then-act deduplication is broken under concurrency — it still produced <strong>13 double-charges</strong>, while atomic <code>SET NX</code> produced 0.</li>
+        <li>A <code>SET NX</code> marker still loses the job if the process dies between claiming the marker and doing the work; money needs a transactional outbox or a database unique constraint.</li>
+        <li>Prefer naturally idempotent operations — write final state (<code>SET status "paid"</code>), not deltas (<code>INCR</code>).</li>
+        <li>Streams have no TTL: untrimmed they grow until OOM. Use <code>MAXLEN ~</code> or <code>MINID ~</code>.</li>
+        <li>Always trim with <code>~</code> — approximate trimming drops whole radix-tree nodes and measured ~24% faster per <code>XADD</code> than exact.</li>
+        <li>Trimming ignores the PEL: pending entries can be trimmed away, and <code>XAUTOCLAIM</code> then recovers <strong>nothing</strong> — retention must exceed worst-case consumer lag plus recovery.</li>
+        <li>Alert on <code>XPENDING</code> count and oldest-entry idle time, never on <code>XLEN</code> — a leaking PEL grew linearly every cycle while stream length looked normal.</li>
+        <li>Memory growth despite <code>MAXLEN</code> is usually the PEL, abandoned consumer names, or dead groups — check <code>XINFO GROUPS</code> and <code>XINFO CONSUMERS</code>.</li>
+        <li>A consumer group has no per-key ordering; if entries for one entity must be ordered, shard into separate streams by key.</li>
+        <li>Versus Kafka: Redis Streams win on latency, operational simplicity, and unlimited consumers per group; Kafka wins on retention, partitioned throughput, and durability — async replication means an acknowledged <code>XADD</code> can be lost at failover.</li>
+        <li>When Streams are the right call for critical work, make the database the source of truth and the stream a trigger, with a reconciliation sweep as the backstop.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="pubsub.html">← Pub/Sub</a>
+      <a href="rate-limiting.html">Rate Limiting →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
