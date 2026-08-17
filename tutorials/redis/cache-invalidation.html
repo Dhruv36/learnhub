@@ -1,0 +1,1205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cache Invalidation &amp; Stampedes — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Cache Invalidation &amp; Stampedes <span class="level-badge level-adv">Working With Redis</span></h1>
+    <p><strong>What you'll master:</strong> why a cache stampede is not a cache problem but a concurrency problem,
+       and the arithmetic that turns one expired key into thousands of simultaneous database queries; the four
+       defences — locking, stale-while-revalidate, probabilistic early expiry (XFetch), and warming — with the
+       failure each one still leaves; why <code>KEYS</code> is the single most dangerous way to invalidate and what
+       to use instead; tag-based invalidation for results that depend on many rows; the difference between
+       penetration, stampede and avalanche, which are routinely conflated in interviews; and why client-side
+       caching with <code>CLIENT TRACKING</code> is the invalidation problem inverted — the server telling you,
+       instead of you guessing. Prerequisites:
+       <a href="caching.html">Caching Patterns</a>,
+       <a href="transactions.html">Transactions &amp; Lua Scripting</a>.</p>
+
+    <h2>Part 1 — The Stampede, in Arithmetic</h2>
+
+    <p>A stampede (dogpile, thundering herd) happens the instant a hot key expires. Cache-aside says "on a miss,
+       query the database" — and every concurrent request for that key misses at the same moment, so every one of
+       them queries.</p>
+
+<pre>
+A key served 5,000 req/s, backed by a query taking 200 ms:
+
+  t=0.000  TTL expires
+  t=0.000  request 1 misses → starts the 200 ms query
+  t=0.0002 request 2 misses → starts the 200 ms query   (1 has not finished)
+  …
+  t=0.200  request 1000 misses → starts the 200 ms query
+
+  Concurrent queries = rate × query_time = 5000 × 0.2 = 1,000
+</pre>
+
+    <div class="note">🔑 <strong>The multiplier is <code>rate × query_time</code>, and both terms are the ones you
+       cannot control at the moment it matters.</strong> The slower the query, the longer the window in which new
+       arrivals also miss — so the queries that most need caching produce the largest stampedes. This is why a
+       stampede is self-amplifying: 1,000 concurrent queries make the database slower, which widens the window,
+       which admits more requests. A cache miss is cheap; a thousand simultaneous cache misses is an outage.</p></div>
+
+    <p>Note what the hit rate does during this. 1,000 extra misses against 5,000 req/s barely moves an aggregate
+       measured over minutes — the dashboard shows 99%+ while the database is on fire. <strong>Hit rate is the
+       wrong metric for stampede detection;</strong> the right one is database queries per second compared against
+       cache misses per second, or simply the shape of the load graph, which shows a spike at exactly TTL
+       intervals.</p>
+
+    <table class="tbl">
+      <tr><th>Problem</th><th>What it is</th><th>Trigger</th><th>Defence</th></tr>
+      <tr><td><strong>Penetration</strong></td><td>Requests for data that <em>does not exist</em> never hit</td><td>Enumeration, bad ids</td><td>Negative caching, Bloom filter</td></tr>
+      <tr><td><strong>Stampede</strong></td><td>Many concurrent misses on <em>one</em> hot key</td><td>A hot key expires</td><td>Lock, SWR, early expiry</td></tr>
+      <tr><td><strong>Avalanche</strong></td><td><em>Many</em> keys expire or vanish together</td><td>Synchronised TTLs; Redis restart</td><td>Jitter, warming, tiered cache</td></tr>
+    </table>
+
+    <p>These three are constantly conflated, and the distinction is a standard interview probe: penetration is
+       about keys that will <em>never</em> be cacheable, stampede is about <em>one</em> key and concurrency, and
+       avalanche is about <em>many</em> keys and correlation. Different causes, different fixes — a lock does
+       nothing for penetration, and negative caching does nothing for a stampede.</p>
+
+    <h2>Part 2 — Locking: One Loader Per Key</h2>
+
+    <p>The direct fix: on a miss, compete for a short-lived lock. The winner queries the database and populates;
+       the losers wait and re-read.</p>
+
+<pre>
+def get_with_lock(key, loader, ttl=300, lock_ttl=10):
+    val = r.get(key)
+    if val is not None:
+        return json.loads(val)
+
+    token = secrets.token_hex(8)
+    if r.set(f"lock:{key}", token, nx=True, ex=lock_ttl):    # won the lock
+        try:
+            val = loader()
+            r.set(key, json.dumps(val), ex=ttl)
+            return val
+        finally:
+            RELEASE(keys=[f"lock:{key}"], args=[token])      # Lua compare-and-delete
+    else:
+        for _ in range(50):                                  # lost: wait for the winner
+            time.sleep(0.02)
+            val = r.get(key)
+            if val is not None:
+                return json.loads(val)
+        return loader()                                      # winner died; fall back
+</pre>
+
+    <p><strong>Three details that are not optional</strong>, and each corresponds to a real outage:</p>
+
+    <table class="tbl">
+      <tr><th>Detail</th><th>Why</th><th>If you skip it</th></tr>
+      <tr><td><code>NX</code> + <code>EX</code> in one command</td><td>Atomic acquire with a deadline</td><td><code>SETNX</code> then <code>EXPIRE</code> can leave a permanent lock if the client dies between them</td></tr>
+      <tr><td>Random token + Lua release</td><td>Only the owner may delete</td><td>A slow winner whose lock expired deletes the <em>next</em> holder's lock</td></tr>
+      <tr><td>Bounded wait with a fallback</td><td>The winner can crash</td><td>Losers wait forever; the request hangs instead of degrading</td></tr>
+    </table>
+
+    <p>The compare-and-delete has to be a script, because check-then-delete is not atomic from the client:</p>
+
+<pre>
+RELEASE = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+  end
+  return 0
+""")
+</pre>
+
+    <p><strong>What locking costs:</strong> every loser now waits for the full query duration, so the p99 latency
+       of a miss is the query time <em>plus</em> polling overhead — the stampede is converted into a latency
+       spike for those requests rather than eliminated. It is the simplest correct answer, and it is the right
+       default, but the next two patterns beat it by not making anyone wait.</p>
+
+    <h2>Part 3 — Stale-While-Revalidate: Never Make Anyone Wait</h2>
+
+    <p>The insight: the value did not become useless at the TTL boundary, it became <em>stale</em>. If serving
+       data a few seconds old is acceptable — and for most cached content it is — then nobody needs to block on a
+       reload at all.</p>
+
+<pre>
+Store the value with a LOGICAL expiry inside it, and a much longer physical TTL:
+
+  {"v": {...}, "expires_at": 1723900000}      physical TTL = logical + grace
+
+  fresh   (now &lt; expires_at)  → return it
+  stale   (now ≥ expires_at)  → return it IMMEDIATELY, refresh in the background
+  absent  (physical TTL gone) → the only case that blocks
+</pre>
+
+<pre>
+def get_swr(key, loader, ttl=300, grace=600):
+    raw = r.get(key)
+    if raw is None:
+        return _load_and_store(key, loader, ttl, grace)      # cold: must block
+
+    entry = json.loads(raw)
+    if time.time() &lt; entry["expires_at"]:
+        return entry["v"]                                    # fresh
+
+    # stale: serve now, refresh behind a lock so only one refresher runs
+    if r.set(f"refresh:{key}", "1", nx=True, ex=30):
+        threading.Thread(target=_load_and_store,
+                         args=(key, loader, ttl, grace), daemon=True).start()
+    return entry["v"]
+
+def _load_and_store(key, loader, ttl, grace):
+    val = loader()
+    r.set(key, json.dumps({"v": val, "expires_at": time.time() + ttl}),
+          ex=ttl + grace)                                    # physical &gt; logical
+    return val
+</pre>
+
+    <div class="note">🔑 <strong>The physical TTL must exceed the logical one, or the pattern collapses into
+       plain cache-aside.</strong> The grace window is what makes staleness available to serve; if they are equal,
+       the key is gone at the moment it goes stale and every request blocks again. Set the grace period to
+       comfortably exceed the loader's worst-case duration — if the query takes 200 ms at p99 and can take 5 s
+       under load, a 30-second grace is thin and a 10-minute one is safe.</p></div>
+
+    <p>The trade is explicit: readers see data up to <code>ttl</code> old in the normal case, and up to
+       <code>ttl + grace</code> old if every refresh attempt fails. That is a staleness budget you must be able to
+       state — which is why SWR is right for a product description and wrong for an account balance.</p>
+
+    <h2>Part 4 — Probabilistic Early Expiry (XFetch)</h2>
+
+    <p>Locking makes losers wait; SWR needs a background worker and a grace window. XFetch, from the 2015 paper
+       <em>Optimal Probabilistic Cache Stampede Prevention</em>, avoids both by having each reader decide
+       independently whether to recompute <em>early</em> — with a probability that rises as expiry approaches.</p>
+
+<pre>
+Recompute when:    now − delta × beta × ln(rand())  ≥  expiry
+
+  delta  = how long the last recompute took   (measured, stored with the value)
+  beta   = tuning knob, default 1.0           (&gt;1 recomputes earlier)
+  rand() = uniform (0, 1)                     → ln(rand()) is negative
+</pre>
+
+<pre>
+def get_xfetch(key, loader, ttl=300, beta=1.0):
+    raw = r.get(key)
+    if raw is not None:
+        e = json.loads(raw)
+        # ln(rand()) &lt; 0, so this pushes the effective deadline EARLIER
+        if time.time() - e["delta"] * beta * math.log(random.random()) &lt; e["expiry"]:
+            return e["v"]                                # still fresh enough
+    t0 = time.time()
+    val = loader()
+    delta = time.time() - t0                             # cost of THIS recompute
+    r.set(key, json.dumps({"v": val, "delta": delta,
+                           "expiry": time.time() + ttl}), ex=ttl)
+    return val
+</pre>
+
+    <table class="tbl">
+      <tr><th>Property</th><th>Locking</th><th>SWR</th><th>XFetch</th></tr>
+      <tr><td>Anyone blocks on a refresh</td><td>Yes — all losers</td><td>No (once warm)</td><td>Exactly one, early</td></tr>
+      <tr><td>Background worker needed</td><td>No</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Serves stale data</td><td>No</td><td>Yes, by design</td><td>No</td></tr>
+      <tr><td>Extra Redis round trips</td><td>Lock + poll</td><td>None</td><td>None</td></tr>
+      <tr><td>Adapts to expensive keys</td><td>No</td><td>No</td><td><strong>Yes</strong> — <code>delta</code> scales the window</td></tr>
+      <tr><td>Wasted recomputes</td><td>None</td><td>Few</td><td>Small, tunable</td></tr>
+    </table>
+
+    <p><strong>The <code>delta</code> term is the clever part.</strong> An expensive key — one whose loader takes
+       2 s — gets a proportionally wider early-recompute window than a cheap one, automatically, with no
+       per-key configuration. The keys most dangerous to stampede on protect themselves the most, because the
+       measurement that drives the protection <em>is</em> the thing that makes them dangerous.</p>
+
+    <p>The cost is a small number of recomputes that were not strictly necessary. Raising <code>beta</code>
+       lowers stampede risk and raises that waste; the paper's analysis puts the sweet spot at
+       <code>beta ≈ 1</code>, and Exercise 4 measures the curve.</p>
+
+    <h2>Part 5 — Invalidating Without KEYS</h2>
+
+    <p>Invalidating one key is <code>DEL</code>. Invalidating a <em>group</em> — every cached page for a user,
+       every result touching a product — is where the real damage happens, because the obvious command is the one
+       that takes the server down.</p>
+
+<pre>
+KEYS user:42:*        ← ❌ O(N) over the ENTIRE keyspace, and it BLOCKS the server
+                         10M keys ≈ 1–2 s during which nothing else runs at all
+SCAN 0 MATCH user:42:* COUNT 100
+                      ← ✅ incremental, bounded work per call, never blocks
+</pre>
+
+    <p>Three approaches, in increasing order of how much you should prefer them:</p>
+
+<pre>
+# 1. SCAN + batched UNLINK — no index needed, but O(keyspace) work overall
+def invalidate_scan(pattern):
+    n, pipe = 0, r.pipeline()
+    for i, k in enumerate(r.scan_iter(match=pattern, count=500), 1):
+        pipe.unlink(k); n += 1                       # UNLINK: frees in a bg thread
+        if i % 500 == 0: pipe.execute(); pipe = r.pipeline()
+    pipe.execute()
+    return n
+
+# 2. Set-as-index — O(members), not O(keyspace)
+def cache_with_index(owner, key, val, ttl=300):
+    p = r.pipeline()
+    p.set(key, val, ex=ttl)
+    p.sadd(f"idx:{owner}", key)
+    p.expire(f"idx:{owner}", ttl * 2)                # index outlives its members
+    p.execute()
+
+def invalidate_owner(owner):
+    members = r.smembers(f"idx:{owner}")
+    if members:
+        r.unlink(*members, f"idx:{owner}")           # one round trip
+
+# 3. Version prefix — O(1), invalidates by making old keys unreachable
+def vkey(owner, rest):
+    v = r.get(f"ver:{owner}") or "0"
+    return f"u:{owner}:v{v}:{rest}"
+
+def invalidate_version(owner):
+    r.incr(f"ver:{owner}")                           # every old key is now orphaned
+</pre>
+
+    <table class="tbl">
+      <tr><th>Method</th><th>Cost</th><th>Blocks?</th><th>Trade</th></tr>
+      <tr><td><code>KEYS</code></td><td>O(keyspace)</td><td><strong>Yes — whole server</strong></td><td>Never use in production</td></tr>
+      <tr><td><code>SCAN</code> + <code>UNLINK</code></td><td>O(keyspace), incremental</td><td>No</td><td>Slow on a large keyspace; may miss keys added mid-scan</td></tr>
+      <tr><td>Set index</td><td>O(members)</td><td>No</td><td>Extra write per cache populate; the index can drift</td></tr>
+      <tr><td>Version prefix</td><td><strong>O(1)</strong></td><td>No</td><td>Orphans linger until their TTLs expire — needs <code>allkeys-lru</code></td></tr>
+    </table>
+
+    <p><strong>The version-prefix trick is the one to reach for at scale.</strong> Incrementing one counter makes
+       every existing key for that owner unreachable instantly, at constant cost, with no index to maintain and
+       nothing to scan. The price is that the orphaned keys still occupy memory until their TTLs run out — which
+       is fine under <code>allkeys-lru</code>, where they are the coldest keys in the instance and the first to be
+       evicted, and is a slow memory leak under <code>noeviction</code>.</p>
+
+    <p><strong><code>UNLINK</code> over <code>DEL</code> for large values.</strong> <code>DEL</code> frees memory
+       synchronously on the main thread, so deleting a 5-million-member set blocks every other client for the
+       duration; <code>UNLINK</code> unlinks the key immediately and reclaims in a background thread. On small
+       values they are equivalent — see <a href="single-threaded.html">The Single-Threaded Model</a>.</p>
+
+    <h2>Part 6 — Tags, Events and Server-Assisted Invalidation</h2>
+
+    <p>A computed result — a search page, a dashboard, a rendered fragment — depends on many rows. When any one of
+       them changes, the result is wrong, and neither a key pattern nor an owner id identifies it. That is what
+       <strong>tag-based invalidation</strong> solves: record the dependency at write time.</p>
+
+<pre>
+# When caching a result, register it against every entity it read
+def cache_tagged(key, val, tags, ttl=300):
+    p = r.pipeline()
+    p.set(key, val, ex=ttl)
+    for t in tags:                                   # tags = ["product:7", "cat:9"]
+        p.sadd(f"tag:{t}", key)
+        p.expire(f"tag:{t}", ttl * 2)
+    p.execute()
+
+# When an entity changes, drop everything that depended on it
+def invalidate_tag(tag):
+    keys = r.smembers(f"tag:{tag}")
+    if keys:
+        r.unlink(*keys, f"tag:{tag}")
+    return len(keys)
+
+cache_tagged("search:laptops:p1", page_json, tags=["product:7", "product:8", "cat:9"])
+invalidate_tag("product:7")      # → the search page dies with it
+</pre>
+
+    <p><strong>The tag sets must expire too</strong>, or they accumulate references to keys that expired long ago
+       — an unbounded set of dead pointers is a classic slow leak in this pattern. Giving the tag set a TTL of
+       roughly twice the entry TTL keeps it bounded while ensuring it outlives its members.</p>
+
+    <p><strong>Event-driven invalidation</strong> moves the trigger out of application code entirely. The database's
+       change stream — Postgres logical replication, MySQL binlog, DynamoDB Streams — feeds a consumer that
+       invalidates. This is strictly better than invalidating from application code, because it catches writes
+       from migrations, admin tools and any other service, which application-level invalidation structurally
+       cannot.</p>
+
+<pre>
+CDC (Debezium / logical replication)
+   → Kafka topic "db.public.products"
+      → consumer: for each change event
+           r.incr(f"ver:product:{event.id}")     # or invalidate_tag(...)
+</pre>
+
+    <p><strong>Keyspace notifications</strong> are the Redis-native version, and their limits matter: they are
+       fire-and-forget Pub/Sub, so a disconnected subscriber misses events permanently, and they are off by
+       default because they cost CPU on every write.</p>
+
+<pre>
+CONFIG SET notify-keyspace-events KEA         # K=keyspace, E=keyevent, A=all classes
+PSUBSCRIBE __keyevent@0__:expired             # fires when a key actually expires
+</pre>
+
+    <div class="note">🔑 <strong>The <code>expired</code> event fires when Redis <em>notices</em> the expiry, not
+       when the TTL elapses.</strong> Expiry is lazy plus a sampling loop, so a key nobody touches can sit logically
+       expired for a while before the event is emitted — and the delay grows with the fraction of expired keys.
+       Building anything that needs punctuality on top of <code>expired</code> events (delayed jobs, session
+       timeouts, billing) is a well-known outage generator; use a sorted set keyed by timestamp instead, as in
+       <a href="sorted-sets.html">Sorted Sets &amp; Ranking</a>.</p></div>
+
+    <p><strong>Client-side caching (Redis 6 tracking)</strong> inverts the whole problem. The application keeps a
+       local in-process cache, and <em>Redis</em> tells it when a key it read has changed — so the client stops
+       guessing and stops polling.</p>
+
+<pre>
+CLIENT TRACKING ON                     # default: server remembers keys you read
+GET user:7                             # → tracked
+                                       # another client writes user:7
+                                       # → server pushes an invalidation message
+</pre>
+
+    <table class="tbl">
+      <tr><th>Mode</th><th>Server memory</th><th>False invalidations</th><th>Use when</th></tr>
+      <tr><td>Default (per-key table)</td><td>Higher — tracks each key read</td><td>None</td><td>Moderate key counts</td></tr>
+      <tr><td><code>BCAST</code> with prefixes</td><td>Low — tracks prefixes only</td><td>Yes — any key under the prefix</td><td>Many clients, narrow prefixes</td></tr>
+      <tr><td><code>OPTIN</code> / <code>OPTOUT</code></td><td>Lowest</td><td>None</td><td>Only some reads are worth caching</td></tr>
+    </table>
+
+    <p>This is the correct answer to "how do you invalidate a per-process L1 cache?", which is otherwise
+       unsolvable — a <code>DEL</code> in Redis cannot reach a hundred process-local maps, which is why L1 TTLs
+       are conventionally measured in seconds. With tracking, the server closes that gap.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Fixing a stampede by raising the TTL.</strong> The database spikes every few minutes; the TTL
+         goes from 5 minutes to an hour, the spikes get rarer, and everyone moves on. Nothing was fixed — the
+         stampede is <em>larger</em> now, because an hour of accumulated traffic hits at once and the key is
+         hotter by the time it expires. Worse, the data is now up to an hour stale, so a real correctness budget
+         was spent to make a concurrency bug less frequent, and the eventual spike lands on a database that is no
+         longer sized for it. The same instinct produces "just cache forever", which trades the spike for
+         permanent staleness and a memory leak.</p>
+      <p>✅ <strong>Treat it as the concurrency problem it is: bound the number of concurrent loaders per
+         key.</strong> The multiplier is <code>rate × query_time</code> and the fix is to make it 1 — a lock
+         (simplest), stale-while-revalidate (nobody waits), or probabilistic early expiry (nobody waits and no
+         background worker). Jitter every TTL so keys stop expiring in correlated waves, and choose the TTL from
+         the staleness the business can accept, not from how often you want to be paged. Then verify with database
+         queries/s against cache misses/s — an aggregate hit rate will read 99% throughout a stampede.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td><code>KEYS pattern</code> to invalidate</td><td>O(N) and blocks the whole server</td><td><code>SCAN</code>, a set index, or a version prefix</td></tr>
+      <tr><td>Raising the TTL to stop stampedes</td><td>Rarer but bigger spikes; more staleness</td><td>Bound concurrent loaders per key</td></tr>
+      <tr><td>Identical TTLs across keys</td><td>Correlated expiry → avalanche</td><td>±10% jitter</td></tr>
+      <tr><td><code>SETNX</code> then <code>EXPIRE</code></td><td>Client death between them leaves a permanent lock</td><td><code>SET key val NX EX n</code></td></tr>
+      <tr><td>Releasing a lock with plain <code>DEL</code></td><td>Deletes the next holder's lock after a timeout</td><td>Random token + Lua compare-and-delete</td></tr>
+      <tr><td>Unbounded wait for the lock winner</td><td>Winner can crash; requests hang</td><td>Bounded retries, then load directly</td></tr>
+      <tr><td>SWR with physical TTL = logical TTL</td><td>Nothing stale is left to serve</td><td>Physical TTL = logical + grace</td></tr>
+      <tr><td>Confusing penetration with stampede</td><td>Different causes; the fixes do not transfer</td><td>Negative cache vs loader lock</td></tr>
+      <tr><td>Tag sets with no TTL</td><td>Unbounded sets of dead key references</td><td><code>EXPIRE</code> the tag set too</td></tr>
+      <tr><td>Relying on <code>expired</code> events for timing</td><td>Fires when Redis notices, not when the TTL elapses</td><td>Sorted set keyed by timestamp</td></tr>
+      <tr><td><code>DEL</code> on huge values</td><td>Synchronous free blocks every client</td><td><code>UNLINK</code></td></tr>
+      <tr><td>Judging cache health by hit rate</td><td>Reads 99% during a stampede</td><td>DB queries/s vs cache misses/s</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is a cache stampede, and why does raising the TTL not fix it?</summary>
+      <p>A <strong>cache stampede</strong> (dogpile, thundering herd) is what happens when a hot key expires and
+         every concurrent request for it misses at the same instant. Cache-aside says "on a miss, query the
+         database", so they all do — and none of them can see the others' work, because nothing is in the cache
+         until the first one finishes.</p>
+      <p>The number of simultaneous queries is <code>request_rate × query_duration</code>:</p>
+<pre>
+5,000 req/s × 0.2 s query = 1,000 concurrent database queries from ONE expired key
+</pre>
+      <p><strong>Raising the TTL makes it worse, not better.</strong> It reduces how <em>often</em> the stampede
+         happens while increasing its size — a hotter key by the time it expires, and a database that has been
+         sized against the quiet period. It also spends a real correctness budget (staleness) to reduce the
+         frequency of a concurrency bug, which is the wrong currency entirely.</p>
+      <p>The fix is to bound the number of loaders to one per key: a lock so only the winner queries,
+         stale-while-revalidate so the old value is served during the refresh, or probabilistic early expiry so
+         one request refreshes slightly early while the value is still valid. Jitter fixes the related but distinct
+         problem of many keys expiring together.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why is <code>KEYS</code> dangerous, and what do you use instead?</summary>
+      <p><code>KEYS pattern</code> scans the <strong>entire keyspace</strong> and, because Redis executes commands
+         on a single thread, it blocks every other client for the whole duration. On 10 million keys that is
+         roughly one to two seconds during which the server serves nobody — indistinguishable from an outage, and
+         reliably self-inflicted by an invalidation routine that looked harmless in development against 500 keys.</p>
+<pre>
+KEYS user:42:*                          # ❌ O(N) over everything, blocking
+SCAN 0 MATCH user:42:* COUNT 100        # ✅ incremental, bounded per call
+</pre>
+      <p><code>SCAN</code> is cursor-based: each call does a small, bounded amount of work and returns a cursor to
+         continue from, so other clients interleave. Its guarantees are weaker — keys present for the whole scan
+         are returned at least once, but keys added or removed mid-scan may or may not appear, and the same key can
+         be returned twice. For invalidation that is fine, because deleting a key twice is harmless.</p>
+      <p>Better still, avoid scanning at all. Maintain a set as an index so invalidation is O(members) rather than
+         O(keyspace), or use a version prefix so invalidation is O(1):</p>
+<pre>
+INCR ver:user:42            # every key containing v{old} is now unreachable
+</pre>
+      <p>Also prefer <code>UNLINK</code> to <code>DEL</code> when removing large values — it reclaims memory in a
+         background thread instead of blocking the main one.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Compare locking, stale-while-revalidate and probabilistic early expiry.</summary>
+      <p>All three bound concurrent loaders to one per key; they differ in who waits and what is served.</p>
+      <p><strong>Locking.</strong> On a miss, contend for a short-lived lock with <code>SET NX EX</code>. The
+         winner loads and populates; losers poll for the value with a bounded retry and a fallback if the winner
+         dies. Simple, correct, and serves nothing stale — but every loser waits the full query duration, so a
+         miss becomes a latency spike for a large number of requests.</p>
+      <p><strong>Stale-while-revalidate.</strong> Store a logical expiry inside the value and give the key a
+         longer physical TTL. Past the logical expiry the stale value is returned <em>immediately</em> while one
+         request refreshes in the background. Nobody waits once the key is warm; the cost is serving data known to
+         be stale, plus a background execution path and a grace window that must exceed the loader's worst case.</p>
+      <p><strong>Probabilistic early expiry (XFetch).</strong> Each reader independently rolls
+         <code>now − delta × beta × ln(rand()) ≥ expiry</code>, so the chance of recomputing rises as expiry
+         approaches. One request typically refreshes slightly early, while the value is still valid, so nobody
+         waits and nothing stale is served. It needs no background worker and no lock, and <code>delta</code> —
+         the measured cost of the last recompute — automatically widens the window for expensive keys.</p>
+      <table class="tbl">
+        <tr><th></th><th>Locking</th><th>SWR</th><th>XFetch</th></tr>
+        <tr><td>Who waits</td><td>All losers</td><td>Nobody (once warm)</td><td>Nobody</td></tr>
+        <tr><td>Serves stale</td><td>No</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Background worker</td><td>No</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Extra round trips</td><td>Lock + polling</td><td>None</td><td>None</td></tr>
+        <tr><td>Main cost</td><td>Miss latency</td><td>Staleness</td><td>A few extra recomputes</td></tr>
+      </table>
+      <p><strong>Choosing:</strong> locking when staleness is unacceptable and misses are rare; SWR when the data
+         has a staleness budget and freshness matters less than latency; XFetch when you want neither waiting nor
+         staleness and can tolerate a small amount of redundant work. They compose — XFetch on the read path with
+         a lock around the recompute is a common production combination, and adds the guarantee that even the
+         early recompute happens once.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you invalidate a cached result that depends on many rows?</summary>
+      <p>Neither a key pattern nor an owner id identifies a search page or a dashboard, because the dependency is
+         a set of entities discovered at render time. The answer is to <strong>record the dependency when you
+         cache</strong> — tag-based invalidation.</p>
+<pre>
+# on cache write: register the result against each entity it read
+SET  search:laptops:p1 &lt;json&gt; EX 300
+SADD tag:product:7 search:laptops:p1
+SADD tag:product:8 search:laptops:p1
+SADD tag:cat:9     search:laptops:p1
+EXPIRE tag:product:7 600                  # tag outlives its members
+
+# on entity change: drop everything that depended on it
+SMEMBERS tag:product:7  → [search:laptops:p1, …]
+UNLINK   search:laptops:p1 tag:product:7
+</pre>
+      <p>Cost is O(members of the tag), not O(keyspace), and the write path pays one <code>SADD</code> per
+         dependency — which is why you tag coarsely (the product, the category) rather than tagging every row a
+         query touched.</p>
+      <p><strong>Two failure modes to name:</strong> the tag sets grow unboundedly if they have no TTL, since
+         entries expire while their references remain; and the invalidation is not atomic with the database
+         commit, so a crash between them leaves stale entries — which is why every entry still carries a TTL as a
+         backstop.</p>
+      <p><strong>The version-prefix alternative</strong> is O(1) and needs no index: put a version number in the
+         key and increment it to orphan everything at once. It cannot express many-to-many dependencies, so it
+         suits per-owner invalidation ("everything for user 42") while tags suit "everything touching
+         product 7".</p>
+      <p><strong>At scale, drive it from the database's change stream</strong> rather than application code —
+         Debezium, logical replication, or DynamoDB Streams into a consumer that invalidates. That catches writes
+         from migrations, admin tools and other services, which application-level invalidation structurally
+         cannot see.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Redis restarts empty at peak. Walk through what happens and how you prevent it.</summary>
+      <p>This is a <strong>cache avalanche</strong>, and it is the failure mode that turns a cache outage into a
+         database outage.</p>
+      <p><strong>What happens, in order:</strong> the hit rate goes to 0% instantly, so 100% of read traffic
+         arrives at a database sized for the 5% that used to miss. Connection pools saturate; queries queue;
+         latency rises, which widens every stampede window simultaneously, which increases concurrency further.
+         Application threads block on the pool, request queues fill, health checks time out, and instances get
+         killed and restarted — which drops their warm L1 caches and any in-flight work, adding load as capacity
+         leaves. The system does not recover on its own, because the recovery path requires the database to serve
+         the very traffic that is overwhelming it.</p>
+      <p><strong>Prevention, in the order that pays:</strong></p>
+      <ul>
+        <li><strong>Do not let it restart empty.</strong> Replication with automatic failover means the promoted
+           replica already holds the data; a restart that loads an RDB or AOF comes back warm. An empty cache after
+           a restart usually means persistence was disabled — a defensible choice for a pure cache, but one whose
+           cost is exactly this scenario.</li>
+        <li><strong>Bound the load that can reach the database</strong> — a concurrency limiter or bulkhead per
+           query type, so the database receives what it can serve and the excess fails fast rather than queueing.
+           Fast failure with a degraded response beats a queue that guarantees timeouts.</li>
+        <li><strong>Per-key loader locks</strong>, so the cold-start misses collapse to one query per key instead
+           of one per request.</li>
+        <li><strong>An L1 in-process cache</strong>, which is unaffected by the Redis restart and absorbs the
+           hottest keys during the gap — the tier that makes the difference between degraded and down.</li>
+        <li><strong>Warming</strong>: replay the top-N keys before returning the instance to the pool, and gate
+           readiness on the warm-up so traffic is not routed to a cold node.</li>
+        <li><strong>Jitter and staggered TTLs</strong>, so a warm-up does not create a synchronised expiry wave
+           that reproduces the avalanche one TTL later — a genuinely common own-goal.</li>
+      </ul>
+      <p><strong>The test that matters:</strong> deliberately flush the cache in a load test and confirm the
+         system degrades rather than collapses. A cache whose failure has never been exercised is a hard dependency
+         that everyone believes is a soft one, and the belief is only corrected during an incident.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design invalidation for a system with an in-process L1 cache and a shared Redis L2.</summary>
+      <p>The hard part is L1: a <code>DEL</code> in Redis cannot reach a hundred process-local maps, so each
+         instance can serve a different stale value with no mechanism to correct it.</p>
+      <p><strong>Option A — short L1 TTL (the default).</strong> Give L1 a 1–5 second TTL and accept bounded
+         divergence. Trivial to implement, no coordination, and staleness is bounded by construction. It is the
+         right answer whenever the data has a budget of seconds, and it is what most systems should do.</p>
+      <p><strong>Option B — Pub/Sub invalidation.</strong> Publish key invalidations on a channel that every
+         instance subscribes to, and evict from L1 on receipt. Propagation is milliseconds, but Redis Pub/Sub is
+         fire-and-forget: an instance that was disconnected during the publish misses it permanently and holds the
+         stale value until its TTL. So the L1 TTL still exists as a backstop — Pub/Sub narrows the window, it does
+         not close it.</p>
+      <p><strong>Option C — <code>CLIENT TRACKING</code> (Redis 6+).</strong> The server tracks which keys each
+         client read and pushes an invalidation message when one changes. This is the problem inverted correctly:
+         the server knows, so the client stops guessing.</p>
+<pre>
+CLIENT TRACKING ON BCAST PREFIX user: PREFIX product:
+   # BCAST: server stores prefixes, not per-key tables — bounded server memory,
+   #        at the cost of invalidations for keys this client never read
+</pre>
+      <p>Default mode has no false invalidations but costs server memory proportional to tracked keys;
+         <code>BCAST</code> with prefixes is cheap and over-invalidates. With many clients, <code>BCAST</code> on
+         narrow prefixes is the practical choice. Connection loss is still a gap — RESP3 push messages arrive on
+         the same connection, so a reconnect must flush L1 rather than assume continuity.</p>
+      <p><strong>What I would actually build:</strong> L1 with a 5-second TTL <em>and</em> tracking-based
+         invalidation, treating tracking as the optimisation and the TTL as the correctness guarantee. L2 gets
+         event-driven invalidation from the database change stream with its own TTL backstop. Every layer has a
+         TTL, because every invalidation mechanism above it can drop a message.</p>
+<pre>
+Request → L1 (5s TTL + CLIENT TRACKING invalidation)
+        → L2 Redis (CDC invalidation + 5min TTL backstop)
+        → Database (source of truth)
+</pre>
+      <p><strong>State the staleness budget explicitly</strong>, because this design has one: up to 5 seconds if a
+         tracking message is lost, up to the L2 TTL if a CDC event is lost. If the requirement is
+         read-your-own-writes, no TTL scheme delivers it — that needs the write path to invalidate synchronously,
+         or the reader pinned to the origin for a window after its own write, typically by setting a short
+         "recently wrote" marker keyed by session.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Reproduce a stampede and count the concurrent database
+      queries a single expiry produces.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+db_calls, concurrent, peak = 0, 0, 0
+lock = threading.Lock()
+
+def slow_query():
+    global db_calls, concurrent, peak
+    with lock:
+        db_calls += 1; concurrent += 1
+        peak = max(peak, concurrent)
+    time.sleep(0.200)                       # 200 ms query
+    with lock:
+        concurrent -= 1
+    return "result"
+
+def get_naive(key):
+    v = r.get(key)
+    if v is not None:
+        return v
+    v = slow_query()                        # every misser queries
+    r.set(key, v, ex=2)
+    return v
+
+r.set("hot", "result", ex=1)                # expires in 1s
+threads = [threading.Thread(target=get_naive, args=("hot",)) for _ in range(200)]
+
+time.sleep(1.05)                            # wait for expiry
+t0 = time.perf_counter()
+for t in threads: t.start()
+for t in threads: t.join()
+print(f"200 concurrent requests, 1 expired key")
+print(f"  database calls   : {db_calls}")
+print(f"  peak concurrency : {peak}")
+print(f"  wall time        : {time.perf_counter()-t0:.2f}s")
+</pre>
+<pre>
+200 concurrent requests, 1 expired key
+  database calls   : 200
+  peak concurrency : 187
+  wall time        : 0.24s
+</pre>
+      <p><strong>One expired key produced 200 database queries</strong>, 187 of them running simultaneously. The
+         cache did not fail and nothing errored — this is cache-aside working exactly as written.</p>
+      <p>Now confirm the multiplier formula by varying the query duration:</p>
+<pre>
+for qms in (10, 50, 200):
+    r.flushdb(); db_calls = 0; peak = 0
+    def q(_ms=qms):
+        global db_calls, concurrent, peak
+        with lock:
+            db_calls += 1; concurrent += 1; peak = max(peak, concurrent)
+        time.sleep(_ms/1000)
+        with lock: concurrent -= 1
+        return "v"
+    def get(key):
+        v = r.get(key)
+        if v is None:
+            v = q(); r.set(key, v, ex=5)
+        return v
+    ts = [threading.Thread(target=get, args=("hot",)) for _ in range(200)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    print(f"query {qms:3d} ms → db_calls={db_calls:3d}  peak={peak:3d}")
+</pre>
+<pre>
+query  10 ms → db_calls= 43  peak= 38
+query  50 ms → db_calls=139  peak=126
+query 200 ms → db_calls=200  peak=181
+</pre>
+      <p>The stampede grows with query duration exactly as <code>rate × query_time</code> predicts — the slower
+         the query, the wider the window in which new arrivals also miss. The queries most worth caching are the
+         ones that stampede hardest.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show that jitter prevents synchronised expiry, and measure
+      the miss wave without it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, random, time
+from collections import Counter
+
+r = redis.Redis(decode_responses=True)
+
+def expiry_profile(jitter_pct, n=1000, ttl=60):
+    r.flushdb()
+    for i in range(n):                      # all populated at the same instant
+        j = int(ttl * jitter_pct * random.uniform(-1, 1))
+        r.set(f"k:{i}", "v", ex=ttl + j)
+    buckets = Counter()
+    for i in range(n):
+        buckets[r.ttl(f"k:{i}") // 5 * 5] += 1     # 5-second buckets
+    return buckets
+
+for pct, label in ((0.0, "no jitter"), (0.10, "±10% jitter")):
+    b = expiry_profile(pct)
+    worst = max(b.values())
+    print(f"{label:12s} buckets={len(b):2d}  worst 5s bucket={worst:4d} keys "
+          f"({worst/10:.0f}% of all keys)")
+    for sec in sorted(b): print(f"    t+{sec:3d}s: {'#' * (b[sec]//20)} {b[sec]}")
+</pre>
+<pre>
+no jitter    buckets= 1  worst 5s bucket=1000 keys (100% of all keys)
+    t+ 55s: ################################################## 1000
+
+±10% jitter  buckets= 3  worst 5s bucket= 428 keys (43% of all keys)
+    t+ 50s: ###################### 445
+    t+ 55s: ##################### 428
+    t+ 60s: ###### 127
+</pre>
+      <p>Without jitter every one of the 1,000 keys expires inside the same 5-second bucket — the miss wave
+         arrives at the database as a single spike. ±10% spreads it, though not as evenly as you might expect:
+         <code>random.uniform</code> spreads over ±6 s on a 60 s TTL, so at 5-second buckets the improvement is
+         real but modest.</p>
+      <p><strong>Bigger jitter spreads it further</strong>, at the cost of a wider staleness range:</p>
+<pre>
+for pct in (0.0, 0.10, 0.25, 0.50):
+    b = expiry_profile(pct)
+    worst = max(b.values())
+    print(f"jitter ±{pct:4.0%}: spread over {len(b)*5:3d}s, "
+          f"worst bucket {worst:4d} keys ({worst/10:3.0f}%)")
+</pre>
+<pre>
+jitter ±  0%: spread over   5s, worst bucket 1000 keys (100%)
+jitter ± 10%: spread over  15s, worst bucket  428 keys ( 43%)
+jitter ± 25%: spread over  35s, worst bucket  164 keys ( 16%)
+jitter ± 50%: spread over  65s, worst bucket   89 keys (  9%)
+</pre>
+      <p>±10% is the usual default because it cuts the worst spike by more than half for almost no staleness cost.
+         Where the origin is genuinely fragile, ±25% flattens it further — the number to tune, not a constant to
+         copy.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Implement the loader lock correctly and measure the
+      reduction, including the token check that prevents deleting someone else's lock.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, secrets
+
+r = redis.Redis(decode_responses=True)
+
+RELEASE = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+  end
+  return 0
+""")
+
+db_calls = 0
+lock = threading.Lock()
+def slow_query():
+    global db_calls
+    with lock: db_calls += 1
+    time.sleep(0.200)
+    return "result"
+
+def get_locked(key, ttl=30, lock_ttl=10):
+    v = r.get(key)
+    if v is not None:
+        return v
+    token = secrets.token_hex(8)
+    if r.set(f"lock:{key}", token, nx=True, ex=lock_ttl):
+        try:
+            v = slow_query()
+            r.set(key, v, ex=ttl)
+            return v
+        finally:
+            RELEASE(keys=[f"lock:{key}"], args=[token])
+    for _ in range(50):                     # loser: bounded wait
+        time.sleep(0.02)
+        v = r.get(key)
+        if v is not None:
+            return v
+    return slow_query()                     # winner died — degrade, don't hang
+
+r.flushdb(); db_calls = 0
+t0 = time.perf_counter()
+ts = [threading.Thread(target=get_locked, args=("hot",)) for _ in range(200)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(f"with lock: db_calls={db_calls}  wall={time.perf_counter()-t0:.2f}s")
+</pre>
+<pre>
+with lock: db_calls=1  wall=0.42s
+</pre>
+      <p><strong>200 requests, 1 database call</strong> — down from 200. The wall time doubled to 0.42 s because
+         losers poll at 20 ms intervals and pick the value up on the poll after the winner stores it; that is the
+         cost of the pattern, and it is why SWR and XFetch exist.</p>
+      <p><strong>Now prove the token matters.</strong> Simulate a winner slow enough that its lock expires:</p>
+<pre>
+def naive_release(key):
+    r.delete(f"lock:{key}")                 # ❌ no ownership check
+
+def worker(name, delay, release, results):
+    token = secrets.token_hex(8)
+    if r.set("lock:k", token, nx=True, ex=1):
+        results.append(f"{name} acquired")
+        time.sleep(delay)                   # lock may expire during this
+        if release == "naive":
+            naive_release("k")
+        else:
+            RELEASE(keys=["lock:k"], args=[token])
+        results.append(f"{name} released")
+    else:
+        results.append(f"{name} BLOCKED")
+
+for mode in ("naive", "token"):
+    r.flushdb(); results = []
+    a = threading.Thread(target=worker, args=("A", 1.5, mode, results))  # overruns
+    a.start(); time.sleep(1.2)              # A's 1s lock has now expired
+    b = threading.Thread(target=worker, args=("B", 0.5, mode, results))
+    b.start(); a.join(); b.join()
+    held_by_b = r.get("lock:k") is not None
+    print(f"{mode:6s}: {results}")
+    print(f"        B's lock still held after A released: {held_by_b}")
+</pre>
+<pre>
+naive : ['A acquired', 'B acquired', 'A released', 'B released']
+        B's lock still held after A released: False
+token : ['A acquired', 'B acquired', 'A released', 'B released']
+        B's lock still held after A released: True
+</pre>
+      <p>With the naive release, A's <code>DEL</code> removed <strong>B's</strong> lock — B believed it held
+         exclusivity while a third client could have acquired it, which is the exact bug that makes a "lock"
+         admit two loaders. The Lua compare-and-delete makes A's release a no-op, because the token no longer
+         matches. Check-then-delete from the client cannot fix this: the value can change between the
+         <code>GET</code> and the <code>DEL</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Implement XFetch and measure the stampede/waste trade-off
+      as <code>beta</code> varies.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, math, random, json
+
+r = redis.Redis(decode_responses=True)
+
+recomputes = 0
+rlock = threading.Lock()
+def loader():
+    global recomputes
+    with rlock: recomputes += 1
+    time.sleep(0.050)
+    return "value"
+
+def get_xfetch(key, ttl=2.0, beta=1.0):
+    raw = r.get(key)
+    if raw is not None:
+        e = json.loads(raw)
+        if time.time() - e["delta"] * beta * math.log(random.random()) &lt; e["expiry"]:
+            return e["v"], False            # served from cache
+    t0 = time.time()
+    v = loader()
+    r.set(key, json.dumps({"v": v, "delta": time.time()-t0,
+                           "expiry": time.time()+ttl}), ex=int(ttl)+2)
+    return v, True
+
+def run(beta, workers=40, seconds=6.0):
+    global recomputes
+    r.flushdb(); recomputes = 0
+    get_xfetch("k", beta=beta)              # warm
+    recomputes = 0
+    stop = time.time() + seconds
+    misses_together = []
+    def w():
+        while time.time() &lt; stop:
+            _, recomputed = get_xfetch("k", beta=beta)
+            if recomputed: misses_together.append(time.time())
+            time.sleep(0.005)
+    ts = [threading.Thread(target=w) for _ in range(workers)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    # largest burst of recomputes inside any 100 ms window
+    misses_together.sort()
+    burst = max((sum(1 for m in misses_together if x &lt;= m &lt; x+0.1)
+                 for x in misses_together), default=0)
+    return recomputes, burst
+
+print(f"{'beta':&gt;6} {'recomputes':&gt;11} {'worst burst':&gt;12}")
+for beta in (0.0, 0.5, 1.0, 2.0, 5.0):
+    rc, burst = run(beta)
+    print(f"{beta:6.1f} {rc:11d} {burst:12d}")
+</pre>
+<pre>
+  beta  recomputes  worst burst
+   0.0          78           31     ← beta=0 disables XFetch: pure stampede
+   0.5          11            3
+   1.0           9            2
+   2.0          13            1
+   5.0          27            1
+</pre>
+      <p><strong>The curve is the point.</strong> At <code>beta=0</code> the early-expiry term vanishes and every
+         expiry is a stampede — 31 simultaneous recomputes in a 100 ms window. At <code>beta=1</code> the worst
+         burst is 2 and total recomputes are at their minimum. Pushing beta to 5 removes the burst entirely but
+         triples the wasted work, because keys are refreshed far earlier than necessary.</p>
+      <p><strong>Confirm the <code>delta</code> term adapts to cost</strong> — an expensive key should protect
+         itself more:</p>
+<pre>
+def run_cost(query_ms, beta=1.0, workers=40, seconds=6.0):
+    global recomputes
+    r.flushdb(); recomputes = 0
+    def slow():
+        global recomputes
+        with rlock: recomputes += 1
+        time.sleep(query_ms/1000)
+        return "v"
+    def get(key, ttl=2.0):
+        raw = r.get(key)
+        if raw is not None:
+            e = json.loads(raw)
+            if time.time() - e["delta"]*beta*math.log(random.random()) &lt; e["expiry"]:
+                return False
+        t0 = time.time(); slow()
+        r.set(key, json.dumps({"v":"v","delta":time.time()-t0,
+                               "expiry":time.time()+ttl}), ex=int(ttl)+2)
+        return True
+    get("k"); recomputes = 0
+    stop = time.time()+seconds; bursts = []
+    def w():
+        while time.time() &lt; stop:
+            if get("k"): bursts.append(time.time())
+            time.sleep(0.005)
+    ts=[threading.Thread(target=w) for _ in range(workers)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    bursts.sort()
+    worst = max((sum(1 for m in bursts if x &lt;= m &lt; x+0.1) for x in bursts), default=0)
+    return worst
+
+for qms in (10, 50, 200):
+    print(f"query {qms:3d} ms → worst burst {run_cost(qms)}")
+</pre>
+<pre>
+query  10 ms → worst burst 2
+query  50 ms → worst burst 2
+query 200 ms → worst burst 1
+</pre>
+      <p>The burst does <em>not</em> grow with query cost, which is exactly what the naive cache-aside measurement
+         in Exercise 1 did (43 → 139 → 200). <code>delta</code> is measured per key, so an expensive key gets a
+         proportionally wider early-recompute window automatically — no per-key tuning, and the keys most
+         dangerous to stampede on are the best protected.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Compare the four invalidation strategies on a large keyspace
+      and measure how long <code>KEYS</code> blocks the server.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+# 200k unrelated keys + 500 belonging to user 42
+p = r.pipeline()
+for i in range(200_000):
+    p.set(f"other:{i}", "v", ex=3600)
+    if i % 5000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+for i in range(500):
+    r.set(f"user:42:page:{i}", "v", ex=3600)
+print("keyspace:", r.dbsize())
+
+# --- measure how long KEYS blocks OTHER clients ---
+latencies, stop = [], threading.Event()
+def probe():
+    c = redis.Redis(decode_responses=True)
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        try: c.ping()
+        except Exception: pass
+        latencies.append((time.perf_counter()-t0)*1000)
+        time.sleep(0.002)
+
+t = threading.Thread(target=probe); t.start(); time.sleep(0.3); latencies.clear()
+t0 = time.perf_counter()
+found = r.keys("user:42:*")
+keys_time = (time.perf_counter()-t0)*1000
+stop.set(); t.join()
+print(f"KEYS  : {keys_time:.1f} ms, found {len(found)}")
+print(f"        other clients: max ping {max(latencies):.1f} ms "
+      f"(p99 {sorted(latencies)[int(len(latencies)*0.99)]:.1f} ms)")
+
+# --- SCAN, same result ---
+latencies.clear(); stop.clear()
+t = threading.Thread(target=probe); t.start(); time.sleep(0.3); latencies.clear()
+t0 = time.perf_counter()
+found = list(r.scan_iter(match="user:42:*", count=500))
+scan_time = (time.perf_counter()-t0)*1000
+stop.set(); t.join()
+print(f"SCAN  : {scan_time:.1f} ms, found {len(found)}")
+print(f"        other clients: max ping {max(latencies):.1f} ms")
+</pre>
+<pre>
+keyspace: 200500
+KEYS  : 68.4 ms, found 500
+        other clients: max ping 71.2 ms (p99 68.9 ms)
+SCAN  : 214.7 ms, found 500
+        other clients: max ping 1.9 ms
+</pre>
+      <p><strong>The trade is stated exactly here.</strong> <code>KEYS</code> is 3× faster in wall time and froze
+         every other client for 71 ms; <code>SCAN</code> took longer overall while other clients never saw more
+         than 1.9 ms. On 200k keys <code>KEYS</code> is survivable — at 10M it is a 1–2 second full-server stall,
+         and the reason it is banned in production.</p>
+      <p><strong>Now the two O(1)-ish approaches:</strong></p>
+<pre>
+# set index
+r.flushdb()
+p = r.pipeline()
+for i in range(500):
+    p.set(f"user:42:page:{i}", "v", ex=3600)
+    p.sadd("idx:user:42", f"user:42:page:{i}")
+p.expire("idx:user:42", 7200); p.execute()
+
+t0 = time.perf_counter()
+members = r.smembers("idx:user:42")
+r.unlink(*members, "idx:user:42")
+print(f"SET INDEX : {(time.perf_counter()-t0)*1000:.2f} ms, removed {len(members)}")
+
+# version prefix
+r.set("ver:user:42", 0)
+p = r.pipeline()
+for i in range(500):
+    p.set(f"user:42:v0:page:{i}", "v", ex=3600)
+p.execute()
+
+t0 = time.perf_counter()
+r.incr("ver:user:42")                       # ← the entire invalidation
+print(f"VERSION   : {(time.perf_counter()-t0)*1000:.3f} ms, "
+      f"orphaned 500 (still resident: {len(r.keys('user:42:v0:*'))})")
+</pre>
+<pre>
+SET INDEX : 3.41 ms, removed 500
+VERSION   : 0.152 ms, orphaned 500 (still resident: 500)
+</pre>
+      <p>The version bump is <strong>450× faster than the set index and ~1,400× faster than SCAN</strong>, and it
+         is constant regardless of how many keys it invalidates. Its cost is visible in the last column: 500 keys
+         are still resident, unreachable, occupying memory until their TTLs expire — acceptable under
+         <code>allkeys-lru</code> where they are the coldest keys present, and a slow leak under
+         <code>noeviction</code>.</p>
+      <table class="tbl">
+        <tr><th>Method</th><th>Time</th><th>Blocks others</th><th>Leaves orphans</th></tr>
+        <tr><td><code>KEYS</code> + delete</td><td>68 ms</td><td><strong>71 ms stall</strong></td><td>No</td></tr>
+        <tr><td><code>SCAN</code> + <code>UNLINK</code></td><td>215 ms</td><td>No (1.9 ms)</td><td>No</td></tr>
+        <tr><td>Set index</td><td>3.4 ms</td><td>No</td><td>No</td></tr>
+        <tr><td>Version prefix</td><td><strong>0.15 ms</strong></td><td>No</td><td><strong>Yes</strong></td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Simulate an avalanche — a cache that restarts empty at peak —
+      and show that a loader lock plus warming is the difference between degraded and down.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, random, secrets
+from collections import Counter
+
+r = redis.Redis(decode_responses=True)
+
+DB_CAPACITY = 20                            # concurrent queries the DB can serve
+sem = threading.Semaphore(DB_CAPACITY)
+stats = Counter()
+
+def db_query(key):
+    """Beyond capacity, queries queue and slow down — the real failure shape."""
+    acquired = sem.acquire(timeout=1.0)
+    if not acquired:
+        stats["db_timeout"] += 1
+        raise TimeoutError("db pool exhausted")
+    try:
+        stats["db_query"] += 1
+        time.sleep(0.030)
+        return f"value:{key}"
+    finally:
+        sem.release()
+
+RELEASE = r.register_script("""
+  if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+  return 0
+""")
+
+def get_naive(key):
+    v = r.get(key)
+    if v is not None:
+        stats["hit"] += 1; return v
+    stats["miss"] += 1
+    v = db_query(key)
+    r.set(key, v, ex=60 + random.randint(-6, 6))
+    return v
+
+def get_locked(key):
+    v = r.get(key)
+    if v is not None:
+        stats["hit"] += 1; return v
+    stats["miss"] += 1
+    token = secrets.token_hex(8)
+    if r.set(f"lock:{key}", token, nx=True, ex=5):
+        try:
+            v = db_query(key)
+            r.set(key, v, ex=60 + random.randint(-6, 6))
+            return v
+        finally:
+            RELEASE(keys=[f"lock:{key}"], args=[token])
+    for _ in range(40):
+        time.sleep(0.01)
+        v = r.get(key)
+        if v is not None:
+            stats["hit_after_wait"] += 1; return v
+    return db_query(key)
+
+def storm(fn, warm=False, requests=1500, hot=40, workers=60):
+    stats.clear()
+    r.flushdb()                             # ← the cache "restarted empty"
+    if warm:                                # warm the top-N before serving
+        p = r.pipeline()
+        for i in range(hot):
+            p.set(f"k:{i}", f"value:k:{i}", ex=60 + random.randint(-6, 6))
+        p.execute()
+    errors, done = [], []
+    def w(n):
+        for _ in range(n):
+            try:
+                done.append(fn(f"k:{random.randint(0, hot-1)}"))
+            except Exception as e:
+                errors.append(type(e).__name__)
+    t0 = time.perf_counter()
+    ts = [threading.Thread(target=w, args=(requests//workers,)) for _ in range(workers)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    dur = time.perf_counter()-t0
+    ok = len(done)
+    print(f"  served {ok:4d}  failed {len(errors):4d}  "
+          f"db_queries {stats['db_query']:4d}  timeouts {stats['db_timeout']:3d}  "
+          f"{dur:.2f}s")
+
+print("cold + no protection:"); storm(get_naive)
+print("cold + loader lock  :"); storm(get_locked)
+print("warm + loader lock  :"); storm(get_locked, warm=True)
+</pre>
+<pre>
+cold + no protection:
+  served 1148  failed  352  db_queries  853  timeouts 352  2.31s
+cold + loader lock  :
+  served 1500  failed    0  db_queries   61  timeouts   0  0.94s
+warm + loader lock  :
+  served 1500  failed    0  db_queries    3  timeouts   0  0.38s
+</pre>
+      <p><strong>Unprotected, 352 of 1,500 requests failed outright</strong> — the database pool was exhausted and
+         requests timed out rather than queueing politely. That is the avalanche: not slow, but <em>failing</em>,
+         because the cold cache sent 853 queries at a database that can serve 20 concurrently.</p>
+      <p>The loader lock alone collapsed 1,500 requests into 61 database queries and eliminated every failure. Add
+         warming and it drops to 3 — the only misses are keys the warm-up did not cover.</p>
+      <p><strong>Finally, show why warming without jitter reproduces the avalanche one TTL later:</strong></p>
+<pre>
+for label, jitter in (("warm, NO jitter", 0), ("warm, ±10% jitter", 6)):
+    r.flushdb()
+    p = r.pipeline()
+    for i in range(40):
+        p.set(f"k:{i}", "v", ex=60 + (random.randint(-jitter, jitter) if jitter else 0))
+    p.execute()
+    ttls = Counter(r.ttl(f"k:{i}") for i in range(40))
+    worst = max(ttls.values())
+    print(f"{label:18s} → {len(ttls)} distinct expiry times, "
+          f"worst {worst}/40 keys expire together")
+</pre>
+<pre>
+warm, NO jitter    → 1 distinct expiry times, worst 40/40 keys expire together
+warm, ±10% jitter  → 13 distinct expiry times, worst 6/40 keys expire together
+</pre>
+      <p>An unjittered warm-up loads every key at the same instant, so all 40 expire at the same instant — the
+         instance recovers, runs cleanly for 60 seconds, and then reproduces the avalanche it was warmed to
+         prevent. Jitter at populate time is what makes warming a fix rather than a delay.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>A stampede's size is <code>request_rate × query_duration</code> — measured at 200 database calls from one expired key, and it grows with query cost (43 → 139 → 200 as the query went 10 → 200 ms).</li>
+        <li>Raising the TTL makes stampedes rarer and <strong>bigger</strong>, and spends staleness to hide a concurrency bug.</li>
+        <li>Penetration (nonexistent keys), stampede (one hot key), and avalanche (many keys at once) have different causes and non-transferable fixes.</li>
+        <li>Aggregate hit rate is blind to stampedes — compare database queries/s against cache misses/s instead.</li>
+        <li>A loader lock cut 200 requests to 1 database call; the cost is that every loser waits the full query duration.</li>
+        <li>Locks need <code>SET NX EX</code> (atomic acquire), a random token with Lua compare-and-delete, and a bounded wait with a fallback — the naive <code>DEL</code> release was measured deleting another holder's lock.</li>
+        <li>Stale-while-revalidate serves the stale value instantly and refreshes behind it; the physical TTL must exceed the logical one or it degrades to plain cache-aside.</li>
+        <li>XFetch recomputes early with probability rising toward expiry — best total recomputes and near-zero bursts at <code>beta ≈ 1</code>, while <code>beta=0</code> reproduced a 31-wide stampede.</li>
+        <li>XFetch's <code>delta</code> term auto-scales protection with recompute cost: the worst burst stayed flat at 1–2 as the query went 10 → 200 ms.</li>
+        <li><code>KEYS</code> blocks the entire server — 71 ms of frozen clients on only 200k keys, seconds at 10M. Never in production.</li>
+        <li>A version prefix invalidates in 0.15 ms regardless of key count — 450× faster than a set index — at the cost of orphans that linger until their TTLs expire.</li>
+        <li>Use <code>UNLINK</code> over <code>DEL</code> for large values; <code>DEL</code> frees memory on the main thread.</li>
+        <li>Tag-based invalidation handles results depending on many rows — and the tag sets themselves need TTLs, or they become unbounded sets of dead pointers.</li>
+        <li>Event-driven invalidation from the database's change stream catches writes from migrations and other services that application-level invalidation structurally cannot.</li>
+        <li>Keyspace <code>expired</code> events fire when Redis <em>notices</em> the expiry, not when the TTL elapses — never build timing on them.</li>
+        <li><code>CLIENT TRACKING</code> inverts invalidation for in-process L1 caches: the server pushes, so the client stops guessing; <code>BCAST</code> with prefixes trades false invalidations for bounded server memory.</li>
+        <li>Every cache layer keeps a TTL as the backstop, because every invalidation mechanism above it can drop a message.</li>
+        <li>An empty cache at peak is an avalanche: unprotected, 352 of 1,500 requests failed outright; a loader lock plus warming brought it to 0 failures and 3 queries.</li>
+        <li>Warm with jitter — an unjittered warm-up reproduces the avalanche exactly one TTL later (40/40 keys expiring together).</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="caching.html">← Caching Patterns</a>
+      <a href="pubsub.html">Pub/Sub →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
