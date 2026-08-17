@@ -71,10 +71,17 @@ quiz-bank retune.
 Forward links to unwritten lessons show as "broken link" in validate.py — currently 5, all expected;
 they clear as each file lands. Re-run the whole-track validate at the end.
 
-⚠️ **The Redis quiz bank has ALL 200 answers at index 1** (worse than LeetCode's 191/200) — it must
-be de-skewed as well as retuned. NOTE: the retune/shuffle scripts lived in a session-specific
-scratchpad and are GONE — rewrite them (each is ~40 lines: load both banks via a `window` shim,
-apply swaps, Fisher-Yates the options with a fixed seed, re-emit the JS).
+✅ **Redis quiz answer-skew already fixed** (was 200/200 at index 1, now 73/57/70). The bank still
+needs a **content retune** to the v4 curriculum when the lessons are done — the existing 200 questions
+are v3-era and miss the v4 material (TTL-loss bug, listpack cliff, 2⁵³ score budget, head-of-line
+blocking, MULTI-has-no-rollback, WATCH contention, unkillable scripts, round-trip arithmetic).
+
+**Tooling is committed in `tools/` — see `tools/README.md`. Nothing lives in a scratchpad.**
+```
+PYTHONIOENCODING=utf-8 python validate.py tutorials/<track>   # lessons: det=12 ex=6, 0 errors
+python tools/quizcheck.py tutorials/<track>                   # bank: 10 200 0, no skew
+node tools/quizshuffle.js tutorials/<track>                   # de-skew (idempotent)
+```
 
 **Then the remaining infra five, in the user's order:** Docker → Kubernetes → AWS → CI/CD → MongoDB.
 
