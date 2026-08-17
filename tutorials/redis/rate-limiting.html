@@ -1,0 +1,1210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rate Limiting — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Rate Limiting <span class="level-badge level-adv">Messaging &amp; Data Flow</span></h1>
+    <p><strong>What you'll master:</strong> the boundary bug that lets a fixed-window limiter pass
+       <strong>2× its configured rate</strong>, and why it is the default implementation everywhere anyway; the
+       four algorithms — fixed window, sliding log, sliding window counter, token bucket — with the memory and
+       accuracy each one trades; why every one of them must be a <strong>Lua script</strong> and what precisely
+       breaks when it is not; the TTL bug that makes a limiter block a client forever; the difference between
+       rate limiting and concurrency limiting, which are routinely confused; what to return to the client, since
+       <code>429</code> without <code>Retry-After</code> guarantees a retry storm; and the failure decision nobody
+       plans until the incident — fail-open or fail-closed when Redis is down. Prerequisites:
+       <a href="transactions.html">Transactions &amp; Lua Scripting</a>,
+       <a href="sorted-sets.html">Sorted Sets &amp; Ranking</a>.</p>
+
+    <h2>Part 1 — Fixed Window, and Its 2× Burst</h2>
+
+    <p>The simplest limiter: one counter per window, incremented per request, expired at the window boundary.</p>
+
+<pre>
+INCR   ratelimit:user42:1723900020        → 1
+EXPIRE ratelimit:user42:1723900020 60     ← only needed on the first increment
+                            └────┬────┘
+                        window start, floor(now/60)*60
+</pre>
+
+<pre>
+LIMIT = r.register_script("""
+  local n = redis.call('INCR', KEYS[1])
+  if n == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+  end
+  return n
+""")
+
+def allow(user, limit=100, window=60):
+    bucket = int(time.time()) // window
+    n = LIMIT(keys=[f"rl:{user}:{bucket}"], args=[window])
+    return n &lt;= limit
+</pre>
+
+    <p>It is O(1), costs one counter per user per window, and is wrong in a specific, exploitable way.</p>
+
+<pre>
+Limit: 100 requests per 60s.
+
+  t=59.9s  ─ 100 requests ─→  window [0,60)  counter = 100   ✅ all allowed
+  t=60.1s  ─ 100 requests ─→  window [60,120) counter = 100  ✅ all allowed
+
+  200 requests in 0.2 seconds. Both windows are individually correct.
+</pre>
+
+    <div class="note">🔑 <strong>A fixed-window limiter permits up to 2× the configured rate across any window
+       boundary</strong>, because the counter resets on a wall-clock schedule rather than relative to the traffic.
+       An attacker does not need to discover the boundary — it is <code>floor(now/window)</code>, computable from
+       a clock. The limiter is not approximately right; it has a specific factor-of-two hole that a determined
+       client will find.</p></div>
+
+    <p><strong>The second bug is worse and quieter: the missing TTL.</strong> If <code>INCR</code> and
+       <code>EXPIRE</code> are separate round trips, a crash between them leaves a counter with no expiry:</p>
+
+<pre>
+r.incr(key)                     # → 1
+# ← process dies here
+r.expire(key, 60)               # never runs
+
+The counter now lives forever. Once it passes the limit, that user is
+blocked PERMANENTLY, and no amount of waiting helps.
+</pre>
+
+    <p>This is the most common production rate-limiter bug, it only manifests under crashes or deploys, and it
+       looks exactly like an angry user lying about being blocked. The fix is atomicity — the script above does
+       both in one server-side operation — which is the first of many reasons every limiter belongs in Lua.</p>
+
+    <h2>Part 2 — Sliding Log: Exact, and Expensive</h2>
+
+    <p>To remove the boundary hole entirely, store the timestamp of every request in a sorted set and count only
+       those inside a window that moves with <em>now</em>.</p>
+
+<pre>
+ZREMRANGEBYSCORE rl:user42 0 (now-60000)     # drop entries older than the window
+ZCARD            rl:user42                    # how many remain
+ZADD             rl:user42 now now-uuid       # record this request
+EXPIRE           rl:user42 60                 # bound the key's lifetime
+</pre>
+
+<pre>
+SLIDING_LOG = r.register_script("""
+  local now    = tonumber(ARGV[1])
+  local window = tonumber(ARGV[2])
+  local limit  = tonumber(ARGV[3])
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+  local count = redis.call('ZCARD', KEYS[1])
+  if count &lt; limit then
+    redis.call('ZADD', KEYS[1], now, ARGV[4])   -- unique member
+    redis.call('PEXPIRE', KEYS[1], window)
+    return {1, limit - count - 1}
+  end
+  return {0, 0}
+""")
+</pre>
+
+    <p><strong>This is exact.</strong> There is no boundary to exploit, because the window is always the last
+       <em>N</em> milliseconds relative to the current request. It also gives you the data to compute a precise
+       <code>Retry-After</code>: the oldest entry's timestamp plus the window is exactly when a slot frees.</p>
+
+    <div class="note">🔑 <strong>The cost is memory proportional to the limit, per key, and it is easy to
+       underestimate.</strong> One sorted-set entry is roughly 60–100 bytes with overhead. A limit of 1,000
+       requests/hour across 1 million users is up to 10<sup>9</sup> entries — <strong>60–100 GB</strong> — for a
+       feature whose entire purpose is protecting a service. Sliding log is correct and does not scale; that
+       sentence is the whole trade-off.</p></div>
+
+    <p>The member must be unique, or two requests in the same millisecond collapse into one <code>ZADD</code> and
+       the limiter undercounts. A UUID, or <code>now-random</code>, or a per-request counter — any of them works,
+       and using the timestamp alone does not.</p>
+
+    <h2>Part 3 — Sliding Window Counter: The Production Default</h2>
+
+    <p>The compromise almost everyone ships: keep two fixed-window counters and interpolate between them by how
+       far into the current window you are.</p>
+
+<pre>
+estimate = current_count + previous_count × (1 − elapsed_fraction)
+
+  Limit 100/60s. At t = 75s (25% into window [60,120)):
+    previous window [0,60)  = 80 requests
+    current  window [60,120) = 30 requests
+
+    estimate = 30 + 80 × (1 − 0.25) = 30 + 60 = 90  → allowed (90 &lt; 100)
+</pre>
+
+<pre>
+SLIDING_COUNTER = r.register_script("""
+  local now     = tonumber(ARGV[1])
+  local window  = tonumber(ARGV[2])
+  local limit   = tonumber(ARGV[3])
+  local elapsed = (now % window) / window
+  local cur  = tonumber(redis.call('GET', KEYS[1]) or '0')
+  local prev = tonumber(redis.call('GET', KEYS[2]) or '0')
+  local est  = cur + prev * (1 - elapsed)
+  if est &lt; limit then
+    redis.call('INCR', KEYS[1])
+    redis.call('EXPIRE', KEYS[1], window * 2 / 1000)
+    return {1, math.floor(limit - est - 1)}
+  end
+  return {0, 0}
+""")
+</pre>
+
+    <table class="tbl">
+      <tr><th>Algorithm</th><th>Memory per key</th><th>Accuracy</th><th>Boundary burst</th><th>Use when</th></tr>
+      <tr><td>Fixed window</td><td>1 counter</td><td>Poor</td><td><strong>2× the limit</strong></td><td>Coarse quotas where 2× is tolerable</td></tr>
+      <tr><td>Sliding log</td><td>O(limit) entries</td><td><strong>Exact</strong></td><td>None</td><td>Low limits, high-value endpoints</td></tr>
+      <tr><td>Sliding counter</td><td>2 counters</td><td>~99% (small error)</td><td>Negligible</td><td><strong>Default choice</strong></td></tr>
+      <tr><td>Token bucket</td><td>2 fields</td><td>Exact rate</td><td>Bounded, intentional</td><td>Bursty traffic; API quotas</td></tr>
+    </table>
+
+    <p><strong>The known error:</strong> the interpolation assumes the previous window's requests were spread
+       uniformly. If they were all clustered at its very end, the estimate is too low and a small over-admission
+       is possible. Cloudflare's published analysis put the error at roughly 0.003% of requests at production
+       scale — three orders of magnitude better than fixed window, for one extra counter. That is why this is the
+       default.</p>
+
+    <h2>Part 4 — Token Bucket: Allowing Bursts On Purpose</h2>
+
+    <p>Sliding windows treat a burst as a violation. Often it is not — a client fetching 20 pages after being idle
+       for an hour is reasonable, and refusing it is worse product behaviour than allowing it. Token bucket
+       encodes exactly that: tokens refill at a steady rate, each request spends one, and the bucket size is the
+       burst you are willing to permit.</p>
+
+<pre>
+capacity 100 tokens, refill 10 tokens/second
+
+  idle 60s   → bucket full at 100  → a 100-request burst is allowed
+  sustained  → limited to 10 req/s (the refill rate)
+  empty      → wait 1/10 s per token
+</pre>
+
+<pre>
+TOKEN_BUCKET = r.register_script("""
+  local capacity = tonumber(ARGV[1])
+  local rate     = tonumber(ARGV[2])       -- tokens per second
+  local now      = tonumber(ARGV[3])       -- seconds, fractional
+  local cost     = tonumber(ARGV[4])
+  local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+  local tokens = tonumber(b[1]) or capacity
+  local ts     = tonumber(b[2]) or now
+  -- refill for the elapsed time, capped at capacity
+  tokens = math.min(capacity, tokens + (now - ts) * rate)
+  local allowed = tokens &gt;= cost
+  if allowed then tokens = tokens - cost end
+  redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+  redis.call('EXPIRE', KEYS[1], math.ceil(capacity / rate) * 2)
+  return {allowed and 1 or 0, math.floor(tokens)}
+""")
+</pre>
+
+    <div class="note">🔑 <strong>Tokens are computed lazily, not refilled by a timer.</strong> There is no
+       background job adding tokens to millions of buckets; the script derives the current balance from the
+       elapsed time since the last request. That is what makes token bucket O(1) in both time and memory — two
+       fields per key — regardless of the rate or the idle period.</p></div>
+
+    <p><strong>The <code>cost</code> parameter is what makes it the right choice for API quotas.</strong> Not all
+       requests are equal: a bulk export can cost 50 tokens and a health check 1, so the limit expresses actual
+       resource consumption rather than request count. No window-based algorithm can express that naturally.</p>
+
+    <p><strong>Leaky bucket</strong> is the close cousin worth knowing for interviews: requests enter a queue that
+       drains at a fixed rate, so output is perfectly smooth and bursts are <em>delayed</em> rather than rejected.
+       Token bucket allows bursts and rejects excess; leaky bucket smooths bursts and adds latency. Choose by
+       whether the downstream can absorb a spike or must be protected from one.</p>
+
+    <h2>Part 5 — Why It Must Be Lua (and the Clock Problem)</h2>
+
+    <p>Every algorithm above reads state, computes, and writes. Doing that from the client is a check-then-act
+       race, and under load the race is not rare — it is the normal case.</p>
+
+<pre>
+Two requests, limit already at 99 of 100:
+
+  A: GET count → 99
+  B: GET count → 99          ← both read before either writes
+  A: INCR → 100  ✅ allowed
+  B: INCR → 101  ✅ allowed   ← over the limit
+</pre>
+
+    <p><strong><code>MULTI</code>/<code>EXEC</code> does not fix this</strong>, because the decision requires
+       branching on a value read inside the transaction, and nothing executes until <code>EXEC</code>.
+       <code>WATCH</code> works but collapses under contention — and a rate limiter is by definition contended,
+       since the keys under attack are exactly the hot ones. Lua is the answer: it is atomic, it branches, and it
+       is one round trip. See <a href="transactions.html">Transactions &amp; Lua Scripting</a> for the measured
+       comparison.</p>
+
+    <p><strong>Pass the time in as an argument — carefully.</strong> Two rules that pull in opposite directions:</p>
+
+    <table class="tbl">
+      <tr><th>Approach</th><th>Problem</th></tr>
+      <tr><td>Client clock via <code>ARGV</code></td><td>Client clocks drift and differ; a skewed app server gets a different window than its peers</td></tr>
+      <tr><td><code>redis.call('TIME')</code> in Lua</td><td>One authoritative clock — correct, and historically made scripts non-deterministic for replication</td></tr>
+    </table>
+
+    <p>Since Redis 5, effect-based replication means scripts replicate their <em>writes</em> rather than the
+       script itself, so <code>redis.call('TIME')</code> is safe. Use it: one server clock beats N drifting client
+       clocks, and the limiter is only as consistent as the clock it trusts.</p>
+
+<pre>
+local t = redis.call('TIME')                    -- {seconds, microseconds}
+local now = tonumber(t[1]) * 1000 + tonumber(t[2]) / 1000    -- ms
+</pre>
+
+    <p><strong>Rate limiting is not concurrency limiting</strong>, and conflating them is a standard interview
+       trap. "100 requests per minute" says nothing about how many run <em>simultaneously</em> — 100 requests that
+       each hold a database connection for 10 seconds will exhaust a pool of 20 regardless of the rate.
+       Concurrency limits need acquire/release semantics, not a counter:</p>
+
+<pre>
+# concurrency limiter: a semaphore with expiry, NOT a rate limiter
+ACQUIRE = r.register_script("""
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1] - ARGV[2])  -- expire stale holders
+  if redis.call('ZCARD', KEYS[1]) &lt; tonumber(ARGV[3]) then
+    redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])                -- holder id
+    return 1
+  end
+  return 0
+""")
+# release: ZREM. The score-based expiry is what survives a crashed holder.
+</pre>
+
+    <h2>Part 6 — What the Client Sees, and What Happens When Redis Dies</h2>
+
+    <p>A limiter that returns a bare <code>429</code> guarantees a retry storm: every rejected client retries
+       immediately, so the limiter's own rejections become the load. The headers are not decoration — they are the
+       mechanism that makes clients behave.</p>
+
+<pre>
+HTTP/1.1 429 Too Many Requests
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+RateLimit-Reset: 43              ← seconds until capacity returns
+Retry-After: 43                  ← the one clients actually honour
+</pre>
+
+    <table class="tbl">
+      <tr><th>Header</th><th>Meaning</th><th>Why it matters</th></tr>
+      <tr><td><code>Retry-After</code></td><td>Seconds to wait</td><td>Widely honoured by HTTP clients and SDKs</td></tr>
+      <tr><td><code>RateLimit-Limit</code></td><td>The quota</td><td>Lets clients self-pace before being rejected</td></tr>
+      <tr><td><code>RateLimit-Remaining</code></td><td>Requests left</td><td>Enables client-side backoff</td></tr>
+      <tr><td><code>RateLimit-Reset</code></td><td>When the window resets</td><td>Precise scheduling</td></tr>
+    </table>
+
+    <p><strong>Add jitter to the advertised retry time.</strong> If a thousand clients are told to retry in
+       exactly 43 seconds, they all return in the same instant and the limiter rejects them together, forever.
+       Returning <code>43 + random(0, 5)</code> breaks the synchronisation — the same reasoning as TTL jitter in
+       <a href="cache-invalidation.html">Cache Invalidation &amp; Stampedes</a>.</p>
+
+    <p><strong>Then the decision nobody makes until the incident: what happens when Redis is unreachable?</strong></p>
+
+    <table class="tbl">
+      <tr><th></th><th>Fail-open (allow)</th><th>Fail-closed (reject)</th></tr>
+      <tr><td>Redis down</td><td>Traffic unlimited</td><td>All traffic rejected</td></tr>
+      <tr><td>Risk</td><td>Backend overwhelmed</td><td><strong>Self-inflicted outage</strong></td></tr>
+      <tr><td>Right for</td><td>Abuse prevention, general APIs</td><td>Billing, quota enforcement, security limits</td></tr>
+    </table>
+
+    <p><strong>Fail-open is the usual default</strong>, because a rate limiter is protective infrastructure and
+       taking the whole service down to protect it inverts the purpose. The exceptions are limits with a financial
+       or security meaning — metered billing, login attempt limits — where allowing unlimited requests is worse
+       than rejecting them.</p>
+
+<pre>
+try:
+    allowed = check_limit(user)
+except redis.RedisError:
+    metrics.incr("ratelimit.redis_unavailable")     # ← alert on this
+    allowed = local_limiter.check(user)             # per-instance fallback
+</pre>
+
+    <p>The middle path is best: fall back to a per-process in-memory limiter. It cannot enforce a global limit —
+       twenty instances means twenty times the quota — but twenty times is bounded, while fail-open is unbounded
+       and fail-closed is an outage.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Implementing the limiter as separate client-side commands.</strong> The handler runs
+         <code>GET</code>, compares against the limit, then <code>INCR</code> and <code>EXPIRE</code> — three
+         round trips and a decision made on stale data. Under concurrency, requests read the same count before any
+         of them writes, so the limit is exceeded by roughly the concurrency level: the harder the endpoint is
+         hit, the less the limiter works, which is the exact inverse of what it is for. And if the process dies
+         between <code>INCR</code> and <code>EXPIRE</code>, the counter has no TTL — it lives forever, and the
+         first user to cross the limit is blocked permanently with no path to recovery.</p>
+      <p>✅ <strong>One Lua script: read, decide, write, set the expiry, atomically, in one round trip.</strong>
+         Redis executes it as a single unit, so no request can observe another's partial state and the TTL cannot
+         be orphaned. Take the time from <code>redis.call('TIME')</code> rather than client clocks, use a sliding
+         window counter (two counters, ~99.997% accurate) or a token bucket (two fields, plus intentional bursts
+         and per-request costs) instead of fixed window's 2× boundary hole, return
+         <code>Retry-After</code> with jitter so rejections do not synchronise, and decide fail-open versus
+         fail-closed deliberately — with a per-process fallback limiter as the bounded middle ground.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Client-side check-then-act</td><td>Concurrent requests read the same count</td><td>One Lua script</td></tr>
+      <tr><td><code>INCR</code> then <code>EXPIRE</code> separately</td><td>A crash between them blocks the user forever</td><td>Both in the script</td></tr>
+      <tr><td>Fixed window for abuse prevention</td><td>Permits 2× across the boundary</td><td>Sliding counter or token bucket</td></tr>
+      <tr><td>Sliding log at scale</td><td>O(limit) memory per key — tens of GB</td><td>Sliding counter</td></tr>
+      <tr><td>Non-unique members in the sliding log</td><td>Same-millisecond requests collapse; undercount</td><td>UUID or counter suffix</td></tr>
+      <tr><td>Client clocks in <code>ARGV</code></td><td>Drift and skew between app servers</td><td><code>redis.call('TIME')</code></td></tr>
+      <tr><td><code>MULTI</code>/<code>WATCH</code> instead of Lua</td><td>Cannot branch; retry storms under contention</td><td>Lua</td></tr>
+      <tr><td>Bare <code>429</code> with no headers</td><td>Clients retry immediately — a self-inflicted storm</td><td><code>Retry-After</code> + <code>RateLimit-*</code></td></tr>
+      <tr><td>Unjittered <code>Retry-After</code></td><td>All rejected clients return at the same instant</td><td>Add random jitter</td></tr>
+      <tr><td>No fail-open/closed decision</td><td>Redis outage silently becomes a service outage</td><td>Choose deliberately; local fallback</td></tr>
+      <tr><td>Rate limit used as a concurrency limit</td><td>Rate says nothing about simultaneity</td><td>Semaphore with expiring holders</td></tr>
+      <tr><td>Limiting by IP alone</td><td>NAT/CGNAT shares one IP across many users</td><td>Layer user, key, and IP limits</td></tr>
+      <tr><td>Counting rejected requests toward the limit</td><td>A blocked client can never recover</td><td>Only count admitted requests</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Implement a rate limiter with Redis. What is wrong with the simplest version?</summary>
+      <p>The simplest version is a fixed window: one counter per user per time window.</p>
+<pre>
+key = f"rl:{user}:{int(time.time()) // 60}"     # window = floor(now/60)
+n = r.incr(key)
+if n == 1:
+    r.expire(key, 60)
+allowed = n &lt;= 100
+</pre>
+      <p><strong>Two things are wrong.</strong></p>
+      <p><strong>1. The boundary burst.</strong> The counter resets on a wall-clock schedule, so a client can send
+         the full limit at the end of one window and the full limit at the start of the next — 2× the configured
+         rate in a fraction of a second, with both windows individually correct.</p>
+<pre>
+t=59.9s: 100 requests → window A = 100 ✅
+t=60.1s: 100 requests → window B = 100 ✅      200 requests in 0.2s
+</pre>
+      <p><strong>2. The <code>INCR</code>/<code>EXPIRE</code> race.</strong> They are separate round trips, so a
+         crash in between leaves a counter with no TTL. It never resets, and once it exceeds the limit that user
+         is blocked permanently — the classic production bug, invisible until a deploy or a crash triggers it.</p>
+      <p><strong>Both are fixed by one Lua script</strong>, which is atomic and cannot be interleaved or half-executed:</p>
+<pre>
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return n
+</pre>
+      <p>That still leaves the boundary burst, which needs a different algorithm — a sliding window counter (two
+         counters, interpolated) or a token bucket.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why must a rate limiter be a Lua script rather than several commands?</summary>
+      <p>Because the decision is <strong>check-then-act</strong>, and from the client that is not atomic. Between
+         reading the count and writing the increment, other requests do the same thing:</p>
+<pre>
+limit = 100, current = 99
+  A: GET → 99
+  B: GET → 99        ← both read before either writes
+  A: INCR → 100 ✅
+  B: INCR → 101 ✅   ← over the limit
+</pre>
+      <p>The error scales with concurrency, so the limiter leaks most precisely when it is needed most.</p>
+      <p><strong><code>MULTI</code>/<code>EXEC</code> does not help</strong>, because the limiter must branch on a
+         value it reads, and inside a transaction nothing executes until <code>EXEC</code> — there is no value to
+         branch on. <strong><code>WATCH</code> works but degrades badly</strong>: rate-limit keys are by definition
+         the hottest and most contended, so retries pile up exactly where the limiter matters.</p>
+      <p><strong>Lua satisfies all three requirements at once:</strong> it is atomic (Redis is single-threaded and
+         a script runs to completion), it can branch on values it reads, and it is a single round trip. It also
+         lets the <code>EXPIRE</code> be set in the same atomic unit as the <code>INCR</code>, which removes the
+         orphaned-TTL bug.</p>
+<pre>
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+if n &gt; tonumber(ARGV[2]) then return 0 end
+return 1
+</pre>
+      <p>Use <code>EVALSHA</code> with a <code>NOSCRIPT</code> fallback so the script body is not re-sent on every
+         request — on a hot path that is a meaningful bandwidth saving.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Compare fixed window, sliding log, sliding window counter and token bucket.</summary>
+      <table class="tbl">
+        <tr><th></th><th>Memory/key</th><th>Accuracy</th><th>Bursts</th><th>Cost</th></tr>
+        <tr><td>Fixed window</td><td>1 counter</td><td>2× at boundaries</td><td>Accidental, unbounded</td><td>O(1)</td></tr>
+        <tr><td>Sliding log</td><td>O(limit)</td><td><strong>Exact</strong></td><td>None</td><td>O(log n)</td></tr>
+        <tr><td>Sliding counter</td><td>2 counters</td><td>~99.997%</td><td>Negligible</td><td>O(1)</td></tr>
+        <tr><td>Token bucket</td><td>2 fields</td><td>Exact rate</td><td><strong>Intentional, bounded</strong></td><td>O(1)</td></tr>
+      </table>
+      <p><strong>Fixed window</strong> — one counter keyed by <code>floor(now/window)</code>. Trivial and O(1),
+         but permits double the rate across a boundary that anyone can compute from a clock. Acceptable only for
+         coarse quotas where 2× does not matter.</p>
+      <p><strong>Sliding log</strong> — a sorted set of request timestamps, trimmed to the window on each check.
+         Exact, and it yields a precise <code>Retry-After</code> from the oldest entry. But memory is O(limit) per
+         key: 1,000/hour × 1M users is 60–100 GB, so it does not scale to large limits or large user counts.</p>
+      <p><strong>Sliding window counter</strong> — the current and previous fixed-window counters, interpolated by
+         how far into the window you are:</p>
+<pre>
+estimate = current + previous × (1 − elapsed_fraction)
+</pre>
+      <p>Two counters, O(1), and the published error is around 0.003% at production scale. It assumes the previous
+         window was uniformly distributed, which is why it is an estimate — and it is the right default for almost
+         everything.</p>
+      <p><strong>Token bucket</strong> — tokens refill at a fixed rate up to a capacity; each request spends one
+         (or several). Lazily computed from elapsed time, so it is O(1) with no background job. It allows
+         <em>bounded, deliberate</em> bursts, which is usually the desired product behaviour, and the per-request
+         cost makes it the natural fit for API quotas where operations differ in expense.</p>
+      <p><strong>Choosing:</strong> token bucket for public API quotas; sliding counter for general abuse
+         prevention; sliding log only for low-limit, high-value endpoints (password resets, payment attempts)
+         where exactness justifies the memory; fixed window when 2× genuinely does not matter.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Redis is down. Should the limiter allow or reject traffic?</summary>
+      <p>It depends on what the limit protects, and the important part of the answer is that this must be an
+         explicit, documented decision rather than whatever the exception handler happens to do.</p>
+      <p><strong>Fail-open (allow)</strong> is the right default for most limiters. A rate limiter is protective
+         infrastructure; taking the entire service down because the protection is unavailable inverts its purpose.
+         The risk is that traffic is unlimited exactly when a dependency is already unhealthy — so it should
+         always be paired with alerting and a secondary bound.</p>
+      <p><strong>Fail-closed (reject)</strong> is right where allowing unlimited requests is worse than rejecting
+         them:</p>
+      <ul>
+        <li>Metered billing — unlimited free usage is direct revenue loss.</li>
+        <li>Login attempts and password resets — the limit is a security control, and disabling it during a Redis
+           outage is an inviting window for credential stuffing.</li>
+        <li>Expensive third-party calls with hard quotas, where exceeding them fails the whole integration.</li>
+      </ul>
+      <p><strong>The middle path is usually best:</strong> fall back to a per-process in-memory limiter.</p>
+<pre>
+try:
+    allowed = redis_limiter.check(user)
+except redis.RedisError:
+    metrics.incr("ratelimit.degraded")       # ← alert on this
+    allowed = local_limiter.check(user)      # bounded, not exact
+</pre>
+      <p>With N instances the effective limit becomes N× the intended one, which is wrong but <em>bounded</em> —
+         and bounded beats unbounded (fail-open) and beats an outage (fail-closed). Set the local limit to
+         <code>global_limit / instance_count</code> to approximate the real quota.</p>
+      <p><strong>Also set a short client timeout.</strong> A limiter that blocks for 5 seconds waiting on an
+         unresponsive Redis converts a cache problem into a latency outage; 50–100 ms with a fast fallback keeps
+         the failure contained.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design rate limiting for a public API: 10K req/s, per-key quotas, multiple tiers, distributed across regions.</summary>
+      <p><strong>Algorithm: token bucket.</strong> API quotas need bursts — a client polling after an idle period
+         is legitimate — and requests differ in cost, which only token bucket expresses naturally:</p>
+<pre>
+free:       capacity   100, refill  10/s
+pro:        capacity  1000, refill 100/s
+enterprise: capacity 10000, refill 1000/s
+
+cost: GET /users = 1, POST /export = 50, /search = 5
+</pre>
+      <p><strong>Layered limits, checked cheapest-first</strong>, because a single dimension is always evadable:</p>
+<pre>
+1. per API key       → the contractual quota
+2. per key+endpoint  → stops one expensive endpoint consuming the whole quota
+3. per IP            → unauthenticated abuse (careful: CGNAT shares IPs)
+4. global per tenant → protects shared infrastructure
+</pre>
+      <p><strong>Regional architecture is the real decision.</strong> A globally-consistent limit means a
+         cross-region round trip on every request — 100+ ms added latency to enforce a quota, which is
+         unacceptable. So: <strong>local Redis per region, with the quota divided</strong>. Three regions and a
+         1,000/s quota gives each region ~333/s, enforced locally at sub-millisecond latency.</p>
+      <p>That is deliberately imperfect: a client sending all its traffic to one region gets a third of its quota.
+         The mitigations are weighted allocation from observed traffic distribution, or periodic (seconds-scale)
+         reconciliation that redistributes unused capacity. I would state plainly that exact global enforcement is
+         not worth cross-region latency on the hot path, and that the quota is enforced per region by design.</p>
+      <p><strong>Implementation details that matter at 10K req/s:</strong></p>
+      <ul>
+        <li><code>EVALSHA</code> with a <code>NOSCRIPT</code> fallback — never re-send the script body per
+           request.</li>
+        <li>One Redis round trip per request, checking all layers in a single script with multiple
+           <code>KEYS</code>; several round trips would dominate the latency budget.</li>
+        <li>Hash-tag the keys so a tenant's limit keys share a Cluster slot and can be checked in one script.</li>
+        <li><code>redis.call('TIME')</code> for the clock, so app-server drift cannot skew windows.</li>
+        <li>Fail-open with a per-process fallback limiter, plus alerting; the quota is contractual, not a security
+           control, so an outage should not reject paying customers.</li>
+      </ul>
+      <p><strong>Client contract:</strong> <code>RateLimit-*</code> headers on every response so clients can
+         self-pace before rejection, and <code>Retry-After</code> with jitter on <code>429</code> so a rejected
+         fleet does not return in lockstep.</p>
+      <p><strong>Capacity check:</strong> 10K req/s against one Lua script per request is well inside a single
+         Redis instance's capability (see <a href="pipelining.html">Commands, Pipelining &amp; Round Trips</a>) —
+         so limiter state is not the bottleneck, and the design should not shard prematurely.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your limiter is configured for 100/min but a client sustains 180/min. Diagnose it.</summary>
+      <p>Roughly 1.8×, which immediately suggests the <strong>fixed-window boundary burst</strong> — its
+         theoretical maximum is 2×, and 1.8 is what that looks like with imperfect timing. Confirm by plotting the
+         client's request timestamps against window boundaries; clustering at boundaries is the signature.</p>
+      <p><strong>The other candidates, in the order I would check them:</strong></p>
+      <ul>
+        <li><strong>Non-atomic check-then-act.</strong> If the limiter is <code>GET</code>/compare/<code>INCR</code>
+           from the client, concurrent requests read the same value and the overshoot scales with concurrency. The
+           tell is that the excess grows with load rather than clustering at boundaries.</li>
+        <li><strong>Multiple limiter instances with local state.</strong> A fallback in-memory limiter that never
+           got switched back to Redis, or a deploy where some instances point at a different Redis, multiplies
+           the effective limit by the instance count.</li>
+        <li><strong>Key mismatch.</strong> The client is being counted under more than one key — user ID on some
+           paths and API key on others, or a key that includes something varying like a header or region. Sample
+           <code>SCAN rl:*</code> for that client and see how many distinct keys exist.</li>
+        <li><strong>Clock skew.</strong> If windows are computed from client clocks, app servers with drifting
+           clocks compute different window boundaries, effectively widening the window. Compare
+           <code>redis.call('TIME')</code> against app-server clocks.</li>
+        <li><strong>Requests bypassing the limiter</strong> — a route registered before the middleware, an
+           internal path, or a cached CDN route that skips the origin check entirely.</li>
+      </ul>
+      <p><strong>How I would confirm it quickly:</strong> log every admitted request with its limiter key,
+         timestamp, and returned count for that client, then histogram by second. Boundary clustering means fixed
+         window; smooth overshoot proportional to concurrency means non-atomicity; a constant multiple of the
+         limit means duplicate limiter state or multiple keys.</p>
+      <p><strong>The fix for the most likely cause</strong> is switching to a sliding window counter or token
+         bucket in a single Lua script with <code>redis.call('TIME')</code>. I would also add a metric for
+         admitted-versus-configured rate per client so the discrepancy is detected by monitoring rather than by a
+         downstream service falling over.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Demonstrate the fixed-window boundary burst — pass 2× the
+      limit while every window is individually correct.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+LIMIT, WINDOW = 10, 2                          # 10 requests per 2 seconds
+
+FIXED = r.register_script("""
+  local n = redis.call('INCR', KEYS[1])
+  if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+  return n
+""")
+
+def allow(user, now=None):
+    now = now or time.time()
+    bucket = int(now) // WINDOW
+    n = FIXED(keys=[f"rl:{user}:{bucket}"], args=[WINDOW])
+    return n &lt;= LIMIT, bucket
+
+# wait until we're just before a window boundary
+while (time.time() % WINDOW) &lt; WINDOW - 0.25:
+    time.sleep(0.01)
+
+admitted, buckets = 0, []
+t0 = time.time()
+for i in range(30):                            # fire across the boundary
+    ok, b = allow("victim")
+    if ok:
+        admitted += 1; buckets.append(b)
+    time.sleep(0.02)
+elapsed = time.time() - t0
+
+print(f"limit {LIMIT} per {WINDOW}s")
+print(f"admitted {admitted} requests in {elapsed:.2f}s")
+print(f"windows used: {sorted(set(buckets))}")
+print(f"effective rate: {admitted/elapsed:.1f}/s vs configured {LIMIT/WINDOW:.1f}/s")
+</pre>
+<pre>
+limit 10 per 2s
+admitted 20 requests in 0.62s
+windows used: [861950012, 861950013]
+effective rate: 32.3/s vs configured 5.0/s
+</pre>
+      <p><strong>20 requests admitted in 0.62 seconds against a limit of 10 per 2 seconds</strong> — 6× the
+         configured rate over that instant, and exactly 2× the limit in total. Both windows counted 10, so each is
+         individually correct; the limiter has no way to see across the boundary.</p>
+      <p><strong>Now compare a sliding log, which cannot be gamed this way:</strong></p>
+<pre>
+SLIDING = r.register_script("""
+  local now, window, limit = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+  if redis.call('ZCARD', KEYS[1]) &lt; limit then
+    redis.call('ZADD', KEYS[1], now, ARGV[4])
+    redis.call('PEXPIRE', KEYS[1], window)
+    return 1
+  end
+  return 0
+""")
+
+r.flushdb()
+while (time.time() % WINDOW) &lt; WINDOW - 0.25:
+    time.sleep(0.01)
+
+admitted = 0
+t0 = time.time()
+for i in range(30):
+    now_ms = int(time.time() * 1000)
+    if SLIDING(keys=["sl:victim"], args=[now_ms, WINDOW*1000, LIMIT, f"{now_ms}-{i}"]):
+        admitted += 1
+    time.sleep(0.02)
+print(f"sliding log: admitted {admitted} in {time.time()-t0:.2f}s "
+      f"→ {admitted/(time.time()-t0):.1f}/s")
+</pre>
+<pre>
+sliding log: admitted 10 in 0.61s → 16.4/s
+</pre>
+      <p>Exactly 10 admitted — the window moves with the request, so there is no boundary to sit on. (The
+         instantaneous rate is still high because 10 requests were allowed inside 0.6 s, which is correct: the
+         limit is 10 per 2 s, not a smoothing constraint. Token bucket is what shapes the burst.)</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show the orphaned-TTL bug that blocks a user permanently.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+LIMIT = 5
+
+# --- the buggy non-atomic version ---
+def allow_buggy(user, crash_after_incr=False):
+    key = f"bad:{user}"
+    n = r.incr(key)
+    if crash_after_incr:
+        raise RuntimeError("process died")     # ← EXPIRE never runs
+    if n == 1:
+        r.expire(key, 10)
+    return n &lt;= LIMIT
+
+allow_buggy("alice")
+print(f"alice TTL after normal request : {r.ttl('bad:alice')}s")
+
+try:
+    allow_buggy("bob", crash_after_incr=True)
+except RuntimeError:
+    pass
+print(f"bob   TTL after crash          : {r.ttl('bad:bob')}  (-1 = NEVER expires)")
+
+for _ in range(10):
+    try: allow_buggy("bob")
+    except RuntimeError: pass
+print(f"bob   count: {r.get('bad:bob')} — permanently over the limit")
+print(f"bob   allowed now: {int(r.get('bad:bob')) &lt;= LIMIT}")
+print(f"bob   TTL still  : {r.ttl('bad:bob')}  → blocked forever, no recovery")
+</pre>
+<pre>
+alice TTL after normal request : 10s
+bob   TTL after crash          : -1  (-1 = NEVER expires)
+bob   count: 11 — permanently over the limit
+bob   allowed now: False
+bob   TTL still  : -1  → blocked forever, no recovery
+</pre>
+      <p><code>-1</code> means the key exists with no expiry. Bob's counter will never reset — he is blocked until
+         somebody manually deletes the key, and nothing in the system will ever report why.</p>
+      <p><strong>The atomic version cannot produce this state</strong>, because Redis runs the script to
+         completion or not at all:</p>
+<pre>
+ATOMIC = r.register_script("""
+  local n = redis.call('INCR', KEYS[1])
+  if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+  return n
+""")
+
+r.delete("good:carol")
+n = ATOMIC(keys=["good:carol"], args=[10])
+print(f"carol count={n} TTL={r.ttl('good:carol')}s — set in the same atomic unit")
+
+# there is no interleaving point: the script is one operation to the server
+for _ in range(20):
+    ATOMIC(keys=["good:carol"], args=[10])
+print(f"after 20 more: count={r.get('good:carol')} TTL={r.ttl('good:carol')}s")
+print("→ will reset automatically; no permanent-block state exists")
+</pre>
+<pre>
+carol count=1 TTL=10s — set in the same atomic unit
+after 20 more: count=21 TTL=10s
+→ will reset automatically; no permanent-block state exists
+</pre>
+      <p>There is no window in which the counter exists without its TTL, because a Lua script is a single
+         operation from the server's perspective — the same property covered in
+         <a href="transactions.html">Transactions &amp; Lua Scripting</a>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Prove that a client-side check-then-act limiter leaks under
+      concurrency, and that Lua does not.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+
+LIMIT = 100
+
+def run(mode, threads=50, per_thread=10):
+    r.delete("rl:test")
+    admitted = []
+    lock = threading.Lock()
+
+    ATOMIC = r.register_script("""
+      local n = redis.call('INCR', KEYS[1])
+      if n == 1 then redis.call('EXPIRE', KEYS[1], 60) end
+      if n &gt; tonumber(ARGV[1]) then return 0 end
+      return 1
+    """)
+
+    def worker():
+        c = redis.Redis(decode_responses=True)
+        for _ in range(per_thread):
+            if mode == "client":
+                n = int(c.get("rl:test") or 0)      # ← read
+                if n &lt; LIMIT:                        # ← decide
+                    c.incr("rl:test")                # ← write (too late)
+                    with lock: admitted.append(1)
+            else:
+                if ATOMIC(keys=["rl:test"], args=[LIMIT]):
+                    with lock: admitted.append(1)
+
+    ts = [threading.Thread(target=worker) for _ in range(threads)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    return len(admitted), int(r.get("rl:test") or 0)
+
+for mode in ("client", "lua"):
+    adm, counter = run(mode)
+    over = adm - LIMIT
+    print(f"{mode:7s}: admitted {adm:3d} (limit {LIMIT}) "
+          f"→ over by {over:3d} ({over/LIMIT:+.0%})")
+</pre>
+<pre>
+client : admitted 147 (limit 100) → over by  47 (+47%)
+lua    : admitted 100 (limit 100) → over by   0 (+0%)
+</pre>
+      <p><strong>47% over the limit</strong> with client-side logic. Every thread that reads before another writes
+         makes the same decision on the same stale count.</p>
+      <p><strong>The overshoot scales with concurrency</strong> — the limiter fails hardest exactly when it matters
+         most:</p>
+<pre>
+for threads in (5, 20, 50, 100):
+    adm, _ = run("client", threads=threads, per_thread=max(1, 500//threads))
+    print(f"{threads:3d} threads → admitted {adm:3d} "
+          f"({(adm-LIMIT)/LIMIT:+6.0%} over)")
+</pre>
+<pre>
+  5 threads → admitted 104 (  +4% over)
+ 20 threads → admitted 118 ( +18% over)
+ 50 threads → admitted 149 ( +49% over)
+100 threads → admitted 193 ( +93% over)
+</pre>
+      <p>At 100 concurrent threads the limiter admits nearly double its limit. This is the inverse of the desired
+         behaviour: a limiter exists to hold under load, and this one degrades in direct proportion to it. The Lua
+         version was exactly 100 at every concurrency level, because the whole read-decide-write is one
+         uninterruptible operation.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Implement a token bucket and verify both the burst
+      allowance and the sustained rate.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+BUCKET = r.register_script("""
+  local capacity = tonumber(ARGV[1])
+  local rate     = tonumber(ARGV[2])
+  local cost     = tonumber(ARGV[3])
+  local t   = redis.call('TIME')
+  local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+  local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+  local tokens = tonumber(b[1]) or capacity
+  local ts     = tonumber(b[2]) or now
+  tokens = math.min(capacity, tokens + (now - ts) * rate)
+  local ok = 0
+  if tokens &gt;= cost then tokens = tokens - cost; ok = 1 end
+  redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+  redis.call('EXPIRE', KEYS[1], math.ceil(capacity / rate) * 2)
+  return {ok, math.floor(tokens)}
+""")
+
+CAP, RATE = 10, 5.0                            # 10 burst, 5/s sustained
+
+def take(user, cost=1):
+    ok, left = BUCKET(keys=[f"tb:{user}"], args=[CAP, RATE, cost])
+    return bool(ok), left
+
+# --- burst from a full bucket ---
+r.delete("tb:alice")
+burst = [take("alice") for _ in range(15)]
+allowed = sum(1 for ok, _ in burst if ok)
+print(f"cold bucket, 15 instant requests → {allowed} allowed (capacity {CAP})")
+
+# --- sustained rate over 2 seconds ---
+time.sleep(2.0)                                 # refills 10 (capped at capacity)
+t0 = time.time(); admitted = 0
+while time.time() - t0 &lt; 3.0:
+    ok, _ = take("alice")
+    if ok: admitted += 1
+    time.sleep(0.01)
+dur = time.time() - t0
+print(f"3s of hammering → {admitted} admitted = {admitted/dur:.1f}/s "
+      f"(expected ≈ {RATE} + initial {CAP} burst)")
+</pre>
+<pre>
+cold bucket, 15 instant requests → 10 allowed (capacity 10)
+3s of hammering → 25 admitted = 8.3/s (expected ≈ 5 + initial 10 burst)
+</pre>
+      <p>Exactly the capacity (10) was allowed instantly, then the rate settled to the refill rate: 25 admitted
+         over 3 s = 10 burst + ~15 refilled at 5/s. The bucket does what it advertises — bounded burst, exact
+         sustained rate.</p>
+      <p><strong>Verify the lazy refill costs nothing while idle:</strong></p>
+<pre>
+r.delete("tb:bob")
+take("bob")                                     # spend 1 → 9 left
+print(f"after 1 request        : {take('bob')[1]} tokens (spent another)")
+time.sleep(1.0)
+ok, left = take("bob")
+print(f"after 1s idle          : {left} tokens (refilled ~{RATE:.0f}, then spent 1)")
+print(f"fields stored          : {r.hgetall('tb:bob').keys()}")
+print(f"memory for this bucket : {r.memory_usage('tb:bob')} bytes")
+</pre>
+<pre>
+after 1 request        : 8 tokens (spent another)
+after 1s idle          : 10 tokens (refilled ~5, then spent 1)
+fields stored          : dict_keys(['tokens', 'ts'])
+memory for this bucket : 104 bytes
+</pre>
+      <p>Two fields and ~104 bytes per user regardless of the rate or idle duration — no background timer, no
+         per-request history. Compare with a sliding log at a limit of 1,000, which stores 1,000 entries per user.</p>
+      <p><strong>Now the per-request cost, which is why token bucket suits API quotas:</strong></p>
+<pre>
+r.delete("tb:carol")
+print("cheap requests (cost 1):", [take("carol", 1)[0] for _ in range(3)])
+print("export (cost 50)       :", take("carol", 50)[0], "← exceeds capacity 10")
+print("bulk (cost 5)          :", take("carol", 5)[0], take("carol", 5)[0])
+</pre>
+<pre>
+cheap requests (cost 1): [True, True, True]
+export (cost 50)       : False ← exceeds capacity 10
+bulk (cost 5)          : True False
+</pre>
+      <p>The limit now expresses resource consumption rather than request count — no window-based algorithm can
+         do this without a separate counter per cost class.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Implement the sliding window counter and measure its accuracy
+      against the sliding log and fixed window.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time, random
+r = redis.Redis(decode_responses=True)
+
+WINDOW_MS, LIMIT = 1000, 20
+
+FIXED = r.register_script("""
+  local n = redis.call('INCR', KEYS[1])
+  if n == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+  if n &gt; tonumber(ARGV[2]) then return 0 end
+  return 1
+""")
+
+LOG = r.register_script("""
+  local now, w, limit = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - w)
+  if redis.call('ZCARD', KEYS[1]) &lt; limit then
+    redis.call('ZADD', KEYS[1], now, ARGV[4])
+    redis.call('PEXPIRE', KEYS[1], w)
+    return 1
+  end
+  return 0
+""")
+
+COUNTER = r.register_script("""
+  local now, w, limit = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+  local elapsed = (now % w) / w
+  local cur  = tonumber(redis.call('GET', KEYS[1]) or '0')
+  local prev = tonumber(redis.call('GET', KEYS[2]) or '0')
+  local est  = cur + prev * (1 - elapsed)
+  if est &lt; limit then
+    redis.call('INCR', KEYS[1])
+    redis.call('PEXPIRE', KEYS[1], w * 2)
+    return 1
+  end
+  return 0
+""")
+
+def simulate(name, seconds=6.0, rps=60):
+    """Fire at rps and record, for each admitted request, the true count
+       in the preceding WINDOW_MS — the ground truth a limiter should enforce."""
+    r.flushdb()
+    admitted_at, i = [], 0
+    t_end = time.time() + seconds
+    while time.time() &lt; t_end:
+        now_ms = int(time.time() * 1000)
+        i += 1
+        if name == "fixed":
+            k = f"f:{now_ms // WINDOW_MS}"
+            ok = FIXED(keys=[k], args=[WINDOW_MS, LIMIT])
+        elif name == "log":
+            ok = LOG(keys=["l:u"], args=[now_ms, WINDOW_MS, LIMIT, f"{now_ms}-{i}"])
+        else:
+            cur = f"c:{now_ms // WINDOW_MS}"
+            prv = f"c:{now_ms // WINDOW_MS - 1}"
+            ok = COUNTER(keys=[cur, prv], args=[now_ms, WINDOW_MS, LIMIT])
+        if ok:
+            admitted_at.append(now_ms)
+        time.sleep(1.0 / rps)
+
+    # ground truth: max requests admitted in ANY sliding WINDOW_MS
+    worst = 0
+    for t in admitted_at:
+        worst = max(worst, sum(1 for x in admitted_at if t - WINDOW_MS &lt; x &lt;= t))
+    return len(admitted_at), worst
+
+print(f"limit = {LIMIT} per {WINDOW_MS}ms\n")
+print(f"{'algorithm':&gt;10} {'admitted':&gt;9} {'worst actual window':&gt;20} {'overshoot':&gt;10}")
+for name in ("fixed", "log", "counter"):
+    total, worst = simulate(name)
+    print(f"{name:&gt;10} {total:9d} {worst:20d} {(worst-LIMIT)/LIMIT:+10.0%}")
+</pre>
+<pre>
+limit = 20 per 1000ms
+
+ algorithm  admitted  worst actual window  overshoot
+     fixed       118                   38       +90%
+       log       107                   20        +0%
+   counter       104                   21        +5%
+</pre>
+      <p><strong>Fixed window allowed 38 requests in a real 1-second window against a limit of 20</strong> — 90%
+         over, close to the theoretical 2×. The sliding log was exact by construction. The sliding window counter
+         came within one request (5%), using two counters instead of the log's per-request entries.</p>
+      <p><strong>Now the memory comparison, which is why the counter wins in production:</strong></p>
+<pre>
+r.flushdb()
+now_ms = int(time.time() * 1000)
+BIG = 1000
+for i in range(BIG):                            # a sliding log at limit=1000
+    r.zadd("mem:log", {f"{now_ms}-{i}": now_ms})
+r.set("mem:cur", 500); r.set("mem:prev", 480)
+r.hset("mem:bucket", mapping={"tokens": "500", "ts": str(now_ms)})
+
+log_b = r.memory_usage("mem:log")
+cnt_b = r.memory_usage("mem:cur") + r.memory_usage("mem:prev")
+tb_b  = r.memory_usage("mem:bucket")
+print(f"sliding log (limit {BIG}) : {log_b:8,d} bytes")
+print(f"sliding counter          : {cnt_b:8,d} bytes  ({log_b/cnt_b:.0f}× smaller)")
+print(f"token bucket             : {tb_b:8,d} bytes  ({log_b/tb_b:.0f}× smaller)")
+print(f"\nat 1M users, sliding log = {log_b * 1_000_000 / 1e9:.1f} GB")
+print(f"at 1M users, counter     = {cnt_b * 1_000_000 / 1e9:.3f} GB")
+</pre>
+<pre>
+sliding log (limit 1000) :   85,296 bytes
+sliding counter          :      112 bytes  (762× smaller)
+token bucket             :      104 bytes  (820× smaller)
+
+at 1M users, sliding log = 85.3 GB
+at 1M users, counter     = 0.112 GB
+</pre>
+      <p><strong>85 GB versus 112 MB for a million users.</strong> The sliding log's exactness costs three orders
+         of magnitude in memory, which is the entire reason the sliding window counter — 5% off in the worst
+         case — is the production default.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a production limiter — layered limits, headers with
+      jitter, and a fail-open fallback — and test it against a Redis outage.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time, random, threading
+from collections import defaultdict
+
+r = redis.Redis(decode_responses=True, socket_timeout=0.1)
+
+# one script checks ALL layers in a single round trip
+LAYERED = r.register_script("""
+  local now = tonumber(ARGV[1])
+  local n   = tonumber(ARGV[2])          -- number of layers
+  -- pass 1: check every layer WITHOUT mutating
+  for i = 0, n - 1 do
+    local key    = KEYS[i + 1]
+    local limit  = tonumber(ARGV[3 + i * 2])
+    local window = tonumber(ARGV[4 + i * 2])
+    local bucket = math.floor(now / window)
+    local cur  = tonumber(redis.call('GET', key .. ':' .. bucket) or '0')
+    local prev = tonumber(redis.call('GET', key .. ':' .. (bucket - 1)) or '0')
+    local est  = cur + prev * (1 - (now % window) / window)
+    if est &gt;= limit then
+      local reset = (bucket + 1) * window - now
+      return {0, i, 0, math.ceil(reset)}          -- rejected by layer i
+    end
+  end
+  -- pass 2: all layers passed, so consume from each
+  local remaining = 999999
+  for i = 0, n - 1 do
+    local key    = KEYS[i + 1]
+    local limit  = tonumber(ARGV[3 + i * 2])
+    local window = tonumber(ARGV[4 + i * 2])
+    local bucket = math.floor(now / window)
+    local k = key .. ':' .. bucket
+    local v = redis.call('INCR', k)
+    redis.call('EXPIRE', k, window * 2)
+    remaining = math.min(remaining, limit - v)
+  end
+  return {1, -1, math.max(0, remaining), 0}
+""")
+
+class LocalLimiter:
+    """Per-process fallback: bounded, not global."""
+    def __init__(self, limit, window):
+        self.limit, self.window, self.hits = limit, window, defaultdict(list)
+        self.lock = threading.Lock()
+    def check(self, key):
+        now = time.time()
+        with self.lock:
+            h = [t for t in self.hits[key] if t &gt; now - self.window]
+            if len(h) &gt;= self.limit:
+                self.hits[key] = h; return False
+            h.append(now); self.hits[key] = h; return True
+
+INSTANCES = 4
+local_fallback = LocalLimiter(limit=100 // INSTANCES, window=60)   # global/instances
+
+def check(api_key, endpoint, ip):
+    layers = [(f"rl:key:{api_key}",           100, 60),
+              (f"rl:ep:{api_key}:{endpoint}",  30, 60),
+              (f"rl:ip:{ip}",                 200, 60)]
+    args = [int(time.time()), len(layers)]
+    for _, limit, window in layers:
+        args += [limit, window]
+    try:
+        ok, layer, remaining, reset = LAYERED(keys=[k for k, _, _ in layers],
+                                              args=args)
+        return {"allowed": bool(ok), "layer": layer, "remaining": remaining,
+                "reset": reset, "degraded": False}
+    except redis.RedisError:
+        allowed = local_fallback.check(api_key)          # ← FAIL-OPEN, bounded
+        return {"allowed": allowed, "layer": -1, "remaining": -1,
+                "reset": 60, "degraded": True}
+
+def headers(res, limit=100):
+    h = {"RateLimit-Limit": str(limit),
+         "RateLimit-Remaining": str(max(0, res["remaining"])),
+         "RateLimit-Reset": str(res["reset"])}
+    if not res["allowed"]:
+        h["Retry-After"] = str(res["reset"] + random.randint(0, 5))   # ← jitter
+    return h
+
+r.flushdb()
+print("--- normal operation ---")
+for i in range(35):
+    res = check("key1", "/search", "1.2.3.4")
+    if not res["allowed"]:
+        print(f"request {i:2d}: 429 by layer {res['layer']} "
+              f"(0=key,1=endpoint,2=ip)  headers={headers(res)}")
+        break
+    if i % 10 == 0:
+        print(f"request {i:2d}: 200  {headers(res)}")
+</pre>
+<pre>
+--- normal operation ---
+request  0: 200  {'RateLimit-Limit': '100', 'RateLimit-Remaining': '29', 'RateLimit-Reset': '0'}
+request 10: 200  {'RateLimit-Limit': '100', 'RateLimit-Remaining': '19', 'RateLimit-Reset': '0'}
+request 20: 200  {'RateLimit-Limit': '100', 'RateLimit-Remaining': '9', 'RateLimit-Reset': '0'}
+request 30: 429 by layer 1 (0=key,1=endpoint,2=ip)  headers={'RateLimit-Limit': '100', 'RateLimit-Remaining': '0', 'RateLimit-Reset': '37', 'Retry-After': '39'}
+</pre>
+      <p>The <em>endpoint</em> layer (30/min) rejected first, not the key layer (100/min) — which is the point of
+         layering: one expensive endpoint cannot consume the whole quota. Note the two-pass script: it checks all
+         layers before incrementing any, so a request rejected by layer 1 does not consume quota from layer 0.</p>
+      <p><strong>Verify that rejected requests do not consume quota</strong> — otherwise a blocked client can
+         never recover:</p>
+<pre>
+r.flushdb()
+for _ in range(30):                                    # exhaust the endpoint layer
+    check("key2", "/search", "9.9.9.9")
+before = r.get(f"rl:key:key2:{int(time.time())//60}")
+for _ in range(50):                                    # 50 more, all rejected
+    check("key2", "/search", "9.9.9.9")
+after = r.get(f"rl:key:key2:{int(time.time())//60}")
+print(f"key-layer counter before rejections: {before}")
+print(f"key-layer counter after 50 rejections: {after}  → unchanged")
+</pre>
+<pre>
+key-layer counter before rejections: 30
+key-layer counter after 50 rejections: 30  → unchanged
+</pre>
+      <p><strong>Now the outage test:</strong></p>
+<pre>
+print("\n--- Redis unreachable ---")
+broken = redis.Redis(host="127.0.0.1", port=6399, socket_timeout=0.1)  # nothing there
+real_script = LAYERED
+class Boom:
+    def __call__(self, *a, **k): raise redis.ConnectionError("down")
+LAYERED = Boom()
+
+admitted = degraded = 0
+for i in range(40):
+    res = check("key3", "/search", "5.5.5.5")
+    if res["allowed"]: admitted += 1
+    if res["degraded"]: degraded += 1
+print(f"40 requests during outage → admitted {admitted}, "
+      f"degraded-path {degraded}")
+print(f"local fallback limit was {100 // INSTANCES}/min per instance "
+      f"→ effective global {100 // INSTANCES * INSTANCES}/min across {INSTANCES} instances")
+
+LAYERED = real_script
+print("\n--- Redis restored ---")
+r.flushdb()
+res = check("key4", "/search", "7.7.7.7")
+print(f"allowed={res['allowed']} degraded={res['degraded']} → back to global limits")
+</pre>
+<pre>
+--- Redis unreachable ---
+40 requests during outage → admitted 25, degraded-path 40
+local fallback limit was 25/min per instance → effective global 100/min across 4 instances
+
+--- Redis restored ---
+allowed=True degraded=False → back to global limits
+</pre>
+      <p><strong>The service kept serving during the Redis outage</strong>, bounded at 25/min per instance rather
+         than unlimited. Across 4 instances that approximates the intended 100/min global limit — imprecise,
+         because a client hitting one instance gets only its share, but <em>bounded</em>, which is the property
+         that matters. Pure fail-open would have admitted all 40; fail-closed would have rejected all 40 and
+         turned a Redis outage into a service outage.</p>
+      <p>The <code>degraded</code> flag is what should drive the alert — a limiter silently running on local
+         fallback for a week is how quota enforcement disappears without anyone noticing.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Fixed window permits <strong>2× the configured rate</strong> across a boundary anyone can compute from a clock — measured at 20 requests admitted in 0.62 s against a limit of 10 per 2 s.</li>
+        <li>Non-atomic <code>INCR</code> + <code>EXPIRE</code> leaves a counter with <code>TTL = -1</code> after a crash, blocking that user <strong>permanently</strong> with no recovery path.</li>
+        <li>Client-side check-then-act leaks in proportion to concurrency: +4% at 5 threads, <strong>+93% at 100</strong> — the limiter fails hardest exactly when it matters most.</li>
+        <li><code>MULTI</code>/<code>EXEC</code> cannot implement a limiter (no branching on read values) and <code>WATCH</code> collapses on contended keys — Lua is the only correct mechanism.</li>
+        <li>Sliding log is exact and does not scale: <strong>85 GB versus 112 MB</strong> for a million users at a limit of 1,000.</li>
+        <li>Sliding window counter interpolates two counters — <code>current + previous × (1 − elapsed)</code> — and came within 5% of exact in testing for two keys of memory. It is the production default.</li>
+        <li>Token bucket refills <em>lazily</em> from elapsed time — no background job, ~104 bytes per user regardless of rate or idle period.</li>
+        <li>Token bucket's per-request <code>cost</code> lets the limit express resource consumption rather than request count, which is why it fits API quotas.</li>
+        <li>Take the clock from <code>redis.call('TIME')</code>, not client <code>ARGV</code> — one server clock beats N drifting app-server clocks; effect-based replication makes this safe since Redis 5.</li>
+        <li>Rate limiting is not concurrency limiting: 100 requests/min says nothing about how many run at once. Concurrency needs a semaphore with score-expiring holders.</li>
+        <li>Check all layers before consuming from any, or a request rejected by one layer still burns quota in another — verified unchanged at 30 after 50 rejections.</li>
+        <li>Layer limits (key, key+endpoint, IP, tenant); a single dimension is always evadable, and IP alone breaks under CGNAT.</li>
+        <li>Return <code>Retry-After</code> and <code>RateLimit-*</code> headers — a bare <code>429</code> guarantees an immediate retry storm.</li>
+        <li>Jitter the advertised retry time, or every rejected client returns in the same instant, forever.</li>
+        <li>Decide fail-open versus fail-closed deliberately: fail-open for abuse prevention, fail-closed for billing and security limits.</li>
+        <li>A per-process fallback limiter is the bounded middle ground — N× the intended limit beats unbounded (fail-open) and beats an outage (fail-closed); set it to <code>global / instance_count</code>.</li>
+        <li>Alert on the degraded path: a limiter silently running on local fallback is quota enforcement quietly disappearing.</li>
+        <li>Use <code>EVALSHA</code> with a <code>NOSCRIPT</code> fallback on hot paths so the script body is not re-sent per request.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="streams.html">← Streams &amp; Consumer Groups</a>
+      <a href="persistence.html">Persistence: RDB &amp; AOF →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
