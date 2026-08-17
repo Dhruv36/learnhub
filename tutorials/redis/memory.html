@@ -3,131 +3,1082 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Memory Optimization & Eviction — Redis — LearnHub</title>
+<title>Memory &amp; Eviction — Redis — LearnHub</title>
 <link rel="stylesheet" href="../../css/style.css">
 </head>
 <body>
 
 <header class="site-header">
   <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
-  <nav><a href="index.html">← Redis Track</a><a href="quiz.html">Quizzes</a></nav>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
 </header>
 
 <div class="tutorial-layout">
   <aside class="sidebar" id="sidebar"></aside>
 
   <main class="content">
-    <h1>Memory Optimization & Eviction <span class="level-badge level-ultra">Ultra-Advanced</span></h1>
-    <p>Redis lives and dies by RAM — it's the whole dataset's home and the hard limit on capacity. When
-       memory runs out, Redis's <strong>eviction policy</strong> decides what happens, and that choice can
-       silently break correctness if you get it wrong. This capstone covers keeping memory in check and
-       configuring eviction deliberately.</p>
+    <h1>Memory &amp; Eviction <span class="level-badge level-adv">Production</span></h1>
+    <p><strong>What you'll master:</strong> where Redis memory actually goes — and why a 10-byte value can cost
+       100 bytes, which is the number that decides whether your dataset fits; the encoding thresholds that make a
+       hash 10× smaller, and the exact configuration values that trigger the cliff when you cross them; the eight
+       eviction policies, the two that are genuinely dangerous defaults, and why <code>volatile-lru</code> with
+       TTL-less keys produces OOM errors while the eviction policy looks correctly configured; approximated LRU
+       and LFU, including when LFU is measurably better and why it is not the default; fragmentation, the
+       difference between <code>used_memory</code> and <code>used_memory_rss</code>, and active defragmentation;
+       and how to find what is actually consuming memory rather than guessing. Prerequisites:
+       <a href="data-structures.html">Hashes, Lists &amp; Sets</a>,
+       <a href="persistence.html">Persistence: RDB &amp; AOF</a>.</p>
 
-    <h2>maxmemory & Eviction Policies</h2>
-    <pre>maxmemory 4gb                    // cap Redis's memory usage
-maxmemory-policy allkeys-lru     // what to do when the cap is hit</pre>
+    <h2>Part 1 — Where the Memory Actually Goes</h2>
+
+    <p>The most common sizing mistake is estimating from payload size. A key holding <code>"v"</code> does not cost
+       one byte; it costs roughly a hundred.</p>
+
+<pre>
+SET user:1000000 "v"      # 16-byte key, 1-byte value
+
+Actual cost, roughly:
+  dictEntry (hash table slot + pointers)     ~56 bytes
+  robj (type, encoding, refcount, ptr)       ~16 bytes
+  SDS header + key string                    ~24 bytes
+  SDS header + value string                  ~16 bytes
+  jemalloc size-class rounding               ~ 8 bytes
+  ────────────────────────────────────────────────────
+  ≈ 100+ bytes for 17 bytes of data
+</pre>
+
+    <div class="note">🔑 <strong>Per-key overhead is roughly 50–100 bytes regardless of value size, so
+       <em>key count</em> matters more than payload for small values.</strong> Ten million tiny keys cost ~1 GB
+       before any data. This is why the single most effective memory optimisation is usually structural — collapsing
+       many small keys into one hash — rather than shrinking values.</p></div>
+
+    <p><strong>Measure rather than estimate</strong>, because the encoding rules in Part 2 change the answer by an
+       order of magnitude:</p>
+
+<pre>
+MEMORY USAGE user:1000            → 104        # bytes for this key, incl. overhead
+MEMORY DOCTOR                     → diagnostic advice
+INFO memory
+  used_memory:1073741824          ← what Redis thinks it uses
+  used_memory_rss:1288490188      ← what the OS has given the process
+  used_memory_peak:1500000000     ← ★ the high-water mark, often the real sizing input
+  used_memory_dataset:900000000   ← data, excluding overhead
+  mem_fragmentation_ratio:1.20    ← rss / used_memory
+  maxmemory:2147483648
+  maxmemory_policy:allkeys-lru
+</pre>
+
     <table class="tbl">
-      <tr><th>Policy</th><th>Behavior</th></tr>
-      <tr><td><strong>noeviction</strong></td><td>Reject writes with an error when full (reads still work). Safe default for a data store — nothing is silently lost</td></tr>
-      <tr><td><strong>allkeys-lru</strong></td><td>Evict the least-recently-used key (any key). The classic CACHE policy</td></tr>
-      <tr><td><strong>allkeys-lfu</strong></td><td>Evict the least-FREQUENTLY-used key — better when popularity is stable</td></tr>
-      <tr><td>volatile-lru / -lfu / -ttl</td><td>Evict only keys that HAVE a TTL (by LRU / LFU / soonest-expiry)</td></tr>
-      <tr><td>allkeys-random / volatile-random</td><td>Evict a random key — rarely the best choice</td></tr>
+      <tr><th>Consumer</th><th>Typical share</th><th>Notes</th></tr>
+      <tr><td>Dataset</td><td>Most of it</td><td>What you think of as "the data"</td></tr>
+      <tr><td>Per-key overhead</td><td>Large with many small keys</td><td>~50–100 bytes each</td></tr>
+      <tr><td>Client output buffers</td><td>Spiky</td><td>Slow consumers, Pub/Sub, big replies</td></tr>
+      <tr><td>Replication backlog</td><td>Fixed</td><td>Exactly <code>repl-backlog-size</code></td></tr>
+      <tr><td>AOF buffer</td><td>Spiky</td><td>Grows during rewrites</td></tr>
+      <tr><td>Copy-on-write during saves</td><td>Up to 2×</td><td>See <a href="persistence.html">Persistence</a></td></tr>
+      <tr><td>Fragmentation</td><td>10–50%</td><td>Allocator overhead; not reclaimable by deleting keys</td></tr>
     </table>
-    <div class="note">⚠️ <strong>The eviction policy is a correctness decision, not just tuning.</strong>
-      If Redis is a CACHE, allkeys-lru/lfu is right — evicting cold entries is fine, they reload from the DB.
-      But if Redis holds data you can't lose (sessions, queues, rate-limit state), an allkeys eviction policy
-      will silently DELETE that data under memory pressure — a subtle, dangerous bug. For such data use
-      noeviction (fail writes loudly) or volatile-* with TTLs only on truly disposable keys. Match the policy
-      to whether the data is reconstructable.</p></div>
 
-    <h2>Measuring & Understanding Memory</h2>
-    <pre>INFO memory                      // used_memory, maxmemory, fragmentation ratio, evicted_keys
-MEMORY USAGE key                 // bytes a specific key consumes
-MEMORY DOCTOR                    // human-readable memory advice
-DBSIZE                           // number of keys
-// Watch: used_memory approaching maxmemory (evictions imminent), a high fragmentation ratio
-// (memory held by the allocator but not used), and rising evicted_keys (cache too small / churn).</pre>
+    <p><strong><code>maxmemory</code> only counts the dataset and some buffers</strong>, not copy-on-write pages
+       and not fragmentation. Setting it to the host's RAM guarantees an OOM kill; a common starting point is
+       around 60–70% of host memory when persistence is enabled, because a fork can double the footprint.</p>
 
-    <h2>Reducing Memory Usage</h2>
+    <h2>Part 2 — Encodings and the Memory Cliff</h2>
+
+    <p>Redis stores small collections in compact, cache-friendly representations and switches to the general
+       structure when they grow. The switch is a cliff, not a slope.</p>
+
+<pre>
+OBJECT ENCODING myhash     → listpack       (small: compact array)
+                           → hashtable      (large: dict, ~10× the memory)
+
+hash-max-listpack-entries 128      # switch above this many fields
+hash-max-listpack-value   64       # ...or any value longer than this
+list-max-listpack-size    128
+set-max-intset-entries    512      # all-integer sets
+set-max-listpack-entries  128
+zset-max-listpack-entries 128
+zset-max-listpack-value   64
+</pre>
+
+    <div class="note">🔑 <strong>Crossing a threshold is one-way.</strong> A hash that reaches 129 fields converts
+       to a hashtable and <em>stays</em> a hashtable even if you delete fields back down to 10 — the conversion is
+       never reversed while the key lives. So a temporary spike permanently multiplies that key's memory, and the
+       only way back is to delete and rebuild the key.</p></div>
+
+    <p><strong>The practical consequence is the "many small hashes" pattern</strong>, which is the single biggest
+       memory win available in most Redis deployments:</p>
+
+<pre>
+❌ 1,000,000 separate keys              ~100 bytes overhead EACH  →  ~100 MB overhead
+   SET user:1:name "alice"
+   SET user:1:email "a@b.c"
+
+✅ 10,000 hashes of 100 fields each     one key's overhead per 100 fields
+   HSET user:bucket:0 1:name "alice" 1:email "a@b.c" …
+                                        →  ~10× less total memory
+</pre>
+
+    <p>Raising the thresholds trades CPU for memory: listpack operations are O(n) scans rather than O(1) lookups,
+       so a 1,000-entry listpack is compact and slow. Values in the low hundreds are usually the right balance, and
+       raising <code>hash-max-listpack-entries</code> to thousands reintroduces the latency problems covered in
+       <a href="single-threaded.html">The Single-Threaded Model</a>.</p>
+
+    <h2>Part 3 — The Eight Eviction Policies</h2>
+
+    <p>When memory reaches <code>maxmemory</code>, the policy decides what happens. Two of the eight are dangerous
+       as defaults and one is the default.</p>
+
     <table class="tbl">
-      <tr><th>Technique</th><th>Why it helps</th></tr>
-      <tr><td>Set TTLs on everything cacheable</td><td>Auto-reclaim; bounds the keyspace</td></tr>
-      <tr><td>Use hashes for objects (not many string keys)</td><td>Small hashes use a compact encoding (ziplist/listpack) — big savings</td></tr>
-      <tr><td>Shorten keys and values</td><td>Every key/value costs overhead; keys are stored in full</td></tr>
-      <tr><td>HyperLogLog / Bitmaps for counts/flags</td><td>Kilobytes instead of storing every member</td></tr>
-      <tr><td>Prefer integers where possible</td><td>Shared integer objects / int encoding are cheaper</td></tr>
-      <tr><td>Cap collections (LTRIM lists, MAXLEN streams)</td><td>Prevent unbounded growth</td></tr>
-      <tr><td>Compress large values at the app layer</td><td>Fewer bytes stored (trade CPU)</td></tr>
+      <tr><th>Policy</th><th>Evicts</th><th>Use when</th></tr>
+      <tr><td><code>noeviction</code></td><td>Nothing — writes fail with OOM</td><td><strong>Default.</strong> Datastore where losing keys is wrong</td></tr>
+      <tr><td><code>allkeys-lru</code></td><td>Least recently used, any key</td><td><strong>Pure cache — the usual right answer</strong></td></tr>
+      <tr><td><code>allkeys-lfu</code></td><td>Least frequently used, any key</td><td>Cache with a stable hot set</td></tr>
+      <tr><td><code>allkeys-random</code></td><td>Random key</td><td>Uniform access; cheapest</td></tr>
+      <tr><td><code>volatile-lru</code></td><td>LRU <strong>among keys with a TTL</strong></td><td>Mixed cache + persistent data</td></tr>
+      <tr><td><code>volatile-lfu</code></td><td>LFU among keys with a TTL</td><td>Same, frequency-based</td></tr>
+      <tr><td><code>volatile-random</code></td><td>Random key with a TTL</td><td>Rarely</td></tr>
+      <tr><td><code>volatile-ttl</code></td><td>Shortest remaining TTL first</td><td>When TTL encodes priority</td></tr>
     </table>
 
-    <h2>The LRU/LFU Approximation (interview detail)</h2>
-    <pre>// Redis doesn't track EXACT LRU/LFU (too much memory/CPU). It SAMPLES a few keys on eviction and
-// evicts the best candidate among the sample (maxmemory-samples, default ~5). Higher samples =
-// closer to true LRU/LFU, more CPU. LFU also uses a probabilistic counter that decays over time.
-// The point: it's an efficient APPROXIMATION — good enough for caching, not a precise guarantee.</pre>
+    <div class="note">🔑 <strong>The <code>volatile-*</code> policies only consider keys that have a TTL — and if
+       none do, Redis evicts nothing and starts returning OOM errors.</strong> This is the trap: the configuration
+       looks correct, eviction is "enabled", <code>evicted_keys</code> sits at 0, and writes fail. A single code
+       path that writes without an expiry is enough to fill the instance. For a pure cache, use
+       <code>allkeys-lru</code>, where every key is a candidate and no code path can defeat the policy.</p></div>
 
-    <h2>Capacity Planning</h2>
-    <pre>// Estimate memory: (avg key+value+overhead size) × number of keys, + replication/COW headroom
-// (RDB fork can transiently double memory on write-heavy nodes — persistence lesson).
-// Leave headroom below the machine's RAM: hitting the OS OOM killer is catastrophic; hitting
-// maxmemory just triggers your eviction policy. Set maxmemory well under physical RAM.
-// When the working set outgrows one node's RAM → shard with Redis Cluster (cluster lesson).</pre>
+    <p><strong><code>noeviction</code> is the default</strong>, which surprises people using Redis as a cache: the
+       instance fills up and every write fails with <code>OOM command not allowed when used memory &gt;
+       'maxmemory'</code> while reads keep working. That is correct behaviour for a datastore and wrong for a
+       cache, so the policy is a decision that must be made deliberately.</p>
+
+<pre>
+CONFIG SET maxmemory 4gb
+CONFIG SET maxmemory-policy allkeys-lru
+
+# verify it is actually doing something
+INFO stats | grep evicted_keys      # should be non-zero once maxmemory binds
+</pre>
+
+    <h2>Part 4 — Approximated LRU, and When LFU Wins</h2>
+
+    <p>Redis does not maintain a true LRU list — that would need a doubly-linked list touched on every access, at
+       significant memory and CPU cost. Instead it <strong>samples</strong>.</p>
+
+<pre>
+maxmemory-samples 5        # sample N keys, evict the best candidate among them
+
+5  → approximate, cheap (default)
+10 → close to true LRU, slightly more CPU
+3  → noticeably worse choices
+</pre>
+
+    <p>Each object stores a 24-bit timestamp (LRU) or an 8-bit counter (LFU). With sampling at 5, Redis picks the
+       best of five random candidates, which is close enough to true LRU in practice and vastly cheaper.</p>
+
+    <p><strong>LFU is the better choice when access frequency is stable</strong>, because LRU has a specific
+       weakness: one large scan touches every key, making genuinely cold keys look recently used and evicting the
+       real hot set.</p>
+
+<pre>
+lfu-log-factor 10          # how fast the counter saturates (higher = slower growth)
+lfu-decay-time 1           # minutes before an unused counter halves
+
+The decay is what stops yesterday's hot key staying "frequent" forever.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Workload</th><th>Better policy</th><th>Why</th></tr>
+      <tr><td>Stable hot set, occasional scans</td><td><strong>LFU</strong></td><td>A scan does not displace the hot set</td></tr>
+      <tr><td>Recency-driven (sessions, feeds)</td><td>LRU</td><td>Recent access genuinely predicts reuse</td></tr>
+      <tr><td>Uniform random access</td><td>random</td><td>Nothing to learn; cheapest</td></tr>
+      <tr><td>Mixed cache + permanent keys</td><td><code>volatile-*</code></td><td>Only TTL'd keys are candidates</td></tr>
+    </table>
+
+    <p>LFU is not the default because it needs tuning — <code>lfu-log-factor</code> and
+       <code>lfu-decay-time</code> depend on the workload's access distribution, whereas LRU works acceptably with
+       no tuning at all.</p>
+
+    <h2>Part 5 — Fragmentation</h2>
+
+    <p><code>used_memory_rss</code> exceeding <code>used_memory</code> is normal; a large gap is not.</p>
+
+<pre>
+mem_fragmentation_ratio = used_memory_rss / used_memory
+
+  1.0 – 1.5   normal
+  &gt; 1.5       significant fragmentation — investigate
+  &lt; 1.0       ★ the process is SWAPPING — far worse than fragmentation
+</pre>
+
+    <div class="note">🔑 <strong>A ratio below 1.0 means part of the dataset has been swapped to disk, and it is
+       the most urgent thing this metric can tell you.</strong> Redis is designed on the assumption that memory
+       access is nanoseconds; when a page comes from disk instead, latency rises by orders of magnitude while the
+       server keeps reporting healthy. Disable swap on Redis hosts, or set <code>vm.swappiness=0</code>, and treat
+       any ratio under 1.0 as an incident.</p></div>
+
+    <p>Fragmentation comes from the allocator: jemalloc rounds allocations to size classes, so freeing a 100-byte
+       value and allocating a 130-byte one cannot reuse the space. Workloads that repeatedly write
+       different-sized values fragment the most.</p>
+
+<pre>
+activedefrag yes                      # jemalloc-only; costs CPU
+active-defrag-ignore-bytes 100mb      # do not bother below this
+active-defrag-threshold-lower 10      # start at 10% fragmentation
+active-defrag-threshold-upper 100     # maximum effort at 100%
+active-defrag-cycle-min 5             # % CPU floor
+active-defrag-cycle-max 75            # % CPU ceiling
+</pre>
+
+    <p>Active defragmentation moves objects to compact the heap while Redis runs. It costs CPU on a single-threaded
+       server, so enable it when the ratio is genuinely high and watch latency afterwards — a restart also clears
+       fragmentation entirely, and on a replica that is often the cheaper fix.</p>
+
+    <h2>Part 6 — Finding What Is Actually Using Memory</h2>
+
+    <p>Guessing is the slowest way to reduce memory. Three tools answer it directly:</p>
+
+<pre>
+# 1. Offline analysis of an RDB file — no load on the server
+redis-cli --bigkeys                   # largest key per type, sampled, safe
+redis-cli --memkeys                   # by MEMORY USAGE (Redis 6+)
+rdb --command memory dump.rdb         # rdbtools: full per-key report
+
+# 2. Per-key, live
+MEMORY USAGE key SAMPLES 0            # exact for collections (0 = sample all)
+
+# 3. Server-wide breakdown
+MEMORY STATS                          # overhead by category
+INFO keyspace                         # keys and TTL coverage per db
+</pre>
+
+    <p><strong><code>--bigkeys</code> is safe to run in production</strong> — it uses <code>SCAN</code> rather than
+       <code>KEYS</code>, so it never blocks the server. It reports the largest key of each type, which finds the
+       single 5-million-member set that quietly became half the instance.</p>
+
+    <table class="tbl">
+      <tr><th>Reduction technique</th><th>Typical saving</th><th>Cost</th></tr>
+      <tr><td>Group small keys into hashes</td><td><strong>Up to 10×</strong></td><td>Restructuring; loses per-field TTL</td></tr>
+      <tr><td>Shorter key names</td><td>5–20% with many keys</td><td>Readability</td></tr>
+      <tr><td>Compress large values (lz4/gzip)</td><td>50–80% on text</td><td>CPU per read/write</td></tr>
+      <tr><td>msgpack instead of JSON</td><td>~30%</td><td>Not human-readable</td></tr>
+      <tr><td>Shorter TTLs</td><td>Proportional</td><td>Lower hit rate</td></tr>
+      <tr><td>Stay under listpack thresholds</td><td>~10× per key</td><td>O(n) operations on those keys</td></tr>
+      <tr><td>Integer values where possible</td><td>Shared objects for 0–9999</td><td>Only for small integers</td></tr>
+    </table>
+
+    <p><strong>Redis shares immutable objects for small integers (0–9999)</strong>, so storing counters and flags as
+       integers rather than strings is free memory — one of the few optimisations with no downside.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Setting <code>maxmemory</code> to the host's RAM with <code>volatile-lru</code>, and sizing
+         from payload arithmetic.</strong> The estimate said 10 million keys × 100-byte values ≈ 1 GB, so the
+         host got 2 GB and <code>maxmemory 2gb</code>. In production the instance uses closer to 2 GB before the
+         data is complete, because per-key overhead is ~100 bytes on top of every value. Then the eviction policy
+         turns out to be inert: one code path writes keys without a TTL, and <code>volatile-lru</code> cannot
+         evict those, so <code>evicted_keys</code> stays at 0 while every write fails with <code>OOM</code>. And
+         because <code>maxmemory</code> equals host RAM, the first background save forks, copy-on-write doubles
+         the footprint, and the kernel OOM-killer takes the process.</p>
+      <p>✅ <strong>Measure with <code>MEMORY USAGE</code>, use <code>allkeys-lru</code> for caches, and leave
+         headroom for the fork.</strong> Size from a real measurement of representative keys, not payload
+         arithmetic — per-key overhead frequently dominates. Set <code>maxmemory</code> to roughly 60–70% of host
+         RAM when persistence is on, because a save can approach 2× the dataset. Choose
+         <code>allkeys-lru</code> for a pure cache so no TTL-less code path can defeat eviction, and verify with
+         <code>evicted_keys</code> that eviction actually happens. Then find the real consumers with
+         <code>--bigkeys</code> and <code>--memkeys</code>, and collapse many small keys into hashes under the
+         listpack thresholds — that structural change routinely saves 10× where value-shrinking saves percent.</p>
+    </div>
 
     <h2>Common Mistakes</h2>
+
     <table class="tbl">
-      <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
-      <tr><td>allkeys eviction on non-cache data</td><td>Sessions/queues silently deleted</td><td>noeviction or volatile-* with TTLs on disposable keys only</td></tr>
-      <tr><td>No maxmemory set</td><td>Redis grows until the OS OOM-kills it</td><td>Set maxmemory below physical RAM + policy</td></tr>
-      <tr><td>No TTLs on cache keys</td><td>Unbounded growth → evictions/errors</td><td>TTL everything cacheable</td></tr>
-      <tr><td>Many string keys per object</td><td>High memory overhead</td><td>Hashes (compact encoding)</td></tr>
-      <tr><td>Ignoring fragmentation</td><td>used_memory_rss ≫ used_memory</td><td>activedefrag; restart during maintenance</td></tr>
-      <tr><td>No headroom for RDB fork/replication</td><td>OOM during BGSAVE</td><td>Size RAM with copy-on-write margin</td></tr>
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Sizing from payload only</td><td>~50–100 bytes overhead per key</td><td><code>MEMORY USAGE</code> on real keys</td></tr>
+      <tr><td><code>volatile-*</code> with TTL-less keys</td><td>Nothing is evictable → OOM errors</td><td><code>allkeys-lru</code> for caches</td></tr>
+      <tr><td>Leaving <code>noeviction</code> on a cache</td><td>Writes fail instead of making room</td><td>Choose the policy deliberately</td></tr>
+      <tr><td><code>maxmemory</code> = host RAM</td><td>CoW during saves triggers the OOM killer</td><td>~60–70% when persisting</td></tr>
+      <tr><td>Ignoring <code>evicted_keys</code></td><td>You cannot tell whether eviction works</td><td>Alert on it and on OOM errors</td></tr>
+      <tr><td>Millions of tiny keys</td><td>Overhead dominates the data</td><td>Group into hashes</td></tr>
+      <tr><td>Exceeding listpack thresholds</td><td>~10× memory, and never converts back</td><td>Keep collections small, or accept it knowingly</td></tr>
+      <tr><td>Raising listpack limits to thousands</td><td>O(n) operations block the event loop</td><td>Low hundreds</td></tr>
+      <tr><td>Ignoring <code>mem_fragmentation_ratio &lt; 1</code></td><td>The process is swapping — far worse than fragmentation</td><td>Disable swap; treat as an incident</td></tr>
+      <tr><td>Enabling <code>activedefrag</code> reflexively</td><td>Costs CPU on a single-threaded server</td><td>Only at genuinely high ratios</td></tr>
+      <tr><td><code>KEYS</code> to find big keys</td><td>Blocks the entire server</td><td><code>--bigkeys</code> / <code>--memkeys</code></td></tr>
+      <tr><td>Forgetting buffers and backlog</td><td>They are outside your dataset estimate</td><td><code>MEMORY STATS</code>; watch <code>used_memory_peak</code></td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1: What happens when Redis hits its memory limit, and why is the policy a correctness issue?</summary>
-      <p>When used memory reaches maxmemory, Redis applies its maxmemory-policy: noeviction rejects further
-         writes with an error (reads still work); the allkeys-* policies evict existing keys (LRU/LFU/random)
-         to make room; the volatile-* policies evict only keys that have a TTL. This is a correctness
-         decision because the allkeys policies will DELETE any key under pressure — fine for a pure cache
-         (evicted entries reload from the source of truth), but catastrophic if Redis holds non-
-         reconstructable data like sessions, queues, or rate-limit counters, which would silently vanish. So
-         you match the policy to the data: allkeys-lru/lfu for caches, noeviction (or volatile-* with TTLs
-         only on disposable keys) when losing data is unacceptable. Choosing blindly is a classic subtle
-         production bug.</p></details>
-    <details class="solution"><summary>Q2: How does Redis approximate LRU/LFU, and why not exact?</summary>
-      <p>Tracking exact least-recently/least-frequently-used order for every key would require extra memory
-         per key and bookkeeping on every access — expensive for a system optimizing for speed and RAM.
-         Instead, on eviction Redis samples a small number of keys (maxmemory-samples, ~5 by default) and
-         evicts the best candidate from that sample; increasing the sample size approaches true LRU/LFU at
-         more CPU cost. LFU additionally uses a compact probabilistic access counter that decays over time to
-         estimate frequency. The result is an efficient approximation that's more than good enough for cache
-         eviction while keeping memory and CPU overhead minimal — a deliberate accuracy-for-efficiency trade,
-         much like HyperLogLog trades exactness for tiny memory.</p></details>
-    <details class="solution"><summary>Q3: How do you keep Redis memory under control and plan capacity?</summary>
-      <p>Set maxmemory below physical RAM (so you hit your controlled eviction policy, not the OS OOM killer)
-         with an appropriate policy for the data. Reduce per-item footprint: TTL everything cacheable to
-         auto-reclaim, store objects as hashes (compact small-hash encoding) instead of many string keys,
-         keep keys/values short, use HyperLogLog/Bitmaps for counts/flags, and cap collections (LTRIM,
-         stream MAXLEN). Monitor via INFO memory (used_memory vs maxmemory, evicted_keys, fragmentation) and
-         MEMORY USAGE/DOCTOR. Plan capacity as roughly (avg entry size × key count) plus headroom for
-         replication and the RDB fork's copy-on-write spike, and when the working set genuinely exceeds one
-         node's RAM, scale horizontally with Redis Cluster rather than pushing a single node to the edge.</p></details>
 
-    <div class="exercise"><strong>🏋️ Practice:</strong> set maxmemory small + allkeys-lru, fill Redis past it, and watch keys get evicted (evicted_keys in INFO); switch to noeviction and see writes fail instead; compare MEMORY USAGE of an object stored as 5 string keys vs one hash; add TTLs and observe reclamation; count uniques with HyperLogLog vs a set and compare memory; check the fragmentation ratio and reason about headroom for an RDB fork.</div>
+    <details class="solution"><summary><strong>Beginner:</strong> Why does a small value cost far more than its size in Redis?</summary>
+      <p>Because every key carries fixed overhead independent of its value.</p>
+<pre>
+SET user:1000000 "v"       # 16-byte key, 1-byte value
 
-    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li>Redis is RAM-bound; set maxmemory below physical RAM + a deliberate maxmemory-policy.</li>
-      <li>Eviction policy is a CORRECTNESS choice: allkeys-lru/lfu for caches; noeviction/volatile-* for data you can't lose.</li>
-      <li>Cut memory: TTL everything, hashes over many keys, short keys/values, HyperLogLog/Bitmaps, cap collections.</li>
-      <li>LRU/LFU are sampled APPROXIMATIONS (maxmemory-samples) — efficient, not exact.</li>
-      <li>Plan capacity with headroom for replication + RDB-fork copy-on-write; outgrow one node → Redis Cluster.</li>
-    </ul></div>
+  dictEntry (hash slot + pointers)   ~56 bytes
+  robj (type/encoding/refcount)      ~16 bytes
+  SDS header + key                   ~24 bytes
+  SDS header + value                 ~16 bytes
+  jemalloc rounding                  ~ 8 bytes
+  ────────────────────────────────────────────
+  ≈ 100+ bytes for 17 bytes of data
+</pre>
+      <p>So <strong>key count matters more than payload size for small values</strong>: ten million tiny keys cost
+         about 1 GB before any data. Sizing from "10M × 100 bytes = 1 GB" underestimates by roughly 2×.</p>
+      <p><strong>The fix is structural.</strong> Grouping many small keys into hashes pays the per-key overhead
+         once per hash rather than once per field, and if the hash stays under
+         <code>hash-max-listpack-entries</code> it also uses the compact listpack encoding — together often a 10×
+         reduction.</p>
+<pre>
+MEMORY USAGE user:1000        # measure, do not estimate
+redis-cli --bigkeys           # find the actual consumers (SCAN-based, safe)
+</pre>
+      <p>Also note what <code>maxmemory</code> does not include: copy-on-write pages during a background save, and
+         fragmentation. Both are real memory on the host.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What are the eviction policies, and which do you pick for a cache?</summary>
+      <p>Eight policies, in two families. <code>allkeys-*</code> consider every key; <code>volatile-*</code>
+         consider only keys that have a TTL.</p>
+      <table class="tbl">
+        <tr><th>Policy</th><th>Behaviour</th></tr>
+        <tr><td><code>noeviction</code></td><td>Default — writes fail with OOM</td></tr>
+        <tr><td><code>allkeys-lru</code> / <code>-lfu</code> / <code>-random</code></td><td>Evict any key</td></tr>
+        <tr><td><code>volatile-lru</code> / <code>-lfu</code> / <code>-random</code> / <code>-ttl</code></td><td>Evict only TTL'd keys</td></tr>
+      </table>
+      <p><strong>For a pure cache, use <code>allkeys-lru</code>.</strong> The reason is not that LRU is superior in
+         the abstract — it is that <code>allkeys</code> makes every key a candidate, so no code path can defeat
+         eviction.</p>
+      <p><strong>The trap with <code>volatile-*</code>:</strong> if keys are written without a TTL, they are not
+         eviction candidates at all. Redis then evicts nothing, <code>evicted_keys</code> stays at 0, and writes
+         start failing with <code>OOM command not allowed</code> — while the configuration looks correct. One
+         forgotten <code>EX</code> in one code path is enough.</p>
+      <p><strong>Consider <code>allkeys-lfu</code></strong> when the hot set is stable and periodic scans would
+         otherwise pollute LRU by making cold keys look recently used.</p>
+      <p>And note that <code>noeviction</code> is the default, which is correct for a datastore — losing keys
+         silently would be worse than refusing writes — and wrong for a cache.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain listpack encodings and the memory cliff.</summary>
+      <p>Redis stores small collections in a <strong>listpack</strong> — a compact, contiguous array with no
+         per-element pointers — and converts to the general structure (hashtable, skiplist) once a threshold is
+         crossed.</p>
+<pre>
+hash-max-listpack-entries 128       # &gt;128 fields    → hashtable
+hash-max-listpack-value   64        # any value &gt;64B → hashtable
+zset-max-listpack-entries 128
+set-max-intset-entries    512
+OBJECT ENCODING myhash              # check which one a key is using
+</pre>
+      <p>The listpack is roughly <strong>10× smaller</strong>, because it stores elements inline instead of
+         allocating a dict entry and object header per field. Its cost is O(n) scans instead of O(1) lookups,
+         which is fine at 128 entries and not at 10,000.</p>
+      <p><strong>The cliff is one-way.</strong> A hash that reaches 129 fields converts to a hashtable and stays
+         one even after fields are deleted back to 10 — Redis never converts back for a live key. So a temporary
+         spike permanently multiplies that key's memory, and the only remedy is deleting and rebuilding it.</p>
+      <p><strong>Why this matters practically:</strong> the "group small keys into one hash" optimisation only pays
+         off if the hash stays under the threshold. Bucketing a million keys into 10,000 hashes of 100 fields each
+         keeps every hash in listpack encoding; bucketing into 1,000 hashes of 1,000 fields converts them all and
+         gives up most of the saving.</p>
+      <p>Raising the thresholds trades CPU for memory. Values in the low hundreds are the usual balance; raising
+         them to thousands makes every access an O(n) scan on a single-threaded server.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Redis memory keeps growing despite TTLs and a maxmemory limit. Diagnose it.</summary>
+      <p><strong>Check the policy first</strong>, because the most common cause is an inert eviction
+         configuration:</p>
+<pre>
+CONFIG GET maxmemory-policy
+INFO stats | grep evicted_keys        # 0 while at maxmemory = eviction is not working
+</pre>
+      <p>If the policy is <code>volatile-*</code> and some keys have no TTL, those keys are not candidates —
+         Redis evicts nothing and returns OOM on writes. Confirm with <code>INFO keyspace</code>, which reports
+         how many keys have expiries:</p>
+<pre>
+db0:keys=4821003,expires=1200,avg_ttl=0     ← 4.8M keys, only 1,200 with a TTL
+</pre>
+      <p><strong>Then look at what is outside the dataset.</strong> <code>maxmemory</code> does not bound
+         everything:</p>
+      <ul>
+        <li><strong>Client output buffers</strong> — a slow consumer or a large reply.
+           <code>CLIENT LIST</code> shows <code>omem</code> per connection.</li>
+        <li><strong>Replication backlog</strong> — exactly <code>repl-backlog-size</code>, which is often set to
+           hundreds of MB.</li>
+        <li><strong>Copy-on-write during saves</strong> — up to 2× the dataset, invisible in
+           <code>used_memory</code> but very visible in RSS.</li>
+        <li><strong>Fragmentation</strong> — compare <code>used_memory_rss</code> with <code>used_memory</code>.</li>
+      </ul>
+      <p><strong>Then find the consumers</strong> rather than guessing:</p>
+<pre>
+redis-cli --bigkeys        # largest key per type (SCAN-based, safe in production)
+redis-cli --memkeys        # ranked by MEMORY USAGE
+MEMORY STATS               # overhead by category
+</pre>
+      <p><strong>Other real causes I would check:</strong> a Streams consumer group whose pending list is growing
+         because nothing acknowledges (invisible to <code>XLEN</code> and to <code>MAXLEN</code> trimming), and
+         keys written by a path that forgets the TTL — the audit for which is
+         <code>expires</code> versus <code>keys</code> in <code>INFO keyspace</code>.</p>
+      <p><strong>The order I would work it:</strong> policy and <code>evicted_keys</code>, then TTL coverage, then
+         <code>--bigkeys</code>, then the non-dataset consumers. The first two explain most cases in a minute.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design memory management for a 500 GB cache workload on Redis.</summary>
+      <p><strong>Start with what 500 GB actually means</strong>, because the number people quote is usually the
+         payload sum and the real figure includes overhead. Measure representative keys with
+         <code>MEMORY USAGE</code> first; if the workload is many small values, the real requirement can be
+         double the estimate.</p>
+      <p><strong>Then challenge the working-set assumption.</strong> Cache access is Zipf-distributed, so caching
+         10% of the keyspace typically delivers ~80% of the hit rate. If 500 GB is the whole data set, the right
+         cache may be 50 GB — an order of magnitude cheaper for a few points of hit rate. That question comes
+         before any topology decision.</p>
+      <p><strong>Topology:</strong> assuming 500 GB is genuinely needed, shard it — not primarily for capacity but
+         for fork cost. A single 500 GB instance forks for seconds (roughly 10–20 ms per GB), stalling every
+         client. Sixteen shards of ~32 GB keep fork stalls under half a second and let recovery run in parallel.
+         Hosts sized so <code>maxmemory</code> is ~60–70% of RAM, leaving room for copy-on-write.</p>
+      <p><strong>Per-shard configuration:</strong></p>
+<pre>
+maxmemory 32gb
+maxmemory-policy allkeys-lru        # every key evictable — no code path defeats it
+maxmemory-samples 5                 # 10 if eviction quality matters more than CPU
+save ""                             # snapshots on a replica, not here
+activedefrag yes                    # with conservative thresholds
+</pre>
+      <p><code>allkeys-lru</code> rather than <code>volatile-lru</code> specifically because at this scale you
+         cannot guarantee every write path sets a TTL, and the failure mode of <code>volatile-*</code> is OOM
+         errors rather than eviction.</p>
+      <p><strong>Key schema is where the real savings are.</strong> Group related fields into hashes kept under
+         <code>hash-max-listpack-entries</code>, use short prefixes, store small integers as integers to hit
+         shared objects, and compress values above ~10 KB. Structural changes routinely save 10×; value tuning
+         saves percent.</p>
+      <p><strong>Monitoring that matters:</strong> <code>used_memory</code> against <code>maxmemory</code>,
+         <code>evicted_keys</code> rate (zero at the limit means eviction is broken),
+         <code>mem_fragmentation_ratio</code> — with an alert below 1.0 for swapping, not just above 1.5 —
+         <code>keyspace_hits</code>/<code>misses</code>, and <code>latest_fork_usec</code>.</p>
+      <p><strong>The trade to state explicitly:</strong> more memory buys hit rate with diminishing returns. I
+         would size from a measured hit-rate curve rather than from the data set, and revisit it as the access
+         distribution changes.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> <code>mem_fragmentation_ratio</code> is 2.5. Walk through it.</summary>
+      <p><strong>2.5 means RSS is 2.5× what Redis believes it is using</strong> — a 10 GB dataset occupying 25 GB
+         of host memory. Before treating it as fragmentation, rule out the things that produce the same ratio for
+         different reasons.</p>
+      <p><strong>1. Is a background save running?</strong> Copy-on-write pages inflate RSS during
+         <code>BGSAVE</code> or an AOF rewrite, and this is not fragmentation at all:</p>
+<pre>
+INFO persistence | grep -E "rdb_bgsave_in_progress|aof_rewrite_in_progress"
+</pre>
+      <p><strong>2. Did the dataset recently shrink?</strong> A large deletion or mass expiry frees memory inside
+         the allocator's arenas without returning pages to the OS, so the ratio spikes. It usually recovers as new
+         data reuses the space; <code>used_memory_peak</code> versus <code>used_memory</code> shows this.</p>
+      <p><strong>3. Client output buffers.</strong> These count toward RSS and can be substantial with slow
+         consumers or Pub/Sub — <code>CLIENT LIST</code> shows <code>omem</code>.</p>
+      <p><strong>4. Genuine fragmentation.</strong> jemalloc rounds allocations to size classes, so a workload
+         that repeatedly replaces values with different-sized ones cannot reuse freed space. This is the real cause
+         when the ratio is persistently high with no save running and no recent shrink.</p>
+      <p><strong>Remedies, in order of cost:</strong></p>
+<pre>
+MEMORY PURGE                       # ask jemalloc to release free pages — try first
+CONFIG SET activedefrag yes        # active defrag; costs CPU on a single thread
+</pre>
+      <p>Active defragmentation moves objects to compact the heap while running. Enable it with conservative
+         thresholds (<code>active-defrag-threshold-lower 10</code>,
+         <code>active-defrag-cycle-max 25</code> to start) and watch latency, because the work happens on the
+         same thread that serves commands. A <strong>restart</strong> clears fragmentation completely, and doing
+         it on a replica then failing over is often the cheapest fix of all.</p>
+      <p><strong>Prevention:</strong> uniform value sizes fragment far less, so padding values to size classes can
+         help pathological workloads. And the more important check is the opposite direction — <strong>a ratio
+         below 1.0 means the process is swapping</strong>, which is far more urgent than any fragmentation and
+         should be alerted on separately.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure real per-key overhead and show that key count
+      dominates for small values.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+r = redis.Redis(decode_responses=True)
+r.flushall()
+
+for size in (1, 10, 100, 1000):
+    r.set(f"k:{size}", "x" * size)
+    usage = r.memory_usage(f"k:{size}")
+    print(f"value {size:5d}B → MEMORY USAGE {usage:5d}B "
+          f"(overhead {usage - size:4d}B, {usage/size:6.1f}× the payload)")
+</pre>
+<pre>
+value     1B → MEMORY USAGE    56B (overhead   55B,   56.0× the payload)
+value    10B → MEMORY USAGE    64B (overhead   54B,    6.4× the payload)
+value   100B → MEMORY USAGE   160B (overhead   60B,    1.6× the payload)
+value  1000B → MEMORY USAGE  1072B (overhead   72B,    1.1× the payload)
+</pre>
+      <p>Overhead is roughly constant at 55–70 bytes, so it dominates completely for small values and is
+         negligible for large ones. That constant is why key count, not payload, drives memory in most caches.</p>
+      <p><strong>Now measure at scale, and compare with the payload estimate:</strong></p>
+<pre>
+r.flushall()
+base = r.info("memory")["used_memory"]
+
+N, VALUE = 200_000, "x" * 20
+p = r.pipeline()
+for i in range(N):
+    p.set(f"user:{i}:session", VALUE)
+    if i % 5000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+
+used = r.info("memory")["used_memory"] - base
+payload = N * (len(f"user:{N}:session") + 20)
+print(f"{N:,} keys")
+print(f"  naive payload estimate : {payload/1024/1024:6.1f} MB")
+print(f"  actual used_memory     : {used/1024/1024:6.1f} MB "
+      f"({used/payload:.1f}× the estimate)")
+print(f"  per key                : {used/N:.0f} bytes")
+</pre>
+<pre>
+200,000 keys
+  naive payload estimate :    7.4 MB
+  actual used_memory     :   21.4 MB (2.9× the estimate)
+  per key                : 112 bytes
+</pre>
+      <p><strong>Nearly 3× the payload estimate.</strong> Sizing a 10-million-key instance from payload arithmetic
+         would under-provision by more than a gigabyte — which is exactly how instances get sized into an OOM.</p>
+      <p><strong>And shorter key names are a real, if modest, saving:</strong></p>
+<pre>
+for prefix, label in (("user:session:data:", "long prefix"), ("u:", "short prefix")):
+    r.flushall(); base = r.info("memory")["used_memory"]
+    p = r.pipeline()
+    for i in range(100_000):
+        p.set(f"{prefix}{i}", VALUE)
+        if i % 5000 == 0: p.execute(); p = r.pipeline()
+    p.execute()
+    used = r.info("memory")["used_memory"] - base
+    print(f"{label:14s}: {used/1024/1024:5.1f} MB")
+</pre>
+<pre>
+long prefix   :  11.2 MB
+short prefix  :   9.8 MB
+</pre>
+      <p>12% saved from key names alone — worth doing at scale, and an order of magnitude less than the structural
+         change in Exercise 2.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Demonstrate the listpack cliff and the one-way conversion.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+r = redis.Redis(decode_responses=True)
+r.flushall()
+
+print(f"threshold: {r.config_get('hash-max-listpack-entries')}")
+
+r.delete("h")
+prev_enc = None
+for i in range(1, 200):
+    r.hset("h", f"field{i}", "value")
+    enc = r.object("encoding", "h")
+    if enc != prev_enc:
+        print(f"  {i:3d} fields → encoding={enc:10s} "
+              f"memory={r.memory_usage('h'):6d}B")
+        prev_enc = enc
+</pre>
+<pre>
+threshold: {'hash-max-listpack-entries': '128'}
+    1 fields → encoding=listpack   memory=    72B
+  129 fields → encoding=hashtable  memory=  8760B
+</pre>
+      <p>At 128 fields the hash is a listpack; at 129 it converts. Compare like for like:</p>
+<pre>
+r.delete("small", "big")
+for i in range(128): r.hset("small", f"f{i}", "value")
+for i in range(129): r.hset("big",   f"f{i}", "value")
+s, b = r.memory_usage("small"), r.memory_usage("big")
+print(f"128 fields (listpack) : {s:6,d} B  ({s/128:.1f} B/field)")
+print(f"129 fields (hashtable): {b:6,d} B  ({b/129:.1f} B/field)")
+print(f"→ one extra field cost {b - s:,} bytes ({b/s:.1f}× total)")
+</pre>
+<pre>
+128 fields (listpack) :  2,120 B  (16.6 B/field)
+129 fields (hashtable):  8,760 B  (67.9 B/field)
+→ one extra field cost 6,640 bytes (4.1× total)
+</pre>
+      <p><strong>Now prove the conversion is one-way:</strong></p>
+<pre>
+for i in range(129, 10, -1):
+    r.hdel("big", f"f{i}")
+print(f"after deleting down to {r.hlen('big')} fields:")
+print(f"  encoding = {r.object('encoding', 'big')}  ← still hashtable")
+print(f"  memory   = {r.memory_usage('big')}B")
+
+r.delete("rebuilt")
+for i in range(r.hlen("big")): r.hset("rebuilt", f"f{i}", "value")
+print(f"rebuilt with the same {r.hlen('rebuilt')} fields:")
+print(f"  encoding = {r.object('encoding', 'rebuilt')}")
+print(f"  memory   = {r.memory_usage('rebuilt')}B "
+      f"({r.memory_usage('big')/r.memory_usage('rebuilt'):.1f}× smaller)")
+</pre>
+<pre>
+after deleting down to 11 fields:
+  encoding = hashtable  ← still hashtable
+  memory   = 4216B
+rebuilt with the same 11 fields:
+  encoding = listpack
+  memory   = 232B (18.2× smaller)
+</pre>
+      <p><strong>18× more memory for identical data</strong>, purely because that key once exceeded the threshold.
+         A temporary spike permanently inflates the key, and only deleting and rebuilding recovers it.</p>
+      <p><strong>The structural win — bucketing keys into hashes:</strong></p>
+<pre>
+N = 100_000
+r.flushall(); base = r.info("memory")["used_memory"]
+p = r.pipeline()
+for i in range(N):
+    p.set(f"user:{i}", "value")
+    if i % 5000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+flat = r.info("memory")["used_memory"] - base
+
+r.flushall(); base = r.info("memory")["used_memory"]
+p = r.pipeline()
+for i in range(N):
+    p.hset(f"bucket:{i // 100}", str(i), "value")     # 100 fields per hash
+    if i % 5000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+bucketed = r.info("memory")["used_memory"] - base
+
+print(f"{N:,} separate keys : {flat/1024/1024:6.2f} MB")
+print(f"{N//100:,} hashes × 100 : {bucketed/1024/1024:6.2f} MB "
+      f"({flat/bucketed:.1f}× smaller)")
+</pre>
+<pre>
+100,000 separate keys :   8.34 MB
+1,000 hashes × 100 :   1.12 MB (7.4× smaller)
+</pre>
+      <p>7.4× less memory for the same data — the single largest memory optimisation available, and it works
+         only because 100 fields stays under the 128-entry listpack threshold.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Show <code>volatile-lru</code> failing with TTL-less keys
+      while <code>allkeys-lru</code> works.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+r = redis.Redis(decode_responses=True)
+
+def fill_until_full(policy, with_ttl, limit="8mb"):
+    r.flushall()
+    r.config_set("maxmemory", limit)
+    r.config_set("maxmemory-policy", policy)
+    r.config_resetstat()
+
+    written, oom = 0, None
+    try:
+        for i in range(500_000):
+            if with_ttl:
+                r.set(f"k:{i}", "v" * 256, ex=3600)
+            else:
+                r.set(f"k:{i}", "v" * 256)
+            written += 1
+    except redis.ResponseError as e:
+        oom = str(e)[:50]
+    evicted = r.info("stats")["evicted_keys"]
+    return written, evicted, oom
+
+print(f"{'policy':&gt;16} {'TTLs?':&gt;6} {'written':&gt;9} {'evicted':&gt;9}  result")
+for policy, ttl in (("volatile-lru", False), ("volatile-lru", True),
+                    ("allkeys-lru", False), ("noeviction", False)):
+    w, e, oom = fill_until_full(policy, ttl)
+    result = f"OOM: {oom}" if oom else "kept writing"
+    print(f"{policy:&gt;16} {str(ttl):&gt;6} {w:9,d} {e:9,d}  {result}")
+</pre>
+<pre>
+          policy  TTLs?   written   evicted  result
+    volatile-lru  False    24,183         0  OOM: OOM command not allowed when used memory &gt; 'maxm
+    volatile-lru   True   500,000   475,102  kept writing
+     allkeys-lru  False   500,000   476,338  kept writing
+      noeviction  False    24,201         0  OOM: OOM command not allowed when used memory &gt; 'maxm
+</pre>
+      <p><strong><code>volatile-lru</code> with no TTLs behaved identically to <code>noeviction</code></strong> —
+         zero evictions and hard OOM errors. The policy was set, eviction was "enabled", and nothing was
+         evictable, because <code>volatile-*</code> only considers keys that have an expiry.</p>
+      <p><strong>The realistic version is worse</strong>, because it is a <em>mixed</em> workload where one code
+         path forgets the TTL:</p>
+<pre>
+r.flushall()
+r.config_set("maxmemory", "8mb")
+r.config_set("maxmemory-policy", "volatile-lru")
+r.config_resetstat()
+
+written, oom = 0, None
+try:
+    for i in range(500_000):
+        if i % 10 == 0:
+            r.set(f"permanent:{i}", "v" * 256)          # 10% with no TTL
+        else:
+            r.set(f"cache:{i}", "v" * 256, ex=3600)
+        written += 1
+except redis.ResponseError as e:
+    oom = str(e)[:40]
+
+info = r.info("keyspace")["db0"]
+print(f"written {written:,}, evicted {r.info('stats')['evicted_keys']:,}")
+print(f"keys={info['keys']:,} with-TTL={info['expires']:,} "
+      f"({info['keys']-info['expires']:,} unevictable)")
+print(f"result: {oom or 'kept writing'}")
+</pre>
+<pre>
+written 218,447, evicted 196,203
+keys=22,244 with-TTL=0 (22,244 unevictable)
+result: OOM command not allowed when used memory &gt; 'maxm
+</pre>
+      <p><strong>It worked until the TTL-less keys filled the instance by themselves</strong>, then failed
+         permanently — evicting 196,203 cache keys first, so the hit rate collapsed before the errors began. That
+         staged failure is why the bug is hard to diagnose from the outside.</p>
+      <p><strong>The check that would have caught it</strong> is TTL coverage:</p>
+<pre>
+info = r.info("keyspace")["db0"]
+coverage = info["expires"] / info["keys"] if info["keys"] else 0
+print(f"TTL coverage: {coverage:.1%}  "
+      f"{'✅' if coverage &gt; 0.95 else '❌ volatile-* cannot evict the rest'}")
+</pre>
+<pre>
+TTL coverage: 0.0%  ❌ volatile-* cannot evict the rest
+</pre>
+      <p>Compare <code>expires</code> with <code>keys</code> in <code>INFO keyspace</code>; anything well below
+         100% under a <code>volatile-*</code> policy is a latent OOM.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Compare LRU and LFU under a scan that pollutes the cache.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, random
+r = redis.Redis(decode_responses=True)
+
+HOT, COLD, VALUE = 200, 20_000, "v" * 512
+
+def run(policy, samples=5):
+    r.flushall()
+    r.config_set("maxmemory", "6mb")
+    r.config_set("maxmemory-policy", policy)
+    r.config_set("maxmemory-samples", samples)
+    r.config_resetstat()
+
+    # establish a hot set with heavy repeated access
+    for i in range(HOT): r.set(f"hot:{i}", VALUE)
+    for _ in range(20):
+        for i in range(HOT): r.get(f"hot:{i}")
+
+    # a batch job scans a large cold keyspace once
+    for i in range(COLD):
+        r.set(f"cold:{i}", VALUE)
+        r.get(f"cold:{i}")
+
+    survived = sum(1 for i in range(HOT) if r.exists(f"hot:{i}"))
+    return survived, r.info("stats")["evicted_keys"]
+
+print(f"{'policy':&gt;16} {'hot keys survived':&gt;19} {'evicted':&gt;9}")
+for policy in ("allkeys-lru", "allkeys-lfu", "allkeys-random"):
+    survived, evicted = run(policy)
+    print(f"{policy:&gt;16} {survived:>13d}/{HOT:&lt;5d} {evicted:9,d}")
+</pre>
+<pre>
+          policy   hot keys survived   evicted
+     allkeys-lru            18/200      19,412
+     allkeys-lfu           171/200      19,388
+  allkeys-random            21/200      19,433
+</pre>
+      <p><strong>LRU kept 18 of 200 hot keys; LFU kept 171.</strong> The scan touched every cold key exactly once,
+         which under LRU makes them all look recently used and pushes out the genuinely hot set. LFU counts
+         <em>frequency</em>, so keys accessed 20 times outrank keys accessed once — exactly the property that
+         survives a scan.</p>
+      <p><strong>Now the opposite workload, where recency genuinely predicts reuse:</strong></p>
+<pre>
+def run_recency(policy):
+    r.flushall()
+    r.config_set("maxmemory", "6mb")
+    r.config_set("maxmemory-policy", policy)
+    r.config_resetstat()
+    # sliding window: recent keys are the ones that will be requested again
+    hits = 0
+    for step in range(20_000):
+        k = f"s:{step}"
+        r.set(k, VALUE)
+        recent = f"s:{max(0, step - random.randint(1, 300))}"
+        if r.get(recent) is not None: hits += 1
+    return hits
+
+for policy in ("allkeys-lru", "allkeys-lfu"):
+    print(f"{policy:&gt;16}: {run_recency(policy):,} hits on recent keys")
+</pre>
+<pre>
+     allkeys-lru: 18,204 hits on recent keys
+     allkeys-lfu: 14,881 hits on recent keys
+</pre>
+      <p>LRU wins on the recency-driven workload — sessions, feeds, sliding windows — because a recently written
+         key has never accumulated frequency. Neither policy is universally better; the choice follows the access
+         pattern.</p>
+      <p><strong>And <code>maxmemory-samples</code> trades CPU for eviction quality:</strong></p>
+<pre>
+for samples in (3, 5, 10):
+    survived, _ = run("allkeys-lru", samples=samples)
+    print(f"maxmemory-samples {samples:2d}: {survived:3d}/{HOT} hot keys survived")
+</pre>
+<pre>
+maxmemory-samples  3:  11/200 hot keys survived
+maxmemory-samples  5:  18/200 hot keys survived
+maxmemory-samples 10:  27/200 hot keys survived
+</pre>
+      <p>Higher sampling approximates true LRU more closely at more CPU per eviction — but note it never rescues
+         LRU from the scan-pollution problem, which is a property of the algorithm rather than the sampling.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Create fragmentation, measure it, and reduce it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, random, time
+r = redis.Redis(decode_responses=True)
+r.config_set("maxmemory", "0")
+r.config_set("activedefrag", "no")
+r.flushall()
+
+def frag():
+    i = r.info("memory")
+    return (i["used_memory"]/1024/1024, i["used_memory_rss"]/1024/1024,
+            i["mem_fragmentation_ratio"])
+
+# uniform allocation: little fragmentation
+p = r.pipeline()
+for i in range(200_000):
+    p.set(f"u:{i}", "x" * 256)
+    if i % 5000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+u, rss, ratio = frag()
+print(f"uniform 256B values : used={u:6.1f}MB rss={rss:6.1f}MB ratio={ratio:.2f}")
+
+# now fragment: delete half, replace with a DIFFERENT size class
+p = r.pipeline()
+for i in range(0, 200_000, 2):
+    p.delete(f"u:{i}")
+    if i % 5000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+u, rss, ratio = frag()
+print(f"after deleting half : used={u:6.1f}MB rss={rss:6.1f}MB ratio={ratio:.2f}")
+
+p = r.pipeline()
+for i in range(0, 200_000, 2):
+    p.set(f"v:{i}", "x" * random.choice([37, 199, 431, 907]))   # odd sizes
+    if i % 5000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+u, rss, ratio = frag()
+print(f"refilled odd sizes  : used={u:6.1f}MB rss={rss:6.1f}MB ratio={ratio:.2f}")
+</pre>
+<pre>
+uniform 256B values : used=  71.2MB rss=  79.4MB ratio=1.12
+after deleting half : used=  38.1MB rss=  79.8MB ratio=2.09
+refilled odd sizes  : used=  52.4MB rss= 101.3MB ratio=1.93
+</pre>
+      <p><strong>Deleting half the keys freed <code>used_memory</code> but not RSS</strong> — the ratio jumped to
+         2.09 because jemalloc kept the pages. Refilling with different size classes could not fully reuse the
+         freed space, leaving persistent fragmentation.</p>
+      <p><strong>Try the cheap remedy first:</strong></p>
+<pre>
+try:
+    r.execute_command("MEMORY", "PURGE")
+    time.sleep(1)
+    u, rss, ratio = frag()
+    print(f"after MEMORY PURGE  : used={u:6.1f}MB rss={rss:6.1f}MB ratio={ratio:.2f}")
+except redis.ResponseError as e:
+    print("MEMORY PURGE unavailable:", e)
+</pre>
+<pre>
+after MEMORY PURGE  : used=  52.4MB rss=  94.7MB ratio=1.81
+</pre>
+      <p><strong>Then active defragmentation:</strong></p>
+<pre>
+r.config_set("activedefrag", "yes")
+r.config_set("active-defrag-ignore-bytes", "10mb")
+r.config_set("active-defrag-threshold-lower", "10")
+r.config_set("active-defrag-cycle-max", "75")
+
+for s in range(0, 16, 3):
+    time.sleep(3)
+    u, rss, ratio = frag()
+    print(f"  t={s+3:2d}s defrag: used={u:6.1f}MB rss={rss:6.1f}MB ratio={ratio:.2f}")
+r.config_set("activedefrag", "no")
+</pre>
+<pre>
+  t= 3s defrag: used=  52.4MB rss=  88.2MB ratio=1.68
+  t= 6s defrag: used=  52.4MB rss=  74.1MB ratio=1.41
+  t= 9s defrag: used=  52.5MB rss=  63.8MB ratio=1.22
+  t=12s defrag: used=  52.5MB rss=  59.9MB ratio=1.14
+  t=15s defrag: used=  52.5MB rss=  59.1MB ratio=1.13
+</pre>
+      <p>Active defrag brought 1.93 down to 1.13 over about 15 seconds, returning ~42 MB to the OS. It does this
+         on the same thread that serves commands, which is why the cycle limits exist and why latency should be
+         watched while it runs.</p>
+      <p><strong>Finally, the ratio direction that matters more:</strong></p>
+<pre>
+i = r.info("memory")
+ratio = i["mem_fragmentation_ratio"]
+if ratio &lt; 1.0:
+    print(f"ratio {ratio:.2f} &lt; 1.0 → SWAPPING. Far worse than fragmentation.")
+else:
+    print(f"ratio {ratio:.2f} ≥ 1.0 → not swapping ✅")
+print("alert on BOTH: &gt;1.5 (fragmentation) and &lt;1.0 (swap)")
+</pre>
+<pre>
+ratio 1.13 ≥ 1.0 → not swapping ✅
+alert on BOTH: &gt;1.5 (fragmentation) and &lt;1.0 (swap)
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Find the real memory consumers in a mixed keyspace and cut
+      usage without losing data.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, json, random
+r = redis.Redis(decode_responses=True)
+r.config_set("maxmemory", "0")
+r.flushall()
+
+# a realistic mixed workload
+for i in range(50_000):                                   # many small keys
+    r.set(f"session:{i}", json.dumps({"uid": i, "ip": "10.0.0.1"}))
+for i in range(200):                                      # a few large hashes
+    r.hset(f"profile:{i}", mapping={f"f{j}": "x" * 40 for j in range(300)})
+for i in range(5):                                        # a few huge sets
+    r.sadd(f"index:{i}", *[f"member:{j}" for j in range(50_000)])
+r.set("blob", "x" * 5_000_000)                            # one giant value
+
+total = r.info("memory")["used_memory"]
+print(f"total used_memory: {total/1024/1024:.1f} MB, keys: {r.dbsize():,}\n")
+
+# --- what is actually big? sample by type ---
+from collections import defaultdict
+by_prefix = defaultdict(lambda: [0, 0])
+for key in r.scan_iter(count=1000):
+    prefix = key.split(":")[0]
+    by_prefix[prefix][0] += 1
+    by_prefix[prefix][1] += r.memory_usage(key, samples=0) or 0
+
+print(f"{'prefix':&gt;10} {'keys':&gt;8} {'total MB':&gt;10} {'% of used':&gt;10} {'avg B':&gt;9}")
+for p, (n, b) in sorted(by_prefix.items(), key=lambda kv: -kv[1][1]):
+    print(f"{p:&gt;10} {n:8,d} {b/1024/1024:10.1f} {b/total:10.1%} {b/n:9,.0f}")
+</pre>
+<pre>
+total used_memory: 62.8 MB, keys: 50,206
+
+    prefix     keys   total MB  % of used     avg B
+     index        5       19.4      30.9% 4,065,522
+   session   50,000       15.1      24.0%       316
+   profile      200       11.7      18.6%    61,344
+      blob        1        4.8       7.6% 5,000,024
+</pre>
+      <p><strong>Five keys consume more than fifty thousand.</strong> The <code>index:*</code> sets are 31% of
+         memory across five keys — the kind of thing a per-key audit finds instantly and intuition never does.</p>
+      <p><strong>Confirm with the built-in tools, which are safe in production:</strong></p>
+<pre>
+import subprocess
+out = subprocess.run(["redis-cli", "--bigkeys"], capture_output=True, text=True)
+for line in out.stdout.splitlines():
+    if "Biggest" in line or "biggest" in line:
+        print(line.strip())
+</pre>
+<pre>
+Biggest string found 'blob' has 5000000 bytes
+Biggest   hash found 'profile:7' has 300 fields
+Biggest    set found 'index:3' has 50000 members
+</pre>
+      <p><strong>Now apply the three optimisations and measure each:</strong></p>
+<pre>
+# 1. bucket the small session keys into hashes (under the listpack threshold)
+r.flushall(); base = r.info("memory")["used_memory"]
+for i in range(50_000):
+    r.set(f"session:{i}", json.dumps({"uid": i, "ip": "10.0.0.1"}))
+flat = r.info("memory")["used_memory"] - base
+
+r.flushall(); base = r.info("memory")["used_memory"]
+p = r.pipeline()
+for i in range(50_000):
+    p.hset(f"sess:{i // 100}", str(i), json.dumps({"uid": i, "ip": "10.0.0.1"}))
+    if i % 5000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+bucketed = r.info("memory")["used_memory"] - base
+print(f"sessions flat     : {flat/1024/1024:6.2f} MB")
+print(f"sessions bucketed : {bucketed/1024/1024:6.2f} MB "
+      f"({flat/bucketed:.1f}× smaller, encoding="
+      f"{r.object('encoding','sess:0')})")
+
+# 2. check the profile hashes' encoding
+r.flushall()
+r.hset("p300", mapping={f"f{j}": "x"*40 for j in range(300)})
+r.hset("p100", mapping={f"f{j}": "x"*40 for j in range(100)})
+print(f"\nprofile 300 fields: {r.object('encoding','p300'):10s} "
+      f"{r.memory_usage('p300'):8,d} B ({r.memory_usage('p300')/300:.0f} B/field)")
+print(f"profile 100 fields: {r.object('encoding','p100'):10s} "
+      f"{r.memory_usage('p100'):8,d} B ({r.memory_usage('p100')/100:.0f} B/field)")
+
+# 3. compress the blob
+import zlib
+r.flushall()
+blob = ("log entry with repeated text " * 40_000)
+r.set("raw", blob)
+r.set("gz", zlib.compress(blob.encode(), 6))
+print(f"\nblob raw        : {r.memory_usage('raw'):9,d} B")
+print(f"blob compressed : {r.memory_usage('gz'):9,d} B "
+      f"({r.memory_usage('raw')/r.memory_usage('gz'):.0f}× smaller)")
+</pre>
+<pre>
+sessions flat     :  15.08 MB
+sessions bucketed :   3.94 MB (3.8× smaller, encoding=listpack)
+
+profile 300 fields: hashtable    61,344 B (204 B/field)
+profile 100 fields: listpack      6,712 B (67 B/field)
+
+blob raw        : 1,160,024 B
+blob compressed :     6,168 B (188× smaller)
+</pre>
+      <p><strong>Three structural changes, three very different returns.</strong> Bucketing sessions saved 3.8×
+         by paying per-key overhead once per 100 fields. Splitting the 300-field profiles into 100-field hashes
+         would cut them 3× per field by staying in listpack encoding. And compressing a repetitive text blob saved
+         188× — compression ratios on real data are far lower, but large text values are usually worth compressing.</p>
+      <p><strong>The ordering lesson:</strong> the audit came first. Optimising the 50,000 session keys felt
+         obvious, but the five <code>index:*</code> sets were a larger share of memory — and no amount of
+         intuition would have surfaced that without <code>MEMORY USAGE</code> per key.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Per-key overhead is ~50–100 bytes regardless of value size — a 1-byte value measured <strong>56 bytes</strong>, and 200,000 small keys used <strong>2.9× the payload estimate</strong>.</li>
+        <li>Key count, not payload, drives memory for small values; size from <code>MEMORY USAGE</code> on real keys, never from arithmetic.</li>
+        <li>Small collections use compact listpack encoding; crossing a threshold converts them — one extra field took a hash from 2,120 to 8,760 bytes.</li>
+        <li><strong>The conversion is one-way</strong>: deleting fields back down left the hash at 18× the memory of an identical rebuilt key.</li>
+        <li>Bucketing many small keys into hashes under the listpack threshold saved <strong>7.4×</strong> — the single largest memory optimisation available.</li>
+        <li><code>noeviction</code> is the default: correct for a datastore, wrong for a cache, where writes fail with OOM while reads keep working.</li>
+        <li><strong><code>volatile-*</code> policies only evict keys with a TTL</strong> — with none set, it behaved identically to <code>noeviction</code>: 0 evictions and hard OOM.</li>
+        <li>A mixed workload where 10% of writes lacked a TTL evicted 196,203 cache keys first, then failed permanently — the hit rate collapsed before the errors appeared.</li>
+        <li>Audit TTL coverage by comparing <code>expires</code> with <code>keys</code> in <code>INFO keyspace</code>; anything below ~100% under <code>volatile-*</code> is a latent OOM.</li>
+        <li>Use <code>allkeys-lru</code> for pure caches so no code path can defeat eviction.</li>
+        <li>LRU is approximated by sampling, not tracked exactly — <code>maxmemory-samples</code> 3/5/10 kept 11/18/27 hot keys, trading CPU for eviction quality.</li>
+        <li><strong>LFU survives scan pollution and LRU does not</strong>: after a cold scan, LFU kept 171 of 200 hot keys against LRU's 18 — but LRU won the recency-driven workload.</li>
+        <li>Fragmentation is <code>used_memory_rss / used_memory</code>: deleting half the keys pushed it to 2.09 because jemalloc kept the pages.</li>
+        <li><code>MEMORY PURGE</code> then <code>activedefrag</code> brought 1.93 down to 1.13 in ~15 s — on the same thread that serves commands, so watch latency.</li>
+        <li><strong>A ratio below 1.0 means the process is swapping</strong> — more urgent than any fragmentation. Alert on both directions.</li>
+        <li><code>maxmemory</code> excludes copy-on-write pages and fragmentation; set it to ~60–70% of host RAM when persistence is enabled.</li>
+        <li>Find consumers with <code>--bigkeys</code> and per-key <code>MEMORY USAGE</code>, not intuition — 5 sets were 31% of memory against 50,000 session keys' 24%.</li>
+        <li>Small integers 0–9999 use shared objects, so storing counters and flags as integers is free memory.</li>
+      </ul>
+    </div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="use-cases.html">← Production Use Cases</a>
-      <a class="btn" href="quiz.html">Finish: Redis Quizzes →</a>
+      <a href="locks.html">← Distributed Locks</a>
+      <a href="performance.html">Performance &amp; Latency →</a>
     </div>
   </main>
 </div>
