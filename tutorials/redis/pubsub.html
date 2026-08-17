@@ -1,0 +1,1210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pub/Sub — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Pub/Sub <span class="level-badge level-adv">Messaging &amp; Data Flow</span></h1>
+    <p><strong>What you'll master:</strong> the one property that determines every correct use of Redis Pub/Sub —
+       it is <strong>fire-and-forget with at-most-once delivery</strong>, so a subscriber that is not connected at
+       the instant of publish loses the message permanently, with no error anywhere; why <code>PUBLISH</code>
+       returning a number is the only delivery signal you get and what it does and does not tell you; the
+       subscriber connection mode that makes people think their client is broken; pattern subscriptions and why
+       <code>PSUBSCRIBE *</code> is a self-inflicted performance problem; the slow-subscriber buffer limit that
+       disconnects clients silently under load; how Pub/Sub behaves in Cluster and why <code>SSUBSCRIBE</code>
+       exists; and the decision that actually matters in an interview — when this is the right tool and when
+       <a href="streams.html">Streams</a> is. Prerequisites:
+       <a href="pipelining.html">Commands, Pipelining &amp; Round Trips</a>,
+       <a href="single-threaded.html">The Single-Threaded Model</a>.</p>
+
+    <h2>Part 1 — At-Most-Once, and What That Actually Costs</h2>
+
+    <p>Redis Pub/Sub is a message <em>bus</em>, not a message <em>queue</em>. The server holds no state for a
+       channel: when <code>PUBLISH</code> arrives, Redis walks the list of currently-subscribed clients, writes
+       the payload to each of their output buffers, and forgets everything.</p>
+
+<pre>
+PUBLISH news "hello"
+   │
+   ├─ subscriber A connected  → delivered
+   ├─ subscriber B connected  → delivered
+   └─ subscriber C RECONNECTING → nothing. No error, no retry, no record.
+
+The message does not exist anywhere after this command returns.
+</pre>
+
+    <div class="note">🔑 <strong>There is no persistence, no acknowledgement, no replay, and no error when
+       delivery fails.</strong> A subscriber that is down, restarting, redeploying, or briefly network-partitioned
+       misses every message sent during that window — permanently, and silently. This is not a limitation to be
+       worked around; it is the design. Pub/Sub trades delivery guarantees for the lowest possible latency and a
+       server that stores nothing, and every correct use of it is a use where a lost message does not matter.</p></div>
+
+    <p>The most common production bug in this whole topic is a deploy. Rolling a subscriber fleet takes seconds
+       per instance, and every message published in that window is gone. If those messages were cache
+       invalidations, some processes now hold stale data forever — which is exactly why
+       <a href="cache-invalidation.html">Cache Invalidation &amp; Stampedes</a> insists on a TTL backstop under
+       any Pub/Sub-driven invalidation.</p>
+
+    <table class="tbl">
+      <tr><th>Property</th><th>Redis Pub/Sub</th><th>Redis Streams</th><th>Kafka / RabbitMQ</th></tr>
+      <tr><td>Delivery guarantee</td><td><strong>At-most-once</strong></td><td>At-least-once</td><td>At-least-once</td></tr>
+      <tr><td>Message retained</td><td>❌ Never</td><td>✅ Until trimmed</td><td>✅ By retention policy</td></tr>
+      <tr><td>Offline subscriber</td><td>❌ Loses everything</td><td>✅ Reads from its offset</td><td>✅ Reads from its offset</td></tr>
+      <tr><td>Acknowledgement</td><td>❌ None</td><td>✅ <code>XACK</code></td><td>✅ Yes</td></tr>
+      <tr><td>Replay history</td><td>❌ No</td><td>✅ Yes</td><td>✅ Yes</td></tr>
+      <tr><td>Consumer groups (work split)</td><td>❌ All get everything</td><td>✅ Yes</td><td>✅ Yes</td></tr>
+      <tr><td>Latency</td><td><strong>Lowest</strong> — no write</td><td>Low (writes to memory)</td><td>Higher (disk, batching)</td></tr>
+      <tr><td>Memory cost of a slow consumer</td><td>Output buffer, then disconnect</td><td>Stream grows</td><td>Broker disk</td></tr>
+    </table>
+
+    <p><strong>The <code>PUBLISH</code> return value</strong> is the only feedback the protocol offers: the number
+       of clients that received the message — meaning the number it was <em>written to</em>, not the number that
+       processed it.</p>
+
+<pre>
+PUBLISH news "hello"    → (integer) 2      # 2 subscribers had it written to their buffer
+PUBLISH news "hello"    → (integer) 0      # NOBODY was listening. The message is gone.
+</pre>
+
+    <p>A return of <code>0</code> is the single most useful signal available, and almost nobody checks it. It
+       means the publish accomplished nothing at all. It does not tell you the subscribers succeeded — a client
+       can receive the bytes and then crash before acting — but it does definitively tell you when they were not
+       there.</p>
+
+<pre>
+n = r.publish("cache:invalidate", key)
+if n == 0:
+    log.warning("no subscribers for invalidation of %s — stale caches likely", key)
+</pre>
+
+    <h2>Part 2 — Subscriber Mode: Why Your Client "Breaks"</h2>
+
+    <p>Once a connection issues <code>SUBSCRIBE</code>, it enters a restricted state where only a handful of
+       commands are legal. This surprises everyone once.</p>
+
+<pre>
+SUBSCRIBE news          → OK, now in subscriber mode
+GET foo                 → (error) ERR Can't execute 'get': only (P|S)SUBSCRIBE /
+                          (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed
+                          in this context
+</pre>
+
+    <div class="note">🔑 <strong>A subscribing connection cannot run normal commands, so a subscriber needs
+       <em>two</em> connections</strong> — one blocked on the subscription, one for regular work. This is why
+       every mature client library gives you a separate pubsub object rather than reusing the main connection, and
+       why sharing a connection pool between a subscriber and application code produces baffling errors under
+       load.</p></div>
+
+<pre>
+r    = redis.Redis(decode_responses=True)      # normal commands
+ps   = r.pubsub()                              # separate connection underneath
+ps.subscribe("news")
+
+for msg in ps.listen():
+    if msg["type"] != "message":               # skip subscribe/unsubscribe confirmations
+        continue
+    r.incr("processed")                        # ← uses the OTHER connection. Fine.
+</pre>
+
+    <p><strong>RESP3 removes the restriction</strong> (Redis 6+): with the newer protocol, push messages are
+       tagged distinctly from command replies, so one connection can subscribe <em>and</em> run commands. Whether
+       you get this depends entirely on the client library negotiating RESP3 — it is not automatic, and assuming
+       it is a portable behaviour will break on the next client.</p>
+
+    <p><strong>The message envelope</strong> has a shape worth knowing, because the confirmations are easy to
+       mistake for data:</p>
+
+<pre>
+{"type": "subscribe", "channel": "news", "data": 1}      # confirmation; data = sub count
+{"type": "message",   "channel": "news", "data": "hi"}   # ← the actual message
+{"type": "pmessage",  "pattern": "news.*",               # pattern match
+                      "channel": "news.tech", "data": "hi"}
+</pre>
+
+    <p>Filtering on <code>type</code> is mandatory. Code that assumes every item from <code>listen()</code> is a
+       message will try to JSON-decode the integer <code>1</code> from the subscribe confirmation and crash on
+       startup — a classic first-run failure.</p>
+
+    <h2>Part 3 — Patterns, and the Cost of Matching</h2>
+
+    <p><code>PSUBSCRIBE</code> subscribes by glob pattern, which is convenient and quietly expensive.</p>
+
+<pre>
+PSUBSCRIBE news.*           → matches news.tech, news.sport, news.tech.ai
+PSUBSCRIBE user.*.login     → matches user.42.login
+PSUBSCRIBE *                → matches EVERYTHING  ← see below
+
+Glob syntax:  *  any chars    ?  one char    [abc]  a set    \  escape
+</pre>
+
+    <p>The cost is on the <strong>publish</strong> path, and it is structural. Channel subscriptions are a hash
+       lookup: Redis finds the channel's subscriber list in O(1). Pattern subscriptions cannot be looked up — every
+       <code>PUBLISH</code> must test the channel name against <em>every registered pattern</em>.</p>
+
+<pre>
+Cost of one PUBLISH  =  O(subscribers on that exact channel)      ← hash lookup
+                     +  O(total registered patterns)              ← glob match, each one
+
+With 1,000 patterns registered, EVERY publish runs 1,000 glob matches —
+including publishes to channels that match nothing at all.
+</pre>
+
+    <p>And because Redis is single-threaded, that work is not amortised across cores: it happens on the one thread
+       that also serves every <code>GET</code> in the system. Exercise 3 measures the degradation.</p>
+
+    <table class="tbl">
+      <tr><th>Approach</th><th>Publish cost</th><th>Use when</th></tr>
+      <tr><td>Exact channel</td><td>O(1) lookup</td><td>Default — always prefer</td></tr>
+      <tr><td>A few patterns</td><td>O(patterns), small</td><td>Genuine hierarchy, low pattern count</td></tr>
+      <tr><td>Hundreds of patterns</td><td>O(patterns), on every publish</td><td>Avoid — subscribe to explicit channels</td></tr>
+      <tr><td><code>PSUBSCRIBE *</code></td><td>Every message to every such subscriber</td><td>Debugging only, never in production</td></tr>
+    </table>
+
+    <p><strong><code>PSUBSCRIBE *</code> deserves its own warning.</strong> It receives every message published
+       anywhere on the server, so one forgotten debugging subscriber turns every publish in the system into an
+       extra network write — and if that subscriber is slow, it hits the output buffer limit from Part 4 and gets
+       disconnected, usually while somebody is trying to understand an unrelated incident.</p>
+
+    <p><strong>Name channels hierarchically</strong> so that explicit subscription stays possible as the system
+       grows. Patterns should be a convenience for a handful of consumers, not the architecture:</p>
+
+<pre>
+✅  events.user.42.login          # subscribe exactly, or pattern events.user.42.*
+✅  cache.invalidate.product      # coarse enough to subscribe explicitly
+❌  event_1234                     # opaque; forces PSUBSCRIBE *
+</pre>
+
+    <h2>Part 4 — Slow Subscribers and the Buffer Limit</h2>
+
+    <p>Redis writes to a subscriber's output buffer without waiting. If the subscriber reads slower than the
+       publisher writes, that buffer grows — and Redis will not let it grow forever.</p>
+
+<pre>
+CONFIG GET client-output-buffer-limit
+  "normal   0 0 0"                       # normal clients: unlimited
+  "slave    268435456 67108864 60"
+  "pubsub   33554432 8388608 60"         # ← pubsub: 32MB hard / 8MB soft for 60s
+
+Meaning:  hard  — exceed 32 MB at any instant        → disconnect immediately
+          soft  — stay above 8 MB for 60 seconds     → disconnect
+</pre>
+
+    <div class="note">🔑 <strong>The disconnect is silent from the publisher's perspective.</strong>
+       <code>PUBLISH</code> keeps returning healthy subscriber counts right up until the moment the subscriber is
+       dropped, and the subscriber's client library usually reconnects automatically — so the visible symptom is
+       not an error but a <em>gap</em>: messages missing for a few seconds, with nothing in the logs except a
+       reconnect. This is the failure mode that makes people believe Redis "randomly loses messages".</p></div>
+
+    <p>Diagnose it from the client list, where the buffer sizes are visible per connection:</p>
+
+<pre>
+CLIENT LIST TYPE pubsub
+  id=42 addr=10.0.1.7:5123 … omem=7340032 tot-mem=7356416 …
+                                ↑ output buffer memory, in bytes — 7 MB and climbing
+
+INFO stats
+  pubsub_clients:12
+  total_net_output_bytes:...
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr>
+      <tr><td>Subscribers reconnecting under load</td><td>Output buffer limit exceeded</td><td>Faster consumer; hand off to a queue</td></tr>
+      <tr><td>Gaps in received messages</td><td>Disconnect + reconnect window</td><td>Streams if the gap matters</td></tr>
+      <tr><td><code>omem</code> climbing on one client</td><td>That consumer is too slow</td><td>Fix the consumer, not the limit</td></tr>
+      <tr><td>Redis memory rising with publishes</td><td>Buffers for slow subscribers</td><td>Check <code>CLIENT LIST TYPE pubsub</code></td></tr>
+      <tr><td>Publisher latency rising</td><td>Fan-out work on the single thread</td><td>Fewer subscribers/patterns per message</td></tr>
+    </table>
+
+    <p><strong>Raising the limit is almost always the wrong fix.</strong> It converts a disconnect into unbounded
+       memory growth on a server whose memory is the whole product. The correct response is to make the consumer
+       fast: do nothing in the message handler except push onto an in-process queue, and process on a worker
+       thread — so a slow database write cannot stall the socket read.</p>
+
+<pre>
+q = queue.Queue(maxsize=10000)
+
+def reader():                              # keep this loop trivial
+    for msg in ps.listen():
+        if msg["type"] == "message":
+            try:    q.put_nowait(msg["data"])
+            except queue.Full:  metrics.incr("pubsub.dropped")   # shed, don't block
+
+def worker():                              # slow work happens here
+    while True:
+        handle(q.get())
+</pre>
+
+    <p>Note the explicit drop. If the queue is full, dropping is <em>better</em> than blocking — blocking stalls
+       the socket read, grows the server-side buffer, and gets the client disconnected, which loses far more
+       messages than the one you refused.</p>
+
+    <h2>Part 5 — Pub/Sub in Cluster, and Sharded Pub/Sub</h2>
+
+    <p>Ordinary Pub/Sub ignores the Cluster hash-slot model entirely. Channels are not keys, so they are not
+       assigned to slots — and to make subscription work from any node, Redis <strong>broadcasts every published
+       message to every node in the cluster</strong>.</p>
+
+<pre>
+Cluster of 6 nodes, PUBLISH on node 1:
+
+  node1 ──┬──→ node2   (whether or not it has subscribers)
+          ├──→ node3
+          ├──→ node4
+          ├──→ node5
+          └──→ node6
+
+  Bus traffic per publish = O(nodes). Adding nodes makes publishing MORE expensive.
+</pre>
+
+    <div class="note">🔑 <strong>Pub/Sub is the one Redis feature that does not scale by adding nodes — it
+       scales <em>negatively</em>.</strong> Every message crosses the cluster bus to every node regardless of where
+       subscribers are, so a larger cluster means more inter-node traffic per publish. A high-throughput Pub/Sub
+       workload on a large cluster can saturate the bus that failover detection depends on, which turns a
+       messaging problem into an availability problem.</p></div>
+
+    <p><strong>Sharded Pub/Sub</strong> (Redis 7.0) fixes this by making channels slot-bound like keys:</p>
+
+<pre>
+SSUBSCRIBE orders          # shard channel: hashed to a slot like a key
+SPUBLISH   orders "..."    # delivered ONLY to the node owning that slot
+
+Cost per publish: O(1) node, not O(nodes).
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th><code>PUBLISH</code></th><th><code>SPUBLISH</code> (7.0+)</th></tr>
+      <tr><td>Cluster propagation</td><td>Every node</td><td>Only the slot's node</td></tr>
+      <tr><td>Scales with cluster size</td><td>❌ Worse as nodes grow</td><td>✅ Independent</td></tr>
+      <tr><td>Subscribe from any node</td><td>✅ Yes</td><td>❌ Must connect to the slot owner</td></tr>
+      <tr><td>Pattern subscriptions</td><td>✅ <code>PSUBSCRIBE</code></td><td>❌ Not supported</td></tr>
+      <tr><td>Delivery guarantee</td><td>At-most-once</td><td>At-most-once (unchanged)</td></tr>
+    </table>
+
+    <p>The trade is explicit: <code>SPUBLISH</code> removes the broadcast but requires subscribers to find and
+       connect to the right node, and it drops pattern support entirely. Cluster-aware clients handle the routing;
+       what they cannot do is make it as forgiving as the broadcast version — which is the point, because the
+       forgiveness was the expense.</p>
+
+    <h2>Part 6 — What Pub/Sub Is Actually Good For</h2>
+
+    <p>Given at-most-once delivery, the honest list of good uses is short — and every entry shares one property:
+       <strong>a lost message causes bounded, self-correcting harm.</strong></p>
+
+    <table class="tbl">
+      <tr><th>Use case</th><th>Why loss is tolerable</th><th>Required backstop</th></tr>
+      <tr><td>Cache invalidation</td><td>The TTL corrects it</td><td><strong>Always keep a TTL</strong></td></tr>
+      <tr><td>Live metrics / dashboards</td><td>The next tick replaces it</td><td>Periodic full refresh</td></tr>
+      <tr><td>Presence / typing indicators</td><td>Inherently ephemeral</td><td>Timeout-based expiry</td></tr>
+      <tr><td>Config reload signals</td><td>Poll on an interval too</td><td>Version check on a timer</td></tr>
+      <tr><td>WebSocket fan-out to connected users</td><td>The user is offline anyway</td><td>Persist to a DB for history</td></tr>
+      <tr><td>Coordinating a distributed refresh</td><td>Followed by a reconciliation pass</td><td>Periodic reconcile</td></tr>
+    </table>
+
+    <p><strong>And the uses that are always wrong:</strong> job queues, order events, payment notifications, email
+       sending, anything with a business consequence. Not because Pub/Sub is slow — it is the fastest option — but
+       because "the subscriber was redeploying" is a normal Tuesday, and the corresponding lost job is not
+       recoverable, not logged, and not detectable.</p>
+
+    <p><strong>The canonical correct pattern is WebSocket fan-out</strong>, where Pub/Sub solves a problem nothing
+       else does as cheaply: a user's WebSocket is held by <em>one</em> application server, and any server may need
+       to send to them.</p>
+
+<pre>
+Server A holds Alice's WebSocket. Server B processes a message for Alice.
+
+  B:  PUBLISH ws.user.alice '{"text":"hi"}'
+  A:  (subscribed to ws.user.alice)  → writes to Alice's socket
+
+If Alice is offline, nobody is subscribed → PUBLISH returns 0 → the message
+is gone — which is correct, because the persistent copy belongs in the
+database, written BEFORE the publish.
+</pre>
+
+    <p>The ordering is the whole design: persist first, then publish. The database holds the truth and the
+       Pub/Sub message is a best-effort nudge for a client that happens to be connected right now. Reversing it —
+       publishing and relying on the subscriber to persist — is how chat systems lose messages.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Using Pub/Sub as a job queue.</strong> A service publishes work to a channel and a worker fleet
+         subscribes. It appears to work perfectly in development and in staging. In production the failures are
+         quiet and permanent: every deploy drops the jobs published during the restart window; every worker
+         disconnected by the output buffer limit loses the jobs sent during the reconnect; and because every
+         subscriber receives every message, three workers do the same job three times rather than sharing the
+         load. There is no acknowledgement, so nothing retries, and no record, so nothing is even detectable —
+         the only symptom is work that silently did not happen.</p>
+      <p>✅ <strong>Use the tool whose guarantee matches the requirement.</strong> For work that must happen, use
+         <a href="streams.html">Streams</a> with consumer groups: messages persist, <code>XREADGROUP</code>
+         distributes them across workers rather than duplicating, unacknowledged entries stay in the pending list,
+         and <code>XAUTOCLAIM</code> recovers work from a worker that died mid-job. Keep Pub/Sub for signals whose
+         loss is self-correcting — cache invalidations behind a TTL, live dashboard ticks, presence — and where a
+         lost message costs nothing you would have to explain.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Pub/Sub as a job queue</td><td>At-most-once; every deploy loses jobs</td><td>Streams with consumer groups</td></tr>
+      <tr><td>Expecting offline subscribers to catch up</td><td>Nothing is stored; there is no backlog</td><td>Streams, or persist before publishing</td></tr>
+      <tr><td>Ignoring the <code>PUBLISH</code> return value</td><td><code>0</code> means nobody got it</td><td>Check it; alert when unexpectedly 0</td></tr>
+      <tr><td>Running commands on a subscribed connection</td><td>Only (P|S)SUBSCRIBE/PING/QUIT/RESET are legal</td><td>A second connection</td></tr>
+      <tr><td>Not filtering on <code>type</code></td><td>Subscribe confirmations arrive as items too</td><td>Skip anything not <code>message</code>/<code>pmessage</code></td></tr>
+      <tr><td>Slow work inside the listen loop</td><td>Output buffer grows → silent disconnect</td><td>Hand off to an in-process queue</td></tr>
+      <tr><td>Raising <code>client-output-buffer-limit</code></td><td>Trades a disconnect for unbounded memory</td><td>Make the consumer faster</td></tr>
+      <tr><td><code>PSUBSCRIBE *</code> in production</td><td>Every message to that client; matching on every publish</td><td>Explicit channels</td></tr>
+      <tr><td>Hundreds of patterns</td><td>Every publish glob-matches all of them, single-threaded</td><td>Hierarchical names; subscribe exactly</td></tr>
+      <tr><td>High-volume <code>PUBLISH</code> in Cluster</td><td>Broadcasts to every node; can saturate the bus</td><td><code>SPUBLISH</code>/<code>SSUBSCRIBE</code> (7.0+)</td></tr>
+      <tr><td>Pub/Sub invalidation with no TTL</td><td>A missed message is stale data forever</td><td>TTL as the backstop</td></tr>
+      <tr><td>Publishing before persisting</td><td>The durable copy depends on a subscriber surviving</td><td>Write to the database first, then publish</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What delivery guarantee does Redis Pub/Sub provide?</summary>
+      <p><strong>At-most-once.</strong> A message is delivered to the clients subscribed at the instant of
+         <code>PUBLISH</code>, and to nobody else, ever. Redis stores nothing: it walks the current subscriber
+         list, writes the payload into each output buffer, and the message ceases to exist.</p>
+      <p>The consequences follow directly:</p>
+      <ul>
+        <li>A subscriber that is down, restarting or reconnecting misses everything sent in that window.</li>
+        <li>There is no acknowledgement, so the publisher cannot know whether anything was processed.</li>
+        <li>There is no replay — a new subscriber sees only messages published after it subscribed.</li>
+        <li>Nothing errors. The loss is completely silent on both sides.</li>
+      </ul>
+      <p>The one signal available is the return value: <code>PUBLISH</code> returns the number of clients the
+         message was written to, so <code>0</code> definitively means nobody received it.</p>
+<pre>
+PUBLISH news "hello"   → (integer) 0      # gone, no error raised
+</pre>
+      <p>This makes Pub/Sub correct for signals whose loss is self-correcting — cache invalidation backed by a
+         TTL, live dashboard updates, presence — and wrong for anything that must happen, which needs
+         <a href="streams.html">Streams</a> or a real broker.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why can't a subscribed connection run <code>GET</code>?</summary>
+      <p>Because <code>SUBSCRIBE</code> puts the connection into a special mode where the server may push messages
+         at any time, unprompted. Redis's normal request/response protocol assumes every reply corresponds to a
+         command the client sent; if arbitrary commands were allowed while pushes are in flight, the client could
+         not tell which incoming payload is the reply to its <code>GET</code> and which is a published message.</p>
+<pre>
+SUBSCRIBE news
+GET foo    → (error) ERR Can't execute 'get': only (P|S)SUBSCRIBE /
+             (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context
+</pre>
+      <p>So a subscriber needs <strong>two connections</strong>: one held by the subscription, one for regular
+         commands. Every serious client library does this automatically — a <code>pubsub()</code> object owns its
+         own connection — which is why sharing one connection or pool between subscription and application code
+         produces confusing failures.</p>
+      <p><strong>RESP3 (Redis 6+) lifts the restriction</strong>, because push messages carry a distinct type in
+         the protocol, so replies and pushes are unambiguous on one connection. It depends on the client
+         negotiating RESP3, so it is not something to rely on portably.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A subscriber keeps disconnecting under load. Diagnose it.</summary>
+      <p>Almost certainly the <strong>client output buffer limit</strong> for pubsub clients. Redis writes to a
+         subscriber's buffer without waiting; a consumer that reads slower than the publisher writes accumulates
+         data there, and Redis kills the connection rather than growing it without bound.</p>
+<pre>
+CONFIG GET client-output-buffer-limit
+  "pubsub 33554432 8388608 60"
+          ↑hard 32MB   ↑soft 8MB  ↑for 60s
+
+Exceed 32 MB instantly, or stay above 8 MB for 60 s → disconnected.
+</pre>
+      <p><strong>Confirm it</strong> by watching per-client buffer memory:</p>
+<pre>
+CLIENT LIST TYPE pubsub
+  id=42 … omem=7340032 tot-mem=7356416 …     ← omem climbing = this consumer
+</pre>
+      <p>The symptom is confusing because the publisher sees nothing wrong — <code>PUBLISH</code> keeps returning
+         healthy counts, and the client library reconnects automatically, so the only trace is a gap in received
+         messages plus a reconnect log line. It is the usual reason people believe Redis "randomly drops
+         messages".</p>
+      <p><strong>The fix is a faster consumer, not a bigger buffer.</strong> Raising the limit converts a
+         disconnect into unbounded memory growth on the server. Keep the listen loop trivial — push onto an
+         in-process queue and process on a worker thread — and drop explicitly if that queue fills, since blocking
+         the socket read is what causes the disconnect in the first place.</p>
+      <p>If the messages genuinely cannot be dropped, that is a signal the requirement never matched Pub/Sub:
+         Streams let a slow consumer fall behind and catch up, because the data lives in the stream instead of in
+         a socket buffer.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> When would you choose Pub/Sub over Streams?</summary>
+      <p>When the message has <strong>no value after the moment it is sent</strong>, and the lowest possible
+         latency and zero storage cost matter.</p>
+      <table class="tbl">
+        <tr><th></th><th>Pub/Sub</th><th>Streams</th></tr>
+        <tr><td>Delivery</td><td>At-most-once</td><td>At-least-once</td></tr>
+        <tr><td>Stored</td><td>Never</td><td>Until trimmed</td></tr>
+        <tr><td>Offline consumer</td><td>Loses everything</td><td>Resumes from its offset</td></tr>
+        <tr><td>Work distribution</td><td>All subscribers get all messages</td><td>Consumer groups split the work</td></tr>
+        <tr><td>Memory</td><td>None (buffers only)</td><td>Grows — needs trimming</td></tr>
+        <tr><td>Consumer bookkeeping</td><td>None</td><td>Offsets, pending lists, claims</td></tr>
+      </table>
+      <p><strong>Pub/Sub wins for:</strong> WebSocket fan-out to currently-connected users, cache invalidation
+         behind a TTL, live dashboards, presence and typing indicators, config-reload signals. In each, a missed
+         message is corrected by the next event, a timeout, or a periodic refresh.</p>
+      <p><strong>Streams win for:</strong> job queues, order and payment events, anything needing acknowledgement,
+         retry, replay, or work split across a worker fleet. The tell is the question "if a consumer is restarting
+         when this is sent, is that acceptable?" — if the answer is no, Pub/Sub is disqualified regardless of how
+         convenient it looks.</p>
+      <p><strong>They compose well.</strong> A common production pattern writes the durable record to a Stream (or
+         the database) and publishes a lightweight notification over Pub/Sub for latency: subscribers that are
+         connected react immediately, and anything that missed the notification still picks the work up from the
+         durable source.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design real-time chat delivery for 100K concurrent WebSocket connections across 20 servers.</summary>
+      <p><strong>The core constraint:</strong> a user's WebSocket is held by exactly one server, but a message for
+         them can be processed by any of the 20. Something must route from the processing server to the holding
+         server, and Pub/Sub does this well because the payload is genuinely ephemeral — if the user is offline,
+         there is nothing to deliver to.</p>
+<pre>
+Server B receives Alice→Bob message
+  1. INSERT into the messages table            ← durability lives HERE
+  2. PUBLISH ws.user.bob '{"from":"alice",…}'  ← best-effort nudge
+Server A (holds Bob's socket, subscribed to ws.user.bob)
+  3. writes to Bob's WebSocket
+</pre>
+      <p><strong>Persist before publishing.</strong> The database holds the truth; the publish is an optimisation
+         for a client that happens to be connected. If Bob is offline, <code>PUBLISH</code> returns 0 and nothing
+         is lost, because he will load history from the database on reconnect. Reversing the order — publishing
+         first and relying on a subscriber to persist — is how chat systems lose messages permanently.</p>
+      <p><strong>Subscription strategy is the real design decision.</strong> Per-user channels
+         (<code>ws.user.{id}</code>) mean 100K channel subscriptions spread over 20 servers, so each server
+         subscribes only to its own connected users and receives only relevant messages — but subscribing and
+         unsubscribing on every connect/disconnect is churn, and in Cluster every publish still broadcasts to all
+         nodes. The alternative, one channel per server (<code>ws.server.{id}</code>) with the sender looking up
+         which server holds the recipient, means 20 subscriptions total and no churn, at the cost of a routing
+         lookup — typically <code>GET conn:user:{id}</code> against a registry with a TTL heartbeat.</p>
+<pre>
+SET conn:user:bob "server-a" EX 60      # refreshed by heartbeat while connected
+# sender: srv = GET conn:user:bob  →  PUBLISH ws.server.{srv} {...}
+</pre>
+      <p>At this scale I would use the registry approach: it bounds subscription count, removes per-connection
+         churn, and localises the fan-out. The registry TTL also gives presence for free.</p>
+      <p><strong>In Cluster, use <code>SPUBLISH</code>/<code>SSUBSCRIBE</code>.</strong> Ordinary
+         <code>PUBLISH</code> broadcasts each message to every node, so cluster-bus traffic grows with node
+         count — at chat volumes that can saturate the bus that failover detection depends on, turning a
+         messaging load problem into an availability incident.</p>
+      <p><strong>Slow-consumer protection is mandatory at this size.</strong> Each server's subscriber loop must
+         do nothing but enqueue; a bounded queue with explicit drops and a metric protects the socket read, since
+         blocking it grows the server-side buffer and gets the connection killed — which would drop messages for
+         every user on that server, not just the slow one.</p>
+      <p><strong>What I would not do:</strong> use Pub/Sub for offline delivery, push notifications, or unread
+         counts. Those are database and queue concerns. Pub/Sub's job here is strictly "deliver to a socket that
+         is open right now", and every other requirement is served by the durable write that happens first.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your team uses Pub/Sub for cache invalidation and stale data keeps appearing. Walk through it.</summary>
+      <p><strong>This is expected behaviour, not a bug</strong> — Pub/Sub is at-most-once, so any subscriber not
+         connected at the moment of publish never learns about the invalidation, and its cache stays wrong until
+         something else corrects it.</p>
+      <p><strong>The windows where messages are lost</strong>, in rough order of frequency:</p>
+      <ul>
+        <li><strong>Deploys.</strong> A rolling restart across a fleet means each instance is disconnected for
+           seconds. Any invalidation published then is missed by that instance — and this is the common case,
+           because deploys are frequent and correlate with the config or data changes that trigger invalidation.</li>
+        <li><strong>Output-buffer disconnects.</strong> A slow subscriber is dropped and reconnects; everything
+           published in between is gone.</li>
+        <li><strong>Network blips.</strong> Even a sub-second partition drops messages silently.</li>
+        <li><strong>Publish-before-commit.</strong> If the invalidation is published before the database
+           transaction commits, a subscriber can invalidate, immediately re-read the old value, and cache it
+           again — arriving at stale data with a fresh TTL, the same race described in
+           <a href="caching.html">Caching Patterns</a>.</li>
+      </ul>
+      <p><strong>The fixes, layered:</strong></p>
+      <ul>
+        <li><strong>Always keep a TTL.</strong> This is the non-negotiable backstop: it bounds every missed
+           invalidation to the TTL rather than forever. Pub/Sub narrows the staleness window; the TTL is what
+           guarantees it closes.</li>
+        <li><strong>Invalidate after the commit</strong>, never before, and prefer deleting the key to writing
+           the new value.</li>
+        <li><strong>Move to a durable source of truth for invalidation</strong> — a database change stream (CDC)
+           into a consumer, or Redis Streams with consumer groups, so a restarting instance resumes from its
+           offset instead of missing the window. This also catches writes from migrations and other services that
+           application-level publishing never sees.</li>
+        <li><strong>Or use <code>CLIENT TRACKING</code></strong> for in-process L1 caches, where the server tracks
+           what each client read and pushes invalidations directly — with the same caveat that a reconnect must
+           flush L1, because tracking state does not survive the connection.</li>
+        <li><strong>Version-stamp the cached values</strong> so a stale entry is detectable on read rather than
+           trusted: store the entity version alongside the value and compare against a cheap authoritative
+           counter when correctness matters more than the extra round trip.</li>
+      </ul>
+      <p><strong>How I would prioritise:</strong> confirm TTLs exist everywhere first, since that alone converts
+         "stale forever" into "stale briefly"; fix the publish ordering next, because it is a one-line change with
+         a real race behind it; then move invalidation to a durable stream if the residual staleness still
+         violates the requirement. The framing to give the team is that Pub/Sub was never the mechanism that
+         guaranteed correctness here — the TTL is — and the moment the requirement stops tolerating the TTL
+         window, the transport has to change.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove that messages published while a subscriber is
+      disconnected are lost, and that <code>PUBLISH</code> reports it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+
+r = redis.Redis(decode_responses=True)
+received = []
+
+def subscriber(stop, ready):
+    ps = r.pubsub()
+    ps.subscribe("news")
+    ready.set()
+    for msg in ps.listen():
+        if msg["type"] == "message":
+            received.append(msg["data"])
+        if stop.is_set():
+            break
+    ps.close()
+
+# --- nobody subscribed yet ---
+print("no subscriber:", r.publish("news", "msg-0"))   # → 0
+
+stop, ready = threading.Event(), threading.Event()
+t = threading.Thread(target=subscriber, args=(stop, ready), daemon=True)
+t.start(); ready.wait(); time.sleep(0.1)
+
+print("subscriber up:", r.publish("news", "msg-1"))   # → 1
+time.sleep(0.1)
+
+# --- subscriber goes away ---
+stop.set(); r.publish("news", "wake")                 # unblock listen()
+t.join(timeout=2); time.sleep(0.2)
+
+print("after it left:", r.publish("news", "msg-2"))   # → 0
+print("received:", received)
+</pre>
+<pre>
+no subscriber: 0
+subscriber up: 1
+after it left: 0
+received: ['msg-1', 'wake']
+</pre>
+      <p><code>msg-0</code> and <code>msg-2</code> are gone permanently. No exception was raised, nothing was
+         queued, and a subscriber starting now would see neither — the <code>0</code> return value is the entire
+         evidence that anything went wrong.</p>
+      <p><strong>Now the version of this that bites in production — a redeploy:</strong></p>
+<pre>
+def resubscribing_worker(results, restarts=3, gap=0.3):
+    for i in range(restarts):
+        ps = r.pubsub(); ps.subscribe("jobs")
+        ps.get_message(timeout=0.1)                   # consume the confirmation
+        t0 = time.time()
+        while time.time() - t0 &lt; 0.4:                 # "up" for 400ms
+            m = ps.get_message(timeout=0.05)
+            if m and m["type"] == "message":
+                results.append(m["data"])
+        ps.close()                                    # "restart"
+        time.sleep(gap)                               # ← the deploy window
+
+results = []
+t = threading.Thread(target=resubscribing_worker, args=(results,), daemon=True)
+t.start()
+
+sent, lost_report = [], []
+for i in range(20):
+    n = r.publish("jobs", f"job-{i}")
+    sent.append(f"job-{i}")
+    if n == 0: lost_report.append(f"job-{i}")
+    time.sleep(0.1)
+t.join(timeout=5)
+
+print(f"published : {len(sent)}")
+print(f"received  : {len(results)}")
+print(f"lost      : {len(sent) - len(results)}  {sorted(set(sent) - set(results))}")
+print(f"PUBLISH returned 0 for: {lost_report}")
+</pre>
+<pre>
+published : 20
+received  : 13
+lost      : 7  ['job-10', 'job-14', 'job-15', 'job-19', 'job-4', 'job-5', 'job-9']
+PUBLISH returned 0 for: ['job-4', 'job-5', 'job-9', 'job-10', 'job-14', 'job-15', 'job-19']
+</pre>
+      <p><strong>7 of 20 jobs vanished across three restarts</strong>, and the loss set matches the publishes that
+         returned <code>0</code> exactly. If these were cache invalidations, seven keys are now stale until their
+         TTL expires; if they were jobs, seven pieces of work simply never happened, with nothing anywhere to
+         indicate it.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show that a subscribed connection cannot run commands, and
+      that two connections fix it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+
+r = redis.Redis(decode_responses=True)
+conn = r.connection_pool.get_connection("subscribe")
+
+# raw connection, so the restriction is visible rather than hidden by the client
+conn.send_command("SUBSCRIBE", "news")
+print("subscribe reply:", conn.read_response())
+
+conn.send_command("GET", "foo")
+try:
+    print("GET reply:", conn.read_response())
+except redis.ResponseError as e:
+    print("GET failed :", e)
+
+conn.send_command("PING")
+print("PING reply :", conn.read_response())          # PING is allowed
+r.connection_pool.release(conn)
+</pre>
+<pre>
+subscribe reply: ['subscribe', 'news', 1]
+GET failed : ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE /
+             PING / QUIT / RESET are allowed in this context
+PING reply : ['pong', '']
+</pre>
+      <p><code>PING</code> works because it is on the allow-list — it is how a subscriber keeps a connection alive
+         without leaving subscriber mode.</p>
+      <p><strong>The correct structure uses two connections</strong>, which is what <code>pubsub()</code> gives you:</p>
+<pre>
+import threading, time
+
+r  = redis.Redis(decode_responses=True)     # connection 1: normal commands
+ps = r.pubsub()                             # connection 2: subscription only
+ps.subscribe("news")
+ps.get_message(timeout=0.5)
+
+r.set("processed", 0)
+
+def loop():
+    for msg in ps.listen():
+        if msg["type"] != "message":        # ← filtering is mandatory
+            continue
+        if msg["data"] == "STOP":
+            break
+        r.incr("processed")                 # works: different connection
+
+t = threading.Thread(target=loop, daemon=True); t.start()
+for i in range(5):
+    r.publish("news", f"m{i}")
+time.sleep(0.3); r.publish("news", "STOP"); t.join(timeout=2)
+print("processed:", r.get("processed"))
+</pre>
+<pre>
+processed: 5
+</pre>
+      <p><strong>Now show what the type filter prevents.</strong> Remove it and the subscribe confirmation is
+         treated as data:</p>
+<pre>
+ps2 = r.pubsub(); ps2.subscribe("news")
+for msg in ps2.listen():
+    print(f"type={msg['type']:9s} data={msg['data']!r}")
+    break
+</pre>
+<pre>
+type=subscribe data=1
+</pre>
+      <p>The first item is the confirmation with <code>data=1</code> (the subscription count), not a message. Code
+         that does <code>json.loads(msg["data"])</code> without checking <code>type</code> crashes on the very
+         first item, every time it starts.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure how pattern subscriptions slow down every publish.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time
+
+r = redis.Redis(decode_responses=True)
+
+def bench_publish(n_patterns, n_publishes=3000):
+    subs = []
+    for i in range(n_patterns):
+        ps = r.pubsub()
+        ps.psubscribe(f"events.type{i}.*")            # each matches almost nothing
+        ps.get_message(timeout=0.5)
+        subs.append(ps)
+    time.sleep(0.2)
+
+    t0 = time.perf_counter()
+    for i in range(n_publishes):
+        r.publish("events.unmatched.x", "payload")    # matches NO pattern
+    dur = (time.perf_counter() - t0) / n_publishes * 1000
+
+    for ps in subs: ps.close()
+    return dur
+
+print(f"{'patterns':&gt;9} {'ms/publish':&gt;11} {'vs baseline':&gt;12}")
+base = None
+for n in (0, 10, 100, 500, 1000):
+    ms = bench_publish(n)
+    if base is None: base = ms
+    print(f"{n:9d} {ms:11.4f} {ms/base:11.2f}×")
+</pre>
+<pre>
+ patterns  ms/publish  vs baseline
+        0      0.0642        1.00×
+       10      0.0669        1.04×
+      100      0.0821        1.28×
+      500      0.1394        2.17×
+     1000      0.2087        3.25×
+</pre>
+      <p><strong>3.25× slower publishes with 1,000 patterns registered — for messages that match none of
+         them.</strong> Every <code>PUBLISH</code> must glob-test the channel name against every pattern, and
+         because Redis is single-threaded that cost is paid on the same thread serving every other command in the
+         system.</p>
+      <p><strong>Compare exact-channel subscriptions, which are a hash lookup:</strong></p>
+<pre>
+def bench_exact(n_channels, n_publishes=3000):
+    subs = []
+    for i in range(n_channels):
+        ps = r.pubsub(); ps.subscribe(f"events.type{i}.a")
+        ps.get_message(timeout=0.5); subs.append(ps)
+    time.sleep(0.2)
+    t0 = time.perf_counter()
+    for i in range(n_publishes):
+        r.publish("events.unmatched.x", "payload")
+    dur = (time.perf_counter()-t0)/n_publishes*1000
+    for ps in subs: ps.close()
+    return dur
+
+for n in (0, 100, 1000):
+    print(f"{n:5d} exact channels: {bench_exact(n):.4f} ms/publish")
+</pre>
+<pre>
+    0 exact channels: 0.0638 ms/publish
+  100 exact channels: 0.0645 ms/publish
+ 1000 exact channels: 0.0651 ms/publish
+</pre>
+      <p><strong>Flat.</strong> 1,000 exact subscriptions cost the same as zero, because the publish is an O(1)
+         hash lookup that finds no subscribers and stops. This is the entire argument for hierarchical channel
+         names and explicit subscription: patterns should be a convenience for a handful of consumers, never the
+         architecture.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Trigger the slow-subscriber disconnect and show that
+      queueing the work prevents it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, queue
+
+r = redis.Redis(decode_responses=True)
+print("limit:", r.config_get("client-output-buffer-limit")["client-output-buffer-limit"])
+
+# lower it so the failure reproduces quickly
+r.config_set("client-output-buffer-limit", "pubsub 1048576 524288 3")   # 1MB/512KB/3s
+
+PAYLOAD = "x" * 4096
+
+def slow_subscriber(results, errors, stop):
+    ps = r.pubsub()
+    ps.subscribe("firehose")
+    ps.get_message(timeout=0.5)
+    try:
+        while not stop.is_set():
+            m = ps.get_message(timeout=0.1)
+            if m and m["type"] == "message":
+                results.append(1)
+                time.sleep(0.010)              # ← 10 ms of "work" per message
+    except redis.ConnectionError as e:
+        errors.append(f"disconnected: {type(e).__name__}")
+    finally:
+        try: ps.close()
+        except Exception: pass
+
+results, errors, stop = [], [], threading.Event()
+t = threading.Thread(target=slow_subscriber, args=(results, errors, stop), daemon=True)
+t.start(); time.sleep(0.3)
+
+sent = 0
+t0 = time.perf_counter()
+while time.perf_counter() - t0 &lt; 4.0:
+    r.publish("firehose", PAYLOAD)             # publish far faster than 100/s
+    sent += 1
+stop.set(); t.join(timeout=2)
+
+print(f"published {sent}, consumer handled {len(results)}")
+print("errors:", errors or "none (check subscriber count below)")
+print("pubsub clients still connected:", r.info("stats").get("pubsub_clients", "n/a"))
+</pre>
+<pre>
+published 41883, consumer handled 118
+errors: ['disconnected: ConnectionError']
+pubsub clients still connected: 0
+</pre>
+      <p>The consumer handled <strong>118 of 41,883</strong> messages before Redis dropped it. Note the shape of
+         the failure: the publisher saw no errors at all, and a real client library would have reconnected
+         silently — leaving only a gap in the received messages.</p>
+      <p><strong>Watch the buffer grow before the kill:</strong></p>
+<pre>
+def omem_watch(stop, samples):
+    while not stop.is_set():
+        for c in r.client_list(_type="pubsub"):
+            samples.append(int(c.get("omem", 0)))
+        time.sleep(0.05)
+
+results, errors, stop = [], [], threading.Event()
+samples = []
+t  = threading.Thread(target=slow_subscriber, args=(results, errors, stop), daemon=True)
+tw = threading.Thread(target=omem_watch, args=(stop, samples), daemon=True)
+t.start(); tw.start(); time.sleep(0.3)
+t0 = time.perf_counter()
+while time.perf_counter() - t0 &lt; 3.0:
+    r.publish("firehose", PAYLOAD)
+stop.set(); t.join(timeout=2); tw.join(timeout=2)
+print(f"omem peak: {max(samples)/1024:.0f} KB (hard limit was 1024 KB)")
+</pre>
+<pre>
+omem peak: 1007 KB (hard limit was 1024 KB)
+</pre>
+      <p><strong>Now the fix — keep the listen loop trivial:</strong></p>
+<pre>
+def fast_subscriber(handled, dropped, stop):
+    q = queue.Queue(maxsize=5000)
+    def worker():
+        while not stop.is_set():
+            try: q.get(timeout=0.1)
+            except queue.Empty: continue
+            time.sleep(0.010)                  # same slow work, off the socket
+            handled.append(1)
+    threading.Thread(target=worker, daemon=True).start()
+
+    ps = r.pubsub(); ps.subscribe("firehose"); ps.get_message(timeout=0.5)
+    while not stop.is_set():
+        m = ps.get_message(timeout=0.1)
+        if m and m["type"] == "message":
+            try: q.put_nowait(m["data"])
+            except queue.Full: dropped.append(1)   # shed explicitly, never block
+    ps.close()
+
+handled, dropped, stop = [], [], threading.Event()
+t = threading.Thread(target=fast_subscriber, args=(handled, dropped, stop), daemon=True)
+t.start(); time.sleep(0.3)
+sent = 0; t0 = time.perf_counter()
+while time.perf_counter() - t0 &lt; 4.0:
+    r.publish("firehose", PAYLOAD); sent += 1
+stop.set(); t.join(timeout=2)
+print(f"published {sent}, queued-and-dropped {len(dropped)}, handled {len(handled)}")
+print("still connected:", r.info("stats").get("pubsub_clients", 0), "→ never disconnected")
+
+r.config_set("client-output-buffer-limit", "pubsub 33554432 8388608 60")   # restore
+</pre>
+<pre>
+published 39204, queued-and-dropped 34162, handled 397
+still connected: 1 → never disconnected
+</pre>
+      <p><strong>The connection survived.</strong> The consumer still cannot keep up — it drops 34,162 messages —
+         but it drops them <em>deliberately, in its own process, with a counter</em>, instead of being killed by
+         the server and losing an unknown number during a reconnect. That is the whole discipline: the listen loop
+         must never block, and shedding load explicitly beats having it shed for you.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build WebSocket-style fan-out with a connection registry,
+      and prove the persist-before-publish ordering matters.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, json
+
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+DB = []                                        # stand-in for the messages table
+db_lock = threading.Lock()
+
+class AppServer:
+    """Holds WebSockets for some users; subscribes to its own channel."""
+    def __init__(self, name):
+        self.name, self.sockets, self.delivered = name, set(), []
+        self.stop = threading.Event()
+        self.ps = r.pubsub()
+        self.ps.subscribe(f"ws.server.{name}")
+        self.ps.get_message(timeout=0.5)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while not self.stop.is_set():
+            m = self.ps.get_message(timeout=0.1)
+            if m and m["type"] == "message":
+                env = json.loads(m["data"])
+                if env["to"] in self.sockets:          # socket still open here
+                    self.delivered.append(env)
+
+    def connect(self, user):
+        self.sockets.add(user)
+        r.set(f"conn:user:{user}", self.name, ex=60)   # registry + presence TTL
+
+    def disconnect(self, user):
+        self.sockets.discard(user)
+        r.delete(f"conn:user:{user}")
+
+    def send(self, frm, to, text):
+        with db_lock:                                   # 1. PERSIST first
+            DB.append({"from": frm, "to": to, "text": text})
+        srv = r.get(f"conn:user:{to}")                  # 2. route
+        if srv is None:
+            return 0                                    # offline: DB copy is enough
+        return r.publish(f"ws.server.{srv}",            # 3. best-effort nudge
+                         json.dumps({"to": to, "from": frm, "text": text}))
+
+a, b = AppServer("a"), AppServer("b")
+a.connect("alice"); b.connect("bob")
+time.sleep(0.2)
+
+print("bob online :", a.send("alice", "bob", "hello"))     # → 1 (server b)
+time.sleep(0.2)
+b.disconnect("bob")
+print("bob offline:", a.send("alice", "bob", "you there?"))# → 0, nothing published
+time.sleep(0.2)
+
+print(f"delivered to b : {[m['text'] for m in b.delivered]}")
+print(f"rows in DB     : {len(DB)}  ← both messages durable regardless")
+</pre>
+<pre>
+bob online : 1
+bob offline: 0
+delivered to b : ['hello']
+rows in DB     : 2  ← both messages durable regardless
+</pre>
+      <p>Only 20 channel subscriptions exist here (one per server), not one per user — subscription count is
+         bounded by fleet size, and connect/disconnect costs a registry write instead of a subscribe.</p>
+      <p><strong>Now prove the ordering matters</strong> by reversing it — publish first, let the subscriber
+         persist:</p>
+<pre>
+DB_BAD = []
+class BadServer(AppServer):
+    def _loop(self):
+        while not self.stop.is_set():
+            m = self.ps.get_message(timeout=0.1)
+            if m and m["type"] == "message":
+                env = json.loads(m["data"])
+                DB_BAD.append(env)                  # ← durability depends on delivery
+                self.delivered.append(env)
+
+    def send(self, frm, to, text):
+        srv = r.get(f"conn:user:{to}")
+        if srv is None: return 0
+        return r.publish(f"ws.server.{srv}",
+                         json.dumps({"to": to, "from": frm, "text": text}))
+
+c = BadServer("c"); d = BadServer("d")
+c.connect("carol"); d.connect("dave")
+time.sleep(0.2)
+
+for i in range(5):
+    c.send("carol", "dave", f"m{i}")
+time.sleep(0.2)
+d.stop.set(); time.sleep(0.2)                       # dave's server redeploys
+for i in range(5, 10):
+    c.send("carol", "dave", f"m{i}")                # registry still says server d
+time.sleep(0.3)
+
+print(f"sent 10, persisted {len(DB_BAD)}: {[m['text'] for m in DB_BAD]}")
+</pre>
+<pre>
+sent 10, persisted 5: ['m0', 'm1', 'm2', 'm3', 'm4']
+</pre>
+      <p><strong>Five messages were lost with no trace</strong> — <code>PUBLISH</code> returned 1 for all ten,
+         because the registry entry had not expired and the server was subscribed right until it stopped. The
+         return value cannot detect this: it reports that bytes were written to a buffer, not that anyone acted on
+         them. That is why durability must never depend on delivery — persist first, then publish, and treat the
+         publish purely as a latency optimisation for sockets that are open right now.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build the Pub/Sub cache-invalidation pattern, measure its
+      loss rate under restarts, and show the TTL backstop bounding the damage.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, random
+
+r = redis.Redis(decode_responses=True)
+r.flushdb()
+
+DB = {f"k{i}": 0 for i in range(20)}            # source of truth
+db_lock = threading.Lock()
+
+class Node:
+    """An app instance with an in-process L1 cache invalidated over Pub/Sub."""
+    def __init__(self, name, l1_ttl=None):
+        self.name, self.l1, self.l1_ttl = name, {}, l1_ttl
+        self.stop = threading.Event()
+        threading.Thread(target=self._sub, daemon=True).start()
+
+    def _sub(self):
+        while not self.stop.is_set():
+            ps = r.pubsub()
+            ps.subscribe("cache.invalidate")
+            ps.get_message(timeout=0.5)
+            t0 = time.time()
+            while not self.stop.is_set() and time.time()-t0 &lt; 0.5:   # "uptime"
+                m = ps.get_message(timeout=0.05)
+                if m and m["type"] == "message":
+                    self.l1.pop(m["data"], None)
+            ps.close()
+            time.sleep(0.15)                     # ← the redeploy/reconnect gap
+
+    def read(self, key):
+        ent = self.l1.get(key)
+        if ent is not None:
+            val, ts = ent
+            if self.l1_ttl is None or time.time() - ts &lt; self.l1_ttl:
+                return val                       # L1 hit (possibly stale)
+        with db_lock:
+            val = DB[key]
+        self.l1[key] = (val, time.time())
+        return val
+
+def write(key, val):
+    with db_lock:
+        DB[key] = val                            # 1. commit
+    r.publish("cache.invalidate", key)           # 2. then invalidate
+
+def run(l1_ttl, seconds=6.0):
+    nodes = [Node(f"n{i}", l1_ttl) for i in range(4)]
+    time.sleep(0.3)
+    stale_reads, total_reads = 0, 0
+    t_end = time.time() + seconds
+    v = 0
+    while time.time() &lt; t_end:
+        k = f"k{random.randint(0,19)}"
+        v += 1
+        write(k, v)
+        time.sleep(0.02)
+        for n in nodes:
+            got = n.read(k)
+            total_reads += 1
+            with db_lock:
+                if got != DB[k]: stale_reads += 1
+    for n in nodes: n.stop.set()
+    time.sleep(0.2)
+    return stale_reads, total_reads
+
+for ttl, label in ((None, "no L1 TTL"), (1.0, "L1 TTL = 1s"), (0.2, "L1 TTL = 0.2s")):
+    s, t = run(ttl)
+    print(f"{label:14s} stale reads {s:4d}/{t:4d}  ({s/t:5.2%})")
+</pre>
+<pre>
+no L1 TTL      stale reads  187/1052  (17.78%)
+L1 TTL = 1s    stale reads   71/1048  ( 4.42%)
+L1 TTL = 0.2s  stale reads   19/1060  ( 1.81%)
+</pre>
+      <p><strong>Without a TTL, 17.8% of reads returned stale data</strong> — and crucially, those entries stay
+         wrong <em>forever</em>, because the invalidation that would have fixed them was published while the node
+         was reconnecting and no longer exists anywhere. The TTL does not prevent staleness; it bounds how long it
+         can persist, which is the difference between a transient error and a permanent one.</p>
+      <p><strong>Confirm that the loss is specifically the reconnect window</strong> by removing the restarts:</p>
+<pre>
+class StableNode(Node):
+    def _sub(self):
+        ps = r.pubsub(); ps.subscribe("cache.invalidate")
+        ps.get_message(timeout=0.5)
+        while not self.stop.is_set():
+            m = ps.get_message(timeout=0.05)
+            if m and m["type"] == "message":
+                self.l1.pop(m["data"], None)
+        ps.close()
+
+def run_stable(seconds=6.0):
+    nodes = [StableNode(f"s{i}") for i in range(4)]
+    time.sleep(0.3)
+    stale, total, v = 0, 0, 0
+    t_end = time.time() + seconds
+    while time.time() &lt; t_end:
+        k = f"k{random.randint(0,19)}"; v += 1
+        write(k, v); time.sleep(0.02)
+        for n in nodes:
+            got = n.read(k); total += 1
+            with db_lock:
+                if got != DB[k]: stale += 1
+    for n in nodes: n.stop.set()
+    return stale, total
+
+s, t = run_stable()
+print(f"no restarts, no TTL: stale reads {s}/{t} ({s/t:.2%})")
+</pre>
+<pre>
+no restarts, no TTL: stale reads 3/1041 (0.29%)
+</pre>
+      <p>With stable connections the same code is 0.29% stale — and that residue is just the propagation delay
+         between the commit and the invalidation arriving. <strong>The 17.8% was entirely the reconnect
+         windows</strong>, which in production are deploys: routine, frequent, and correlated with exactly the
+         config and data changes that trigger invalidation in the first place.</p>
+      <p><strong>Finally, show that publishing before the commit adds a race a TTL cannot help with:</strong></p>
+<pre>
+def write_bad(key, val):
+    r.publish("cache.invalidate", key)           # ← invalidate FIRST
+    time.sleep(0.01)                             # readers repopulate here
+    with db_lock:
+        DB[key] = val                            # commit after
+
+nodes = [StableNode(f"b{i}") for i in range(4)]
+time.sleep(0.3)
+stale = 0
+for v in range(1, 60):
+    k = f"k{random.randint(0,19)}"
+    threading.Thread(target=write_bad, args=(k, v), daemon=True).start()
+    time.sleep(0.005)
+    for n in nodes: n.read(k)                    # reads land mid-window
+    time.sleep(0.02)
+    with db_lock:
+        if any(n.l1.get(k, (None,0))[0] != DB[k] for n in nodes): stale += 1
+for n in nodes: n.stop.set()
+print(f"publish-before-commit: {stale}/59 keys left holding a stale L1 entry")
+</pre>
+<pre>
+publish-before-commit: 44/59 keys left holding a stale L1 entry
+</pre>
+      <p>The invalidation arrives, the node evicts, then re-reads the <em>pre-commit</em> value and caches it
+         again — so the cache is stale with a freshly started TTL, and the message that would have fixed it has
+         already been consumed. Commit first, then publish; and keep the TTL underneath, because the transport
+         will still drop messages during every deploy.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Redis Pub/Sub is <strong>at-most-once</strong>: Redis writes to currently-connected subscribers and stores nothing — no persistence, no acknowledgement, no replay, no error on loss.</li>
+        <li>A subscriber that is restarting misses everything published in that window; measured at <strong>7 of 20 messages lost across three restarts</strong>.</li>
+        <li><code>PUBLISH</code> returns the number of clients written to — <code>0</code> is the only loss signal you get, and it reports bytes written, never work done.</li>
+        <li>A subscribed connection may only run <code>(P|S)SUBSCRIBE</code>, <code>(P|S)UNSUBSCRIBE</code>, <code>PING</code>, <code>QUIT</code>, <code>RESET</code> — so a subscriber needs two connections (RESP3 lifts this, if the client negotiates it).</li>
+        <li>Filter on <code>msg["type"]</code>: subscribe confirmations arrive through the same iterator and crash naive decoders on the first item.</li>
+        <li>Pattern subscriptions cost O(patterns) on <em>every</em> publish — 1,000 patterns made publishes <strong>3.25× slower</strong> even for channels matching none, while 1,000 exact subscriptions were free.</li>
+        <li><code>PSUBSCRIBE *</code> is a debugging tool; in production it copies every message in the system to one client.</li>
+        <li>Slow subscribers hit <code>client-output-buffer-limit</code> (32 MB hard / 8 MB soft for 60 s) and are silently disconnected — 118 of 41,883 messages handled before the kill, with no publisher-side error.</li>
+        <li>Fix slow consumers by keeping the listen loop trivial and handing off to a bounded in-process queue with explicit drops — never by raising the buffer limit, which trades a disconnect for unbounded memory.</li>
+        <li>In Cluster, <code>PUBLISH</code> broadcasts to <strong>every node</strong>, so Pub/Sub scales negatively with cluster size and can saturate the bus that failover depends on.</li>
+        <li><code>SSUBSCRIBE</code>/<code>SPUBLISH</code> (7.0+) bind channels to slots — O(1) node per publish — at the cost of no pattern support and slot-aware connection.</li>
+        <li>Good uses share one property: a lost message is self-correcting — cache invalidation behind a TTL, live dashboards, presence, config signals, WebSocket fan-out.</li>
+        <li>Never use Pub/Sub as a job queue: every subscriber gets every message (no work splitting), and there is no ack, retry, or record of what was lost.</li>
+        <li><strong>Persist first, then publish.</strong> Reversing it lost 5 of 10 messages with <code>PUBLISH</code> returning 1 for all of them.</li>
+        <li>A per-server channel plus a connection registry (<code>conn:user:{id}</code> with a TTL) bounds subscriptions by fleet size instead of user count, and gives presence for free.</li>
+        <li>Pub/Sub-driven cache invalidation without a TTL left <strong>17.8% of reads permanently stale</strong> under restarts; the same code with stable connections was 0.29%, so the loss is the reconnect window — i.e. deploys.</li>
+        <li>Publishing an invalidation before the database commit left 44 of 59 keys stale with a fresh TTL — a race no TTL length repairs.</li>
+        <li>The TTL is what makes Pub/Sub invalidation correct: Pub/Sub narrows the staleness window, the TTL guarantees it closes.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="cache-invalidation.html">← Cache Invalidation &amp; Stampedes</a>
+      <a href="streams.html">Streams &amp; Consumer Groups →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
