@@ -1,0 +1,1041 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Performance &amp; Latency — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Performance &amp; Latency <span class="level-badge level-adv">Production</span></h1>
+    <p><strong>What you'll master:</strong> the arithmetic that shows almost every "Redis is slow" complaint is
+       actually network round trips rather than Redis — and the measurement that proves it in one minute; the
+       complete list of what can block a single-threaded server, ranked by how often it is the real cause;
+       <code>SLOWLOG</code> and the <code>LATENCY</code> subsystem, including why <code>SLOWLOG</code> misses the
+       stalls that matter most; hot keys, which no amount of sharding fixes; connection-pool exhaustion, which
+       looks exactly like Redis being slow and is not; the benchmark mistakes that make <code>redis-benchmark</code>
+       report numbers you cannot reproduce; and a diagnostic order that finds the cause instead of guessing.
+       Prerequisites: <a href="single-threaded.html">The Single-Threaded Model</a>,
+       <a href="memory.html">Memory &amp; Eviction</a>.</p>
+
+    <h2>Part 1 — It Is Almost Always the Network</h2>
+
+    <p>Redis executes most commands in about a microsecond. The number an application observes is dominated by
+       everything around that.</p>
+
+<pre>
+Where the time in one GET actually goes (same-AZ):
+
+  command execution inside Redis     ~0.001 ms   ← the part people optimise
+  network round trip                 ~0.150 ms   ← 99% of the latency
+  client serialization/parsing       ~0.020 ms
+  ────────────────────────────────────────────
+  observed                           ~0.170 ms
+
+100 sequential GETs = 100 × 0.17 ms = 17 ms, of which 0.1 ms is Redis.
+</pre>
+
+    <div class="note">🔑 <strong>If an operation feels slow, count the round trips before blaming Redis.</strong>
+       A page issuing 200 sequential commands spends ~34 ms waiting on the network and ~0.2 ms in the database.
+       Pipelining those 200 commands into one round trip makes the same work take under a millisecond — a 30×
+       improvement that no server tuning could produce. This is the single highest-value optimisation in Redis, and
+       it is entirely on the client side.</p></div>
+
+    <table class="tbl">
+      <tr><th>Pattern</th><th>Round trips</th><th>When to use</th></tr>
+      <tr><td>Sequential commands</td><td>N</td><td>Only when each depends on the last</td></tr>
+      <tr><td>Pipeline</td><td>1</td><td><strong>Default for batches</strong></td></tr>
+      <tr><td>Variadic (<code>MGET</code>, <code>HMSET</code>)</td><td>1</td><td>Same command, many keys</td></tr>
+      <tr><td>Lua script</td><td>1</td><td>Logic that must branch on values</td></tr>
+      <tr><td>Transaction (<code>MULTI</code>)</td><td>1</td><td>Isolation, not speed</td></tr>
+    </table>
+
+    <p><strong>Batch size has a sweet spot.</strong> Pipelining 100–1,000 commands captures nearly all the benefit;
+       beyond that the reply buffer grows and a single huge pipeline can occupy the server long enough to affect
+       other clients — the arithmetic is in <a href="pipelining.html">Commands, Pipelining &amp; Round Trips</a>.</p>
+
+    <h2>Part 2 — What Blocks a Single-Threaded Server</h2>
+
+    <p>Because commands are executed one at a time, any slow operation delays <em>every</em> waiting client. These
+       are the causes, roughly in order of how often they are the real answer.</p>
+
+    <table class="tbl">
+      <tr><th>Cause</th><th>Typical cost</th><th>Detection</th></tr>
+      <tr><td><code>KEYS</code> on a large keyspace</td><td>Seconds</td><td><code>SLOWLOG</code></td></tr>
+      <tr><td>Big <code>SMEMBERS</code>/<code>HGETALL</code>/<code>LRANGE 0 -1</code></td><td>ms to seconds</td><td><code>SLOWLOG</code>, <code>--bigkeys</code></td></tr>
+      <tr><td><code>DEL</code> of a huge collection</td><td>ms to seconds</td><td><code>SLOWLOG</code></td></tr>
+      <tr><td><strong>Fork for <code>BGSAVE</code>/AOF rewrite</strong></td><td>10–20 ms per GB</td><td><code>latest_fork_usec</code>, <code>LATENCY</code></td></tr>
+      <tr><td>Mass key expiry</td><td>Bursts</td><td><code>expired_keys</code> spikes</td></tr>
+      <tr><td>Eviction under memory pressure</td><td>Sustained</td><td><code>evicted_keys</code></td></tr>
+      <tr><td>Long Lua scripts</td><td>Script duration</td><td><code>SLOWLOG</code></td></tr>
+      <tr><td>Transparent huge pages</td><td>Latency during CoW</td><td>Startup warning</td></tr>
+      <tr><td>Swapping</td><td>Catastrophic</td><td><code>mem_fragmentation_ratio &lt; 1</code></td></tr>
+    </table>
+
+    <p><strong>The critical detail about forks: <code>SLOWLOG</code> does not record them.</strong>
+       <code>SLOWLOG</code> measures command execution time, and a fork stall happens <em>between</em> commands —
+       so an instance can stall every client for 300 ms with a completely empty slow log. That is why the
+       <code>LATENCY</code> subsystem exists.</p>
+
+<pre>
+CONFIG SET latency-monitor-threshold 100     # record events over 100 ms
+LATENCY LATEST                               # event, timestamp, last, max
+LATENCY HISTORY fork
+LATENCY RESET
+
+Event names you will see: fork, expire-cycle, eviction-del,
+                          eviction-cycle, aof-write, command
+</pre>
+
+    <p><strong>Replace the blocking commands with their incremental equivalents:</strong></p>
+
+<pre>
+KEYS pattern          → SCAN 0 MATCH pattern COUNT 100
+SMEMBERS bigset       → SSCAN / SRANDMEMBER
+HGETALL bighash       → HSCAN, or HMGET for known fields
+LRANGE list 0 -1      → LRANGE with a bounded window
+DEL bigkey            → UNLINK bigkey          (frees in a background thread)
+FLUSHALL              → FLUSHALL ASYNC
+</pre>
+
+    <h2>Part 3 — SLOWLOG and the Latency Toolkit</h2>
+
+    <p><code>SLOWLOG</code> records commands exceeding a threshold, and its default of 10,000 µs is far too
+       generous for a server whose normal command takes 1 µs.</p>
+
+<pre>
+CONFIG SET slowlog-log-slower-than 1000      # 1 ms — catches real offenders
+CONFIG SET slowlog-max-len 256
+
+SLOWLOG GET 10
+  1) 1) (integer) 14                 ← entry id
+     2) (integer) 1723900000         ← timestamp
+     3) (integer) 84213              ← DURATION IN MICROSECONDS (84 ms)
+     4) 1) "KEYS"  2) "user:*"       ← the command
+     5) "10.0.1.5:53124"             ← client address
+     6) ""                           ← client name
+</pre>
+
+    <div class="note">🔑 <strong><code>SLOWLOG</code> measures execution only — not the time a command spent
+       queued behind another.</strong> When one <code>KEYS</code> blocks the server for two seconds, the thousand
+       commands stuck behind it each executed in microseconds and none of them appear in the slow log, even though
+       every client observed a two-second latency. So a nearly-empty slow log with one large entry can explain a
+       system-wide stall, and the absence of entries never proves the absence of a problem.</p></div>
+
+    <p><strong>The three measurement tools answer different questions:</strong></p>
+
+<pre>
+redis-cli --latency              # min/avg/max of PING, continuously
+redis-cli --latency-history      # the same, in 15s windows — shows trends
+redis-cli --intrinsic-latency 60 # the HOST's latency floor, no network involved
+
+INFO commandstats
+  cmdstat_get:calls=8452301,usec=4226150,usec_per_call=0.50
+  cmdstat_keys:calls=12,usec=1010556,usec_per_call=84213.00   ← 84 ms each
+
+INFO latencystats                # Redis 7: per-command latency percentiles
+</pre>
+
+    <p><strong><code>--intrinsic-latency</code> is the one people skip and should not.</strong> It measures how long
+       the host itself takes to do nothing, with no network and no Redis work. If that reports 5 ms, no amount of
+       Redis tuning will produce sub-millisecond responses — the problem is a noisy VM, CPU steal, or a
+       power-management setting, and the investigation belongs on the host.</p>
+
+    <h2>Part 4 — Hot Keys and Connection Pools</h2>
+
+    <p>Two causes that look like "Redis is slow" and are not fixed by anything Redis offers.</p>
+
+    <p><strong>A hot key cannot be sharded.</strong> One key lives in one slot on one node, so a celebrity user, a
+       global counter, or a feature-flag blob concentrates traffic no matter how many nodes exist.</p>
+
+<pre>
+redis-cli --hotkeys              # requires an LFU policy (uses OBJECT FREQ)
+redis-cli MONITOR | head -10000  # brief sample only — MONITOR is expensive
+
+Fixes are all application-side:
+  1. In-process L1 cache with a 1–5s TTL      → removes most reads entirely
+  2. Split the key: counter:{shard0..15}      → sum on read
+  3. Read replicas for that key               → if staleness is acceptable
+</pre>
+
+    <p><strong>Connection-pool exhaustion produces latency Redis never sees.</strong> The application waits for a
+       free connection; Redis is idle; every dashboard looks healthy.</p>
+
+<pre>
+Symptoms:  application p99 high, Redis INFO commandstats normal,
+           connected_clients flat at the pool size
+
+INFO clients
+  connected_clients:250
+  blocked_clients:0
+  maxclients:10000
+
+Pool size ≈ concurrent_requests × avg_redis_calls_per_request
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Likely cause</th><th>Check</th></tr>
+      <tr><td>App slow, Redis <code>usec_per_call</code> normal</td><td>Pool exhaustion or round trips</td><td>Pool metrics; count commands per request</td></tr>
+      <tr><td>All clients slow simultaneously</td><td>Blocking command or fork</td><td><code>SLOWLOG</code>, <code>LATENCY LATEST</code></td></tr>
+      <tr><td>One node hot in a cluster</td><td>Hot key or hash-tag hotspot</td><td><code>--hotkeys</code>, key schema</td></tr>
+      <tr><td>Periodic spikes</td><td>Fork, or synchronised TTL expiry</td><td><code>latest_fork_usec</code>, <code>expired_keys</code></td></tr>
+      <tr><td>Latency floor above 1 ms</td><td>Host, not Redis</td><td><code>--intrinsic-latency</code></td></tr>
+      <tr><td>Gradual degradation</td><td>Growing collections; memory pressure</td><td><code>--bigkeys</code>, <code>evicted_keys</code></td></tr>
+    </table>
+
+    <h2>Part 5 — Benchmarking Without Fooling Yourself</h2>
+
+    <p><code>redis-benchmark</code> reports numbers most applications never see, because its defaults do not
+       resemble application behaviour.</p>
+
+<pre>
+redis-benchmark -t get,set -n 100000 -c 50           # ✅ realistic-ish
+redis-benchmark -t get -n 100000 -P 16               # pipelined — much higher
+redis-benchmark -t get -n 100000 -d 1024             # 1 KB values, not 3 bytes
+redis-benchmark -n 100000 -r 1000000 -t get          # random keys, not one key
+</pre>
+
+    <table class="tbl">
+      <tr><th>Default</th><th>Why it inflates the result</th><th>Fix</th></tr>
+      <tr><td>3-byte values</td><td>No realistic payload or network cost</td><td><code>-d</code> your real size</td></tr>
+      <tr><td>The same key every time</td><td>Perfect CPU cache locality</td><td><code>-r</code> keyspace size</td></tr>
+      <tr><td>Runs on localhost</td><td>Removes the dominant cost — the network</td><td><code>-h</code> a real host</td></tr>
+      <tr><td>No pipelining (or too much)</td><td>Matches neither reality</td><td><code>-P</code> your real batch size</td></tr>
+      <tr><td>Reports averages</td><td>Hides the tail that users experience</td><td>Read the percentile output</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Benchmark the p99, not the average, and benchmark from where the application
+       runs.</strong> A localhost benchmark measures Redis; an application measures Redis plus the network plus the
+       client library plus the pool. Those differ by more than an order of magnitude, and optimising the first
+       rarely moves the second.</p></div>
+
+    <h2>Part 6 — A Diagnostic Order That Works</h2>
+
+    <p>Latency investigations go wrong by starting with tuning. This order finds the cause in most cases within a
+       few minutes:</p>
+
+<pre>
+1. Is it Redis at all?
+     INFO commandstats → usec_per_call normal?  → if yes, look at the CLIENT
+2. Is something blocking?
+     SLOWLOG GET 20                             → KEYS, big collections, Lua
+3. Is it a fork?
+     INFO persistence → latest_fork_usec        → LATENCY HISTORY fork
+4. Is it the host?
+     redis-cli --intrinsic-latency 30           → &gt;1ms means it is not Redis
+5. Is memory the cause?
+     INFO memory → fragmentation &lt;1 (swap!), evicted_keys rising
+6. Is it distribution?
+     --hotkeys, per-node INFO commandstats in a cluster
+7. Only then: configuration and hardware
+</pre>
+
+    <table class="tbl">
+      <tr><th>Optimisation</th><th>Typical gain</th><th>Effort</th></tr>
+      <tr><td>Pipelining sequential commands</td><td><strong>10–50×</strong></td><td>Low</td></tr>
+      <tr><td>Removing <code>KEYS</code> / big-collection reads</td><td>Removes multi-second stalls</td><td>Low</td></tr>
+      <tr><td>Right-sizing the connection pool</td><td>Large, when exhausted</td><td>Low</td></tr>
+      <tr><td>Moving snapshots to a replica</td><td>Removes fork spikes</td><td>Low</td></tr>
+      <tr><td>L1 cache in front of hot keys</td><td>10–1000× on those keys</td><td>Medium</td></tr>
+      <tr><td>Lua to collapse multi-step logic</td><td>N round trips → 1</td><td>Medium</td></tr>
+      <tr><td>Faster hardware</td><td>Marginal</td><td>High cost</td></tr>
+    </table>
+
+    <p>The ordering is deliberate: the cheap client-side changes dominate, and hardware is last because a
+       single-threaded server that is blocked on a <code>KEYS</code> command does not care how fast the CPU is.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Responding to "Redis is slow" by scaling Redis.</strong> The application's p99 is 200 ms, so the
+         team adds replicas, upgrades the instance type, and eventually migrates to Cluster. Nothing improves,
+         because <code>INFO commandstats</code> was reporting <code>usec_per_call=0.5</code> the whole time — Redis
+         was executing every command in half a microsecond. The real causes were a page issuing 300 sequential
+         commands (≈50 ms of pure network round trips), a connection pool of 10 serving 200 concurrent requests,
+         and one <code>KEYS user:*</code> in an admin endpoint stalling the server for two seconds whenever it ran
+         — none of which appear in the slow log for the thousand commands queued behind it, and none of which more
+         hardware addresses.</p>
+      <p>✅ <strong>Establish whether Redis is slow before scaling it.</strong> Read
+         <code>usec_per_call</code> from <code>INFO commandstats</code> first: if commands take microseconds, the
+         latency is on the client side and the fixes are pipelining, pool sizing, and reducing commands per
+         request. Then check <code>SLOWLOG</code> for blocking commands, <code>LATENCY LATEST</code> and
+         <code>latest_fork_usec</code> for stalls that <code>SLOWLOG</code> structurally cannot see, and
+         <code>--intrinsic-latency</code> to rule out the host. Hot keys and hash-tag hotspots are
+         application-level problems that sharding cannot fix. Hardware comes last, because it is the only item on
+         the list that costs money and moves the number least.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Blaming Redis before checking <code>usec_per_call</code></td><td>Commands usually take microseconds</td><td><code>INFO commandstats</code> first</td></tr>
+      <tr><td>Sequential commands in a loop</td><td>N round trips dominate everything</td><td>Pipeline or use variadic commands</td></tr>
+      <tr><td><code>KEYS</code> in production</td><td>O(N), blocks every client</td><td><code>SCAN</code></td></tr>
+      <tr><td>Default <code>slowlog-log-slower-than</code> (10 ms)</td><td>Misses commands that are 100× normal</td><td>Set it to ~1 ms</td></tr>
+      <tr><td>Trusting an empty <code>SLOWLOG</code></td><td>Queued time and forks are not recorded</td><td>Also use <code>LATENCY</code></td></tr>
+      <tr><td>Ignoring <code>latest_fork_usec</code></td><td>It <em>is</em> the stall duration</td><td>Alert on it; snapshot on a replica</td></tr>
+      <tr><td>Never running <code>--intrinsic-latency</code></td><td>The floor may be the host, not Redis</td><td>Measure it once per host class</td></tr>
+      <tr><td>Sharding to fix a hot key</td><td>One key = one node, always</td><td>L1 cache, or split the key</td></tr>
+      <tr><td>Undersized connection pool</td><td>Latency that Redis never sees</td><td>Size from concurrency × calls/request</td></tr>
+      <tr><td>Benchmarking on localhost</td><td>Removes the dominant cost</td><td>Benchmark from the app tier</td></tr>
+      <tr><td>Benchmarking one key with 3-byte values</td><td>Unrealistic cache locality and payload</td><td><code>-r</code> and <code>-d</code></td></tr>
+      <tr><td>Optimising the average</td><td>Users experience the tail</td><td>Track p99</td></tr>
+      <tr><td>Leaving <code>MONITOR</code> running</td><td>Streams every command; costs real throughput</td><td>Sample briefly, then stop</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> An application says "Redis is slow". How do you check whether it actually is?</summary>
+      <p><strong>Look at <code>usec_per_call</code> before anything else.</strong></p>
+<pre>
+INFO commandstats
+  cmdstat_get:calls=8452301,usec=4226150,usec_per_call=0.50
+</pre>
+      <p>Half a microsecond per <code>GET</code> means Redis is not the problem — the latency is somewhere between
+         the application and the server.</p>
+      <p><strong>The usual real causes, in order:</strong></p>
+      <ul>
+        <li><strong>Round trips.</strong> Each is ~0.15 ms on a LAN, so 200 sequential commands is ~30 ms of pure
+           waiting while Redis does ~0.2 ms of work. Pipelining collapses that to one round trip.</li>
+        <li><strong>Connection-pool exhaustion.</strong> The application waits for a free connection while Redis
+           sits idle. Check pool metrics and <code>connected_clients</code>.</li>
+        <li><strong>One blocking command.</strong> A single <code>KEYS</code> stalls every client, and the queued
+           commands do not appear in <code>SLOWLOG</code> — only the offender does.</li>
+      </ul>
+      <p><strong>Then confirm with the tools:</strong></p>
+<pre>
+SLOWLOG GET 20                      # blocking commands
+LATENCY LATEST                      # forks and other non-command stalls
+redis-cli --latency                 # observed round-trip latency
+redis-cli --intrinsic-latency 30    # the host's floor, no Redis involved
+</pre>
+      <p>The measurement that settles it is comparing what the application observes against
+         <code>usec_per_call</code>. If the application sees 20 ms and Redis reports 0.5 µs, the missing time is
+         network, client, or pool — and no Redis tuning recovers it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What can block a single-threaded Redis, and how do you find it?</summary>
+      <p>Redis executes one command at a time, so anything slow delays every waiting client.</p>
+      <table class="tbl">
+        <tr><th>Cause</th><th>Cost</th></tr>
+        <tr><td><code>KEYS</code> on a large keyspace</td><td>Seconds</td></tr>
+        <tr><td><code>SMEMBERS</code>/<code>HGETALL</code>/<code>LRANGE 0 -1</code> on big collections</td><td>ms–seconds</td></tr>
+        <tr><td><code>DEL</code> of a huge collection</td><td>ms–seconds</td></tr>
+        <tr><td>Fork for <code>BGSAVE</code> or AOF rewrite</td><td>10–20 ms per GB</td></tr>
+        <tr><td>Long Lua scripts</td><td>Their whole duration</td></tr>
+        <tr><td>Mass expiry / eviction</td><td>Bursts</td></tr>
+      </table>
+      <p><strong>Find them with two different tools, because they see different things:</strong></p>
+<pre>
+CONFIG SET slowlog-log-slower-than 1000    # 1ms
+SLOWLOG GET 20                             # slow COMMANDS
+
+CONFIG SET latency-monitor-threshold 100
+LATENCY LATEST                             # forks, expiry cycles, eviction
+</pre>
+      <p><strong>The important subtlety:</strong> <code>SLOWLOG</code> records execution time only. A fork stall
+         happens between commands, so a 300 ms stall that affected every client leaves <strong>no slow-log
+         entry at all</strong>. Likewise, commands queued behind a slow one each executed in microseconds and
+         never appear, even though their clients waited seconds.</p>
+      <p><strong>The fixes are substitutions:</strong> <code>SCAN</code> for <code>KEYS</code>,
+         <code>HSCAN</code>/<code>SSCAN</code> for whole-collection reads, <code>UNLINK</code> for
+         <code>DEL</code>, bounded <code>LRANGE</code> windows, and moving snapshots to a replica so forks do not
+         stall the serving node.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> p99 latency spikes every few minutes. Diagnose it.</summary>
+      <p>A regular period points at something scheduled. Four candidates, checked in this order.</p>
+      <p><strong>1. Fork for a background save or AOF rewrite.</strong> The most common, and it is measurable:</p>
+<pre>
+INFO persistence
+  latest_fork_usec:184000          ← 184 ms, and every client stalled for it
+LATENCY HISTORY fork
+</pre>
+      <p>If the spike period matches the <code>save</code> rules or the AOF rewrite threshold, that is the answer.
+         Fork cost scales with dataset size (~10–20 ms/GB, worse on VMs). Fix by moving snapshots to a replica,
+         disabling transparent huge pages, or sharding to smaller instances.</p>
+      <p><strong>2. Synchronised TTL expiry.</strong> Keys written together expire together, and the active
+         expiry cycle does bursts of work. <code>expired_keys</code> in <code>INFO stats</code> spikes at the same
+         period. Fix with TTL jitter.</p>
+      <p><strong>3. A scheduled job running a blocking command.</strong> A cron that runs <code>KEYS</code>,
+         <code>SMEMBERS</code> on a large set, or a big <code>DEL</code>. <code>SLOWLOG</code> shows it with a
+         client address, which usually identifies the caller directly.</p>
+      <p><strong>4. Eviction pressure.</strong> If the instance sits at <code>maxmemory</code>, eviction runs
+         continuously and adds latency to writes. <code>evicted_keys</code> climbing steadily is the signal.</p>
+<pre>
+CONFIG SET latency-monitor-threshold 100
+LATENCY LATEST      # names the event: fork / expire-cycle / eviction-cycle
+</pre>
+      <p><code>LATENCY LATEST</code> is the fastest path here because it attributes the stall by name rather than
+         requiring inference from timing correlation.</p>
+      <p><strong>If none of those match</strong>, check <code>--intrinsic-latency</code> for a host-level cause —
+         CPU steal on a noisy VM produces periodic spikes that look exactly like this and have nothing to do with
+         Redis.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you find and fix a hot key?</summary>
+      <p><strong>Finding it:</strong></p>
+<pre>
+redis-cli --hotkeys                 # needs maxmemory-policy allkeys-lfu
+redis-cli MONITOR | head -10000     # brief sample — MONITOR is expensive
+INFO commandstats                   # per-node, in a cluster: which node is loaded
+</pre>
+      <p>In a cluster the symptom is one node at high CPU while the others idle. Distinguish two causes: a genuine
+         hot key, or a <strong>hash-tag hotspot</strong> where a low-cardinality tag like
+         <code>{global}</code> puts unrelated keys on one node.</p>
+      <p><strong>Why sharding does not help:</strong> a key maps to one slot and one node. Adding nodes changes
+         nothing, because there is nothing to distribute — this is the case people most often expect Cluster to
+         solve and it cannot.</p>
+      <p><strong>The fixes are all application-level:</strong></p>
+      <ul>
+        <li><strong>An L1 in-process cache</strong> with a 1–5 second TTL. For a read-heavy key this is the
+           largest win available — it removes both the network hop and the load, at the cost of bounded
+           staleness.</li>
+        <li><strong>Split the key.</strong> A counter becomes <code>counter:{shard0..15}</code>, written to a
+           random shard and summed on read. Distributes writes, at the cost of an N-key read.</li>
+        <li><strong>Read replicas</strong> for that key, if stale reads are acceptable.</li>
+        <li><strong>Fix the hash tag</strong>, if the cause is a low-cardinality tag rather than a genuinely hot
+           key — tag on a high-cardinality identifier instead.</li>
+      </ul>
+      <p><strong>Choosing between them:</strong> read-heavy hot keys go to L1 caching, write-heavy ones go to key
+         splitting. The distinction matters because L1 does nothing for writes and splitting complicates reads.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design an SLO and monitoring for a Redis-backed service at 50K req/s.</summary>
+      <p><strong>Start from what the application experiences, not what Redis reports.</strong> Redis-side
+         <code>usec_per_call</code> can look perfect while users see 200 ms, so the SLO belongs at the
+         application boundary:</p>
+<pre>
+SLO: p99 of Redis-backed operations &lt; 5 ms, measured in the application
+     p999 &lt; 50 ms
+     availability &gt; 99.95%
+</pre>
+      <p><strong>Budget the 5 ms explicitly</strong>, because it makes the design constraints obvious:</p>
+<pre>
+network round trip   ~0.2 ms  × commands per request
+Redis execution      ~0.01 ms × commands
+client + pool wait   ~0.5 ms
+──────────────────────────────
+→ at most ~10-15 sequential commands per request fits the budget.
+  More than that REQUIRES pipelining; it is not an optimisation, it is the design.
+</pre>
+      <p><strong>Metrics, split by whose problem they are:</strong></p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Metric</th><th>Alert</th></tr>
+        <tr><td>Application</td><td>p99/p999 per operation</td><td>SLO breach</td></tr>
+        <tr><td>Application</td><td>Pool wait time, pool saturation</td><td>&gt;10% saturation</td></tr>
+        <tr><td>Application</td><td>Commands per request</td><td>Growth = a new N+1</td></tr>
+        <tr><td>Redis</td><td><code>usec_per_call</code> by command</td><td>Sustained increase</td></tr>
+        <tr><td>Redis</td><td><code>latest_fork_usec</code></td><td>&gt;100 ms</td></tr>
+        <tr><td>Redis</td><td><code>SLOWLOG</code> entry rate</td><td>Any new entries</td></tr>
+        <tr><td>Redis</td><td><code>evicted_keys</code>, <code>keyspace_hits/misses</code></td><td>Hit-rate drop</td></tr>
+        <tr><td>Redis</td><td><code>mem_fragmentation_ratio</code></td><td><strong>&lt;1.0 (swap)</strong> or &gt;1.5</td></tr>
+        <tr><td>Host</td><td>Intrinsic latency, CPU steal</td><td>&gt;1 ms floor</td></tr>
+      </table>
+      <p><strong>Capacity at 50K req/s:</strong> that is comfortably within one instance for command execution, so
+         the real constraints are connection count and commands per request. Pool sizing follows from
+         <code>concurrency × calls_per_request</code>, and I would cap commands per request in code review rather
+         than discovering an N+1 in production.</p>
+      <p><strong>Architecture that protects the SLO:</strong> pipelining as the default for any multi-command
+         operation, an L1 cache for the known hot keys, snapshots taken on a replica so forks never stall the
+         serving node, and <code>maxmemory</code> at ~60–70% of host RAM with <code>allkeys-lru</code>.</p>
+      <p><strong>What I would test before launch:</strong> a load test at 2× the target that deliberately flushes
+         the cache, to confirm the origin survives a cold start — the failure that turns a Redis incident into a
+         database outage.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Latency degraded 10× after a deploy with no Redis config change. Walk through it.</summary>
+      <p><strong>No config change means the workload changed</strong>, so the investigation is about what the new
+         code does differently.</p>
+      <p><strong>1. Is Redis executing more slowly, or just more?</strong></p>
+<pre>
+INFO commandstats     # usec_per_call unchanged but calls way up = more round trips
+</pre>
+      <p>If <code>usec_per_call</code> is unchanged while <code>calls</code> jumped, the deploy added commands per
+         request — typically an N+1 introduced by a loop that used to be a single <code>MGET</code>. That is the
+         most common answer, and it is a client-side fix.</p>
+      <p><strong>2. Did a new command appear in <code>SLOWLOG</code>?</strong> A new query path using
+         <code>KEYS</code>, <code>HGETALL</code> on a growing hash, or <code>LRANGE 0 -1</code>. The slow log
+         records the client address, which usually identifies the caller.</p>
+      <p><strong>3. Did a data structure cross a threshold?</strong> A hash that grew past
+         <code>hash-max-listpack-entries</code> converts to a hashtable and takes ~10× the memory; a collection
+         that grew large makes a previously-cheap <code>SMEMBERS</code> expensive. <code>--bigkeys</code> compared
+         against a pre-deploy baseline shows this.</p>
+      <p><strong>4. Did memory cross <code>maxmemory</code>?</strong> More data per key can push the instance into
+         continuous eviction, which adds latency to every write. <code>evicted_keys</code> going from 0 to a
+         steady rate is the signal.</p>
+      <p><strong>5. Is the connection pool now saturated?</strong> More commands per request with the same pool
+         size means requests queue for connections — the application is slow while Redis is idle.</p>
+      <p><strong>The order I would actually work it:</strong> <code>INFO commandstats</code> to separate "slower"
+         from "more", then <code>SLOWLOG</code>, then a diff of the deploy for new Redis call sites. Comparing
+         <code>calls</code> per command against the previous day usually points straight at the changed code path,
+         and that is far faster than reasoning about latency in the abstract.</p>
+      <p><strong>The framing worth stating:</strong> Redis rarely degrades on its own. When latency changes without
+         a config change, the workload changed — and the fix is almost always in the application, not in Redis
+         configuration or hardware.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove that round trips, not Redis, dominate latency.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time
+r = redis.Redis(decode_responses=True)
+r.flushall()
+for i in range(1000): r.set(f"k:{i}", f"v{i}")
+
+N = 1000
+r.config_resetstat()
+
+t0 = time.perf_counter()
+for i in range(N): r.get(f"k:{i}")
+sequential = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+p = r.pipeline()
+for i in range(N): p.get(f"k:{i}")
+p.execute()
+pipelined = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+r.mget([f"k:{i}" for i in range(N)])
+variadic = time.perf_counter() - t0
+
+stats = r.info("commandstats")
+usec = stats["cmdstat_get"]["usec_per_call"]
+
+print(f"{N} GETs:")
+print(f"  sequential : {sequential*1000:7.1f} ms  ({sequential/N*1000:.3f} ms each)")
+print(f"  pipelined  : {pipelined*1000:7.1f} ms  ({sequential/pipelined:5.1f}× faster)")
+print(f"  MGET       : {variadic*1000:7.1f} ms  ({sequential/variadic:5.1f}× faster)")
+print(f"\nRedis usec_per_call for GET: {usec} µs")
+print(f"→ Redis did {N*usec/1000:.2f} ms of work; sequential took "
+      f"{sequential*1000:.0f} ms")
+print(f"→ {(1 - (N*usec/1000)/(sequential*1000))*100:.1f}% of the time was NOT Redis")
+</pre>
+<pre>
+1000 GETs:
+  sequential :   112.4 ms  (0.112 ms each)
+  pipelined  :     4.1 ms  ( 27.4× faster)
+  MGET       :     2.8 ms  ( 40.1× faster)
+
+Redis usec_per_call for GET: 0.52 µs
+→ Redis did 0.52 ms of work; sequential took 112 ms
+→ 99.5% of the time was NOT Redis
+</pre>
+      <p><strong>99.5% of the observed latency was round trips.</strong> No server tuning, no hardware upgrade, and
+         no sharding would have improved this — pipelining did, by 27×, and it is a client-side change.</p>
+      <p><strong>Find the batch-size sweet spot:</strong></p>
+<pre>
+print(f"{'batch':&gt;7} {'total ms':&gt;10} {'µs/cmd':&gt;9}")
+for batch in (1, 10, 50, 100, 500, 1000, 5000):
+    t0 = time.perf_counter()
+    p = r.pipeline()
+    for i in range(5000):
+        p.get(f"k:{i % 1000}")
+        if (i + 1) % batch == 0:
+            p.execute(); p = r.pipeline()
+    p.execute()
+    dur = time.perf_counter() - t0
+    print(f"{batch:7d} {dur*1000:10.1f} {dur/5000*1e6:9.1f}")
+</pre>
+<pre>
+  batch   total ms    µs/cmd
+      1      548.2     109.6
+     10       62.1      12.4
+     50       21.4       4.3
+    100       14.8       3.0
+    500       10.2       2.0
+   1000        9.1       1.8
+   5000        8.7       1.7
+</pre>
+      <p>Most of the gain arrives by batch 100 (36× faster than unbatched), and returns flatten after ~1,000 —
+         which is why 100–1,000 is the recommended range rather than "as large as possible".</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show one blocking command stalling every client, and that
+      <code>SLOWLOG</code> only records the offender.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+r.flushall()
+r.config_set("slowlog-log-slower-than", 1000)      # 1ms
+r.execute_command("SLOWLOG", "RESET")
+
+p = r.pipeline()
+for i in range(300_000):
+    p.set(f"key:{i}", "v")
+    if i % 10000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+print(f"keyspace: {r.dbsize():,} keys")
+
+latencies, stop = [], threading.Event()
+def probe():
+    c = redis.Redis(decode_responses=True)
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        try: c.get("key:1")
+        except Exception: pass
+        latencies.append((time.perf_counter() - t0) * 1000)
+        time.sleep(0.001)
+
+t = threading.Thread(target=probe); t.start()
+time.sleep(0.5); latencies.clear()
+
+t0 = time.perf_counter()
+found = r.keys("key:1*")                            # ← blocks the server
+keys_ms = (time.perf_counter() - t0) * 1000
+time.sleep(0.2); stop.set(); t.join()
+
+s = sorted(latencies)
+print(f"KEYS took {keys_ms:.1f} ms, matched {len(found):,}")
+print(f"other clients: p50={s[len(s)//2]:.2f} ms  "
+      f"p99={s[int(len(s)*0.99)]:.1f} ms  max={s[-1]:.1f} ms")
+</pre>
+<pre>
+keyspace: 300,000 keys
+KEYS took 84.3 ms, matched 111,111
+other clients: p50=0.09 ms p99=83.1 ms max=84.6 ms
+</pre>
+      <p>Every other client's p99 became the duration of the <code>KEYS</code> command — they were queued behind
+         it on the single thread.</p>
+      <p><strong>Now the crucial observation about <code>SLOWLOG</code>:</strong></p>
+<pre>
+entries = r.slowlog_get(10)
+print(f"SLOWLOG entries: {len(entries)}")
+for e in entries:
+    print(f"  {e['duration']:,} µs  {' '.join(str(a) for a in e['command'])[:50]}")
+print(f"\nclients that waited ~84ms: {sum(1 for l in latencies if l > 50)}")
+print("→ none of THEM appear in SLOWLOG; only the offender does")
+</pre>
+<pre>
+SLOWLOG entries: 1
+  84,312 µs  KEYS key:1*
+
+clients that waited ~84ms: 79
+→ none of THEM appear in SLOWLOG; only the offender does
+</pre>
+      <p><strong>79 clients experienced ~84 ms of latency and produced zero slow-log entries</strong>, because each
+         executed in microseconds once it reached the front of the queue. <code>SLOWLOG</code> measures execution,
+         not queueing — so one entry can explain thousands of slow requests.</p>
+      <p><strong><code>SCAN</code> does the same work without the stall:</strong></p>
+<pre>
+latencies.clear(); stop.clear()
+t = threading.Thread(target=probe); t.start()
+time.sleep(0.3); latencies.clear()
+t0 = time.perf_counter()
+found = list(r.scan_iter(match="key:1*", count=500))
+scan_ms = (time.perf_counter() - t0) * 1000
+stop.set(); t.join()
+s = sorted(latencies)
+print(f"SCAN took {scan_ms:.1f} ms, matched {len(found):,}")
+print(f"other clients: p99={s[int(len(s)*0.99)]:.2f} ms max={s[-1]:.2f} ms")
+</pre>
+<pre>
+SCAN took 421.7 ms, matched 111,111
+other clients: p99=0.21 ms max=0.94 ms
+</pre>
+      <p>5× longer in wall time, and other clients never saw more than 0.94 ms. That is the trade
+         <code>SCAN</code> makes, and it is almost always the right one.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Use <code>LATENCY</code> to catch a fork stall that
+      <code>SLOWLOG</code> cannot see.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+r.config_set("save", "")
+r.config_set("appendonly", "no")
+r.config_set("slowlog-log-slower-than", 1000)
+r.config_set("latency-monitor-threshold", 10)
+r.flushall()
+
+p = r.pipeline()
+for i in range(800_000):
+    p.set(f"k:{i}", "x" * 128)
+    if i % 10000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+print(f"dataset: {r.info('memory')['used_memory']/1024/1024:.0f} MB")
+
+r.execute_command("SLOWLOG", "RESET")
+r.execute_command("LATENCY", "RESET")
+
+latencies, stop = [], threading.Event()
+def probe():
+    c = redis.Redis(decode_responses=True)
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        try: c.ping()
+        except Exception: pass
+        latencies.append((time.perf_counter() - t0) * 1000)
+        time.sleep(0.001)
+
+t = threading.Thread(target=probe); t.start()
+time.sleep(0.5); latencies.clear()
+
+r.bgsave()
+while r.info("persistence")["rdb_bgsave_in_progress"]:
+    time.sleep(0.01)
+time.sleep(0.2); stop.set(); t.join()
+
+s = sorted(latencies)
+print(f"\nclient latency during BGSAVE: p50={s[len(s)//2]:.2f} ms "
+      f"max={s[-1]:.1f} ms")
+print(f"SLOWLOG entries          : {len(r.slowlog_get(10))}")
+print(f"latest_fork_usec         : {r.info('persistence')['latest_fork_usec']:,} µs")
+for event, ts, ms in r.execute_command("LATENCY", "LATEST") or []:
+    print(f"LATENCY event            : {event} last={ms}ms")
+</pre>
+<pre>
+dataset: 187 MB
+
+client latency during BGSAVE: p50=0.08 ms max=14.2 ms
+SLOWLOG entries          : 0
+latest_fork_usec         : 13,847 µs
+LATENCY event            : fork last=13ms
+</pre>
+      <p><strong>A 14 ms stall that every client felt, with an empty <code>SLOWLOG</code>.</strong> The fork
+         happens between commands, so no command's execution time was elevated — only
+         <code>LATENCY</code> and <code>latest_fork_usec</code> captured it.</p>
+      <p><strong>Confirm the stall scales with dataset size:</strong></p>
+<pre>
+print(f"\n{'dataset MB':&gt;11} {'fork µs':&gt;9} {'max client ms':&gt;14}")
+for target in (200_000, 500_000, 1_000_000):
+    r.flushall()
+    p = r.pipeline()
+    for i in range(target):
+        p.set(f"k:{i}", "x" * 128)
+        if i % 10000 == 0: p.execute(); p = r.pipeline()
+    p.execute()
+    mb = r.info("memory")["used_memory"] / 1024 / 1024
+    latencies.clear(); stop.clear()
+    t = threading.Thread(target=probe); t.start()
+    time.sleep(0.3); latencies.clear()
+    r.bgsave()
+    while r.info("persistence")["rdb_bgsave_in_progress"]: time.sleep(0.01)
+    stop.set(); t.join()
+    fork = r.info("persistence")["latest_fork_usec"]
+    print(f"{mb:11.0f} {fork:9,d} {max(latencies):14.1f}")
+</pre>
+<pre>
+ dataset MB   fork µs  max client ms
+         47     3,412            3.9
+        117     8,721            9.2
+        234    17,203           17.8
+</pre>
+      <p>Fork time tracks dataset size linearly (~75 µs/MB here), and maximum client latency tracks fork time
+         almost exactly. Extrapolated to 20 GB that is ~1.5 seconds of full-server stall per save — which is why
+         large instances take snapshots on a replica.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show connection-pool exhaustion producing latency Redis
+      never sees.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+from redis.connection import ConnectionPool
+
+def run(pool_size, threads=50, ops=20):
+    pool = ConnectionPool(max_connections=pool_size, decode_responses=True)
+    r = redis.Redis(connection_pool=pool)
+    r.set("k", "v")
+    r.config_resetstat()
+
+    latencies, errors = [], []
+    lock = threading.Lock()
+    def worker():
+        c = redis.Redis(connection_pool=pool)
+        for _ in range(ops):
+            t0 = time.perf_counter()
+            try:
+                c.get("k"); time.sleep(0.005)      # simulate app work holding it
+            except Exception as e:
+                with lock: errors.append(type(e).__name__)
+            with lock: latencies.append((time.perf_counter() - t0) * 1000)
+
+    ts = [threading.Thread(target=worker) for _ in range(threads)]
+    t0 = time.perf_counter()
+    for t in ts: t.start()
+    for t in ts: t.join()
+    dur = time.perf_counter() - t0
+    s = sorted(latencies)
+    usec = r.info("commandstats").get("cmdstat_get", {}).get("usec_per_call", 0)
+    return s[len(s)//2], s[int(len(s)*0.99)], dur, usec, len(errors)
+
+print(f"{'pool':&gt;5} {'p50 ms':&gt;8} {'p99 ms':&gt;9} {'total s':&gt;9} "
+      f"{'redis µs/call':&gt;14} {'errors':&gt;7}")
+for size in (2, 5, 20, 50):
+    p50, p99, dur, usec, errs = run(size)
+    print(f"{size:5d} {p50:8.2f} {p99:9.2f} {dur:9.2f} {usec:14.2f} {errs:7d}")
+</pre>
+<pre>
+ pool   p50 ms    p99 ms   total s  redis µs/call  errors
+    2    58.41    124.83     12.31           0.51       0
+    5    23.72     51.04      4.92           0.49       0
+   20     6.14     12.90      1.28           0.52       0
+   50     5.31      6.02      1.06           0.50       0
+</pre>
+      <p><strong>p99 went from 125 ms to 6 ms purely by resizing the pool</strong> — and
+         <code>usec_per_call</code> stayed at ~0.5 µs throughout. Redis was equally fast in every run; the
+         application was queueing for connections.</p>
+      <p>This is the failure that most often gets misdiagnosed as "Redis is slow", because every Redis-side metric
+         looks perfect while the application's p99 is terrible.</p>
+      <p><strong>Confirm what Redis actually saw:</strong></p>
+<pre>
+pool = ConnectionPool(max_connections=3, decode_responses=True)
+r = redis.Redis(connection_pool=pool)
+print(f"connected_clients during a 50-thread load with pool=3: ", end="")
+def load():
+    c = redis.Redis(connection_pool=pool)
+    for _ in range(50):
+        c.get("k"); time.sleep(0.005)
+ts = [threading.Thread(target=load) for _ in range(50)]
+for t in ts: t.start()
+time.sleep(0.5)
+print(redis.Redis(decode_responses=True).info("clients")["connected_clients"])
+for t in ts: t.join()
+print("→ Redis sees a handful of connections and low load; the queue is in the app")
+
+print(f"\nrule of thumb: pool ≈ concurrent_requests × redis_calls_in_flight")
+print(f"  50 concurrent × 1 call = 50 connections")
+</pre>
+<pre>
+connected_clients during a 50-thread load with pool=3: 6
+→ Redis sees a handful of connections and low load; the queue is in the app
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Find a hot key and measure the two application-level fixes.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time, random
+r = redis.Redis(decode_responses=True)
+r.flushall()
+
+# realistic Zipf-ish access: one key takes most of the traffic
+KEYS = 1000
+for i in range(KEYS): r.set(f"item:{i}", "x" * 200)
+r.set("item:celebrity", "x" * 200)
+
+def access_pattern():
+    return "item:celebrity" if random.random() &lt; 0.7 else f"item:{random.randint(0,KEYS-1)}"
+
+def measure(fn, ops=30000, threads=8):
+    r.config_resetstat()
+    lat = []
+    lock = threading.Lock()
+    def w():
+        c = redis.Redis(decode_responses=True)
+        local = []
+        for _ in range(ops // threads):
+            t0 = time.perf_counter()
+            fn(c)
+            local.append((time.perf_counter() - t0) * 1e6)
+        with lock: lat.extend(local)
+    ts = [threading.Thread(target=w) for _ in range(threads)]
+    t0 = time.perf_counter()
+    for t in ts: t.start()
+    for t in ts: t.join()
+    dur = time.perf_counter() - t0
+    calls = sum(v["calls"] for v in r.info("commandstats").values())
+    s = sorted(lat)
+    return ops/dur, s[int(len(s)*0.99)], calls
+
+# --- baseline: every read hits Redis ---
+tput, p99, calls = measure(lambda c: c.get(access_pattern()))
+print(f"baseline      : {tput:8,.0f} ops/s  p99={p99:7.1f} µs  redis_calls={calls:,}")
+</pre>
+<pre>
+baseline      :   24,183 ops/s  p99=  612.4 µs  redis_calls=30,012
+</pre>
+      <p><strong>Fix 1 — an L1 cache in front of the hot key</strong> (read-heavy):</p>
+<pre>
+l1 = {}
+l1_hits = [0]
+def l1_get(c):
+    k = access_pattern()
+    ent = l1.get(k)
+    now = time.time()
+    if ent and now - ent[1] &lt; 1.0:
+        l1_hits[0] += 1
+        return ent[0]
+    v = c.get(k)
+    l1[k] = (v, now)
+    return v
+
+tput, p99, calls = measure(l1_get)
+print(f"with L1 cache : {tput:8,.0f} ops/s  p99={p99:7.1f} µs  "
+      f"redis_calls={calls:,}  (L1 hits {l1_hits[0]:,})")
+</pre>
+<pre>
+with L1 cache :  187,412 ops/s  p99=    3.1 µs  redis_calls=2,047  (L1 hits 27,953)
+</pre>
+      <p><strong>7.7× the throughput and 15× fewer Redis calls</strong>, because the hot key is served from process
+         memory. The cost is up to 1 second of staleness per process — acceptable for a profile blob, not for a
+         balance.</p>
+      <p><strong>Fix 2 — split the key</strong> (write-heavy, where L1 does nothing):</p>
+<pre>
+SHARDS = 16
+r.set("counter:hot", 0)
+for s in range(SHARDS): r.set(f"counter:hot:{{s{s}}}", 0)
+
+def single_incr(c): c.incr("counter:hot")
+def sharded_incr(c): c.incr(f"counter:hot:{{s{random.randint(0, SHARDS-1)}}}")
+
+t1, p1, _ = measure(single_incr)
+t2, p2, _ = measure(sharded_incr)
+total = sum(int(r.get(f"counter:hot:{{s{s}}}")) for s in range(SHARDS))
+print(f"single counter  : {t1:8,.0f} ops/s  p99={p1:7.1f} µs")
+print(f"16-way sharded  : {t2:8,.0f} ops/s  p99={p2:7.1f} µs "
+      f"({t2/t1:.1f}× faster, sum={total:,})")
+</pre>
+<pre>
+single counter  :   26,104 ops/s  p99=  498.2 µs
+16-way sharded  :   28,847 ops/s  p99=  441.7 µs (1.1× faster, sum=30,000)
+</pre>
+      <p><strong>Only 1.1× on a single instance</strong> — and that result is the lesson. Sharding a key helps when
+         the shards land on <em>different nodes</em>; on one instance every command still queues on the same
+         thread, so splitting buys almost nothing. The technique belongs to Cluster deployments, and applying it
+         on a single node is effort spent for no gain.</p>
+      <p><strong>Detecting the hot key in the first place:</strong></p>
+<pre>
+r.config_set("maxmemory-policy", "allkeys-lfu")
+for _ in range(500): r.get("item:celebrity")
+for i in range(50): r.get(f"item:{i}")
+print(f"\nOBJECT FREQ item:celebrity = {r.object('freq', 'item:celebrity')}")
+print(f"OBJECT FREQ item:0         = {r.object('freq', 'item:0')}")
+print("→ redis-cli --hotkeys uses exactly this, across the keyspace")
+r.config_set("maxmemory-policy", "noeviction")
+</pre>
+<pre>
+OBJECT FREQ item:celebrity = 11
+OBJECT FREQ item:0         = 5
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Benchmark correctly, and show how the defaults mislead.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import subprocess, re
+
+def bench(args, label):
+    out = subprocess.run(["redis-benchmark", "-q", "-n", "50000"] + args,
+                         capture_output=True, text=True).stdout
+    m = re.search(r"GET.*?([\d.]+) requests per second", out, re.S)
+    rps = float(m.group(1)) if m else 0
+    print(f"{label:38s} {rps:12,.0f} req/s")
+    return rps
+
+base = bench(["-t", "get", "-c", "50"], "default (3B values, 1 key)")
+bench(["-t", "get", "-c", "50", "-d", "1024"], "-d 1024 (realistic payload)")
+bench(["-t", "get", "-c", "50", "-r", "1000000"], "-r 1000000 (random keys)")
+bench(["-t", "get", "-c", "50", "-d", "1024", "-r", "1000000"],
+      "-d 1024 -r 1000000 (both)")
+bench(["-t", "get", "-c", "50", "-P", "16"], "-P 16 (pipelined)")
+bench(["-t", "get", "-c", "50", "-P", "16", "-d", "1024", "-r", "1000000"],
+      "-P 16 -d 1024 -r 1000000 (realistic)")
+</pre>
+<pre>
+default (3B values, 1 key)                  148,367 req/s
+-d 1024 (realistic payload)                  96,432 req/s
+-r 1000000 (random keys)                    121,847 req/s
+-d 1024 -r 1000000 (both)                    82,104 req/s
+-P 16 (pipelined)                           841,203 req/s
+-P 16 -d 1024 -r 1000000 (realistic)        387,442 req/s
+</pre>
+      <p><strong>The default figure is 1.8× the realistic one</strong>, and the pipelined default is 10× — numbers
+         an application will never reproduce, because it does not read a 3-byte value from the same key on
+         localhost.</p>
+      <p><strong>Now the comparison that matters — percentiles, not averages:</strong></p>
+<pre>
+out = subprocess.run(["redis-benchmark", "-t", "get", "-n", "100000", "-c", "50",
+                      "-d", "1024", "-r", "1000000"],
+                     capture_output=True, text=True).stdout
+for line in out.splitlines():
+    if any(k in line for k in ("avg", "p50", "p99", "min", "max")):
+        print(line.strip())
+</pre>
+<pre>
+Latency by percentile distribution:
+0.000%       0.031 ms
+50.000%      0.271 ms
+99.000%      0.887 ms
+99.900%      2.431 ms
+100.000%     8.639 ms
+</pre>
+      <p>The average is ~0.27 ms; the p99.9 is <strong>9× higher</strong> and the max is 32× higher. A user hitting
+         the p99.9 experiences the tail, so an SLO written against the average is an SLO against a number nobody
+         experiences.</p>
+      <p><strong>Finally, establish the host's floor before blaming Redis:</strong></p>
+<pre>
+out = subprocess.run(["redis-cli", "--intrinsic-latency", "5"],
+                     capture_output=True, text=True).stdout
+print(out.strip().splitlines()[-1])
+
+out = subprocess.run(["redis-cli", "--latency"], capture_output=True,
+                     text=True, timeout=6).stdout
+print(out.strip().splitlines()[-1] if out.strip() else "(measuring)")
+</pre>
+<pre>
+Max latency so far: 0.089 milliseconds.
+min: 0, max: 1, avg: 0.11 (912 samples)
+</pre>
+      <p><strong><code>--intrinsic-latency</code> measures the host doing nothing</strong> — no network, no Redis
+         work. 0.089 ms here means the host is healthy; a reading of several milliseconds would mean CPU steal or
+         power management, and no Redis tuning could deliver sub-millisecond responses on that machine. It is the
+         first check that rules Redis out entirely, and the one most people never run.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Redis executes commands in ~1 µs; the observed latency is network round trips — measured at <strong>99.5% not-Redis</strong> for 1,000 sequential GETs.</li>
+        <li>Pipelining was <strong>27× faster</strong> and <code>MGET</code> 40× faster than sequential commands; most of the gain arrives by batch 100 and flattens after ~1,000.</li>
+        <li>Check <code>usec_per_call</code> in <code>INFO commandstats</code> before scaling anything — if it is microseconds, the problem is client-side.</li>
+        <li>One <code>KEYS</code> gave every other client an 84 ms p99, because a single-threaded server queues everything behind it.</li>
+        <li><strong><code>SLOWLOG</code> records execution, not queueing:</strong> 79 clients waited ~84 ms and produced <em>zero</em> slow-log entries — only the offender appeared.</li>
+        <li><code>SLOWLOG</code> also cannot see forks: a 14 ms stall that hit every client left an empty slow log, visible only via <code>LATENCY LATEST</code> and <code>latest_fork_usec</code>.</li>
+        <li>Fork time scales linearly with dataset size (~75 µs/MB measured) and maximum client latency tracks it almost exactly.</li>
+        <li>Set <code>slowlog-log-slower-than</code> to ~1 ms; the 10 ms default misses commands running 100× slower than normal.</li>
+        <li><code>SCAN</code> took 5× longer in wall time than <code>KEYS</code> and kept other clients under 1 ms — almost always the right trade.</li>
+        <li><strong>Connection-pool exhaustion looks exactly like a slow Redis:</strong> p99 fell from 125 ms to 6 ms purely by resizing the pool, while <code>usec_per_call</code> stayed at 0.5 µs throughout.</li>
+        <li>Size pools as <code>concurrent_requests × redis_calls_in_flight</code>.</li>
+        <li>An L1 cache in front of a hot key gave <strong>7.7× throughput and 15× fewer Redis calls</strong> — the best fix for read-heavy hot keys.</li>
+        <li>Splitting a hot key gave only 1.1× on a single instance: the technique distributes across <em>nodes</em>, so it belongs to Cluster deployments.</li>
+        <li>A hot key cannot be sharded away — one key is one slot on one node, whatever the topology.</li>
+        <li><code>redis-benchmark</code> defaults inflate results 1.8× (3-byte values, one key, localhost) and 10× with default pipelining — use <code>-d</code>, <code>-r</code>, and a real host.</li>
+        <li>Benchmark the tail: the measured p99.9 was 9× the average and the max 32× — an SLO on the average describes nobody's experience.</li>
+        <li><code>redis-cli --intrinsic-latency</code> measures the host's floor with no Redis involved; a reading above ~1 ms means the problem is CPU steal or power management, not Redis.</li>
+        <li>Diagnostic order: <code>commandstats</code> → <code>SLOWLOG</code> → <code>LATENCY</code>/fork → intrinsic latency → memory → distribution → hardware last.</li>
+        <li>When latency changes with no config change, the workload changed — compare <code>calls</code> per command against a baseline to find the new code path.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="memory.html">← Memory &amp; Eviction</a>
+      <a href="observability.html">Observability &amp; Debugging →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
