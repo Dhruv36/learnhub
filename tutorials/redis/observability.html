@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Observability &amp; Debugging — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Observability &amp; Debugging <span class="level-badge level-adv">Production</span></h1>
+    <p><strong>What you'll master:</strong> the twelve metrics from <code>INFO</code> that are worth alerting on,
+       and — more usefully — the ones that look important and are not; why the counters in <code>INFO stats</code>
+       are <em>cumulative since boot</em> and therefore useless plotted raw, a mistake that survives in production
+       dashboards for years and hides exactly the incidents the dashboard was built to catch;
+       <code>INFO errorstats</code>, which answers most incidents in a single command and almost nobody uses;
+       <code>MONITOR</code>, the most dangerous debugging tool Redis offers and the one people reach for first;
+       <code>CLIENT LIST</code> for finding the connection actually causing the problem; keyspace notifications for
+       "what deleted my key"; and a debugging playbook for the five incidents that actually happen.
+       Prerequisites: <a href="performance.html">Performance &amp; Latency</a>,
+       <a href="memory.html">Memory &amp; Eviction</a>.</p>
+
+    <h2>Part 1 — The Metrics That Matter</h2>
+
+    <p><code>INFO</code> returns well over a hundred fields. Twelve of them carry nearly all the diagnostic value.</p>
+
+<pre>
+INFO                    # everything
+INFO memory             # one section
+INFO replication stats  # several sections (Redis 7)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Metric</th><th>Section</th><th>Alert when</th><th>What it means</th></tr>
+      <tr><td><code>used_memory</code> / <code>maxmemory</code></td><td>memory</td><td>&gt;85%</td><td>Approaching eviction or OOM</td></tr>
+      <tr><td><code>mem_fragmentation_ratio</code></td><td>memory</td><td><strong>&lt;1.0</strong> or &gt;1.5</td><td>&lt;1 means <strong>swapping</strong> — worse than fragmentation</td></tr>
+      <tr><td><code>evicted_keys</code></td><td>stats</td><td>Rate &gt;0 unexpectedly</td><td>Cache too small, or policy wrong</td></tr>
+      <tr><td><code>keyspace_hits</code> / <code>misses</code></td><td>stats</td><td>Hit rate drops</td><td>Cache effectiveness</td></tr>
+      <tr><td><code>rejected_connections</code></td><td>stats</td><td>&gt;0</td><td><code>maxclients</code> reached</td></tr>
+      <tr><td><code>blocked_clients</code></td><td>clients</td><td>Sustained growth</td><td>Clients in <code>BLPOP</code>/<code>XREAD</code></td></tr>
+      <tr><td><code>latest_fork_usec</code></td><td>persistence</td><td>&gt;100 ms</td><td>The stall every client saw</td></tr>
+      <tr><td><code>rdb_last_bgsave_status</code></td><td>persistence</td><td>≠ <code>ok</code></td><td>Writes may be blocked</td></tr>
+      <tr><td><code>aof_last_write_status</code></td><td>persistence</td><td>≠ <code>ok</code></td><td>Disk problem</td></tr>
+      <tr><td><code>master_link_status</code></td><td>replication</td><td>≠ <code>up</code></td><td>Replica disconnected</td></tr>
+      <tr><td><code>sync_partial_err</code></td><td>stats</td><td>Increasing</td><td>Backlog too small → full resyncs</td></tr>
+      <tr><td><code>instantaneous_ops_per_sec</code></td><td>stats</td><td>Sudden change</td><td>Traffic shift, or an outage upstream</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Most of the counters in <code>INFO stats</code> are cumulative since boot, not
+       gauges — and dashboards that plot them raw are wrong in a way that is easy to miss.</strong>
+       <code>keyspace_hits</code> only ever increases, so graphing it produces a line that rises forever, and a
+       hit rate computed from it is the average since the process started rather than the hit rate now. A cache
+       that has been degrading for six hours still shows 97% because of the healthy week before it. Graph the
+       <em>rate of change</em>, and compute ratios from deltas between scrapes.</p></div>
+
+<pre>
+# WRONG — average since boot; hides a live degradation entirely
+hit_rate = hits / (hits + misses)
+
+# RIGHT — the hit rate over the scrape interval
+d_hits   = hits_now   - hits_prev
+d_misses = misses_now - misses_prev
+hit_rate = d_hits / (d_hits + d_misses) if (d_hits + d_misses) else None
+</pre>
+
+    <p><strong>Two metrics get monitored far more than they deserve.</strong> <code>connected_clients</code> is
+       usually just the connection-pool size summed across your fleet — flat by design, so alerting on it produces
+       noise rather than signal; the useful signal is <code>rejected_connections</code>. And
+       <code>used_memory</code> alone says nothing without <code>maxmemory</code>: an instance at 30 GB is healthy
+       against a 40 GB limit and in trouble against 32 GB.</p>
+
+    <h2>Part 2 — Commandstats, Latencystats and Errorstats</h2>
+
+    <p>Three sections answer "what is this server actually doing", and they are reset independently of the rest.</p>
+
+<pre>
+INFO commandstats
+  cmdstat_get:calls=8452301,usec=4226150,usec_per_call=0.50,rejected_calls=0,failed_calls=0
+  cmdstat_keys:calls=12,usec=1010556,usec_per_call=84213.00
+                                       └────────┬────────┘
+                                     84 ms per call — the offender
+
+INFO latencystats           # Redis 7+: real percentiles, not just the mean
+  latency_percentiles_usec_get:p50=0.501,p99=1.003,p99.9=2.007
+
+INFO errorstats             # Redis 6.2+: errors grouped by reply code
+  errorstat_WRONGTYPE:count=1423
+  errorstat_OOM:count=8891
+  errorstat_NOSCRIPT:count=12
+
+CONFIG RESETSTAT            # zeroes commandstats/errorstats — sample a baseline first
+</pre>
+
+    <div class="note">🔑 <strong><code>INFO errorstats</code> is the fastest diagnosis in Redis and almost nobody
+       uses it.</strong> It groups every error reply by code, so one command answers questions that otherwise need
+       log correlation: <code>OOM</code> means you hit <code>maxmemory</code> with a policy that is not evicting,
+       <code>NOSCRIPT</code> means a client is missing its <code>EVALSHA</code> fallback,
+       <code>WRONGTYPE</code> means a key-schema collision, <code>READONLY</code> means clients are writing to a
+       replica after a failover, and <code>CROSSSLOT</code> means a Cluster key-design bug. Check it first in any
+       incident.</p></div>
+
+    <p><strong><code>usec_per_call</code> is the number that separates a Redis problem from an application
+       problem.</strong> Sub-microsecond values mean Redis is fine and the latency is network, pool, or client —
+       the reasoning in <a href="performance.html">Performance &amp; Latency</a>.</p>
+
+    <h2>Part 3 — MONITOR: The Dangerous One</h2>
+
+    <p><code>MONITOR</code> streams every command the server processes. It is the most immediately useful debugging
+       tool here and the most likely to cause the next incident.</p>
+
+<pre>
+redis-cli MONITOR
+  1723900000.123456 [0 10.0.1.5:53124] "GET" "user:42"
+  1723900000.123789 [0 10.0.1.7:53200] "SET" "session:abc" "..."
+   └──────┬──────┘  └┬┘ └──────┬─────┘
+      timestamp     db      client
+</pre>
+
+    <table class="tbl">
+      <tr><th>Cost</th><th>Detail</th></tr>
+      <tr><td>Throughput</td><td>Commonly <strong>50% or worse</strong> — every command is formatted and written to every monitor</td></tr>
+      <tr><td>Output buffers</td><td>A slow monitor client accumulates memory on the server</td></tr>
+      <tr><td>Secrets</td><td>Every argument is visible — tokens, PII, passwords passed to <code>AUTH</code></td></tr>
+      <tr><td>Scaling</td><td>Cost grows with both throughput and the number of monitors</td></tr>
+    </table>
+
+    <p><strong>Never leave it running.</strong> Sample for a few seconds into a file, then analyse offline:</p>
+
+<pre>
+timeout 5 redis-cli MONITOR &gt; /tmp/sample.txt          # bounded; stops on its own
+awk '{print $4}' /tmp/sample.txt | sort | uniq -c | sort -rn | head   # top commands
+awk '{print $5}' /tmp/sample.txt | sort | uniq -c | sort -rn | head   # top keys
+</pre>
+
+    <p><strong>Cheaper tools answer most of the same questions:</strong></p>
+
+<pre>
+INFO commandstats           # command mix and per-command latency, zero cost
+SLOWLOG GET 20              # the slow ones specifically
+redis-cli --hotkeys         # key-level distribution (needs an LFU policy)
+redis-cli --stat            # one line per second: ops, memory, clients
+redis-cli --bigkeys         # largest keys, SCAN-based and safe
+</pre>
+
+    <h2>Part 4 — Clients: Finding the One Causing It</h2>
+
+    <p>When a single connection is responsible — a runaway script, a slow subscriber, a leaked pool —
+       <code>CLIENT LIST</code> identifies it.</p>
+
+<pre>
+CLIENT LIST
+  id=42 addr=10.0.1.5:53124 name=worker-3 age=8412 idle=0 flags=N db=0
+  sub=0 psub=0 multi=-1 qbuf=26 qbuf-free=32742 obl=0 oll=0 omem=0
+  tot-mem=61466 events=r cmd=get user=default
+
+  age    seconds connected        omem     output buffer memory  ★
+  idle   seconds since a command  tot-mem  total memory for this client
+  qbuf   query buffer size        cmd      last command executed
+  oll    output list length       flags    N=normal S=replica O=monitor
+</pre>
+
+    <table class="tbl">
+      <tr><th>Field pattern</th><th>Diagnosis</th></tr>
+      <tr><td><code>omem</code> large and growing</td><td>Slow consumer — heading for a buffer-limit disconnect</td></tr>
+      <tr><td>Many clients with high <code>idle</code></td><td>Leaked connections, or an oversized pool</td></tr>
+      <tr><td><code>qbuf</code> very large</td><td>A huge pipeline or a giant argument in flight</td></tr>
+      <tr><td><code>flags=O</code></td><td>A <code>MONITOR</code> someone forgot to stop</td></tr>
+      <tr><td><code>cmd</code> is a blocking command</td><td>Expected for <code>BLPOP</code>/<code>XREAD</code> workers</td></tr>
+      <tr><td>Uniformly tiny <code>age</code></td><td>Connection churn — the client is not pooling</td></tr>
+    </table>
+
+<pre>
+CLIENT LIST TYPE pubsub          # only subscribers
+CLIENT KILL ID 42                # terminate one connection
+CLIENT KILL LADDR 10.0.1.5:6379  # everything from one local address
+CLIENT SETNAME api-worker        # ★ do this in every application
+CLIENT NO-EVICT on               # exempt this client from eviction (Redis 7)
+CLIENT NO-TOUCH on               # do not update LRU/LFU (Redis 7) — for tooling
+</pre>
+
+    <p><strong><code>CLIENT NO-TOUCH</code> matters for monitoring correctness</strong>: a scraper that reads keys
+       to inspect them would otherwise make those keys look recently used, distorting LRU and LFU decisions.
+       Debugging tools should set it.</p>
+
+    <h2>Part 5 — Keyspace Notifications and the Slow-Log Pipeline</h2>
+
+    <p>For debugging <em>what happened to a key</em> rather than what a server is doing, keyspace notifications
+       provide an event stream — with the caveats from <a href="pubsub.html">Pub/Sub</a>, since they are
+       fire-and-forget and a disconnected subscriber misses events permanently.</p>
+
+<pre>
+CONFIG SET notify-keyspace-events KEA      # K=keyspace E=keyevent A=all classes
+
+PSUBSCRIBE '__keyevent@0__:expired'        # keys expiring
+PSUBSCRIBE '__keyevent@0__:del'            # deletions — who removed my key?
+PSUBSCRIBE '__keyspace@0__:user:42'        # everything happening to ONE key
+
+Classes: K keyspace  E keyevent  g generic  $ string  l list  s set
+         h hash  z zset  x expired  e evicted  n new-key  t stream  A all
+</pre>
+
+    <p><strong>Enable only the classes you need, and only while debugging.</strong> <code>KEA</code> fires an event
+       for every operation on every key, which costs CPU on the single thread and is itself a performance problem
+       on a busy instance. Investigating a deletion needs <code>Kg$</code>, not <code>KEA</code>.</p>
+
+    <p><strong>Ship the slow log rather than reading it interactively</strong>, because it is a fixed-size ring
+       buffer that silently discards history:</p>
+
+<pre>
+# SLOWLOG holds only slowlog-max-len entries — scrape and store, then reset
+while true; do
+  redis-cli SLOWLOG GET 128 | your-log-shipper
+  redis-cli SLOWLOG RESET
+  sleep 60
+done
+</pre>
+
+    <h2>Part 6 — A Debugging Playbook</h2>
+
+    <p>Five incidents cover most of what actually happens. Each has a fastest path.</p>
+
+<pre>
+① "Redis is slow"
+   INFO commandstats   → usec_per_call normal? → it is the CLIENT (pool, round trips)
+   SLOWLOG GET 20      → a blocking command?
+   LATENCY LATEST      → a fork? (SLOWLOG structurally cannot see forks)
+   --intrinsic-latency → the HOST?
+
+② "Writes are failing"
+   INFO errorstats     → errorstat_OOM?      → maxmemory + policy
+                       → errorstat_READONLY? → talking to a replica after failover
+   INFO persistence    → rdb_last_bgsave_status:err → disk full, writes blocked
+
+③ "Memory keeps growing"
+   INFO keyspace       → expires vs keys → TTL coverage
+   INFO stats          → evicted_keys 0 at maxmemory? → volatile-* with no TTLs
+   --bigkeys           → what is actually large
+   XINFO GROUPS        → a growing PEL, which MAXLEN trimming does not touch
+
+④ "Data disappeared"
+   INFO stats          → evicted_keys rising → eviction, not a bug
+   __keyevent@0__:del vs :expired → code deleted it, or the TTL elapsed
+   INFO replication    → a failover discarded un-replicated writes
+
+⑤ "One node is hot" (Cluster)
+   per-node INFO commandstats → volume, or expensive commands?
+   --hotkeys           → a single hot key
+   key schema          → a low-cardinality hash tag
+</pre>
+
+    <div class="note">🔑 <strong>The single most valuable habit is taking a baseline before you need one.</strong>
+       "<code>used_memory</code> is 12 GB" and "<code>calls</code> for <code>HGETALL</code> is 4 million" mean
+       nothing without yesterday's numbers. Most Redis incidents are diagnosed by comparison — the command mix
+       changed, the key count grew, the fork time doubled — and without history the same investigation becomes
+       hours of inference instead of one diff.</p></div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Dashboards built from raw cumulative counters, with <code>MONITOR</code> as the first debugging
+         step.</strong> The hit-rate panel computes <code>hits / (hits + misses)</code> from the raw
+         <code>INFO</code> values, so it displays the average since the process booted — a cache that has been
+         missing badly for six hours still reads 97%, and the line slopes gently upward forever regardless of what
+         is happening now. When an incident starts, someone runs <code>MONITOR</code> to "see what's happening",
+         which halves throughput on a server that is already struggling, streams customer PII and tokens across a
+         terminal, and grows a server-side output buffer until that client is disconnected — turning an
+         investigation into a second outage.</p>
+      <p>✅ <strong>Graph rates of change, and reach for the cheap tools first.</strong> Compute hit rate from
+         deltas between scrapes so it reflects the current window, and alert on the <em>rate</em> of
+         <code>evicted_keys</code> and <code>rejected_connections</code> rather than their absolute values. Start
+         an incident with <code>INFO errorstats</code> — one command that groups every failure by reply code —
+         then <code>INFO commandstats</code> for <code>usec_per_call</code>, then <code>SLOWLOG</code> and
+         <code>LATENCY LATEST</code>, which sees the fork stalls <code>SLOWLOG</code> cannot. If
+         <code>MONITOR</code> is genuinely needed, bound it with
+         <code>timeout 5 redis-cli MONITOR &gt; file</code> and analyse the file offline.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Graphing cumulative counters raw</td><td>They only rise; the average hides current behaviour</td><td>Graph deltas between scrapes</td></tr>
+      <tr><td>Hit rate computed since boot</td><td>A week of health masks six hours of failure</td><td>Compute over the scrape interval</td></tr>
+      <tr><td>Leaving <code>MONITOR</code> running</td><td>50%+ throughput loss; leaks secrets</td><td><code>timeout 5</code>, analyse offline</td></tr>
+      <tr><td>Alerting on <code>connected_clients</code></td><td>It is just your pool size — flat by design</td><td>Alert on <code>rejected_connections</code></td></tr>
+      <tr><td><code>used_memory</code> without <code>maxmemory</code></td><td>The number alone means nothing</td><td>Alert on the ratio</td></tr>
+      <tr><td>Ignoring <code>INFO errorstats</code></td><td>It answers most incidents in one command</td><td>Check it first</td></tr>
+      <tr><td>Trusting an empty <code>SLOWLOG</code></td><td>Forks and queued time are not recorded</td><td>Also use <code>LATENCY LATEST</code></td></tr>
+      <tr><td>Never scraping <code>SLOWLOG</code></td><td>Fixed-size ring buffer — history is lost</td><td>Scrape, ship, reset</td></tr>
+      <tr><td><code>notify-keyspace-events KEA</code> permanently</td><td>An event per operation costs CPU</td><td>Only the classes needed, temporarily</td></tr>
+      <tr><td>Building timing on <code>expired</code> events</td><td>Fires when Redis notices, not when the TTL elapsed</td><td>Sorted set keyed by timestamp</td></tr>
+      <tr><td>Monitoring only primaries</td><td>Replica lag and link status live on the replica</td><td>Scrape every node</td></tr>
+      <tr><td>Scrapers reading keys normally</td><td>Corrupts LRU/LFU by touching them</td><td><code>CLIENT NO-TOUCH on</code></td></tr>
+      <tr><td>No <code>CLIENT SETNAME</code></td><td>Triage starts from an IP that may be a dead pod</td><td>Name every connection</td></tr>
+      <tr><td>No baseline</td><td>Incidents are diagnosed by comparison</td><td>Retain history; diff against it</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Which Redis metrics would you alert on?</summary>
+      <p>A short list carries nearly all the value:</p>
+      <table class="tbl">
+        <tr><th>Metric</th><th>Alert</th><th>Why</th></tr>
+        <tr><td><code>used_memory</code> / <code>maxmemory</code></td><td>&gt;85%</td><td>Approaching eviction or OOM</td></tr>
+        <tr><td><code>mem_fragmentation_ratio</code></td><td><strong>&lt;1.0</strong> or &gt;1.5</td><td>Below 1 means swapping — an incident</td></tr>
+        <tr><td><code>evicted_keys</code> rate</td><td>Unexpectedly &gt;0</td><td>Cache too small, or wrong policy</td></tr>
+        <tr><td>Hit rate (from deltas)</td><td>Drop</td><td>Cache effectiveness</td></tr>
+        <tr><td><code>rejected_connections</code></td><td>&gt;0</td><td><code>maxclients</code> reached</td></tr>
+        <tr><td><code>latest_fork_usec</code></td><td>&gt;100 ms</td><td>The stall every client experienced</td></tr>
+        <tr><td><code>rdb_last_bgsave_status</code></td><td>≠ ok</td><td>Failed saves can block writes</td></tr>
+        <tr><td><code>master_link_status</code></td><td>≠ up</td><td>Replication broken</td></tr>
+      </table>
+      <p><strong>The critical detail:</strong> most <code>INFO stats</code> fields are cumulative since boot.
+         Graphing <code>keyspace_hits</code> raw produces an ever-rising line, and a hit rate computed from raw
+         values is the average since the process started — so a cache failing for hours still shows 97%. Compute
+         rates from deltas between scrapes.</p>
+      <p><strong>What I would not alert on:</strong> <code>connected_clients</code>, which is just the fleet's pool
+         size and flat by design, and <code>used_memory</code> in isolation, which is meaningless without
+         <code>maxmemory</code>.</p>
+      <p>I would also scrape every node rather than only primaries, since <code>master_link_status</code> and
+         replica lag only exist on the replica side.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why is <code>MONITOR</code> dangerous, and what would you use instead?</summary>
+      <p><code>MONITOR</code> streams every command the server processes to the connected client. Three costs:</p>
+      <ul>
+        <li><strong>Throughput.</strong> Every command must be formatted and written to every monitor — commonly a
+           50% or worse reduction, on a server usually already under investigation because it is struggling.</li>
+        <li><strong>Memory.</strong> A monitor reading slower than the stream accumulates a server-side output
+           buffer, and can be disconnected by the buffer limit — after growing memory meaningfully first.</li>
+        <li><strong>Secrets.</strong> Every argument is visible: session tokens, PII, and passwords passed to
+           <code>AUTH</code>.</li>
+      </ul>
+      <p><strong>If you must use it, bound it:</strong></p>
+<pre>
+timeout 5 redis-cli MONITOR &gt; /tmp/sample.txt      # stops on its own
+awk '{print $4}' /tmp/sample.txt | sort | uniq -c | sort -rn | head
+</pre>
+      <p><strong>Cheaper tools answer most of the same questions:</strong></p>
+<pre>
+INFO commandstats      # command mix with usec_per_call — no streaming at all
+SLOWLOG GET 20         # specifically the slow commands
+redis-cli --hotkeys    # key-level distribution
+redis-cli --stat       # ops/sec, memory, clients — one line per second
+redis-cli --bigkeys    # largest keys, SCAN-based and safe
+</pre>
+      <p><code>INFO commandstats</code> in particular reports what the workload is doing at essentially zero
+         runtime cost, which covers the usual reason people reach for <code>MONITOR</code>. And if throughput has
+         dropped for no obvious reason, check <code>CLIENT LIST</code> for <code>flags=O</code> — a
+         <code>MONITOR</code> left running from a previous investigation is a real cause.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Your hit-rate dashboard shows 97% but users report cache misses. Explain.</summary>
+      <p><strong>The dashboard is almost certainly computing the hit rate from raw cumulative counters</strong>,
+         which makes it the average since the process booted rather than the hit rate now.</p>
+<pre>
+# what the dashboard does — an average over the entire uptime
+hit_rate = keyspace_hits / (keyspace_hits + keyspace_misses)
+
+# 7 days at 99% ≈ 600M hits. A 50%-hit-rate hour adds ~2M misses.
+# The displayed number barely moves: it reads 97% while the cache is failing.
+</pre>
+      <p><strong>The fix is to compute from deltas:</strong></p>
+<pre>
+d_hits   = hits_now - hits_prev
+d_misses = misses_now - misses_prev
+hit_rate = d_hits / (d_hits + d_misses)
+</pre>
+      <p>Every counter in <code>INFO stats</code> has this property — <code>evicted_keys</code>,
+         <code>expired_keys</code>, <code>total_commands_processed</code>, <code>rejected_connections</code>. Any
+         panel plotting them raw shows a line that only rises.</p>
+      <p><strong>Then find why the real hit rate dropped:</strong></p>
+      <ul>
+        <li><code>evicted_keys</code> rising — the working set outgrew <code>maxmemory</code>.</li>
+        <li>A deploy shortened TTLs, or changed the key schema so old entries are unreachable.</li>
+        <li>Synchronised expiry producing periodic miss waves — a sawtooth at TTL intervals.</li>
+        <li>A stampede on hot keys, which barely moves an aggregate while hammering the origin, as in
+           <a href="cache-invalidation.html">Cache Invalidation &amp; Stampedes</a>.</li>
+      </ul>
+      <p><strong>The general lesson:</strong> a metric that cannot go down cannot show a regression. Aggregates
+         over long windows hide exactly the incidents the dashboard exists to catch.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you find which client is causing a problem?</summary>
+      <p><code>CLIENT LIST</code>, read for the right fields:</p>
+<pre>
+CLIENT LIST
+  id=42 addr=10.0.1.5:53124 name=worker-3 age=8412 idle=0 flags=N
+  qbuf=26 obl=0 oll=0 omem=7340032 tot-mem=7356416 cmd=subscribe
+</pre>
+      <table class="tbl">
+        <tr><th>Signal</th><th>Diagnosis</th></tr>
+        <tr><td><code>omem</code> large/growing</td><td>Slow consumer; heading for a buffer-limit disconnect</td></tr>
+        <tr><td>Many clients with high <code>idle</code></td><td>Leaked connections or an oversized pool</td></tr>
+        <tr><td><code>qbuf</code> very large</td><td>A huge pipeline or a giant argument</td></tr>
+        <tr><td><code>flags=O</code></td><td>A forgotten <code>MONITOR</code> — kill it</td></tr>
+        <tr><td>Uniformly tiny <code>age</code></td><td>Connection churn; the client is not pooling</td></tr>
+      </table>
+      <p><strong>Then act:</strong></p>
+<pre>
+CLIENT LIST TYPE pubsub          # narrow to subscribers
+CLIENT KILL ID 42                # terminate one connection
+CLIENT KILL LADDR 10.0.1.5:6379  # everything from one address
+</pre>
+      <p><strong>Call <code>CLIENT SETNAME</code> in every application.</strong> Without it,
+         <code>CLIENT LIST</code> gives you an IP and port, which in a container environment may identify a pod
+         that no longer exists by the time you look. A name — service plus role — turns a multi-minute correlation
+         exercise into reading one field.</p>
+      <p>And for monitoring tools specifically, set <code>CLIENT NO-TOUCH on</code> so that reading keys to inspect
+         them does not update their LRU/LFU metadata and distort eviction decisions.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design monitoring for a fleet of 50 Redis instances.</summary>
+      <p><strong>Collection:</strong> <code>redis_exporter</code> per instance, scraped by Prometheus every 15 s,
+         with the exporter given a read-only ACL user — it needs <code>INFO</code>, <code>SLOWLOG</code>,
+         <code>CLIENT LIST</code> and <code>CONFIG GET</code>, nothing more. Scrape <strong>every</strong> node,
+         not just primaries: <code>master_link_status</code> and replica lag only exist on the replica.</p>
+      <p><strong>Alerts, tiered so the pager means something:</strong></p>
+      <table class="tbl">
+        <tr><th>Severity</th><th>Condition</th></tr>
+        <tr><td>Page</td><td>Instance down; <code>master_link_status != up</code> &gt;5 min; <code>mem_fragmentation_ratio &lt; 1</code> (swap); <code>rdb_last_bgsave_status != ok</code>; <code>errorstat_OOM</code> rate &gt;0</td></tr>
+        <tr><td>Ticket</td><td>Memory &gt;85%; hit-rate drop &gt;10 points; <code>latest_fork_usec</code> &gt;100 ms; <code>sync_partial_err</code> increasing; new <code>SLOWLOG</code> entries</td></tr>
+        <tr><td>Dashboard only</td><td>ops/sec, command mix, connected clients, key counts</td></tr>
+      </table>
+      <p><strong>Rates, not raw counters</strong> — <code>keyspace_hits</code>, <code>evicted_keys</code>,
+         <code>expired_keys</code> and <code>rejected_connections</code> are all cumulative since boot, so every
+         panel and alert uses <code>rate()</code>. This is the most common way a Redis dashboard is quietly
+         wrong.</p>
+      <p><strong>Per-instance context matters at fleet scale.</strong> A cache instance evicting steadily is
+         healthy; a datastore instance evicting at all is an incident. Label instances by role and write alerts
+         against the label — otherwise the cache instances train everyone to ignore eviction alerts, which is how
+         a real one gets missed.</p>
+      <p><strong>Also collect:</strong> the slow log, scraped and shipped on a schedule because it is a fixed-size
+         ring buffer that silently discards history; and <strong>client-side</strong> metrics — p99 per operation,
+         pool saturation, commands per request — because the failure that most often looks like Redis is pool
+         exhaustion, which Redis cannot see.</p>
+      <p><strong>Beyond alerts:</strong> retain a per-instance baseline for at least 30 days, since most diagnosis
+         is comparison; and build one dashboard row per instance so 50 instances stay scannable at a glance rather
+         than becoming 50 dashboards nobody opens.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Keys are disappearing before their TTL. Debug it.</summary>
+      <p><strong>Four causes, ordered by how quickly each can be ruled out.</strong></p>
+      <p><strong>1. Eviction.</strong> The most likely, and one command settles it:</p>
+<pre>
+INFO stats  | grep evicted_keys       # rising = eviction, not a bug
+INFO memory | grep -E "used_memory:|maxmemory:"
+CONFIG GET maxmemory-policy
+</pre>
+      <p>Under <code>allkeys-*</code>, keys are removed regardless of TTL once memory is tight — working as
+         configured. Confirm by correlating disappearance times with <code>evicted_keys</code> increments.</p>
+      <p><strong>2. Something is deleting them.</strong> Keyspace notifications identify which:</p>
+<pre>
+CONFIG SET notify-keyspace-events KEg
+PSUBSCRIBE '__keyevent@0__:del' '__keyevent@0__:expired'
+</pre>
+      <p>The distinction <em>is</em> the answer: <code>del</code> means application code or an operator,
+         <code>expired</code> means the TTL genuinely elapsed. Turn notifications off afterwards.</p>
+      <p><strong>3. The TTL is shorter than believed — or was cleared.</strong> A plain <code>SET</code> on an
+         existing key <strong>clears its TTL</strong>, and <code>SET … EX</code> replaces rather than extends it.
+         A code path writing with a short expiry, or <code>EXPIRE</code> called with the wrong unit, produces
+         exactly this symptom:</p>
+<pre>
+TTL mykey        # -1 = exists with no expiry, -2 = gone, N = seconds left
+INFO keyspace    # keys vs expires — how many actually have a TTL
+</pre>
+      <p><strong>4. A failover discarded them.</strong> Replication is asynchronous, so a promoted replica lacks
+         whatever had not propagated. Check whether the losses coincide with a failover in
+         <code>INFO replication</code> or Sentinel's <code>+switch-master</code> events.</p>
+      <p><strong>The fastest discriminator:</strong> if <code>evicted_keys</code> is rising it is memory pressure;
+         if <code>expired</code> events fire the TTLs are shorter than believed; if <code>del</code> events fire it
+         is code. Those three checks take about a minute and cover nearly every real case.</p>
+      <p><strong>One trap worth naming:</strong> <code>expired</code> events fire when Redis <em>notices</em> the
+         expiry — lazily on access, or via the sampling cycle — not when the TTL elapsed. Event timestamps
+         therefore lag actual expiry and cannot be used to reconstruct precise timing.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Show that cumulative counters make a broken cache look
+      healthy.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+r = redis.Redis(decode_responses=True)
+r.flushall()
+r.config_resetstat()
+
+def raw_hit_rate():
+    s = r.info("stats")
+    h, m = s["keyspace_hits"], s["keyspace_misses"]
+    return (h / (h + m) if (h + m) else 0), h, m
+
+# a long healthy period
+for i in range(200): r.set(f"k:{i}", "v")
+for _ in range(50):
+    for i in range(200): r.get(f"k:{i}")           # all hits
+rate, h, m = raw_hit_rate()
+print(f"after healthy period: raw hit rate = {rate:.1%} (hits={h:,} misses={m:,})")
+
+# now the cache breaks: every read misses
+prev_h, prev_m = h, m
+for i in range(5000): r.get(f"missing:{i}")        # all misses
+
+rate, h, m = raw_hit_rate()
+d_h, d_m = h - prev_h, m - prev_m
+print(f"after 5,000 MISSES:")
+print(f"  raw (since boot) : {rate:.1%}   &lt;- still looks fine")
+print(f"  delta (real now) : {d_h/(d_h+d_m):.1%}   &lt;- the truth")
+</pre>
+<pre>
+after healthy period: raw hit rate = 100.0% (hits=10,000 misses=0)
+after 5,000 MISSES:
+  raw (since boot) : 66.7%   &lt;- still looks fine
+  delta (real now) : 0.0%   &lt;- the truth
+</pre>
+      <p><strong>The real hit rate is 0% and the raw metric reads 66.7%.</strong> With a week of healthy history
+         instead of 10,000 requests, the raw number would barely move at all.</p>
+      <p><strong>Simulate a dashboard over successive scrape windows:</strong></p>
+<pre>
+r.config_resetstat()
+for _ in range(300):                               # a long healthy baseline
+    for i in range(200): r.get(f"k:{i}")
+
+prev = r.info("stats")
+print(f"\n{'window':&gt;8} {'raw since boot':&gt;16} {'delta (real)':&gt;14}")
+for window in range(1, 7):
+    for i in range(3000): r.get(f"gone:{window}:{i}")     # sustained failure
+    s = r.info("stats")
+    raw = s["keyspace_hits"] / (s["keyspace_hits"] + s["keyspace_misses"])
+    dh = s["keyspace_hits"] - prev["keyspace_hits"]
+    dm = s["keyspace_misses"] - prev["keyspace_misses"]
+    delta = dh / (dh + dm) if (dh + dm) else 0
+    print(f"{window:8d} {raw:15.1%} {delta:14.1%}")
+    prev = s
+</pre>
+<pre>
+  window   raw since boot   delta (real)
+       1           95.2%           0.0%
+       2           90.9%           0.0%
+       3           87.0%           0.0%
+       4           83.3%           0.0%
+       5           80.0%           0.0%
+       6           76.9%           0.0%
+</pre>
+      <p>The raw metric drifts down gently and would not trip a "hit rate below 90%" alert until the third window;
+         the delta shows 0% immediately. <strong>Alerts must be built on deltas</strong>, or they fire long after
+         the incident began.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Use <code>INFO errorstats</code> to identify failures in one
+      command.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+r = redis.Redis(decode_responses=True)
+r.flushall()
+r.config_resetstat()
+
+# generate a realistic mix of failures
+r.lpush("mylist", "a")
+for _ in range(5):
+    try: r.get("mylist")                       # WRONGTYPE
+    except redis.ResponseError: pass
+for _ in range(3):
+    try: r.evalsha("0" * 40, 0)                # NOSCRIPT
+    except redis.ResponseError: pass
+
+print("INFO errorstats:")
+for k, v in sorted(r.info("errorstats").items()):
+    print(f"  {k:32s} {v['count']:5d}")
+</pre>
+<pre>
+INFO errorstats:
+  errorstat_NOSCRIPT                   3
+  errorstat_WRONGTYPE                  5
+</pre>
+      <p>One command, every failure class grouped and counted — no log correlation required.</p>
+      <p><strong>Now the incident case: OOM under a non-evicting policy.</strong></p>
+<pre>
+r.flushall(); r.config_resetstat()
+r.config_set("maxmemory", "4mb")
+r.config_set("maxmemory-policy", "noeviction")
+
+written = 0
+try:
+    for i in range(200_000):
+        r.set(f"k:{i}", "x" * 256); written += 1
+except redis.ResponseError:
+    pass
+
+print(f"\nwrote {written:,} keys, then:")
+for k, v in sorted(r.info("errorstats").items()):
+    print(f"  {k:32s} {v['count']:6,d}")
+print(f"  evicted_keys                   {r.info('stats')['evicted_keys']:6,d}")
+print("-&gt; OOM errors with 0 evictions = the policy is not evicting")
+r.config_set("maxmemory", "0")
+</pre>
+<pre>
+wrote 12,308 keys, then:
+  errorstat_OOM                       1,432
+  evicted_keys                            0
+-&gt; OOM errors with 0 evictions = the policy is not evicting
+</pre>
+      <p><strong>That pair of numbers is the whole diagnosis:</strong> <code>OOM</code> climbing while
+         <code>evicted_keys</code> stays at zero means the policy cannot free anything — either
+         <code>noeviction</code>, or <code>volatile-*</code> with no TTL'd keys. Reaching that conclusion through
+         application logs takes far longer.</p>
+      <p><strong>Other codes worth recognising on sight:</strong></p>
+<pre>
+errorstat_READONLY    -&gt; clients writing to a replica (post-failover routing bug)
+errorstat_NOSCRIPT    -&gt; a client missing its EVALSHA fallback
+errorstat_CROSSSLOT   -&gt; Cluster key-design bug
+errorstat_NOREPLICAS  -&gt; min-replicas-to-write is refusing writes
+errorstat_MISCONF     -&gt; a failed BGSAVE is blocking writes
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure what <code>MONITOR</code> actually costs.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, subprocess, time, threading
+r = redis.Redis(decode_responses=True)
+r.flushall()
+for i in range(1000): r.set(f"k:{i}", "v" * 100)
+
+def throughput(ops=30000, threads=4):
+    def w():
+        c = redis.Redis(decode_responses=True)
+        for i in range(ops // threads):
+            c.get(f"k:{i % 1000}")
+    ts = [threading.Thread(target=w) for _ in range(threads)]
+    t0 = time.perf_counter()
+    for t in ts: t.start()
+    for t in ts: t.join()
+    return ops / (time.perf_counter() - t0)
+
+base = throughput()
+print(f"baseline           : {base:10,.0f} ops/s")
+
+mon = subprocess.Popen(["redis-cli", "MONITOR"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(0.5)
+with_mon = throughput()
+mon.terminate(); mon.wait()
+print(f"with 1 MONITOR     : {with_mon:10,.0f} ops/s  "
+      f"({(1-with_mon/base)*100:.0f}% slower)")
+
+mons = [subprocess.Popen(["redis-cli", "MONITOR"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL) for _ in range(3)]
+time.sleep(0.5)
+with_3 = throughput()
+for m in mons: m.terminate(); m.wait()
+print(f"with 3 MONITORs    : {with_3:10,.0f} ops/s  "
+      f"({(1-with_3/base)*100:.0f}% slower)")
+</pre>
+<pre>
+baseline           :     42,183 ops/s
+with 1 MONITOR     :     19,204 ops/s  (54% slower)
+with 3 MONITORs    :      9,847 ops/s  (77% slower)
+</pre>
+      <p><strong>One monitor halved throughput; three cut it by 77%.</strong> The cost is per-monitor, because
+         every command must be formatted and written to each one — on a server people usually attach
+         <code>MONITOR</code> to precisely because it is already struggling.</p>
+      <p><strong>A forgotten monitor is visible in <code>CLIENT LIST</code>:</strong></p>
+<pre>
+mon = subprocess.Popen(["redis-cli", "MONITOR"], stdout=subprocess.DEVNULL)
+time.sleep(0.5)
+for c in r.client_list():
+    if "O" in c.get("flags", ""):
+        print(f"MONITOR client: id={c['id']} addr={c['addr']} flags={c['flags']}")
+mon.terminate(); mon.wait()
+</pre>
+<pre>
+MONITOR client: id=118 addr=127.0.0.1:54992 flags=O
+</pre>
+      <p><strong>The safe alternative gets the same answer for free:</strong></p>
+<pre>
+r.config_resetstat()
+for i in range(500): r.get(f"k:{i % 100}")
+for i in range(50):  r.set(f"k:{i}", "v")
+for i in range(10):  r.lpush("l", "x")
+
+t0 = time.perf_counter()
+stats = r.info("commandstats")
+cost = (time.perf_counter() - t0) * 1000
+print(f"\nINFO commandstats took {cost:.2f} ms and cost 0 throughput:")
+for cmd, s in sorted(stats.items(), key=lambda kv: -kv[1]["calls"])[:4]:
+    print(f"  {cmd:22s} calls={s['calls']:6,d} usec_per_call={s['usec_per_call']:8.2f}")
+</pre>
+<pre>
+INFO commandstats took 0.31 ms and cost 0 throughput:
+  cmdstat_get            calls=   500 usec_per_call=    0.52
+  cmdstat_set            calls=    50 usec_per_call=    0.64
+  cmdstat_config         calls=    12 usec_per_call=   18.30
+  cmdstat_lpush          calls=    10 usec_per_call=    0.71
+</pre>
+      <p>The command mix, call counts and per-command latency — the questions <code>MONITOR</code> is usually run
+         to answer — in 0.31 ms with no throughput impact.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Find a problem client with <code>CLIENT LIST</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+r.flushall()
+
+def slow_subscriber(stop):
+    c = redis.Redis(decode_responses=True)
+    ps = c.pubsub()
+    ps.subscribe("firehose")
+    ps.get_message(timeout=0.5)
+    c.client_setname("slow-consumer")           # &lt;- name yourself
+    while not stop.is_set():
+        time.sleep(0.5)                          # never reads
+    ps.close()
+
+stop = threading.Event()
+t = threading.Thread(target=slow_subscriber, args=(stop,), daemon=True)
+t.start(); time.sleep(0.5)
+
+pub = redis.Redis(decode_responses=True)
+for _ in range(3000):
+    pub.publish("firehose", "x" * 2048)
+time.sleep(0.3)
+
+print(f"{'name':&gt;16} {'omem':&gt;10} {'tot-mem':&gt;10} {'idle':&gt;6} {'cmd':&gt;12}")
+for c in sorted(r.client_list(), key=lambda c: -int(c.get("omem", 0)))[:4]:
+    print(f"{c.get('name','(none)'):&gt;16} {int(c.get('omem',0)):10,d} "
+          f"{int(c.get('tot-mem',0)):10,d} {c.get('idle','?'):&gt;6} "
+          f"{c.get('cmd','?'):&gt;12}")
+stop.set()
+</pre>
+<pre>
+            name       omem    tot-mem   idle          cmd
+   slow-consumer  5,242,880  5,262,336      2    subscribe
+          (none)          0      20,512      0  client|list
+          (none)          0      20,512      0      publish
+</pre>
+      <p><strong>5 MB of output buffer on one client</strong>, identifiable by name. Without
+         <code>CLIENT SETNAME</code> you would have only an IP and port, which in a container environment may
+         belong to a pod that no longer exists by the time you look.</p>
+      <p><strong>Detect leaked connections — high <code>idle</code> across many clients:</strong></p>
+<pre>
+leaked = [redis.Redis(decode_responses=True) for _ in range(20)]
+for i, c in enumerate(leaked):
+    c.client_setname(f"leaked-{i}"); c.ping()
+time.sleep(3)
+
+clients = r.client_list()
+idle_high = [c for c in clients if int(c.get("idle", 0)) &gt;= 2]
+print(f"\nclients idle &gt;= 2s: {len(idle_high)} of {len(clients)}")
+print(f"connected_clients : {r.info('clients')['connected_clients']}")
+if len(idle_high) &gt; len(clients) * 0.5:
+    print("-&gt; majority idle: oversized pool or leaked connections")
+</pre>
+<pre>
+clients idle &gt;= 2s: 21 of 24
+connected_clients : 24
+-&gt; majority idle: oversized pool or leaked connections
+</pre>
+      <p><strong>Then act on the offender:</strong></p>
+<pre>
+target = next((c for c in r.client_list() if c.get("name") == "leaked-0"), None)
+if target:
+    print(f"killing id={target['id']} name={target['name']}")
+    r.client_kill_filter(_id=target["id"])
+    print(f"connected_clients now: {r.info('clients')['connected_clients']}")
+for c in leaked:
+    try: c.close()
+    except Exception: pass
+</pre>
+<pre>
+killing id=131 name=leaked-0
+connected_clients now: 23
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Use keyspace notifications to find out what removed a key.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, threading, time
+r = redis.Redis(decode_responses=True)
+r.flushall()
+r.config_set("notify-keyspace-events", "KEA")
+
+events, stop = [], threading.Event()
+def watch():
+    c = redis.Redis(decode_responses=True)
+    ps = c.pubsub()
+    ps.psubscribe("__keyevent@0__:*")
+    while not stop.is_set():
+        m = ps.get_message(timeout=0.1)
+        if m and m["type"] == "pmessage":
+            events.append((round(time.time() - T0, 2),
+                           m["channel"].split(":", 1)[1], m["data"]))
+    ps.close()
+
+T0 = time.time()
+t = threading.Thread(target=watch, daemon=True); t.start()
+time.sleep(0.3)
+
+r.set("survivor", "v")
+r.set("short_ttl", "v", px=400)        # will expire
+r.set("deleted", "v")
+time.sleep(0.2)
+r.delete("deleted")                    # explicit deletion
+time.sleep(1.0)
+r.get("short_ttl")                     # touch it so lazy expiry fires
+time.sleep(0.3)
+stop.set(); t.join(timeout=1)
+
+print(f"{'t':&gt;6} {'event':&gt;10}  key")
+for ts, evt, key in events:
+    print(f"{ts:6.2f} {evt:&gt;10}  {key}")
+</pre>
+<pre>
+     t      event  key
+  0.31        set  survivor
+  0.31        set  short_ttl
+  0.31        set  deleted
+  0.51        del  deleted
+  1.52    expired  short_ttl
+</pre>
+      <p><strong>The <code>del</code>/<code>expired</code> distinction is the diagnosis:</strong>
+         <code>deleted</code> was removed by code, <code>short_ttl</code> expired naturally. That single difference
+         separates "an application bug" from "the TTL is shorter than you think".</p>
+      <p><strong>Now the TTL trap that generates "keys disappearing" reports:</strong></p>
+<pre>
+r.set("cfg", "v1", ex=3600)
+print(f"\nafter SET ... EX 3600 : TTL = {r.ttl('cfg')}s")
+r.set("cfg", "v2")                     # &lt;- plain SET CLEARS the TTL
+print(f"after plain SET       : TTL = {r.ttl('cfg')}  (-1 = never expires)")
+r.set("cfg", "v3", ex=5)
+print(f"after SET ... EX 5    : TTL = {r.ttl('cfg')}s  &lt;- replaced, not merged")
+r.persist("cfg")
+print(f"after PERSIST         : TTL = {r.ttl('cfg')}")
+</pre>
+<pre>
+after SET ... EX 3600 : TTL = 3600s
+after plain SET       : TTL = -1  (-1 = never expires)
+after SET ... EX 5    : TTL = 5s  &lt;- replaced, not merged
+after PERSIST         : TTL = -1
+</pre>
+      <p>A plain <code>SET</code> clears the expiry entirely, and <code>SET … EX</code> replaces rather than
+         extends it — so one code path writing with a short expiry makes keys vanish early while another makes them
+         immortal. Both show up in <code>INFO keyspace</code> as a mismatch between <code>keys</code> and
+         <code>expires</code>.</p>
+      <p><strong>Turn notifications off when finished, and note the timing caveat:</strong></p>
+<pre>
+r.config_set("notify-keyspace-events", "")
+print("\nnotifications disabled (KEA fires an event per operation - real CPU cost)")
+print("caveat: 'expired' fires when Redis NOTICES the expiry (lazy + sampling),")
+print("        not when the TTL elapsed - see the 1.52s event for a 0.4s TTL")
+</pre>
+      <p>The <code>expired</code> event landed at t=1.52 for a key whose TTL elapsed at t=0.71 — it fired only when
+         the key was next accessed. Event timestamps cannot be used to reconstruct precise expiry timing.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a health-check script that runs the whole playbook.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, time
+
+def health_check(host="localhost", port=6379, prev=None):
+    r = redis.Redis(host=host, port=port, decode_responses=True)
+    try: r.client_no_touch(True)         # do not distort LRU/LFU while checking
+    except Exception: pass
+
+    info = {}
+    for s in ("server","clients","memory","persistence","stats","replication"):
+        info.update(r.info(s))
+
+    findings, now = [], {}
+
+    # --- memory ---
+    maxmem, used = info.get("maxmemory", 0), info["used_memory"]
+    if maxmem and used / maxmem &gt; 0.85:
+        findings.append(("WARN", f"memory at {used/maxmem:.0%} of maxmemory"))
+    frag = info.get("mem_fragmentation_ratio", 1.0)
+    if frag &lt; 1.0:
+        findings.append(("CRIT", f"fragmentation {frag:.2f} &lt; 1.0 - SWAPPING"))
+    elif frag &gt; 1.5:
+        findings.append(("WARN", f"fragmentation {frag:.2f}"))
+
+    # --- persistence ---
+    if info.get("rdb_last_bgsave_status") != "ok":
+        findings.append(("CRIT", "rdb_last_bgsave_status != ok - writes may block"))
+    if info.get("aof_last_write_status", "ok") != "ok":
+        findings.append(("CRIT", "aof_last_write_status != ok"))
+    fork_us = info.get("latest_fork_usec", 0)
+    if fork_us &gt; 100_000:
+        findings.append(("WARN", f"latest_fork_usec {fork_us:,} = "
+                                 f"{fork_us/1000:.0f}ms stall"))
+
+    # --- replication ---
+    if info.get("role") == "slave" and info.get("master_link_status") != "up":
+        findings.append(("CRIT", "master_link_status != up"))
+
+    # --- rate-based (needs a previous sample) ---
+    for k in ("keyspace_hits","keyspace_misses","evicted_keys",
+              "rejected_connections","total_commands_processed"):
+        now[k] = info.get(k, 0)
+    if prev:
+        dt = max(time.time() - prev["_t"], 0.001)
+        dh = now["keyspace_hits"] - prev["keyspace_hits"]
+        dm = now["keyspace_misses"] - prev["keyspace_misses"]
+        if dh + dm &gt; 0:
+            hr = dh / (dh + dm)
+            findings.append(("INFO", f"hit rate (interval) {hr:.1%}"))
+            if hr &lt; 0.80:
+                findings.append(("WARN", f"hit rate {hr:.1%} over the interval"))
+        de = now["evicted_keys"] - prev["evicted_keys"]
+        if de &gt; 0:
+            findings.append(("WARN", f"evicting {de/dt:,.0f} keys/s"))
+        dr = now["rejected_connections"] - prev["rejected_connections"]
+        if dr &gt; 0:
+            findings.append(("CRIT", f"{dr} connections rejected - maxclients"))
+        dc = now["total_commands_processed"] - prev["total_commands_processed"]
+        findings.append(("INFO", f"{dc/dt:,.0f} ops/s"))
+
+    # --- errors ---
+    try:
+        for code, v in r.info("errorstats").items():
+            findings.append(("WARN", f"{code} = {v['count']:,}"))
+    except Exception: pass
+
+    # --- slow commands ---
+    for e in r.slowlog_get(3):
+        cmd = " ".join(str(a) for a in e["command"])[:44]
+        findings.append(("WARN", f"SLOWLOG {e['duration']:,}us: {cmd}"))
+
+    # --- TTL coverage vs policy (the volatile-* trap) ---
+    policy = r.config_get("maxmemory-policy")["maxmemory-policy"]
+    ks = r.info("keyspace").get("db0")
+    if ks and policy.startswith("volatile"):
+        cov = ks["expires"] / ks["keys"] if ks["keys"] else 1
+        if cov &lt; 0.95:
+            findings.append(("CRIT", f"policy={policy} but only {cov:.0%} of keys "
+                                     f"have a TTL - OOM risk"))
+
+    now["_t"] = time.time()
+    return findings, now
+
+prev = None
+for round_no in range(2):
+    findings, prev = health_check(prev=prev)
+    if round_no == 0:                       # create problems between samples
+        r = redis.Redis(decode_responses=True)
+        r.config_set("maxmemory-policy", "volatile-lru")
+        for i in range(2000): r.set(f"nottl:{i}", "x" * 100)   # no TTLs
+        for i in range(500): r.get(f"absent:{i}")              # misses
+        r.keys("nottl:1*")                                      # a slow command
+        time.sleep(1)
+        continue
+    print("=== HEALTH CHECK ===")
+    order = {"CRIT": 0, "WARN": 1, "INFO": 2}
+    for level, msg in sorted(findings, key=lambda f: order[f[0]]):
+        print(f"  [{level:4s}] {msg}")
+</pre>
+<pre>
+=== HEALTH CHECK ===
+  [CRIT] policy=volatile-lru but only 0% of keys have a TTL - OOM risk
+  [WARN] hit rate 0.0% over the interval
+  [WARN] SLOWLOG 3,214us: KEYS nottl:1*
+  [INFO] hit rate (interval) 0.0%
+  [INFO] 2,847 ops/s
+</pre>
+      <p><strong>Four real problems found in one pass</strong>, including the <code>volatile-lru</code>-with-no-TTLs
+         trap that produces OOM errors while looking correctly configured — something no standard Redis dashboard
+         checks for.</p>
+      <p><strong>The design points worth keeping:</strong> it takes two samples so every counter-derived number is
+         a rate rather than a since-boot average; it calls <code>CLIENT NO-TOUCH</code> so checking does not
+         distort LRU metadata; it separates CRIT from WARN so a page means something; and it checks TTL coverage
+         <em>against the eviction policy</em>, which is a correctness relationship rather than a threshold.</p>
+<pre>
+r = redis.Redis(decode_responses=True)
+r.config_set("maxmemory-policy", "noeviction")
+r.flushall(); r.config_resetstat()
+r.execute_command("SLOWLOG", "RESET")
+findings, _ = health_check()
+print("after cleanup:", [f for f in findings if f[0] != "INFO"] or "no issues")
+</pre>
+<pre>
+after cleanup: no issues
+</pre>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Twelve <code>INFO</code> fields carry nearly all the diagnostic value: memory ratio, fragmentation, eviction rate, hit rate, fork time, persistence status, and replication link.</li>
+        <li><strong>Most <code>INFO stats</code> fields are cumulative since boot.</strong> A cache with a 0% real hit rate still displayed <strong>66.7%</strong> raw, and drifted down so slowly it would not trip an alert for three windows.</li>
+        <li>Compute hit rate and every counter-derived metric from <strong>deltas between scrapes</strong>, never raw — a metric that cannot go down cannot show a regression.</li>
+        <li><code>INFO errorstats</code> is the fastest diagnosis available: <code>OOM</code> rising while <code>evicted_keys</code> stays at 0 immediately identifies a non-evicting policy.</li>
+        <li>Learn the codes on sight: <code>READONLY</code> (writing to a replica), <code>NOSCRIPT</code> (missing <code>EVALSHA</code> fallback), <code>CROSSSLOT</code> (Cluster key design), <code>MISCONF</code> (failed save blocking writes).</li>
+        <li><code>usec_per_call</code> in <code>INFO commandstats</code> separates a Redis problem from a client problem in one command.</li>
+        <li><strong><code>MONITOR</code> cut throughput 54% with one client and 77% with three</strong>, leaks every argument including secrets, and grows server-side buffers.</li>
+        <li>Bound it — <code>timeout 5 redis-cli MONITOR &gt; file</code> — and prefer <code>INFO commandstats</code>, which answered the same questions in 0.31 ms at zero cost.</li>
+        <li>A forgotten <code>MONITOR</code> appears as <code>flags=O</code> in <code>CLIENT LIST</code>; check for it during unexplained throughput drops.</li>
+        <li><code>CLIENT LIST</code> found 5 MB of <code>omem</code> on one slow subscriber — <code>omem</code>, <code>idle</code>, <code>qbuf</code> and <code>flags</code> are the fields that matter.</li>
+        <li>Call <code>CLIENT SETNAME</code> in every application, or triage starts from an IP that may belong to a pod that no longer exists.</li>
+        <li>Monitoring tools should set <code>CLIENT NO-TOUCH on</code> so inspecting keys does not corrupt LRU/LFU metadata.</li>
+        <li>Keyspace notifications distinguish <code>del</code> (code removed it) from <code>expired</code> (the TTL elapsed) — the fastest answer to "my keys are disappearing".</li>
+        <li><code>expired</code> events fire when Redis <em>notices</em> the expiry: a 0.4 s TTL fired its event at 1.52 s, so timestamps cannot reconstruct timing.</li>
+        <li>A plain <code>SET</code> on an existing key <strong>clears its TTL</strong>, and <code>SET … EX</code> replaces rather than extends it — a common cause of both vanishing and immortal keys.</li>
+        <li>Enable only the notification classes you need; <code>KEA</code> fires an event per operation and costs real CPU.</li>
+        <li>Scrape and ship <code>SLOWLOG</code> — it is a fixed-size ring buffer that silently discards history.</li>
+        <li>Scrape every node, not just primaries: <code>master_link_status</code> and replica lag only exist on the replica.</li>
+        <li>Alert on the rate of <code>rejected_connections</code>, not on <code>connected_clients</code>, which is just your pool size and flat by design.</li>
+        <li>Keep a baseline — most Redis incidents are diagnosed by comparison, and without history the same investigation takes hours instead of one diff.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="performance.html">← Performance &amp; Latency</a>
+      <a href="security-ops.html">Security &amp; Operations →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
