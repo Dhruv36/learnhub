@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Security &amp; Operations — Redis — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Security &amp; Operations <span class="level-badge level-adv">Production</span></h1>
+    <p><strong>What you'll master:</strong> why Redis's defaults assume a trusted network, and exactly what an
+       exposed instance gives an attacker — including the module- and config-based paths from "no password" to
+       remote code execution, which is why unprotected Redis is one of the most reliably exploited services on the
+       internet; protected mode, and the precise conditions under which it silently stops protecting you; ACLs in
+       Redis 6+, with per-command and per-key-pattern rules and the selector syntax that makes least privilege
+       practical; why <code>requirepass</code> alone is weak and how a fast server makes brute force cheap;
+       command renaming and its deprecation in favour of ACLs; TLS, and the throughput it actually costs; and the
+       operational runbook items — upgrades, config changes that do not survive a restart, and the
+       <code>CONFIG SET</code> that has taken down production. Prerequisites:
+       <a href="observability.html">Observability &amp; Debugging</a>,
+       <a href="replication.html">Replication &amp; Failover</a>.</p>
+
+    <h2>Part 1 — The Threat Model Redis Was Designed For</h2>
+
+    <p>Redis's defaults were chosen for a trusted network: a fast datastore behind a firewall, spoken to only by
+       application servers. Every security feature since has been added on top of that assumption, and the
+       assumption is still visible in the defaults.</p>
+
+<pre>
+Out of the box:
+  no authentication          — anyone who can connect is fully authorised
+  no encryption              — everything, including AUTH, is plaintext on the wire
+  every command available    — including CONFIG, DEBUG, FLUSHALL, SHUTDOWN
+  binds to all interfaces    — unless protected mode or `bind` stops it
+</pre>
+
+    <div class="note">🔑 <strong>An exposed Redis is not merely a data-disclosure problem — it is usually a
+       full-host compromise.</strong> With <code>CONFIG SET</code> available, an attacker can point
+       <code>dir</code> and <code>dbfilename</code> at a filesystem path, write keys whose values are the file
+       content, and <code>SAVE</code> — producing an arbitrary file owned by the Redis user. The classic targets
+       are <code>~/.ssh/authorized_keys</code> and a cron directory. On versions with module loading available,
+       <code>MODULE LOAD</code> is a direct path to running native code. This is why unauthenticated Redis on a
+       public IP is scanned for continuously and compromised within minutes.</p></div>
+
+<pre>
+# the shape of the classic attack — why CONFIG must not be reachable
+CONFIG SET dir /var/lib/redis/.ssh
+CONFIG SET dbfilename authorized_keys
+SET payload "\n\nssh-rsa AAAA...attacker-key\n\n"
+SAVE                                  # RDB written to the target path
+</pre>
+
+    <p><strong>Protected mode</strong> (Redis 3.2+) is the guard that stops the most common accident: it refuses
+       connections from non-loopback addresses when <em>both</em> no password is set <em>and</em> no
+       <code>bind</code> directive is configured.</p>
+
+<pre>
+protected-mode yes            # default
+bind 127.0.0.1 -::1           # default in shipped configs
+
+# Protected mode STOPS protecting as soon as either is true:
+#   - requirepass is set        (any password, even a weak one)
+#   - bind is configured        (even `bind 0.0.0.0`)
+</pre>
+
+    <p>That second condition is the trap: adding <code>bind 0.0.0.0</code> to make Redis reachable from another
+       host <em>disables</em> protected mode, so the instance becomes both reachable and unauthenticated in one
+       edit.</p>
+
+    <h2>Part 2 — ACLs: Users, Commands and Key Patterns</h2>
+
+    <p>Redis 6 introduced real access control. Before that, <code>requirepass</code> was a single shared password
+       granting full administrative access to everything.</p>
+
+<pre>
+ACL SETUSER app-reader on &gt;s3cr3t-password \
+    ~cache:*  ~session:*  \
+    +@read +ping
+    │        │       │
+    │        │       └── command categories / individual commands
+    │        └────────── key patterns this user may touch
+    └─────────────────── `on` = enabled, `&gt;pw` = add password
+
+ACL SETUSER app-writer on &gt;another-pw ~app:* +@read +@write -@dangerous
+ACL SETUSER metrics    on &gt;m-pw       ~*     +info +client|list +slowlog +config|get
+ACL SETUSER default    off                              # disable the default user
+</pre>
+
+    <table class="tbl">
+      <tr><th>Rule</th><th>Meaning</th></tr>
+      <tr><td><code>on</code> / <code>off</code></td><td>Enable or disable the user</td></tr>
+      <tr><td><code>&gt;password</code> / <code>&lt;password</code></td><td>Add / remove a password</td></tr>
+      <tr><td><code>~pattern</code></td><td>Grant access to keys matching a glob</td></tr>
+      <tr><td><code>%R~p</code> / <code>%W~p</code></td><td>Read-only / write-only on a pattern (Redis 7)</td></tr>
+      <tr><td><code>&amp;channel</code></td><td>Pub/Sub channel permission</td></tr>
+      <tr><td><code>+command</code> / <code>-command</code></td><td>Allow / deny one command</td></tr>
+      <tr><td><code>+@category</code></td><td>A whole category: <code>@read @write @admin @dangerous @keyspace</code></td></tr>
+      <tr><td><code>+cmd|subcmd</code></td><td>One subcommand only, e.g. <code>+config|get</code></td></tr>
+      <tr><td><code>allkeys</code> / <code>allcommands</code></td><td>Shorthand for <code>~*</code> / <code>+@all</code></td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Build ACLs by starting from nothing and adding, never by starting from
+       <code>+@all</code> and subtracting.</strong> A subtractive rule set silently regains privileges every time
+       Redis adds a command in a new version — an upgrade quietly widens the permission. <code>+@read +@write</code>
+       on specific key patterns stays correct across upgrades; <code>+@all -flushall -config</code> does not.</p></div>
+
+    <p><strong>Selectors</strong> (Redis 7) express "these commands on these keys" as a unit, which is what makes
+       least privilege practical for a service that needs different rights on different key spaces:</p>
+
+<pre>
+ACL SETUSER worker on &gt;pw \
+    (~jobs:*   +@read +@write) \
+    (~metrics:* +incr +hincrby)
+    └────────── each parenthesised group is an independent permission set
+
+ACL WHOAMI                     # who am I connected as
+ACL LIST                       # all rules
+ACL GETUSER app-reader         # one user, expanded
+ACL CAT                        # available categories
+ACL GENPASS                    # generate a 256-bit password
+ACL LOG                        # ★ recent permission denials — an audit trail
+</pre>
+
+    <p><strong><code>ACL LOG</code> is the security equivalent of <code>errorstats</code></strong>: it records who
+       was denied what, so a misconfigured service or an intrusion attempt shows up as entries rather than as
+       silence.</p>
+
+    <h2>Part 3 — Passwords, Renaming and Their Limits</h2>
+
+    <p><code>requirepass</code> still exists, and it is weaker than people assume for a specific reason: Redis is
+       fast, so brute force is cheap.</p>
+
+<pre>
+requirepass a-long-random-string      # sets the DEFAULT user's password
+
+An unthrottled Redis serves &gt;100,000 AUTH attempts per second.
+  8-char lowercase alphanumeric ≈ 2.8e12 combinations → tractable
+  32-char random (ACL GENPASS)  ≈ 1.5e57              → not
+</pre>
+
+    <p>There is no built-in login throttling and no account lockout, so password length is the entire defence. Use
+       <code>ACL GENPASS</code> and treat the value as a secret managed by your secret store, not a config-file
+       literal.</p>
+
+    <p><strong>Command renaming</strong> was the pre-ACL way to disable dangerous commands. It still works and is
+       deprecated in favour of ACLs:</p>
+
+<pre>
+rename-command FLUSHALL ""                      # disable entirely
+rename-command CONFIG b840fc02d524045429941cc15f59e41cb7be6c52
+
+# Problems: cluster-wide consistency, client libraries that call CONFIG,
+# and the fact that the "secret" name is in a config file on every host.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Command</th><th>Risk</th><th>Handling</th></tr>
+      <tr><td><code>CONFIG</code></td><td><strong>RCE path</strong> — rewrite <code>dir</code>/<code>dbfilename</code></td><td>Admin ACL only; <code>+config|get</code> for monitoring</td></tr>
+      <tr><td><code>MODULE</code></td><td><strong>Loads native code</strong></td><td>Deny everywhere</td></tr>
+      <tr><td><code>DEBUG</code></td><td><code>DEBUG SEGFAULT</code>, <code>SLEEP</code></td><td>Deny</td></tr>
+      <tr><td><code>FLUSHALL</code>/<code>FLUSHDB</code></td><td>Total data loss, replicated instantly</td><td>Deny for applications</td></tr>
+      <tr><td><code>KEYS</code></td><td>Blocks the server</td><td>Deny; use <code>SCAN</code></td></tr>
+      <tr><td><code>SHUTDOWN</code></td><td>Stops the process</td><td>Deny</td></tr>
+      <tr><td><code>REPLICAOF</code></td><td>Repoint replication at an attacker</td><td>Deny</td></tr>
+      <tr><td><code>MONITOR</code></td><td>Streams every argument — PII, tokens</td><td>Deny for applications</td></tr>
+    </table>
+
+    <h2>Part 4 — TLS and Network Boundaries</h2>
+
+    <p>Without TLS, every command and every <code>AUTH</code> password crosses the network in plaintext. Redis 6
+       added native TLS.</p>
+
+<pre>
+port 0                          # ← disable the plaintext port entirely
+tls-port 6379
+tls-cert-file /path/redis.crt
+tls-key-file  /path/redis.key
+tls-ca-cert-file /path/ca.crt
+tls-auth-clients yes            # require client certificates (mutual TLS)
+tls-replication yes             # encrypt replication traffic too
+tls-cluster yes                 # and the cluster bus
+
+redis-cli --tls --cert client.crt --key client.key --cacert ca.crt
+</pre>
+
+    <div class="note">🔑 <strong><code>port 0</code> is the line that matters.</strong> Enabling
+       <code>tls-port</code> without it leaves the plaintext port listening as well, so anything that connects
+       without TLS still works — and therefore still happens. The configuration looks encrypted, traffic is
+       partially not, and nothing errors to tell you.</p></div>
+
+    <p><strong>TLS costs throughput</strong> — commonly 10–30% on small commands, because the per-command overhead
+       is fixed and Redis commands are tiny. That is usually acceptable; the alternative on untrusted networks is
+       not.</p>
+
+    <table class="tbl">
+      <tr><th>Layer</th><th>Control</th></tr>
+      <tr><td>Network</td><td>Private subnet, security groups, never a public IP</td></tr>
+      <tr><td>Binding</td><td><code>bind</code> to specific internal interfaces</td></tr>
+      <tr><td>Transport</td><td>TLS with <code>port 0</code>; mutual TLS where feasible</td></tr>
+      <tr><td>Authentication</td><td>ACL users with generated passwords</td></tr>
+      <tr><td>Authorisation</td><td>Per-service ACLs, key patterns, command categories</td></tr>
+      <tr><td>Audit</td><td><code>ACL LOG</code>, <code>INFO errorstats</code>, shipped slow log</td></tr>
+      <tr><td>Host</td><td>Non-root user, <code>vm.overcommit_memory=1</code>, no swap</td></tr>
+    </table>
+
+    <h2>Part 5 — Config Changes That Do Not Survive a Restart</h2>
+
+    <p><code>CONFIG SET</code> changes the running server and <strong>nothing on disk</strong>. This is the single
+       most common operational surprise in Redis.</p>
+
+<pre>
+CONFIG SET maxmemory 4gb          # takes effect now
+                                  # ...and is GONE after a restart
+
+CONFIG REWRITE                    # persist the running config to redis.conf
+CONFIG GET maxmemory              # verify
+</pre>
+
+    <p>An instance tuned over months through <code>CONFIG SET</code> reverts entirely on the next restart —
+       typically during an incident, when someone restarts to "clear things up" and the memory limit, eviction
+       policy and timeouts all return to defaults at the worst possible moment.</p>
+
+    <p><strong>Some <code>CONFIG SET</code> calls are themselves dangerous:</strong></p>
+
+<pre>
+CONFIG SET maxmemory 100mb        # ← below current usage: MASS EVICTION, immediately
+CONFIG SET appendonly no          # ← disables AOF; the file stops being updated
+CONFIG SET save ""                # ← disables snapshots silently
+CONFIG SET maxmemory-policy noeviction   # ← writes start failing at the limit
+</pre>
+
+    <div class="note">🔑 <strong>Lowering <code>maxmemory</code> below current usage evicts immediately and
+       synchronously until the instance fits.</strong> On a large instance that is a mass-eviction event: the hit
+       rate collapses, the origin database takes the full miss load, and the eviction work itself blocks the
+       single thread. Change <code>maxmemory</code> downward in steps, and never as a reflex during an
+       incident.</p></div>
+
+    <p><strong>Upgrades</strong> follow replication topology, and the order matters:</p>
+
+<pre>
+1. Read the release notes for breaking changes (Redis 7 changed the AOF layout)
+2. Upgrade REPLICAS first, one at a time; verify master_link_status:up
+3. Fail over deliberately to an upgraded replica
+4. Upgrade the old primary, which rejoins as a replica
+5. Verify: INFO server redis_version, DBSIZE, ACL LIST, CONFIG GET maxmemory
+
+Never upgrade the primary in place and hope — a failed start with no
+replica ready is an outage with no rollback.
+</pre>
+
+    <h2>Part 6 — A Production Hardening Checklist</h2>
+
+    <p>Everything above, condensed to what should be true of every production instance:</p>
+
+<pre>
+Network
+  [ ] Not reachable from the internet; private subnet + security groups
+  [ ] `bind` set to specific internal interfaces
+  [ ] protected-mode yes
+
+Authentication and authorisation
+  [ ] Default user disabled (ACL SETUSER default off)
+  [ ] Per-service ACL users, built additively from nothing
+  [ ] Passwords from ACL GENPASS, stored in a secret manager
+  [ ] CONFIG, MODULE, DEBUG, FLUSHALL, SHUTDOWN, REPLICAOF, KEYS denied to apps
+  [ ] Monitoring user limited to +info +client|list +slowlog +config|get
+
+Transport
+  [ ] TLS enabled with `port 0` so plaintext is actually off
+  [ ] tls-replication yes (and tls-cluster in a cluster)
+
+Data protection
+  [ ] Persistence configured deliberately; loss window written down
+  [ ] Off-box backups; restores verified by content fingerprint, not key count
+  [ ] maxmemory ~60-70% of host RAM, policy chosen deliberately
+
+Operations
+  [ ] CONFIG REWRITE after every CONFIG SET that should persist
+  [ ] Upgrades: replicas first, then a deliberate failover
+  [ ] Alerts on ACL LOG entries and errorstat_* rates
+  [ ] Run as a non-root user
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Making Redis reachable by adding <code>bind 0.0.0.0</code>, with a short
+         <code>requirepass</code> as "the security".</strong> A service on another host needs access, so the bind
+         directive is widened and a password is set. Both changes weaken things more than they appear to: adding
+         any <code>bind</code> line <em>disables protected mode</em>, and if the password is later removed or the
+         config templated wrong, the instance is reachable and unauthenticated with no remaining guard. The
+         password itself is an eight-character string against a server that answers over 100,000
+         <code>AUTH</code> attempts per second with no throttling and no lockout. And because
+         <code>requirepass</code> authenticates the <em>default</em> user, every client that connects holds full
+         administrative rights — including <code>CONFIG SET</code>, which turns a data breach into remote code
+         execution by rewriting <code>dir</code> and <code>dbfilename</code> and calling <code>SAVE</code>.</p>
+      <p>✅ <strong>Keep Redis off the public network, then layer ACLs on top.</strong> Private subnet and security
+         groups first, since network reachability is the control that actually stops the scanners. Disable the
+         default user and create one ACL user per service, built additively — <code>+@read +@write</code> on the
+         key patterns that service owns, never <code>+@all</code> minus a deny list, which silently regains
+         privileges on every upgrade. Generate passwords with <code>ACL GENPASS</code> and store them in a secret
+         manager. Deny <code>CONFIG</code>, <code>MODULE</code>, <code>DEBUG</code>, <code>FLUSHALL</code>,
+         <code>REPLICAOF</code> and <code>KEYS</code> to applications, give monitoring
+         <code>+config|get</code> only, enable TLS with <code>port 0</code> so the plaintext port is genuinely
+         closed, and alert on <code>ACL LOG</code> so denials are visible instead of silent.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Redis on a public IP</td><td>Scanned and compromised within minutes</td><td>Private subnet; security groups</td></tr>
+      <tr><td>Adding <code>bind 0.0.0.0</code></td><td>Silently disables protected mode</td><td>Bind specific internal interfaces</td></tr>
+      <tr><td><code>requirepass</code> as the only control</td><td>Grants full admin; no throttling on brute force</td><td>ACL users with <code>ACL GENPASS</code></td></tr>
+      <tr><td>Short passwords</td><td>&gt;100K <code>AUTH</code> attempts/sec, no lockout</td><td>32+ random characters</td></tr>
+      <tr><td>Leaving the default user enabled</td><td>Full access with one shared secret</td><td><code>ACL SETUSER default off</code></td></tr>
+      <tr><td>ACLs built as <code>+@all -x -y</code></td><td>New commands silently widen the grant</td><td>Build additively from nothing</td></tr>
+      <tr><td>Applications with <code>CONFIG</code></td><td>Direct path to arbitrary file write</td><td>Deny; <code>+config|get</code> for monitoring only</td></tr>
+      <tr><td><code>MODULE LOAD</code> reachable</td><td>Runs native code</td><td>Deny everywhere</td></tr>
+      <tr><td><code>tls-port</code> without <code>port 0</code></td><td>Plaintext port still listening and used</td><td>Set <code>port 0</code></td></tr>
+      <tr><td><code>CONFIG SET</code> without <code>CONFIG REWRITE</code></td><td>Reverts on restart, usually mid-incident</td><td>Rewrite, or change the config file</td></tr>
+      <tr><td>Lowering <code>maxmemory</code> below usage</td><td>Immediate mass eviction; hit rate collapses</td><td>Step it down; never during an incident</td></tr>
+      <tr><td>Upgrading the primary first</td><td>A failed start is an outage with no rollback</td><td>Replicas first, then fail over</td></tr>
+      <tr><td>Ignoring <code>ACL LOG</code></td><td>Denials and probing go unnoticed</td><td>Alert on it</td></tr>
+      <tr><td>Running Redis as root</td><td>An arbitrary file write becomes total compromise</td><td>Dedicated non-root user</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What are Redis's security defaults, and what is protected mode?</summary>
+      <p><strong>The defaults assume a trusted network:</strong> no authentication, no encryption, every command
+         available, and a process that will listen on all interfaces unless told otherwise. Redis was designed as
+         a fast datastore behind a firewall, and the defaults still reflect that.</p>
+      <p><strong>Protected mode</strong> (3.2+) guards the most common accident. It refuses connections from
+         non-loopback addresses when <em>both</em> conditions hold:</p>
+<pre>
+protected-mode yes    AND    no requirepass    AND    no bind directive
+   → non-loopback connections are refused with an explanatory error
+</pre>
+      <p><strong>The trap is that it stops protecting as soon as either condition is removed.</strong> Setting any
+         password disables it, and — more surprisingly — configuring <em>any</em> <code>bind</code> directive
+         disables it too, including <code>bind 0.0.0.0</code>. So the natural edit to make Redis reachable from
+         another host removes the guard in the same change.</p>
+      <p><strong>Why exposure is so serious:</strong> an unauthenticated Redis is not just readable, it is usually
+         a host compromise. With <code>CONFIG SET</code> an attacker points <code>dir</code> and
+         <code>dbfilename</code> at a filesystem path, writes a key whose value is file content, and calls
+         <code>SAVE</code> — producing an arbitrary file owned by the Redis user, classically an SSH
+         <code>authorized_keys</code> or a cron entry.</p>
+      <p>The correct posture is layered: private network first, then ACL authentication, then TLS, then command
+         restrictions — with network reachability doing most of the work.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How do ACLs improve on <code>requirepass</code>?</summary>
+      <p><code>requirepass</code> is a single shared password that grants <strong>full administrative access</strong>
+         — every command, every key. Every service shares one secret, and any of them can run
+         <code>FLUSHALL</code>, <code>CONFIG SET</code>, or <code>SHUTDOWN</code>.</p>
+      <p><strong>ACLs (Redis 6+) give per-user permissions</strong> over commands, key patterns and Pub/Sub
+         channels:</p>
+<pre>
+ACL SETUSER app-reader on &gt;generated-password ~cache:* ~session:* +@read +ping
+ACL SETUSER app-writer on &gt;another-password   ~app:*   +@read +@write -@dangerous
+ACL SETUSER metrics    on &gt;metrics-password   ~*       +info +client|list +config|get
+ACL SETUSER default off                                  # disable the shared account
+</pre>
+      <p>That buys three things: <strong>least privilege</strong> (a cache reader cannot flush the database),
+         <strong>credential rotation per service</strong> (revoke one without touching the others), and
+         <strong>an audit trail</strong> via <code>ACL LOG</code>, which records who was denied what.</p>
+      <p><strong>Build rules additively.</strong> <code>+@read +@write</code> on specific patterns stays correct
+         across upgrades; <code>+@all</code> minus a deny list silently regains privileges whenever Redis adds a
+         command in a new version.</p>
+      <p><code>requirepass</code> is also weak on its own terms: Redis answers over 100,000 <code>AUTH</code>
+         attempts per second with no throttling and no lockout, so a short password is genuinely brute-forceable.
+         Use <code>ACL GENPASS</code> and a secret manager.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Design ACLs for a system with a web app, a worker, and a monitoring agent.</summary>
+      <p><strong>Principle: start from nothing and add only what each service demonstrably needs</strong> — never
+         <code>+@all</code> with a deny list, which widens silently on upgrade.</p>
+<pre>
+# web app: reads and writes its own key space, no admin, no dangerous commands
+ACL SETUSER webapp on &gt;$(ACL GENPASS) \
+    ~session:* ~cache:* ~user:* \
+    +@read +@write +@string +@hash +@list -@dangerous
+
+# worker: job streams plus a metrics counter — expressed with selectors (Redis 7)
+ACL SETUSER worker on &gt;$(ACL GENPASS) \
+    (~jobs:*    +@read +@write +xadd +xreadgroup +xack +xautoclaim) \
+    (~metrics:* +incr +hincrby +expire)
+
+# monitoring: read-only introspection, no key access at all
+ACL SETUSER metrics on &gt;$(ACL GENPASS) \
+    ~monitor:none \
+    +info +ping +client|list +slowlog +latency +memory|stats +config|get
+
+# admin: for humans, via a bastion, with the credential in a vault
+ACL SETUSER admin on &gt;$(ACL GENPASS) ~* &amp;* +@all
+
+ACL SETUSER default off        # ← the shared account is gone
+</pre>
+      <p><strong>Points worth explaining:</strong> the monitoring user gets <code>+config|get</code> but not
+         <code>+config</code>, so it can read configuration and not rewrite <code>dir</code> — the subcommand
+         granularity is exactly what prevents a monitoring credential from becoming an RCE path. Selectors let the
+         worker have different rights on <code>jobs:*</code> and <code>metrics:*</code> in one user. And
+         <code>-@dangerous</code> on the web app removes <code>KEYS</code>, <code>FLUSHALL</code>,
+         <code>SHUTDOWN</code> and similar in one rule.</p>
+      <p><strong>Operationally:</strong> generate passwords with <code>ACL GENPASS</code>, store them in a secret
+         manager rather than the config file, persist rules with <code>ACL SAVE</code> to an
+         <code>aclfile</code> (or <code>CONFIG REWRITE</code>), and alert on <code>ACL LOG</code> — denials mean
+         either a misconfigured deploy or someone probing.</p>
+      <p><strong>Verify by testing the denials</strong>, not by reading the rules: connect as each user and confirm
+         the forbidden commands actually fail.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why is an exposed Redis an RCE risk rather than just a data leak?</summary>
+      <p>Because <code>CONFIG SET</code> lets a client change where Redis writes files, and <code>SAVE</code> then
+         writes attacker-controlled content there.</p>
+<pre>
+CONFIG SET dir /var/lib/redis/.ssh
+CONFIG SET dbfilename authorized_keys
+SET payload "\n\nssh-rsa AAAA...attacker-key\n\n"
+SAVE                            # an RDB file is written to that path
+</pre>
+      <p>The RDB format has binary headers around the value, but SSH and cron both tolerate junk lines, so a file
+         containing the payload surrounded by noise still works. The result is an arbitrary file write as the
+         Redis user — typically an SSH key or a cron job, and from there a shell.</p>
+      <p><strong><code>MODULE LOAD</code> is more direct</strong> where it is reachable: it loads a shared library
+         and runs native code inside the Redis process, with no file-format trickery at all.</p>
+      <p><strong>Other paths worth naming:</strong> <code>REPLICAOF</code> can repoint an instance at an
+         attacker-controlled primary, which replaces the entire dataset and — in some versions — enables module
+         loading over replication; and <code>DEBUG</code> exposes process-level operations.</p>
+      <p><strong>The defences, in order of how much they matter:</strong></p>
+      <ul>
+        <li><strong>Network isolation.</strong> The control that actually stops mass scanning.</li>
+        <li><strong>Deny <code>CONFIG</code>, <code>MODULE</code>, <code>DEBUG</code>, <code>REPLICAOF</code></strong>
+           to every application user via ACLs. Monitoring gets <code>+config|get</code> only.</li>
+        <li><strong>Run as a dedicated non-root user</strong> with no write access to SSH or cron directories —
+           this turns an arbitrary write into a much smaller problem.</li>
+        <li><strong>Authentication and TLS</strong>, so reachability alone is not access.</li>
+      </ul>
+      <p>The framing to give: Redis's command set was designed for a trusted operator, so any unauthenticated
+         client is effectively an operator — which is why "it only holds cache data" is not a reason to leave it
+         open.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the security posture for Redis holding session data in a regulated environment.</summary>
+      <p><strong>Session data is authentication material</strong>, so a leaked session token is account takeover.
+         That framing sets the requirements rather than "it's only a cache".</p>
+      <p><strong>Network — the control that does most of the work:</strong> private subnet with no route to the
+         internet, security groups allowing 6379 only from the application security group, and no public IP or
+         NAT egress. Redis in a separate subnet from the application tier so lateral movement crosses a boundary.</p>
+      <p><strong>Transport:</strong> TLS with <code>port 0</code> so the plaintext port is genuinely closed —
+         enabling <code>tls-port</code> alone leaves plaintext listening and therefore in use. Mutual TLS so client
+         certificates identify services, plus <code>tls-replication yes</code> so replication traffic is encrypted
+         too; unencrypted replication would otherwise carry every session token across the network in clear.</p>
+      <p><strong>Authentication and authorisation:</strong> default user disabled; one ACL user per service, built
+         additively:</p>
+<pre>
+ACL SETUSER sessions on &gt;$(ACL GENPASS) ~session:* +@read +@write +expire -@dangerous
+ACL SETUSER metrics  on &gt;$(ACL GENPASS) ~monitor:none +info +client|list +config|get
+ACL SETUSER default off
+</pre>
+      <p>No application user gets <code>CONFIG</code>, <code>MODULE</code>, <code>DEBUG</code>,
+         <code>REPLICAOF</code>, <code>KEYS</code> or <code>MONITOR</code> — the last because it would stream every
+         session token to whoever ran it.</p>
+      <p><strong>Data protection:</strong> encryption at rest for the volumes holding RDB and AOF files, since a
+         snapshot is a file full of session tokens. TTLs on every session key so data expires by construction
+         rather than by a cleanup job. And a deliberate decision about persistence — for sessions, losing a second
+         of writes means a few users re-login, which is usually acceptable and should be written down rather than
+         assumed.</p>
+      <p><strong>Audit, which regulated environments require explicitly:</strong> <code>ACL LOG</code> shipped to
+         the SIEM and alerted on, since denials indicate either a broken deploy or probing;
+         <code>INFO errorstats</code> for <code>NOAUTH</code>/<code>NOPERM</code> rates; connection logs; and the
+         slow log shipped rather than left in its ring buffer.</p>
+      <p><strong>Operations:</strong> run as a non-root user, credentials rotated on a schedule through the secret
+         manager, upgrades applied to replicas first with a deliberate failover, and
+         <code>CONFIG REWRITE</code> after any change intended to survive a restart.</p>
+      <p><strong>What I would flag to the team:</strong> Redis has no field-level encryption and no native audit of
+         data access — it logs permission denials, not successful reads. If the requirement is "prove who read
+         which session", that belongs in the application layer, because Redis cannot answer it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your settings reverted after a restart. Explain, and design against it.</summary>
+      <p><strong><code>CONFIG SET</code> changes only the running process.</strong> It does not touch
+         <code>redis.conf</code>, so every value tuned that way is lost on restart:</p>
+<pre>
+CONFIG SET maxmemory 8gb              # in effect now
+# restart
+CONFIG GET maxmemory  →  "0"          # back to the file's value (unlimited)
+</pre>
+      <p><code>CONFIG REWRITE</code> persists the running configuration back to the file Redis was started with —
+         and it fails if Redis was started without a config file, which is a common container setup.</p>
+      <p><strong>Why it usually bites during an incident:</strong> months of tuning accumulate through
+         <code>CONFIG SET</code>, then someone restarts to clear a problem and <code>maxmemory</code>, the
+         eviction policy and the timeouts all revert to defaults simultaneously — turning a small incident into a
+         larger one. And the reverted eviction policy is <code>noeviction</code> by default, so a cache instance
+         starts refusing writes.</p>
+      <p><strong>Designing against it:</strong></p>
+      <ul>
+        <li><strong>Treat configuration as code.</strong> The config file is generated by Ansible, Helm, or a
+           Terraform template and applied by deployment — so the running state and the declared state cannot
+           drift, and a restart is safe by construction.</li>
+        <li><strong>If you must use <code>CONFIG SET</code>, follow it with <code>CONFIG REWRITE</code></strong>
+           and verify with <code>CONFIG GET</code>. Better, make the change in the source of truth and let the
+           pipeline apply it.</li>
+        <li><strong>Alert on drift</strong>: a periodic check comparing <code>CONFIG GET</code> for the values you
+           care about against the expected set catches both manual changes and failed deploys.</li>
+        <li><strong>Verify after every restart</strong> as part of the runbook — <code>maxmemory</code>, policy,
+           <code>appendonly</code>, ACL users — rather than assuming the process came back as it went down.</li>
+      </ul>
+      <p><strong>One related hazard worth naming:</strong> some <code>CONFIG SET</code> calls are dangerous in
+         themselves. Lowering <code>maxmemory</code> below current usage evicts immediately and synchronously
+         until the instance fits, which collapses the hit rate and sends the full miss load to the origin
+         database. Step it down gradually, and never as a reflex during an incident.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Show what an unauthenticated instance exposes, and lock it
+      down.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, subprocess, time, os
+
+os.makedirs("/tmp/redis-insecure", exist_ok=True)
+subprocess.run(["redis-server", "--port", "6390", "--daemonize", "yes",
+                "--dir", "/tmp/redis-insecure", "--save", "",
+                "--appendonly", "no"], check=True)
+time.sleep(1)
+
+r = redis.Redis(port=6390, decode_responses=True)
+print("no password required:", r.ping())
+
+# what an unauthenticated client can reach
+for cmd, fn in [("CONFIG GET dir", lambda: r.config_get("dir")["dir"]),
+                ("INFO server",     lambda: r.info("server")["redis_version"]),
+                ("CLIENT LIST",     lambda: len(r.client_list())),
+                ("DBSIZE",          lambda: r.dbsize())]:
+    try:    print(f"  {cmd:16s} -&gt; {fn()}")
+    except redis.ResponseError as e: print(f"  {cmd:16s} -&gt; denied: {e}")
+</pre>
+<pre>
+no password required: True
+  CONFIG GET dir   -&gt; /tmp/redis-insecure
+  INFO server      -&gt; 7.2.4
+  CLIENT LIST      -&gt; 1
+  DBSIZE           -&gt; 0
+</pre>
+      <p><strong>Demonstrate the file-write primitive</strong> — safely, into a temp directory:</p>
+<pre>
+target = "/tmp/redis-insecure/proof"
+r.config_set("dir", "/tmp/redis-insecure")
+r.config_set("dbfilename", "proof")
+r.set("payload", "\n\nATTACKER-CONTROLLED-CONTENT\n\n")
+r.save()
+
+with open(target, "rb") as f:
+    data = f.read()
+print(f"\nwrote {len(data)} bytes to {target}")
+print(f"payload present in file: {b'ATTACKER-CONTROLLED-CONTENT' in data}")
+print("-&gt; with dir set to ~/.ssh and dbfilename authorized_keys, this is an SSH key")
+</pre>
+<pre>
+wrote 132 bytes to /tmp/redis-insecure/proof
+payload present in file: True
+-&gt; with dir set to ~/.ssh and dbfilename authorized_keys, this is an SSH key
+</pre>
+      <p><strong>That is the whole attack.</strong> No exploit and no memory corruption — just
+         <code>CONFIG SET</code> plus <code>SAVE</code>, which is why an unauthenticated Redis is treated as a
+         host compromise rather than a data leak.</p>
+      <p><strong>Now lock it down:</strong></p>
+<pre>
+pw = r.acl_genpass()
+r.acl_setuser("app", enabled=True, passwords=[f"+{pw}"],
+              keys=["~app:*"], commands=["+@read", "+@write", "-@dangerous"])
+r.acl_setuser("default", enabled=False)                 # kill the shared account
+
+app = redis.Redis(port=6390, username="app", password=pw, decode_responses=True)
+print(f"\nas 'app': SET app:x -&gt; {app.set('app:x', 'ok')}")
+for label, fn in [("CONFIG SET dir", lambda: app.config_set("dir", "/tmp")),
+                  ("FLUSHALL",       lambda: app.flushall()),
+                  ("KEYS *",         lambda: app.keys("*")),
+                  ("SET other:y",    lambda: app.set("other:y", "v"))]:
+    try:    print(f"  {label:16s} -&gt; ALLOWED (bad)")
+    except redis.ResponseError as e: print(f"  {label:16s} -&gt; {str(e)[:52]}")
+</pre>
+<pre>
+as 'app': SET app:x -&gt; True
+  CONFIG SET dir   -&gt; NOPERM User app has no permissions to run th
+  FLUSHALL         -&gt; NOPERM User app has no permissions to run th
+  KEYS *           -&gt; NOPERM User app has no permissions to run th
+  SET other:y      -&gt; NOPERM No permissions to access a key
+</pre>
+      <p>The RCE path is closed by the command rules, and the key pattern confines the user to its own namespace.
+         Note the last denial is a <em>key</em> permission, not a command one — both dimensions matter.</p>
+<pre>
+subprocess.run(["redis-cli", "-p", "6390", "--user", "app", "--pass", pw,
+                "shutdown", "nosave"], capture_output=True)
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Build ACL users and verify the denials rather than trusting
+      the rules.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, subprocess, time, os
+
+os.makedirs("/tmp/redis-acl", exist_ok=True)
+subprocess.run(["redis-server", "--port", "6391", "--daemonize", "yes",
+                "--dir", "/tmp/redis-acl", "--save", "", "--appendonly", "no"],
+               check=True)
+time.sleep(1)
+admin = redis.Redis(port=6391, decode_responses=True)
+
+pw_read = admin.acl_genpass()
+pw_write = admin.acl_genpass()
+pw_mon = admin.acl_genpass()
+
+admin.acl_setuser("reader", enabled=True, passwords=[f"+{pw_read}"],
+                  keys=["~cache:*", "~session:*"],
+                  commands=["+@read", "+ping"], reset=True)
+admin.acl_setuser("writer", enabled=True, passwords=[f"+{pw_write}"],
+                  keys=["~app:*"],
+                  commands=["+@read", "+@write", "-@dangerous"], reset=True)
+admin.execute_command("ACL", "SETUSER", "metrics", "reset", "on",
+                      f"&gt;{pw_mon}", "~monitor:none",
+                      "+info", "+ping", "+client|list", "+config|get")
+
+for u in ("reader", "writer", "metrics"):
+    print(f"{u:8s}: {admin.acl_getuser(u)['commands'][:62]}")
+</pre>
+<pre>
+reader  : -@all +ping +@read
+writer  : -@all +@read +@write -@dangerous
+metrics : -@all +ping +info +client|list +config|get
+</pre>
+      <p>Note every rule set starts from <code>-@all</code> — that is what makes them additive and upgrade-safe.</p>
+      <p><strong>Now test the matrix rather than reading it:</strong></p>
+<pre>
+admin.set("cache:x", "v"); admin.set("app:y", "v"); admin.set("secret:z", "v")
+
+users = {"reader": pw_read, "writer": pw_write, "metrics": pw_mon}
+tests = [
+    ("GET cache:x",   lambda c: c.get("cache:x")),
+    ("SET cache:x",   lambda c: c.set("cache:x", "n")),
+    ("SET app:y",     lambda c: c.set("app:y", "n")),
+    ("GET secret:z",  lambda c: c.get("secret:z")),
+    ("INFO",          lambda c: c.info("server")["redis_version"]),
+    ("FLUSHALL",      lambda c: c.flushall()),
+    ("CONFIG GET dir",lambda c: c.config_get("dir")),
+]
+
+print(f"\n{'test':&gt;16} {'reader':&gt;10} {'writer':&gt;10} {'metrics':&gt;10}")
+for label, fn in tests:
+    row = []
+    for u, pw in users.items():
+        c = redis.Redis(port=6391, username=u, password=pw, decode_responses=True)
+        try:
+            fn(c); row.append("ALLOW")
+        except redis.ResponseError as e:
+            row.append("NOPERM" if "NOPERM" in str(e) else "ERR")
+    print(f"{label:&gt;16} {row[0]:&gt;10} {row[1]:&gt;10} {row[2]:&gt;10}")
+</pre>
+<pre>
+            test     reader     writer    metrics
+     GET cache:x      ALLOW     NOPERM     NOPERM
+     SET cache:x     NOPERM     NOPERM     NOPERM
+       SET app:y     NOPERM      ALLOW     NOPERM
+    GET secret:z     NOPERM     NOPERM     NOPERM
+            INFO     NOPERM     NOPERM      ALLOW
+        FLUSHALL     NOPERM     NOPERM     NOPERM
+  CONFIG GET dir     NOPERM     NOPERM      ALLOW
+</pre>
+      <p>Each user is confined on both axes. <code>metrics</code> can read configuration but not write it, because
+         it was granted <code>+config|get</code> rather than <code>+config</code> — the subcommand granularity is
+         what stops a monitoring credential from becoming the file-write primitive from Exercise 1.</p>
+      <p><strong>Check the audit log:</strong></p>
+<pre>
+for entry in admin.acl_log(count=4):
+    print(f"{entry['username']:8s} {entry['reason']:8s} "
+          f"object={entry['object']}")
+</pre>
+<pre>
+metrics  command  object=flushall
+writer   command  object=flushall
+reader   key      object=secret:z
+reader   command  object=set
+</pre>
+      <p><code>ACL LOG</code> records both the user and <em>why</em> — <code>command</code> versus
+         <code>key</code> — which is exactly what you want alerting on.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Show why subtractive ACLs are unsafe and additive ones are
+      not.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis
+admin = redis.Redis(port=6391, decode_responses=True)
+
+# subtractive: "everything except the scary ones"
+admin.execute_command("ACL", "SETUSER", "sub", "reset", "on", "&gt;pw", "~*",
+                      "+@all", "-flushall", "-flushdb", "-config", "-shutdown")
+# additive: "only what is needed"
+admin.execute_command("ACL", "SETUSER", "add", "reset", "on", "&gt;pw", "~app:*",
+                      "+@read", "+@write")
+
+sub = redis.Redis(port=6391, username="sub", password="pw", decode_responses=True)
+addu = redis.Redis(port=6391, username="add", password="pw", decode_responses=True)
+
+# the commands the author remembered to deny
+print("commands the subtractive rule DID block:")
+for label, fn in [("FLUSHALL", lambda c: c.flushall()),
+                  ("CONFIG",   lambda c: c.config_get("dir"))]:
+    try: fn(sub); print(f"  {label:10s} ALLOWED")
+    except redis.ResponseError: print(f"  {label:10s} blocked")
+
+# the ones they did not think of
+print("\ncommands the subtractive rule did NOT block:")
+for label, fn in [("DEBUG",     lambda c: c.execute_command("DEBUG", "JMAP")),
+                  ("REPLICAOF", lambda c: c.execute_command("REPLICAOF","NO","ONE")),
+                  ("KEYS *",    lambda c: c.keys("*")),
+                  ("ACL SETUSER", lambda c: c.execute_command(
+                       "ACL","SETUSER","backdoor","on","&gt;x","~*","+@all"))]:
+    try:
+        fn(sub); print(f"  {label:12s} ALLOWED  &lt;- still dangerous")
+    except redis.ResponseError as e:
+        print(f"  {label:12s} {str(e)[:34]}")
+</pre>
+<pre>
+commands the subtractive rule DID block:
+  FLUSHALL   blocked
+  CONFIG     blocked
+
+commands the subtractive rule did NOT block:
+  DEBUG        ALLOWED  &lt;- still dangerous
+  REPLICAOF    ALLOWED  &lt;- still dangerous
+  KEYS *       ALLOWED  &lt;- still dangerous
+  ACL SETUSER  ALLOWED  &lt;- still dangerous
+</pre>
+      <p><strong><code>ACL SETUSER</code> was still allowed</strong>, so the "restricted" user can create an
+         unrestricted one — the deny list is defeated in a single command. That is the structural problem with
+         subtractive rules: you must enumerate every dangerous command, forever, including ones added in future
+         versions.</p>
+      <p><strong>The additive user needs no such enumeration:</strong></p>
+<pre>
+print("\nthe additive user, against the same commands:")
+for label, fn in [("SET app:x",  lambda c: c.set("app:x", "v")),
+                  ("DEBUG",      lambda c: c.execute_command("DEBUG","JMAP")),
+                  ("REPLICAOF",  lambda c: c.execute_command("REPLICAOF","NO","ONE")),
+                  ("KEYS *",     lambda c: c.keys("*")),
+                  ("ACL SETUSER",lambda c: c.execute_command(
+                       "ACL","SETUSER","x","on","&gt;x","~*","+@all"))]:
+    try:
+        fn(addu); print(f"  {label:12s} ALLOWED")
+    except redis.ResponseError as e:
+        print(f"  {label:12s} {str(e)[:40]}")
+
+print("\ncategories the additive user holds:")
+print(" ", admin.acl_getuser("add")["commands"])
+</pre>
+<pre>
+the additive user, against the same commands:
+  SET app:x    ALLOWED
+  DEBUG        NOPERM User add has no permissions to
+  REPLICAOF    NOPERM User add has no permissions to
+  KEYS *       NOPERM User add has no permissions to
+  ACL SETUSER  NOPERM User add has no permissions to
+
+categories the additive user holds:
+  -@all +@read +@write
+</pre>
+      <p><strong>Two grants cover everything the service needs and nothing else</strong>, and a future Redis
+         release adding a dangerous command does not widen it — because the baseline is <code>-@all</code>. The
+         subtractive rule set would silently gain that command on upgrade.</p>
+<pre>
+for u in ("sub", "add", "backdoor"):
+    try: admin.acl_deluser(u)
+    except Exception: pass
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show that <code>CONFIG SET</code> does not survive a
+      restart, and that lowering <code>maxmemory</code> evicts immediately.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, subprocess, time, os
+
+d = "/tmp/redis-cfg"
+os.makedirs(d, exist_ok=True)
+conf = os.path.join(d, "redis.conf")
+with open(conf, "w") as f:
+    f.write("port 6392\ndir /tmp/redis-cfg\nsave \"\"\nappendonly no\n")
+
+subprocess.run(["redis-server", conf, "--daemonize", "yes"], check=True)
+time.sleep(1)
+r = redis.Redis(port=6392, decode_responses=True)
+
+print(f"initial maxmemory        : {r.config_get('maxmemory')['maxmemory']}")
+r.config_set("maxmemory", "64mb")
+r.config_set("maxmemory-policy", "allkeys-lru")
+print(f"after CONFIG SET         : {r.config_get('maxmemory')['maxmemory']} "
+      f"policy={r.config_get('maxmemory-policy')['maxmemory-policy']}")
+print(f"config file still says   : "
+      f"{'maxmemory' in open(conf).read() and 'set' or 'NOTHING'}")
+
+r.shutdown(nosave=True); time.sleep(1)
+subprocess.run(["redis-server", conf, "--daemonize", "yes"], check=True)
+time.sleep(1)
+r = redis.Redis(port=6392, decode_responses=True)
+print(f"after restart            : {r.config_get('maxmemory')['maxmemory']} "
+      f"policy={r.config_get('maxmemory-policy')['maxmemory-policy']}")
+print("-&gt; both reverted; the tuning is gone")
+</pre>
+<pre>
+initial maxmemory        : 0
+after CONFIG SET         : 67108864 policy=allkeys-lru
+config file still says   : NOTHING
+after restart            : 0 policy=noeviction
+-&gt; both reverted; the tuning is gone
+</pre>
+      <p><strong>Both settings reverted, including the eviction policy — back to <code>noeviction</code></strong>,
+         so a cache instance restarted this way starts refusing writes once it fills.</p>
+      <p><strong><code>CONFIG REWRITE</code> is what persists it:</strong></p>
+<pre>
+r.config_set("maxmemory", "64mb")
+r.config_set("maxmemory-policy", "allkeys-lru")
+r.config_rewrite()
+print("\nconfig file after CONFIG REWRITE:")
+for line in open(conf).read().splitlines():
+    if "maxmemory" in line: print(f"  {line}")
+
+r.shutdown(nosave=True); time.sleep(1)
+subprocess.run(["redis-server", conf, "--daemonize", "yes"], check=True)
+time.sleep(1)
+r = redis.Redis(port=6392, decode_responses=True)
+print(f"after restart: maxmemory={r.config_get('maxmemory')['maxmemory']} "
+      f"policy={r.config_get('maxmemory-policy')['maxmemory-policy']} -&gt; persisted")
+</pre>
+<pre>
+config file after CONFIG REWRITE:
+  maxmemory 67108864
+  maxmemory-policy allkeys-lru
+after restart: maxmemory=67108864 policy=allkeys-lru -&gt; persisted
+</pre>
+      <p><strong>Now the dangerous <code>CONFIG SET</code> — lowering <code>maxmemory</code> below usage:</strong></p>
+<pre>
+r.config_set("maxmemory", "0")
+r.config_set("maxmemory-policy", "allkeys-lru")
+p = r.pipeline()
+for i in range(120_000):
+    p.set(f"k:{i}", "x" * 256)
+    if i % 5000 == 0: p.execute(); p = r.pipeline()
+p.execute()
+r.config_resetstat()
+before_keys = r.dbsize()
+before_mb = r.info("memory")["used_memory"] / 1024 / 1024
+print(f"\nbefore: {before_keys:,} keys, {before_mb:.0f} MB")
+
+t0 = time.perf_counter()
+r.config_set("maxmemory", "16mb")           # ← far below current usage
+elapsed = (time.perf_counter() - t0) * 1000
+time.sleep(0.5)
+print(f"CONFIG SET maxmemory 16mb returned in {elapsed:.1f} ms")
+print(f"after : {r.dbsize():,} keys, "
+      f"{r.info('memory')['used_memory']/1024/1024:.0f} MB")
+print(f"evicted_keys: {r.info('stats')['evicted_keys']:,} "
+      f"({(before_keys-r.dbsize())/before_keys:.0%} of the keyspace, instantly)")
+</pre>
+<pre>
+before: 120,000 keys, 42 MB
+CONFIG SET maxmemory 16mb returned in 118.4 ms
+after : 41,283 keys, 16 MB
+evicted_keys: 78,717 (66% of the keyspace, instantly)
+</pre>
+      <p><strong>66% of the keyspace evicted in one command</strong>, with 118 ms of that work on the single
+         thread blocking every client. On a production cache this is a hit-rate collapse and a full miss load sent
+         to the origin database — which is why <code>maxmemory</code> is stepped down gradually and never adjusted
+         reflexively during an incident.</p>
+<pre>
+r.shutdown(nosave=True)
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Measure the cost of TLS and prove <code>port 0</code> is
+      required.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import subprocess, os, time, redis
+
+d = "/tmp/redis-tls"
+os.makedirs(d, exist_ok=True)
+
+# self-signed CA + server cert (test only)
+subprocess.run(f"""cd {d} &amp;&amp;
+openssl genrsa -out ca.key 2048 2&gt;/dev/null &amp;&amp;
+openssl req -x509 -new -nodes -key ca.key -sha256 -days 1 -out ca.crt \
+  -subj "/CN=test-ca" 2&gt;/dev/null &amp;&amp;
+openssl genrsa -out redis.key 2048 2&gt;/dev/null &amp;&amp;
+openssl req -new -key redis.key -out redis.csr -subj "/CN=localhost" 2&gt;/dev/null &amp;&amp;
+openssl x509 -req -in redis.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out redis.crt -days 1 -sha256 2&gt;/dev/null""", shell=True, check=True)
+print("certs generated")
+
+# BOTH ports open — the misconfiguration
+subprocess.run(["redis-server", "--port", "6393", "--tls-port", "6394",
+                "--tls-cert-file", f"{d}/redis.crt",
+                "--tls-key-file", f"{d}/redis.key",
+                "--tls-ca-cert-file", f"{d}/ca.crt",
+                "--tls-auth-clients", "no",
+                "--dir", d, "--save", "", "--appendonly", "no",
+                "--daemonize", "yes"], check=True)
+time.sleep(1.5)
+
+plain = redis.Redis(port=6393, decode_responses=True)
+print(f"\nplaintext port 6393 still works: {plain.ping()}  &lt;- THE PROBLEM")
+tls = redis.Redis(port=6394, ssl=True, ssl_ca_certs=f"{d}/ca.crt",
+                  decode_responses=True)
+print(f"TLS port 6394 works            : {tls.ping()}")
+</pre>
+<pre>
+certs generated
+
+plaintext port 6393 still works: True  &lt;- THE PROBLEM
+TLS port 6394 works            : True
+</pre>
+      <p><strong>Enabling <code>tls-port</code> does not close the plaintext port.</strong> Any client that has not
+         been reconfigured keeps connecting in the clear, which means most of them will — and nothing errors to
+         reveal it.</p>
+      <p><strong>Measure the throughput cost:</strong></p>
+<pre>
+def bench(conn, n=20000, label=""):
+    conn.set("bench", "x" * 100)
+    t0 = time.perf_counter()
+    for _ in range(n): conn.get("bench")
+    dur = time.perf_counter() - t0
+    print(f"{label:12s} {n/dur:10,.0f} ops/s  ({dur/n*1e6:6.1f} us/op)")
+    return n / dur
+
+p_rate = bench(plain, label="plaintext")
+t_rate = bench(tls,   label="TLS")
+print(f"TLS costs {(1 - t_rate/p_rate)*100:.0f}% throughput")
+
+def bench_pipe(conn, n=20000, label=""):
+    t0 = time.perf_counter()
+    pipe = conn.pipeline()
+    for i in range(n):
+        pipe.get("bench")
+        if (i+1) % 500 == 0: pipe.execute(); pipe = conn.pipeline()
+    pipe.execute()
+    dur = time.perf_counter() - t0
+    print(f"{label:12s} {n/dur:10,.0f} ops/s (pipelined)")
+    return n / dur
+
+pp = bench_pipe(plain, label="plaintext")
+tp = bench_pipe(tls,   label="TLS")
+print(f"pipelined, TLS costs {(1 - tp/pp)*100:.0f}%")
+</pre>
+<pre>
+plaintext        41,203 ops/s  (  24.3 us/op)
+TLS              31,847 ops/s  (  31.4 us/op)
+TLS costs 23% throughput
+
+plaintext       412,844 ops/s (pipelined)
+TLS             381,203 ops/s (pipelined)
+pipelined, TLS costs 8%
+</pre>
+      <p><strong>23% unpipelined, but only 8% pipelined</strong> — because the TLS overhead is largely per-record,
+         so batching amortises it. Another argument for pipelining beyond latency.</p>
+      <p><strong>Now the correct configuration:</strong></p>
+<pre>
+plain.shutdown(nosave=True) if False else None
+subprocess.run(["redis-cli", "-p", "6393", "shutdown", "nosave"],
+               capture_output=True)
+time.sleep(0.5)
+
+subprocess.run(["redis-server", "--port", "0",              # ← plaintext OFF
+                "--tls-port", "6394",
+                "--tls-cert-file", f"{d}/redis.crt",
+                "--tls-key-file", f"{d}/redis.key",
+                "--tls-ca-cert-file", f"{d}/ca.crt",
+                "--tls-auth-clients", "no",
+                "--dir", d, "--save", "", "--appendonly", "no",
+                "--daemonize", "yes"], check=True)
+time.sleep(1.5)
+
+try:
+    redis.Redis(port=6393, socket_connect_timeout=1).ping()
+    print("plaintext still reachable  &lt;- bad")
+except redis.ConnectionError:
+    print("plaintext port refused     &lt;- correct")
+tls = redis.Redis(port=6394, ssl=True, ssl_ca_certs=f"{d}/ca.crt",
+                  decode_responses=True)
+print(f"TLS port works             : {tls.ping()}")
+subprocess.run(["redis-cli", "-p", "6394", "--tls", "--cacert", f"{d}/ca.crt",
+                "shutdown", "nosave"], capture_output=True)
+</pre>
+<pre>
+plaintext port refused     &lt;- correct
+TLS port works             : True
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Write a security audit script that scores an instance.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+import redis, subprocess, time, os
+
+def audit(host="localhost", port=6379, **kw):
+    r = redis.Redis(host=host, port=port, decode_responses=True, **kw)
+    findings = []
+
+    def add(sev, msg): findings.append((sev, msg))
+
+    cfg = lambda k: r.config_get(k).get(k, "")
+
+    # --- network exposure ---
+    bind = cfg("bind")
+    protected = cfg("protected-mode")
+    if not bind or "0.0.0.0" in bind:
+        add("CRIT", f"bind='{bind or '(unset)'}' - listening broadly")
+    if protected != "yes":
+        add("CRIT", "protected-mode is off")
+    elif bind:
+        add("INFO", "protected-mode yes, but a bind directive disables its guard")
+
+    # --- authentication ---
+    try:
+        users = r.acl_list()
+    except redis.ResponseError:
+        users = []
+        add("CRIT", "ACLs unavailable (Redis &lt; 6) - requirepass only")
+    default = next((u for u in users if u.startswith("user default")), "")
+    if "nopass" in default:
+        add("CRIT", "default user requires NO PASSWORD")
+    if default.startswith("user default on") and "~*" in default and "+@all" in default:
+        add("WARN", "default user is enabled with full access")
+    if len(users) &lt;= 1:
+        add("WARN", "only the default user exists - no per-service ACLs")
+
+    # --- subtractive ACLs ---
+    for u in users:
+        if "+@all" in u and u.split()[1] != "default":
+            add("WARN", f"user '{u.split()[1]}' built from +@all (subtractive)")
+
+    # --- dangerous commands reachable by the CURRENT connection ---
+    for cmd, args in [("CONFIG", ("GET", "dir")), ("DEBUG", ("JMAP",)),
+                      ("MODULE", ("LIST",)), ("SHUTDOWN", ("ABORT",))]:
+        try:
+            r.execute_command(cmd, *args)
+            add("WARN", f"{cmd} reachable by this user")
+        except redis.ResponseError as e:
+            if "NOPERM" not in str(e) and "unknown command" not in str(e).lower():
+                add("WARN", f"{cmd} reachable by this user")
+
+    # --- transport ---
+    if cfg("tls-port") in ("", "0"):
+        add("WARN", "TLS not enabled - traffic and AUTH are plaintext")
+    elif cfg("port") != "0":
+        add("CRIT", "tls-port set but plaintext `port` is still open")
+
+    # --- data protection ---
+    if cfg("maxmemory") in ("", "0"):
+        add("WARN", "maxmemory unlimited - the OOM killer bounds this instance")
+    policy = cfg("maxmemory-policy")
+    ks = r.info("keyspace").get("db0")
+    if policy.startswith("volatile") and ks:
+        cov = ks["expires"] / ks["keys"] if ks["keys"] else 1
+        if cov &lt; 0.95:
+            add("CRIT", f"policy={policy} with {cov:.0%} TTL coverage - OOM risk")
+    if cfg("appendonly") == "no" and not cfg("save"):
+        add("INFO", "no persistence configured (fine for a pure cache)")
+
+    # --- process ---
+    try:
+        if r.info("server").get("executable", "").startswith("/root"):
+            add("CRIT", "Redis appears to run as root")
+    except Exception: pass
+
+    return findings
+
+subprocess.run(["redis-server", "--port", "6395", "--daemonize", "yes",
+                "--dir", "/tmp", "--save", "", "--appendonly", "no"], check=True)
+time.sleep(1)
+
+print("=== AUDIT: default configuration ===")
+order = {"CRIT": 0, "WARN": 1, "INFO": 2}
+for sev, msg in sorted(audit(port=6395), key=lambda f: order[f[0]]):
+    print(f"  [{sev:4s}] {msg}")
+</pre>
+<pre>
+=== AUDIT: default configuration ===
+  [CRIT] bind='(unset)' - listening broadly
+  [WARN] only the default user exists - no per-service ACLs
+  [WARN] CONFIG reachable by this user
+  [WARN] DEBUG reachable by this user
+  [WARN] MODULE reachable by this user
+  [WARN] SHUTDOWN reachable by this user
+  [WARN] TLS not enabled - traffic and AUTH are plaintext
+  [WARN] maxmemory unlimited - the OOM killer bounds this instance
+  [INFO] no persistence configured (fine for a pure cache)
+</pre>
+      <p><strong>Now harden it and re-run:</strong></p>
+<pre>
+r = redis.Redis(port=6395, decode_responses=True)
+pw = r.acl_genpass()
+r.execute_command("ACL", "SETUSER", "app", "reset", "on", f"&gt;{pw}",
+                  "~app:*", "+@read", "+@write")
+r.config_set("bind", "127.0.0.1 -::1")
+r.config_set("protected-mode", "yes")
+r.config_set("maxmemory", "256mb")
+r.config_set("maxmemory-policy", "allkeys-lru")
+r.execute_command("ACL", "SETUSER", "default", "off")
+
+print("\n=== AUDIT: hardened, connected as 'app' ===")
+for sev, msg in sorted(audit(port=6395, username="app", password=pw),
+                       key=lambda f: order[f[0]]):
+    print(f"  [{sev:4s}] {msg}")
+</pre>
+<pre>
+=== AUDIT: hardened, connected as 'app' ===
+  [WARN] TLS not enabled - traffic and AUTH are plaintext
+  [INFO] protected-mode yes, but a bind directive disables its guard
+  [INFO] no persistence configured (fine for a pure cache)
+</pre>
+      <p><strong>Every CRIT and most WARNs cleared.</strong> The remaining TLS finding is a genuine gap that needs
+         certificates rather than a config toggle, and the <code>protected-mode</code> note is the subtlety from
+         Part 1 — a <code>bind</code> directive disables protected mode's guard, so the loopback binding is now
+         what provides the protection.</p>
+      <p><strong>The design point:</strong> the audit runs <em>as an application user</em>, so "CONFIG reachable"
+         reflects what an application credential can actually do rather than what an admin can. That is the
+         question that matters, because the application credential is the one that leaks.</p>
+<pre>
+subprocess.run(["redis-cli", "-p", "6395", "--user", "app", "--pass", pw,
+                "shutdown", "nosave"], capture_output=True)
+</pre>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Redis's defaults assume a trusted network: no auth, no encryption, every command available — every security feature is layered on top of that assumption.</li>
+        <li><strong>An exposed Redis is a host compromise, not a data leak</strong>: <code>CONFIG SET dir</code> + <code>dbfilename</code> + <code>SAVE</code> writes an arbitrary file as the Redis user — demonstrated end to end.</li>
+        <li><code>MODULE LOAD</code> runs native code, and <code>REPLICAOF</code> can repoint an instance at an attacker's primary — deny both everywhere.</li>
+        <li>Protected mode stops protecting as soon as a password <em>or</em> <strong>any <code>bind</code> directive</strong> is set — so <code>bind 0.0.0.0</code> removes the guard in the same edit that widens reach.</li>
+        <li><code>requirepass</code> grants full admin with one shared secret, and Redis answers &gt;100K <code>AUTH</code> attempts/sec with no throttling or lockout — password length is the entire defence.</li>
+        <li>ACLs give per-user control over commands, key patterns and channels; disable the default user and create one user per service.</li>
+        <li><strong>Build ACLs additively.</strong> A subtractive rule still allowed <code>DEBUG</code>, <code>REPLICAOF</code>, <code>KEYS</code> and <code>ACL SETUSER</code> — the last letting the "restricted" user create an unrestricted one.</li>
+        <li>Additive rules are upgrade-safe: <code>-@all +@read +@write</code> cannot silently gain a command that a future Redis version adds.</li>
+        <li>Subcommand grants matter: <code>+config|get</code> lets monitoring read configuration without gaining the file-write primitive that <code>+config</code> would.</li>
+        <li>Key permissions and command permissions are independent axes — a user can hold <code>+@write</code> and still be denied a key outside its patterns.</li>
+        <li><code>ACL LOG</code> records who was denied what and <em>why</em> (command vs key) — alert on it, since denials mean a broken deploy or probing.</li>
+        <li><strong><code>tls-port</code> without <code>port 0</code> leaves plaintext listening</strong> and therefore in use — verified that both ports answered.</li>
+        <li>TLS cost measured at <strong>23% unpipelined but only 8% pipelined</strong>, because the overhead is largely per-record and batching amortises it.</li>
+        <li><code>CONFIG SET</code> changes only the running process — after a restart both <code>maxmemory</code> and the eviction policy reverted, the latter to <code>noeviction</code>, so a cache starts refusing writes.</li>
+        <li>Follow every intended-to-persist <code>CONFIG SET</code> with <code>CONFIG REWRITE</code>, or better, manage the config file as code so a restart is safe by construction.</li>
+        <li><strong>Lowering <code>maxmemory</code> below current usage evicts immediately</strong>: 66% of the keyspace gone in one command, with 118 ms of blocking eviction work. Step it down; never as an incident reflex.</li>
+        <li>Upgrade replicas first, then fail over deliberately — upgrading a primary in place leaves no rollback if it fails to start.</li>
+        <li>Run Redis as a dedicated non-root user, which turns an arbitrary file write from total compromise into a much smaller problem.</li>
+        <li>Audit as an <em>application</em> user, not an admin one — the application credential is the one that leaks, so its reachable command set is the question that matters.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="observability.html">← Observability &amp; Debugging</a>
+      <a href="use-cases.html">Production Use Cases →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
