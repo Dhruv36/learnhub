@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Namespaces: Isolating What You See — Docker — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Namespaces: Isolating What You See <span class="level-badge level-int">Foundations</span></h1>
+    <p><strong>What you'll master:</strong> the seven namespace types, what each one virtualises, and — more
+       usefully — the significant things they do <em>not</em> cover, which is where every "why does my container
+       see the host's..." question comes from; why <code>/proc/meminfo</code> and <code>nproc</code> report host
+       values inside a container, and the JVM and Go runtime bugs that caused; the PID namespace and why PID 1
+       inside is a real host PID outside; <strong>user namespaces</strong>, the one that actually maps container
+       root to an unprivileged host UID — and why Docker leaves it off by default; how to share namespaces
+       deliberately (<code>--net=container:</code>, <code>--pid=host</code>) and what each sharing decision costs;
+       and how to inspect and enter namespaces with <code>lsns</code> and <code>nsenter</code>.
+       Prerequisites: <a href="index.html">What a Container Actually Is</a>.</p>
+
+    <h2>Part 1 — The Seven Namespaces</h2>
+
+    <p>A namespace virtualises one global system resource so that processes inside it see their own instance of
+       it. Linux has seven, and Docker uses six of them by default.</p>
+
+    <table class="tbl">
+      <tr><th>Namespace</th><th>Virtualises</th><th>Docker default</th></tr>
+      <tr><td><strong>PID</strong></td><td>Process IDs — its own PID 1, cannot see host processes</td><td>✅ Own</td></tr>
+      <tr><td><strong>MNT</strong></td><td>Mount points — its own filesystem tree</td><td>✅ Own</td></tr>
+      <tr><td><strong>NET</strong></td><td>Interfaces, routes, iptables, port space</td><td>✅ Own</td></tr>
+      <tr><td><strong>UTS</strong></td><td>Hostname and domain name</td><td>✅ Own</td></tr>
+      <tr><td><strong>IPC</strong></td><td>System V IPC, POSIX message queues, shared memory</td><td>✅ Own</td></tr>
+      <tr><td><strong>CGROUP</strong></td><td>The cgroup root a process sees</td><td>✅ Own</td></tr>
+      <tr><td><strong>USER</strong></td><td>UID/GID mappings and capabilities</td><td>❌ <strong>Off by default</strong></td></tr>
+    </table>
+
+    <p>Each is just an identifier the kernel attaches to a process, visible in <code>/proc/PID/ns/</code>:</p>
+
+<pre>
+$ PID=$(docker inspect -f '{{.State.Pid}}' mycontainer)
+$ sudo ls -l /proc/$PID/ns/
+lrwxrwxrwx 1 root root 0 cgroup -> 'cgroup:[4026532567]'
+lrwxrwxrwx 1 root root 0 ipc    -> 'ipc:[4026532505]'
+lrwxrwxrwx 1 root root 0 mnt    -> 'mnt:[4026532503]'
+lrwxrwxrwx 1 root root 0 net    -> 'net:[4026532508]'
+lrwxrwxrwx 1 root root 0 pid    -> 'pid:[4026532506]'
+lrwxrwxrwx 1 root root 0 user   -> 'user:[4026531837]'   ← same id as the host!
+lrwxrwxrwx 1 root root 0 uts    -> 'uts:[4026532504]'
+
+$ sudo ls -l /proc/1/ns/user                              # host init
+lrwxrwxrwx 1 root root 0 user -> 'user:[4026531837]'      ← identical
+</pre>
+
+    <div class="note">🔑 <strong>Two processes are in the same namespace if and only if those inode numbers
+       match.</strong> That is the entire mechanism — "isolation" is a set of integers. Note the user namespace
+       above: the container and host share it, which is why <strong>root in a default Docker container is really
+       root on the host</strong>, restricted only by dropped capabilities and seccomp rather than by a UID
+       mapping.</p></div>
+
+    <h2>Part 2 — What Namespaces Do NOT Cover</h2>
+
+    <p>This is the part that generates real production bugs. Several things that feel like they should be isolated
+       are not namespaced at all.</p>
+
+<pre>
+NOT namespaced — the container sees HOST values:
+
+  /proc/cpuinfo        the host's CPU count
+  /proc/meminfo        the host's total RAM
+  /proc/loadavg        the host's load average
+  uname -r             the host kernel version
+  /sys/devices/...     host hardware topology
+  the system clock     one clock for everything (time ns exists but is unused)
+  most sysctls         one kernel, one setting
+</pre>
+
+<pre>
+$ docker run --rm --memory=512m --cpus=1 alpine sh -c \
+    'nproc; grep MemTotal /proc/meminfo'
+16                              ← the HOST's core count, despite --cpus=1
+MemTotal:       65806152 kB     ← the HOST's 64 GB, despite --memory=512m
+</pre>
+
+    <div class="note">🔑 <strong>cgroup limits are enforced but not <em>reported</em> through the usual
+       interfaces</strong>, and that mismatch caused a well-known class of outage. A JVM before Java 10 sized its
+       default heap from <code>/proc/meminfo</code>, so a container limited to 512 MB would size a ~16 GB heap
+       from the host's RAM, grow past its cgroup limit, and be OOM-killed with exit code 137 and no Java error.
+       Go's <code>runtime.NumCPU()</code> and thread pools sized from <code>nproc</code> have the equivalent
+       problem, creating 16 worker threads on a 1-CPU quota and thrashing.</p></div>
+
+    <table class="tbl">
+      <tr><th>Runtime</th><th>Problem</th><th>Fix</th></tr>
+      <tr><td>JVM &lt; 10</td><td>Heap sized from host RAM → OOM kill</td><td>Java 10+ (container-aware), or explicit <code>-Xmx</code></td></tr>
+      <tr><td>Go</td><td><code>GOMAXPROCS</code> from host cores → thrash</td><td><code>automaxprocs</code>, or set it explicitly</td></tr>
+      <tr><td>Node.js</td><td><code>os.cpus()</code> misleading for cluster sizing</td><td>Read the cgroup, or configure explicitly</td></tr>
+      <tr><td>Python multiprocessing</td><td><code>cpu_count()</code> returns host cores</td><td><code>len(os.sched_getaffinity(0))</code></td></tr>
+      <tr><td>nginx <code>worker_processes auto</code></td><td>Workers from host cores</td><td>Set the number explicitly</td></tr>
+    </table>
+
+    <p><strong>Read the cgroup directly</strong> when you need the real limit — that is where the truth lives:</p>
+
+<pre>
+# cgroup v2
+$ docker run --rm --memory=512m alpine cat /sys/fs/cgroup/memory.max
+536870912                       ← 512 MB, the actual limit
+$ docker run --rm --cpus=1.5 alpine cat /sys/fs/cgroup/cpu.max
+150000 100000                   ← 1.5 CPUs (quota/period)
+</pre>
+
+    <h2>Part 3 — PID, UTS, IPC and MNT</h2>
+
+    <p><strong>The PID namespace</strong> gives the container its own process numbering starting at 1. The same
+       task has two PIDs — one per namespace it belongs to.</p>
+
+<pre>
+$ docker run -d --name web nginx
+$ docker exec web ps -eo pid,comm
+  PID COMMAND
+    1 nginx                     ← PID 1 inside
+   29 nginx
+
+$ docker inspect -f '{{.State.Pid}}' web
+48213                           ← the same process, on the host
+
+$ sudo cat /proc/48213/status | grep ^NSpid
+NSpid:  48213   1               ← host PID, then namespace PID
+</pre>
+
+    <p><strong>PID 1 is special</strong>, and that specialness causes the signal-handling and zombie-reaping
+       problems covered in <a href="process-model.html">Process Model, PID 1 &amp; Signals</a>: the kernel does not
+       apply default signal actions to PID 1, so a process that does not explicitly handle SIGTERM ignores it
+       entirely.</p>
+
+    <p><strong>UTS</strong> is the smallest namespace — hostname and domain name only:</p>
+
+<pre>
+$ docker run --rm alpine hostname
+3f8a91c04e7b                    ← the container ID by default
+$ docker run --rm --hostname myapp alpine hostname
+myapp
+</pre>
+
+    <p><strong>IPC</strong> isolates System V IPC and POSIX message queues — and, importantly,
+       <code>/dev/shm</code>, whose default size of 64 MB breaks applications that expect more:</p>
+
+<pre>
+$ docker run --rm alpine df -h /dev/shm
+Filesystem      Size  Used Avail Use% Mounted on
+shm              64M     0   64M   0% /dev/shm      ← Chrome, Postgres, PyTorch need more
+
+$ docker run --rm --shm-size=1g alpine df -h /dev/shm | tail -1
+shm             1.0G     0  1.0G   0% /dev/shm
+</pre>
+
+    <p><strong>MNT</strong> gives the container its own mount table, which is what makes the union filesystem
+       possible — the container's <code>/</code> is the overlayfs merged directory rather than the host's root.</p>
+
+    <h2>Part 4 — User Namespaces: The One That Is Off</h2>
+
+    <p>The user namespace maps UIDs and GIDs between container and host, so that UID 0 inside can be an
+       unprivileged UID outside. This is the strongest namespace-level security control available, and Docker
+       does not enable it by default.</p>
+
+<pre>
+WITHOUT a user namespace (Docker's default):
+  container UID 0  ──is──>  host UID 0        ← real root, restricted by capabilities
+
+WITH a user namespace (userns-remap):
+  container UID 0  ──maps──>  host UID 165536 ← unprivileged on the host
+  container UID 1  ──maps──>  host UID 165537
+</pre>
+
+    <div class="note">🔑 <strong>By default, root inside a container is root on the host.</strong> What stops it
+       doing damage is not a UID mapping but dropped capabilities, seccomp filters, and the read-only masking of
+       parts of <code>/proc</code>. Remove those — <code>--privileged</code>, or
+       <code>--cap-add=SYS_ADMIN</code> — and container root is host root in practice, which is exactly why a
+       mounted Docker socket is a full host compromise.</p></div>
+
+<pre>
+# enable user-namespace remapping in /etc/docker/daemon.json
+{ "userns-remap": "default" }
+
+# then, from the host:
+$ docker run -d --name remapped alpine sleep 300
+$ ps -o uid,cmd -p $(docker inspect -f '{{.State.Pid}}' remapped)
+  UID CMD
+165536 sleep 300           ← container root is an unprivileged host UID
+</pre>
+
+    <table class="tbl">
+      <tr><th>userns-remap</th><th>Gains</th><th>Costs</th></tr>
+      <tr><td>Enabled</td><td>Container root ≠ host root; escapes land unprivileged</td><td>Volume ownership shifts; some features break</td></tr>
+      <tr><td>Disabled (default)</td><td>Simple volume permissions; everything works</td><td>Container root <strong>is</strong> host root</td></tr>
+    </table>
+
+    <p>The costs are why it is off: bind-mounted host directories are owned by the wrong UID from the container's
+       perspective, and <code>--privileged</code>, <code>--pid=host</code> and <code>--net=host</code> are
+       incompatible with it. Rootless Docker and Podman take the same idea further by running the daemon itself
+       unprivileged.</p>
+
+    <h2>Part 5 — Sharing Namespaces Deliberately</h2>
+
+    <p>Namespaces can be shared, and each sharing decision trades isolation for a capability.</p>
+
+<pre>
+--network=container:web     join another container's NET namespace (localhost between them)
+--network=host              use the HOST's network stack — no isolation, no port mapping
+--pid=container:web         see another container's processes (debugging)
+--pid=host                  see ALL host processes
+--ipc=container:web         share memory segments
+--uts=host                  share the hostname
+--userns=host               opt out of userns-remap for one container
+</pre>
+
+    <p><strong>The debugging pattern</strong> is the most valuable use: attach a toolbox container to a
+       distroless container that has no shell:</p>
+
+<pre>
+# a minimal image has no ps, no curl, no shell
+$ docker run --rm -it \
+    --network=container:web \
+    --pid=container:web \
+    nicolaka/netshoot sh
+/ # ps aux                   ← sees web's processes
+/ # curl localhost:8080      ← web's port is on OUR localhost
+/ # ss -tlnp                 ← web's listening sockets
+</pre>
+
+    <table class="tbl">
+      <tr><th>Sharing</th><th>Use for</th><th>Risk</th></tr>
+      <tr><td><code>--network=container:</code></td><td>Sidecars, debugging, service meshes</td><td>Shared port space — collisions</td></tr>
+      <tr><td><code>--network=host</code></td><td>Performance-critical networking</td><td>No isolation; binds host ports directly</td></tr>
+      <tr><td><code>--pid=container:</code></td><td>Debugging a shell-less image</td><td>Can signal the target's processes</td></tr>
+      <tr><td><code>--pid=host</code></td><td>Monitoring agents</td><td><strong>Sees and can signal every host process</strong></td></tr>
+      <tr><td><code>--ipc=container:</code></td><td>Shared-memory workloads</td><td>Shared memory is a channel between them</td></tr>
+    </table>
+
+    <h2>Part 6 — Inspecting and Entering Namespaces</h2>
+
+<pre>
+$ lsns                                   # all namespaces on the host
+        NS TYPE   NPROCS   PID USER   COMMAND
+4026531835 cgroup    342     1 root   /sbin/init
+4026532503 mnt         2 48213 root   nginx: master process
+4026532506 pid         2 48213 root   nginx: master process
+
+$ lsns -t net                            # only network namespaces
+$ lsns -p 48213                          # namespaces of one process
+</pre>
+
+<pre>
+# enter a container's namespaces from the host — works even with no shell in the image
+$ PID=$(docker inspect -f '{{.State.Pid}}' web)
+$ sudo nsenter -t $PID -n ip addr        # its network only, host binaries
+$ sudo nsenter -t $PID -p -m -u -i -n sh # everything: a full "docker exec" equivalent
+</pre>
+
+    <p><strong><code>nsenter</code> is the tool that works when <code>docker exec</code> cannot</strong> — a
+       distroless or scratch image has no shell to exec, but entering only the network namespace lets you use the
+       host's <code>ip</code>, <code>ss</code>, and <code>tcpdump</code> against the container's stack.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Assuming namespaces isolate everything, and sizing an application from what it reads inside the
+         container.</strong> The team sets <code>--memory=512m</code> and <code>--cpus=1</code>, then the JVM
+         reads <code>/proc/meminfo</code>, sees the host's 64 GB, and sizes a multi-gigabyte default heap; the Go
+         service reads <code>nproc</code>, sees 16 cores, and starts 16 workers on a one-core quota. Neither value
+         is namespaced, so both runtimes are configuring themselves from the host. The result is a container
+         OOM-killed with exit code 137 and no application-level error, or one thrashing on CPU throttling — and
+         because the limits <em>are</em> enforced while the readings are not, nothing in the container's own view
+         explains it.</p>
+      <p>✅ <strong>Treat namespaces as controlling visibility of the process tree, mounts, network, hostname and
+         IPC — and nothing else.</strong> CPU count, memory totals, load average, kernel version and most sysctls
+         come from the host. Read the real limits from the cgroup interface (<code>/sys/fs/cgroup/memory.max</code>,
+         <code>cpu.max</code>) or use container-aware runtimes: Java 10+, Go with
+         <code>automaxprocs</code>, Python's <code>sched_getaffinity</code>, and explicit worker counts for nginx
+         and Node. Then remember the namespace Docker leaves <em>off</em>: without userns-remap, container root is
+         host root, so dropping capabilities and never mounting the Docker socket are what actually contain
+         it.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Sizing heaps/pools from <code>/proc/meminfo</code> or <code>nproc</code></td><td>Not namespaced — host values</td><td>Read the cgroup; use container-aware runtimes</td></tr>
+      <tr><td>Assuming container root is unprivileged</td><td>Without userns-remap it <em>is</em> host root</td><td>Run as non-root; drop capabilities</td></tr>
+      <tr><td>Mounting <code>/var/run/docker.sock</code></td><td>Equivalent to giving away host root</td><td>Never in untrusted workloads</td></tr>
+      <tr><td>Using <code>--privileged</code> to fix a permission error</td><td>Grants all capabilities; removes the boundary</td><td>Add the one capability actually needed</td></tr>
+      <tr><td><code>--pid=host</code> casually</td><td>Can see and signal every host process</td><td>Only for monitoring agents, deliberately</td></tr>
+      <tr><td>Expecting <code>/dev/shm</code> to be large</td><td>Defaults to 64 MB</td><td><code>--shm-size</code></td></tr>
+      <tr><td>Expecting <code>uname -r</code> to reflect the image</td><td>The kernel is the host's</td><td>Match host kernel requirements explicitly</td></tr>
+      <tr><td>Believing the container clock can differ</td><td>One system clock for everything</td><td>Fix time on the host</td></tr>
+      <tr><td>Debugging a distroless image with <code>docker exec</code></td><td>There is no shell to exec</td><td><code>nsenter</code>, or a sidecar sharing namespaces</td></tr>
+      <tr><td>Treating <code>--network=host</code> as a small optimisation</td><td>Removes network isolation entirely</td><td>Use published ports unless measured otherwise</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What are Linux namespaces, and which does Docker use?</summary>
+      <p><strong>A namespace virtualises one global system resource</strong> so processes inside it see their own
+         instance. They are the mechanism behind "what a container can see".</p>
+      <table class="tbl">
+        <tr><th>Namespace</th><th>Isolates</th></tr>
+        <tr><td>PID</td><td>Process IDs — its own PID 1</td></tr>
+        <tr><td>MNT</td><td>Mount points and filesystem tree</td></tr>
+        <tr><td>NET</td><td>Interfaces, routes, iptables, ports</td></tr>
+        <tr><td>UTS</td><td>Hostname and domain</td></tr>
+        <tr><td>IPC</td><td>System V IPC, message queues, <code>/dev/shm</code></td></tr>
+        <tr><td>CGROUP</td><td>The visible cgroup root</td></tr>
+        <tr><td>USER</td><td>UID/GID mapping — <strong>off by default in Docker</strong></td></tr>
+      </table>
+      <p>Docker uses the first six by default. Mechanically a namespace is just an inode number attached to a
+         process, visible in <code>/proc/PID/ns/</code> — two processes are in the same namespace exactly when
+         those numbers match.</p>
+      <p><strong>The important half of the answer is what they do NOT isolate:</strong> CPU count, memory totals,
+         load average, kernel version, and most sysctls are not namespaced, so a container reads the host's values
+         for all of them. That is the source of the classic JVM-heap-from-host-RAM OOM.</p>
+      <p>Namespaces answer "what can it see"; <a href="cgroups.html">cgroups</a> answer "what can it use". Both are
+         needed, and confusing them is the most common misunderstanding here.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why does <code>nproc</code> show 16 cores in a container limited to 1 CPU?</summary>
+      <p><strong>Because CPU and memory information is not namespaced.</strong> There is no "CPU namespace" —
+         <code>/proc/cpuinfo</code>, <code>/proc/meminfo</code> and <code>/proc/loadavg</code> are the host's, and
+         the container reads them directly.</p>
+<pre>
+$ docker run --rm --cpus=1 --memory=512m alpine sh -c 'nproc; grep MemTotal /proc/meminfo'
+16                              ← host cores
+MemTotal:       65806152 kB     ← host RAM
+</pre>
+      <p><strong>The limit is enforced, just not reported.</strong> cgroups throttle the container to one CPU's
+         worth of time and kill it above 512 MB — the enforcement is real, the <em>visibility</em> is missing.</p>
+      <p><strong>That mismatch is what breaks runtimes.</strong> A JVM before Java 10 sized its default heap as a
+         fraction of <code>/proc/meminfo</code>, so a 512 MB container would target a multi-gigabyte heap, exceed
+         its cgroup limit, and be OOM-killed with exit 137 and no Java exception. Go sizing
+         <code>GOMAXPROCS</code> from host cores creates 16 threads on a 1-core quota and thrashes on throttling.</p>
+      <p><strong>Read the cgroup for the truth:</strong></p>
+<pre>
+$ cat /sys/fs/cgroup/memory.max     # 536870912
+$ cat /sys/fs/cgroup/cpu.max        # 100000 100000  → 1 CPU
+</pre>
+      <p>Or use container-aware runtimes: Java 10+, Go with <code>automaxprocs</code>, Python's
+         <code>os.sched_getaffinity(0)</code>, and explicit worker counts instead of <code>auto</code> in nginx.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is a user namespace, and why is it off by default?</summary>
+      <p><strong>A user namespace maps UIDs and GIDs between container and host</strong>, so UID 0 inside can
+         correspond to an unprivileged UID outside.</p>
+<pre>
+Without (Docker default):  container UID 0 → host UID 0        ← real root
+With userns-remap:         container UID 0 → host UID 165536   ← unprivileged
+</pre>
+      <p><strong>Without it, root in a container is root on the host.</strong> What limits the damage is not
+         identity but capabilities, seccomp filters, and masked <code>/proc</code> paths. Remove those with
+         <code>--privileged</code> or <code>--cap-add=SYS_ADMIN</code> and container root is effectively host root
+         — which is why mounting the Docker socket into a container is a full host compromise.</p>
+      <p><strong>Why Docker leaves it off:</strong></p>
+      <ul>
+        <li><strong>Volume ownership.</strong> Bind-mounted host directories appear owned by the wrong UID inside,
+           so existing setups break in confusing ways.</li>
+        <li><strong>Feature incompatibility.</strong> <code>--privileged</code>, <code>--pid=host</code> and
+           <code>--net=host</code> do not work with it.</li>
+        <li><strong>It is daemon-wide</strong>, not per container, so enabling it changes every workload at once.</li>
+        <li>Historically it was late and incomplete relative to other isolation features.</li>
+      </ul>
+      <p><strong>What I would do instead in most environments:</strong> run the application as a non-root UID in
+         the image, drop all capabilities and add back only what is needed, use a seccomp profile, and never mount
+         the Docker socket. Where the workload is genuinely untrusted, rootless Docker or Podman — which run the
+         daemon itself unprivileged — are a better answer than remapping alone, and VM-backed isolation is better
+         still.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you debug a distroless container with no shell?</summary>
+      <p><code>docker exec</code> fails because there is no shell or utility in the image to execute. Two
+         approaches, both using namespaces.</p>
+      <p><strong>1. A sidecar sharing the target's namespaces</strong> — the portable option, and the one that
+         works in Kubernetes as an ephemeral container:</p>
+<pre>
+docker run --rm -it \
+  --network=container:myapp \
+  --pid=container:myapp \
+  nicolaka/netshoot sh
+
+/ # ps aux            # sees myapp's processes (shared PID namespace)
+/ # ss -tlnp          # sees myapp's listening sockets
+/ # curl localhost:8080   # myapp's ports are on our localhost
+</pre>
+      <p><strong>2. <code>nsenter</code> from the host</strong> — no extra container, and you get the host's full
+         toolset:</p>
+<pre>
+PID=$(docker inspect -f '{{.State.Pid}}' myapp)
+sudo nsenter -t $PID -n ip addr        # network namespace only
+sudo nsenter -t $PID -n tcpdump -i eth0
+sudo nsenter -t $PID -p -m -u -i -n sh # all namespaces, host binaries
+</pre>
+      <p><strong>Entering only the network namespace is often the best choice</strong>: you keep the host's
+         binaries and its filesystem while seeing exactly the container's network stack, which is what most
+         connectivity debugging needs.</p>
+      <p><strong>Other options worth naming:</strong> a debug image variant built <code>FROM</code> the distroless
+         one with tools added, published alongside; and copying a static binary in with <code>docker cp</code> —
+         though that only works if the container filesystem is writable and it drifts from the image.</p>
+      <p>The general point is that namespaces are joinable. Nothing about a minimal image prevents inspection; it
+         only prevents inspection <em>from inside</em>.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> An attacker gets code execution in a container. What can they reach?</summary>
+      <p><strong>It depends almost entirely on how the container was configured</strong>, and I would reason
+         through it in layers.</p>
+      <p><strong>Default configuration (non-root user, no extra capabilities):</strong> the process sees its own
+         PID, mount, network, UTS and IPC namespaces; capabilities are a reduced set; seccomp blocks roughly 44
+         syscalls; parts of <code>/proc</code> are masked. Escape requires a kernel vulnerability. Realistically
+         they can attack the network — reaching other containers and internal services that assume network
+         position is authentication.</p>
+      <p><strong>Running as root in the container (Docker's default if the image does not say otherwise):</strong>
+         because the user namespace is off, that is host UID 0 restricted by capabilities. Any capability-based
+         kernel bug now yields host root, and writable bind mounts are written as root.</p>
+      <p><strong>Specific configurations that hand over the host:</strong></p>
+      <table class="tbl">
+        <tr><th>Setting</th><th>Consequence</th></tr>
+        <tr><td><code>-v /var/run/docker.sock:/...</code></td><td><strong>Immediate host root</strong> — start a privileged container mounting <code>/</code></td></tr>
+        <tr><td><code>--privileged</code></td><td>All capabilities, device access — escape is straightforward</td></tr>
+        <tr><td><code>--cap-add=SYS_ADMIN</code></td><td>Mount operations; several known escape paths</td></tr>
+        <tr><td><code>--pid=host</code></td><td>See and signal every host process; read their memory as root</td></tr>
+        <tr><td><code>-v /:/host</code></td><td>The host filesystem, directly</td></tr>
+        <tr><td><code>--net=host</code></td><td>Host network position; reach services bound to localhost</td></tr>
+      </table>
+      <p><strong>The lateral movement people underestimate</strong> is the network: cloud metadata endpoints
+         (169.254.169.254) hand out instance credentials unless IMDSv2 is enforced, and internal services on a
+         shared Docker network are usually unauthenticated.</p>
+      <p><strong>Hardening in priority order:</strong> run as non-root with a read-only root filesystem; drop all
+         capabilities and add back only what is required; never mount the Docker socket; keep seccomp and
+         AppArmor enabled; segment networks so a compromised container cannot reach unrelated services; block
+         metadata access; and enable userns-remap or use rootless/Podman where practical. For genuinely untrusted
+         code, none of this substitutes for a VM boundary — gVisor, Kata, or Firecracker.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design namespace configuration for a monitoring agent and a service mesh sidecar.</summary>
+      <p>Both need to break isolation deliberately, and the interesting part is bounding how much.</p>
+      <p><strong>Monitoring agent (node-level metrics):</strong></p>
+<pre>
+docker run -d --name node-agent \
+  --pid=host \                       # see all host processes — required
+  --network=host \                   # report host interfaces
+  -v /proc:/host/proc:ro \           # read-only host proc
+  -v /sys:/host/sys:ro \
+  --cap-drop=ALL --cap-add=SYS_PTRACE \   # only what per-process stats need
+  --read-only \
+  agent:1.0
+</pre>
+      <p><code>--pid=host</code> is unavoidable for process-level metrics, and it is a large grant: the agent can
+         see every command line (which frequently contains secrets) and signal any process. I would bound it with
+         <code>--cap-drop=ALL</code> plus the single capability needed, read-only mounts and a read-only root
+         filesystem, one agent image from a trusted source with pinned digests, and — because these agents are a
+         supply-chain target — scanning and provenance verification in the pipeline.</p>
+      <p><strong>Service mesh sidecar:</strong></p>
+<pre>
+# the sidecar shares the app's NETWORK namespace only
+docker run -d --name app myapp:1.0
+docker run -d --name envoy \
+  --network=container:app \          # same network stack, same localhost
+  --cap-drop=ALL --cap-add=NET_ADMIN \  # to install iptables redirect rules
+  envoy:1.29
+</pre>
+      <p><strong>Sharing only the network namespace is the key decision.</strong> The sidecar needs to intercept
+         traffic, so it must share the network stack — but it does <em>not</em> need
+         <code>--pid=container:</code>, so it cannot see or signal the application's processes, and it does not
+         need the application's filesystem. <code>NET_ADMIN</code> is required for the iptables redirect and is
+         dropped afterwards in mature meshes via an init container that does the setup and exits.</p>
+      <p><strong>The shared port space is the practical constraint:</strong> the sidecar and the app cannot both
+         bind the same port, so port allocation becomes a contract between them — a real source of confusing
+         "address already in use" failures when an application is moved into a mesh.</p>
+      <p><strong>The principle I would state:</strong> share the narrowest namespace that accomplishes the job,
+         and compensate for each grant with capability dropping, read-only mounts, and provenance controls on the
+         image — because a component that shares namespaces is inside your trust boundary regardless of what the
+         diagram says.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Show that namespaces are just inode numbers.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name ns1 alpine sleep 3600
+$ docker run -d --name ns2 alpine sleep 3600
+$ P1=$(docker inspect -f '{{.State.Pid}}' ns1)
+$ P2=$(docker inspect -f '{{.State.Pid}}' ns2)
+
+$ sudo readlink /proc/$P1/ns/pid /proc/$P2/ns/pid /proc/1/ns/pid
+pid:[4026532506]      ← ns1
+pid:[4026532611]      ← ns2   (different)
+pid:[4026531836]      ← host  (different again)
+</pre>
+      <p>Three different PID namespaces, identified by three inode numbers. That difference is the whole
+         isolation mechanism.</p>
+      <p><strong>Now find which namespaces are shared with the host:</strong></p>
+<pre>
+$ for ns in pid mnt net uts ipc cgroup user; do
+    C=$(sudo readlink /proc/$P1/ns/$ns)
+    H=$(sudo readlink /proc/1/ns/$ns)
+    [ "$C" = "$H" ] && echo "$ns:    SHARED with host" || echo "$ns:    isolated"
+  done
+pid:    isolated
+mnt:    isolated
+net:    isolated
+uts:    isolated
+ipc:    isolated
+cgroup: isolated
+user:   SHARED with host        ← the one Docker does not use
+</pre>
+      <p><strong>Six isolated, one shared</strong> — and the shared one is why container root is host root by
+         default.</p>
+      <p><strong>Confirm the isolation is real:</strong></p>
+<pre>
+$ docker exec ns1 ps -eo pid,comm
+  PID COMMAND
+    1 sleep
+    7 ps
+                              ← cannot see ns2 or any host process
+
+$ docker exec ns1 hostname
+$ docker exec ns2 hostname
+3f8a91c04e7b
+7d2e5f1a9b3c                  ← separate UTS namespaces
+
+$ docker exec ns1 ip addr | grep -c inet
+2                             ← its own network stack
+
+$ lsns -t pid | head -4
+        NS TYPE NPROCS   PID USER COMMAND
+4026531836 pid     342     1 root /sbin/init
+4026532506 pid       1 48213 root sleep 3600
+4026532611 pid       1 48260 root sleep 3600
+$ docker rm -f ns1 ns2 >/dev/null
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Demonstrate that CPU and memory are not namespaced.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ nproc                                    # on the host
+16
+$ grep MemTotal /proc/meminfo
+MemTotal:       65806152 kB                # 64 GB
+
+$ docker run --rm --cpus=1 --memory=512m alpine sh -c \
+    'echo "nproc:    $(nproc)"
+     echo "MemTotal: $(grep MemTotal /proc/meminfo | awk "{print \$2}") kB"
+     echo "loadavg:  $(cat /proc/loadavg)"'
+nproc:    16                               ← host value, despite --cpus=1
+MemTotal: 65806152 kB                      ← host value, despite --memory=512m
+loadavg:  2.14 1.87 1.92 3/1204 41         ← the HOST's load
+</pre>
+      <p><strong>The limits are real, though — they are just reported elsewhere:</strong></p>
+<pre>
+$ docker run --rm --cpus=1 --memory=512m alpine sh -c \
+    'echo "memory.max: $(cat /sys/fs/cgroup/memory.max)"
+     echo "cpu.max:    $(cat /sys/fs/cgroup/cpu.max)"'
+memory.max: 536870912                      ← 512 MB, correct
+cpu.max:    100000 100000                  ← quota/period = 1 CPU, correct
+</pre>
+      <p><strong>Prove the limit is enforced despite the misleading reading:</strong></p>
+<pre>
+$ docker run --rm --memory=512m alpine sh -c \
+    'dd if=/dev/zero of=/dev/shm/fill bs=1M count=600 2>&1 | tail -1'
+Killed
+$ echo "exit code: $?"
+exit code: 137                             ← 128 + 9 (SIGKILL by the OOM killer)
+</pre>
+      <p><strong>Now the classic JVM failure this causes:</strong></p>
+<pre>
+# an OLD JVM sizes the heap from host RAM
+$ docker run --rm --memory=512m openjdk:8u102-jdk \
+    java -XX:+PrintFlagsFinal -version 2>/dev/null | grep MaxHeapSize
+   uintx MaxHeapSize    := 16873684992     ← ~16 GB heap in a 512 MB container
+
+# a container-aware JVM reads the cgroup
+$ docker run --rm --memory=512m eclipse-temurin:21 \
+    java -XX:+PrintFlagsFinal -version 2>/dev/null | grep MaxHeapSize
+   size_t MaxHeapSize    = 134217728       ← 128 MB: 25% of the LIMIT
+</pre>
+      <p><strong>Same flag, same container limit, a 125× difference in heap sizing.</strong> The old JVM would
+         grow past 512 MB and be OOM-killed with exit 137 and no Java stack trace — the symptom that made this
+         famous.</p>
+      <p><strong>The portable way to read the real CPU allocation:</strong></p>
+<pre>
+$ docker run --rm --cpus=2 python:3.12-alpine python -c \
+    "import os; print('cpu_count:', os.cpu_count());
+     print('affinity: ', len(os.sched_getaffinity(0)));
+     q,p=open('/sys/fs/cgroup/cpu.max').read().split(); print('cgroup:   ', int(q)/int(p))"
+cpu_count: 16                              ← wrong
+affinity:  16                              ← also wrong with quota-based limits
+cgroup:    2.0                             ← correct
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Share namespaces to debug a container with no shell.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# a distroless-style container: no shell, no tools
+$ docker run -d --name api gcr.io/distroless/static-debian12 /pause 2>/dev/null || \
+  docker run -d --name api --entrypoint sleep alpine 3600
+
+$ docker exec api sh
+OCI runtime exec failed: exec failed: unable to start container process:
+exec: "sh": executable file not found in $PATH
+</pre>
+      <p><strong>Approach 1 — a sidecar sharing its namespaces:</strong></p>
+<pre>
+$ docker run -d --name web nginx
+$ docker run --rm -it \
+    --network=container:web \
+    --pid=container:web \
+    nicolaka/netshoot sh
+
+/ # ps aux
+PID   USER  COMMAND
+    1 root  nginx: master process nginx -g daemon off;   ← web's processes
+   29 nginx nginx: worker process
+   41 root  sh                                           ← us
+
+/ # curl -s -o /dev/null -w '%{http_code}\n' localhost:80
+200                              ← web's port on OUR localhost (shared NET ns)
+
+/ # ss -tlnp
+State  Local Address:Port   Process
+LISTEN 0.0.0.0:80            users:(("nginx",pid=1,fd=6))
+</pre>
+      <p><strong>Approach 2 — <code>nsenter</code> from the host, no extra container:</strong></p>
+<pre>
+$ PID=$(docker inspect -f '{{.State.Pid}}' web)
+
+# only the NETWORK namespace: host binaries, container's network stack
+$ sudo nsenter -t $PID -n ip -br addr
+lo               UNKNOWN  127.0.0.1/8
+eth0@if42        UP       172.17.0.3/16
+
+$ sudo nsenter -t $PID -n ss -tlnp
+LISTEN 0 511  0.0.0.0:80   users:(("nginx",pid=48213,fd=6))
+
+# capture the container's traffic with the HOST's tcpdump
+$ sudo nsenter -t $PID -n timeout 3 tcpdump -i eth0 -c 3 2>/dev/null
+</pre>
+      <p><strong>Entering only the network namespace is usually the best choice</strong> — you keep the host's
+         full toolset while seeing exactly the container's network.</p>
+      <p><strong>Verify which namespaces you actually joined:</strong></p>
+<pre>
+$ sudo nsenter -t $PID -n readlink /proc/self/ns/net /proc/self/ns/pid
+net:[4026532508]        ← the container's net namespace
+pid:[4026531836]        ← still the HOST's pid namespace
+
+$ sudo readlink /proc/$PID/ns/net
+net:[4026532508]        ← matches: we are in its network namespace
+$ docker rm -f web api >/dev/null
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show that container root is host root without user
+      namespaces.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name asroot -v /tmp/shared:/data alpine sleep 3600
+$ mkdir -p /tmp/shared
+
+$ docker exec asroot id
+uid=0(root) gid=0(root) groups=0(root),1(bin),...    ← root inside
+
+$ docker exec asroot sh -c 'echo "written by container" > /data/file.txt'
+$ ls -l /tmp/shared/file.txt
+-rw-r--r-- 1 root root 21 Aug 18 15:04 /tmp/shared/file.txt
+                └──┬──┘
+            owned by HOST root — the same UID 0
+</pre>
+      <p><strong>The container process itself runs as host UID 0:</strong></p>
+<pre>
+$ PID=$(docker inspect -f '{{.State.Pid}}' asroot)
+$ ps -o pid,uid,user,cmd -p $PID
+  PID   UID USER     CMD
+48213     0 root     sleep 3600           ← host UID 0
+
+$ sudo readlink /proc/$PID/ns/user
+user:[4026531837]
+$ sudo readlink /proc/1/ns/user
+user:[4026531837]                          ← identical: no user namespace
+</pre>
+      <p><strong>What actually restrains it is capabilities, not identity:</strong></p>
+<pre>
+$ docker exec asroot grep CapEff /proc/self/status
+CapEff: 00000000a80425fb                  ← a reduced set
+
+$ docker exec asroot sh -c 'mount -t tmpfs none /mnt'
+mount: permission denied (are you root?)   ← root, but lacks CAP_SYS_ADMIN
+
+$ docker run --rm --cap-add=SYS_ADMIN alpine sh -c 'mount -t tmpfs none /mnt && echo mounted'
+mounted                                    ← one capability changes everything
+</pre>
+      <p><strong>Now contrast with a non-root container:</strong></p>
+<pre>
+$ docker run -d --name nonroot --user 1000:1000 -v /tmp/shared:/data alpine sleep 3600
+$ docker exec nonroot id
+uid=1000 gid=1000
+$ docker exec nonroot sh -c 'echo x > /data/nonroot.txt'
+sh: can't create /data/nonroot.txt: Permission denied     ← cannot write as root
+
+$ ps -o uid,cmd -p $(docker inspect -f '{{.State.Pid}}' nonroot)
+  UID CMD
+ 1000 sleep 3600                          ← unprivileged on the host too
+</pre>
+      <p><strong>The lesson:</strong> with the user namespace disabled, the <code>--user</code> flag and a non-root
+         USER in the image are what separate container identity from host root. Enabling
+         <code>userns-remap</code> would map container UID 0 to an unprivileged host UID instead:</p>
+<pre>
+# /etc/docker/daemon.json → { "userns-remap": "default" }, then restart dockerd
+$ ps -o uid,cmd -p $(docker inspect -f '{{.State.Pid}}' remapped)
+  UID CMD
+165536 sleep 3600                         ← container root, unprivileged on the host
+$ docker rm -f asroot nonroot >/dev/null
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build a container by hand with <code>unshare</code> and
+      observe each namespace.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# a root filesystem to use
+$ mkdir -p /tmp/ns-demo && docker export $(docker create alpine) | tar -C /tmp/ns-demo -xf -
+
+# add ONE namespace at a time and observe the effect
+# 1. UTS only — own hostname
+$ sudo unshare --uts sh -c 'hostname isolated; hostname; echo "host sees:"; \
+    nsenter -t 1 -u hostname'
+isolated
+host sees:
+my-laptop                       ← the host hostname is unchanged
+</pre>
+      <p><strong>2. PID namespace — own process numbering:</strong></p>
+<pre>
+$ sudo unshare --pid --fork --mount-proc sh -c 'echo "I am PID $$"; ps -eo pid,comm'
+I am PID 1
+  PID COMMAND
+    1 sh
+    4 ps
+                                ← the host's 342 processes are invisible
+
+# without --mount-proc, /proc still shows the host: namespaces need the right mounts
+$ sudo unshare --pid --fork sh -c 'ps -eo pid,comm | wc -l'
+343                             ← reading the HOST's /proc
+</pre>
+      <p><strong>That second case is instructive</strong> — the PID namespace was created, but <code>ps</code> reads
+         <code>/proc</code>, which was still the host's. Isolation needs the mount namespace too.</p>
+      <p><strong>3. Network namespace — own, empty stack:</strong></p>
+<pre>
+$ sudo unshare --net sh -c 'ip -br addr; echo "---"; ping -c1 -W1 8.8.8.8 2>&1 | tail -1'
+lo               DOWN           ← only loopback, and it is down
+---
+ping: connect: Network is unreachable
+</pre>
+      <p><strong>4. Everything together — a working container:</strong></p>
+<pre>
+$ sudo unshare --pid --mount --uts --ipc --net --fork \
+       --mount-proc=/tmp/ns-demo/proc \
+       chroot /tmp/ns-demo /bin/sh
+
+/ # hostname handmade
+/ # hostname
+handmade
+/ # ps -eo pid,comm
+  PID COMMAND
+    1 /bin/sh                   ← PID 1
+    6 ps
+/ # ip -br addr
+lo               DOWN
+/ # cat /etc/os-release | head -1
+NAME="Alpine Linux"             ← a different distro's userland
+/ # uname -r
+6.5.0-27-generic                ← but the HOST's kernel — not namespaced
+/ # exit
+</pre>
+      <p><strong>From another terminal, the host saw it as an ordinary process the whole time:</strong></p>
+<pre>
+$ ps -ef | grep '[/]bin/sh' | head -1
+root     51204  51203  0 15:22 pts/3  /bin/sh
+</pre>
+      <p><strong>Compare what Docker adds:</strong></p>
+      <table class="tbl">
+        <tr><th>Hand-rolled</th><th>Docker</th></tr>
+        <tr><td><code>unshare</code> flags</td><td>Same namespaces, configured for you</td></tr>
+        <tr><td>Empty network</td><td>veth pair, bridge, DNS, port publishing</td></tr>
+        <tr><td>No limits</td><td>cgroups via <code>--memory</code>/<code>--cpus</code></td></tr>
+        <tr><td>Full capabilities</td><td>Reduced set + seccomp + AppArmor</td></tr>
+        <tr><td><code>chroot</code> to a directory</td><td>overlayfs from layered images</td></tr>
+      </table>
+      <p>The isolation was the kernel's all along; Docker supplies the images, networking, limits, and security
+         profiles that make it usable.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Show the consequences of sharing namespaces, including the
+      dangerous ones.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# --network=container: shares the port space
+$ docker run -d --name app1 nginx
+$ docker run -d --name app2 --network=container:app1 nginx
+$ docker logs app2 2>&1 | tail -2
+nginx: [emerg] bind() to 0.0.0.0:80 failed (98: Address already in use)
+                              ← same network namespace = same port space
+$ docker rm -f app2 >/dev/null
+</pre>
+      <p><strong>That collision is the practical constraint when adding a sidecar</strong> — the app and sidecar
+         must agree on port allocation.</p>
+      <p><strong>Shared network means shared localhost, which is the useful half:</strong></p>
+<pre>
+$ docker run --rm --network=container:app1 nicolaka/netshoot \
+    curl -s -o /dev/null -w 'localhost:80 -> %{http_code}\n' localhost:80
+localhost:80 -> 200           ← reaching app1 over loopback
+</pre>
+      <p><strong>Now <code>--pid=host</code>, and what it exposes:</strong></p>
+<pre>
+$ docker run --rm --pid=host alpine sh -c 'ps -eo pid,comm | wc -l'
+344                           ← every host process
+
+$ docker run --rm --pid=host alpine sh -c 'ps -eo pid,args | grep -i "[p]assword\|[t]oken" | head -3'
+ 3821 /usr/bin/backup-tool --db-password=hunter2 ...
+                              ← command lines leak secrets to anything with --pid=host
+
+# and it can SIGNAL host processes
+$ sleep 600 &          # a host process
+[1] 52001
+$ docker run --rm --pid=host alpine kill -TERM 52001
+$ jobs
+[1]+  Terminated              sleep 600
+                              ← a container killed a host process
+</pre>
+      <p><strong>The Docker socket is the most severe case — this is full host root:</strong></p>
+<pre>
+$ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli \
+    docker run --rm -v /:/host alpine cat /host/etc/shadow | head -1
+root:$6$xyz...:19000:0:99999:7:::
+      ↑ the HOST's shadow file, read from inside a container
+</pre>
+      <p>The container did not escape anything — it asked the Docker daemon (running as root) to start a new
+         container mounting the host filesystem. <strong>Mounting the socket is equivalent to granting root.</strong></p>
+      <p><strong>What each grant costs, summarised by measurement:</strong></p>
+      <table class="tbl">
+        <tr><th>Flag</th><th>Observed capability</th></tr>
+        <tr><td><code>--network=container:</code></td><td>Shared localhost and port space; collisions</td></tr>
+        <tr><td><code>--pid=host</code></td><td>Read all command lines (secrets); signal any host process</td></tr>
+        <tr><td><code>-v docker.sock</code></td><td>Read <code>/etc/shadow</code> — full host root</td></tr>
+        <tr><td><code>--privileged</code></td><td>All capabilities; modify host kernel settings</td></tr>
+      </table>
+      <p><strong>The safe defaults:</strong> share the narrowest namespace that does the job, drop capabilities
+         alongside any grant, and treat the Docker socket as a credential rather than a file.</p>
+<pre>
+$ docker rm -f app1 >/dev/null
+</pre>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>A namespace is <strong>an inode number attached to a process</strong> — two processes share a namespace exactly when the ids in <code>/proc/PID/ns/</code> match.</li>
+        <li>Docker uses six namespaces by default (PID, MNT, NET, UTS, IPC, CGROUP) and leaves <strong>USER off</strong>.</li>
+        <li>Because the user namespace is off, <strong>container root is host root</strong> — restrained by capabilities and seccomp, not by identity.</li>
+        <li><strong>CPU count, memory totals, load average and kernel version are NOT namespaced</strong>: a container with <code>--cpus=1 --memory=512m</code> still reported 16 cores and 64 GB.</li>
+        <li>The limits are enforced but not reported — read <code>/sys/fs/cgroup/memory.max</code> and <code>cpu.max</code> for the truth.</li>
+        <li>That mismatch caused the classic JVM bug: an old JVM sized a <strong>16 GB heap in a 512 MB container</strong> versus 128 MB for a container-aware one — a 125× difference, ending in exit code 137 with no Java error.</li>
+        <li>Go, Node, Python and nginx have the same problem — use <code>automaxprocs</code>, <code>sched_getaffinity</code>, or explicit worker counts.</li>
+        <li>The same task has a host PID and a namespace PID; <code>/proc/PID/status</code> shows both in <code>NSpid</code>.</li>
+        <li>Creating a PID namespace without <code>--mount-proc</code> still shows host processes — isolation needs the mount namespace too.</li>
+        <li><code>/dev/shm</code> defaults to <strong>64 MB</strong>, which breaks Chrome, Postgres and PyTorch — raise it with <code>--shm-size</code>.</li>
+        <li><code>userns-remap</code> maps container UID 0 to an unprivileged host UID, but is off by default because it breaks volume ownership and conflicts with <code>--privileged</code>, <code>--pid=host</code> and <code>--net=host</code>.</li>
+        <li><code>--network=container:</code> shares the <strong>port space</strong> — measured as an "address already in use" failure between two nginx containers.</li>
+        <li><code>--pid=host</code> exposes every host command line (secrets included) and lets a container <strong>signal host processes</strong>, demonstrated by killing one.</li>
+        <li><strong>Mounting <code>/var/run/docker.sock</code> is equivalent to host root</strong> — used it to read <code>/etc/shadow</code>.</li>
+        <li><code>nsenter -t PID -n</code> debugs a shell-less image with the host's tools while seeing the container's network stack.</li>
+        <li>A sidecar with <code>--network=container:</code> plus <code>--pid=container:</code> is the portable equivalent, and the pattern behind Kubernetes ephemeral containers.</li>
+        <li>Share the narrowest namespace that does the job, and pair every grant with dropped capabilities and read-only mounts.</li>
+        <li>Namespaces answer "what can it see"; <a href="cgroups.html">cgroups</a> answer "what can it use" — confusing the two is the most common misunderstanding here.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="images-containers.html">← Images, Layers &amp; the Union Filesystem</a>
+      <a href="cgroups.html">cgroups: Limiting What You Use →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
