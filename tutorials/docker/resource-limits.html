@@ -1,0 +1,1002 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Resource Limits &amp; the OOM Killer — Docker — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Resource Limits &amp; the OOM Killer <span class="level-badge level-adv">Production Concerns</span></h1>
+    <p><strong>What you'll master:</strong> why an unlimited container is a host outage waiting for a bad deploy;
+       what <code>--memory</code> actually enforces and why <strong>exit 137 is not a bug in your application</strong>;
+       the page-cache accounting trap that makes <code>docker stats</code> report 94% memory use on an idle
+       container and how to read the real number; the difference between <code>--cpus</code> (a hard quota that
+       throttles) and <code>--cpu-shares</code> (a weight that only matters under contention), and the latency
+       cliff quota produces even at low average utilisation; the single most expensive default in containerised
+       runtimes — <strong>the process inside sees the host's CPUs and RAM, not yours</strong> — and the fix for
+       the JVM, Node, Go and Python; PID limits and the fork bomb they stop; how to size limits from measurement
+       rather than superstition; and how to tell an OOM kill from a crash, from a liveness restart, in one
+       command. Prerequisites: <a href="cgroups.html">cgroups</a>,
+       <a href="process-model.html">Process Model, PID 1 &amp; Signals</a>,
+       <a href="namespaces.html">Namespaces</a>.</p>
+
+    <h2>Part 1 — The Default Is Unlimited</h2>
+
+    <p>A container with no limits is a normal process with a normal appetite. Nothing about being containerised
+       restrains it: it can allocate until the host's memory is gone, spin every core, and open every file
+       descriptor the kernel allows.</p>
+
+<pre>
+$ docker run -d --name greedy alpine sh -c 'while true; do :; done'
+$ docker inspect greedy --format '{{.HostConfig.Memory}} {{.HostConfig.NanoCpus}} {{.HostConfig.PidsLimit}}'
+0 0 0                              ← zero means UNLIMITED, in all three cases
+
+$ docker stats --no-stream
+CONTAINER  CPU %    MEM USAGE / LIMIT     MEM %
+greedy     100.04%  1.1MiB / 15.61GiB     0.01%
+                              ↑ "LIMIT" is the HOST's total RAM, not a limit
+</pre>
+
+    <p>The failure this produces is not subtle, and it is not the leaking container that suffers most:</p>
+
+<pre>
+t=0     api container has a leak; RSS climbs past its normal 400 MB
+t=6m    host free memory approaches zero; the kernel starts reclaiming page cache
+t=7m    every container's disk reads slow down (cache evicted) — unrelated services degrade
+t=8m    global OOM killer fires and picks by oom_score, which favours BIG processes
+t=8m    it kills postgres (2.1 GB RSS), not the 3.4 GB api that caused it
+t=8m    sshd is also a candidate; the host may become unreachable
+</pre>
+
+    <div class="note">🔑 <strong>Limits are not only about capping the offender — they are about localising the
+       damage.</strong> With <code>--memory</code> set, the kernel fires a <em>cgroup</em> OOM kill that can only
+       select processes inside that cgroup. The leaking container dies, the restart policy restarts it, and every
+       other service on the host is untouched. Without limits, a memory bug in your least important service is a
+       host-wide incident whose victim is chosen by a heuristic you do not control.</div>
+
+    <table class="tbl">
+      <tr><th>Resource</th><th>Flag</th><th>Compose</th><th>Default</th><th>Enforcement</th></tr>
+      <tr><td>Memory</td><td><code>--memory=512m</code></td><td><code>deploy.resources.limits.memory</code></td><td>Unlimited</td><td><strong>Hard: OOM kill</strong></td></tr>
+      <tr><td>Memory (soft)</td><td><code>--memory-reservation=256m</code></td><td><code>reservations.memory</code></td><td>None</td><td>Reclaim pressure only</td></tr>
+      <tr><td>Swap</td><td><code>--memory-swap=512m</code></td><td>—</td><td>= 2× memory</td><td>Total memory + swap</td></tr>
+      <tr><td>CPU quota</td><td><code>--cpus=1.5</code></td><td><code>limits.cpus</code></td><td>Unlimited</td><td><strong>Hard: throttling</strong></td></tr>
+      <tr><td>CPU weight</td><td><code>--cpu-shares=512</code></td><td>—</td><td>1024</td><td>Relative, only under contention</td></tr>
+      <tr><td>CPU pinning</td><td><code>--cpuset-cpus=0-3</code></td><td>—</td><td>All</td><td>Hard: which cores</td></tr>
+      <tr><td>Processes</td><td><code>--pids-limit=200</code></td><td><code>pids_limit</code></td><td>Unlimited</td><td>Hard: <code>fork</code> fails</td></tr>
+      <tr><td>Block I/O</td><td><code>--device-read-bps</code></td><td>—</td><td>Unlimited</td><td>Hard, per device</td></tr>
+      <tr><td>File descriptors</td><td><code>--ulimit nofile=65535</code></td><td><code>ulimits</code></td><td>Inherited from daemon</td><td>Hard, per process</td></tr>
+    </table>
+
+    <h2>Part 2 — Memory, and Exit 137</h2>
+
+    <p><code>--memory</code> sets <code>memory.max</code> on the container's cgroup. When the cgroup cannot
+       reclaim enough to satisfy an allocation, the kernel OOM killer fires <em>inside that cgroup</em>:</p>
+
+<pre>
+$ docker run --rm -m 128m --name hog alpine sh -c \
+    'dd if=/dev/zero of=/dev/shm/x bs=1M count=200'
+$ echo $?
+137
+</pre>
+
+    <table class="tbl">
+      <tr><th>Exit code</th><th>Signal</th><th>Meaning</th><th>Typical cause</th></tr>
+      <tr><td><strong>137</strong></td><td>128 + 9 (SIGKILL)</td><td>Killed, no chance to clean up</td><td><strong>OOM</strong>, or <code>docker kill</code>, or a stop timeout expiring</td></tr>
+      <tr><td><strong>143</strong></td><td>128 + 15 (SIGTERM)</td><td>Asked to stop and did</td><td>Normal <code>docker stop</code></td></tr>
+      <tr><td>139</td><td>128 + 11 (SIGSEGV)</td><td>Segfault</td><td>A real crash</td></tr>
+      <tr><td>1</td><td>—</td><td>Application error exit</td><td>Your code</td></tr>
+      <tr><td>125 / 126 / 127</td><td>—</td><td>Daemon error / not executable / not found</td><td>Bad command or image</td></tr>
+    </table>
+
+    <p>137 alone is ambiguous — it also appears when a container ignores SIGTERM and the stop timeout expires
+       (<a href="process-model.html">Process Model</a>). One field disambiguates it:</p>
+
+<pre>
+$ docker inspect hog --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.State.Error}}'
+true 137
+
+$ dmesg -T | tail -4
+[Tue Aug 19 12:31:02] Memory cgroup out of memory: Killed process 20481 (dd)
+  total-vm:206184kB, anon-rss:130024kB, file-rss:1436kB
+[Tue Aug 19 12:31:02] Memory cgroup stats for /docker/8f21c0e4: anon 129.9M file 0
+                       ↑ "Memory cgroup out of memory" = the container's own limit,
+                         NOT a host-wide OOM. Exactly what you want to see.
+</pre>
+
+    <div class="note">⚠️ <strong>The OOM killer chooses a process, not the container.</strong> If your container
+       runs several processes, the kernel may kill a worker and leave PID 1 alive — so the container stays
+       <code>Up</code>, with a silently missing worker and no restart. This is one more argument for one process
+       per container, and for <code>--oom-kill-disable</code> being a trap: it does not prevent the OOM, it
+       <em>freezes</em> the cgroup until memory is freed, which usually means a hung container instead of a dead
+       one.</div>
+
+    <h4>The page-cache accounting trap</h4>
+
+    <p>A cgroup's memory usage includes the <strong>page cache</strong> for files that container read or wrote.
+       Page cache is reclaimable — it is not a leak — but <code>docker stats</code> reports it as usage:</p>
+
+<pre>
+$ docker run -d --name reader -m 512m alpine sh -c 'sleep 3600'
+$ docker stats --no-stream reader
+CONTAINER  MEM USAGE / LIMIT   MEM %
+reader     1.2MiB / 512MiB     0.23%
+
+$ docker exec reader sh -c 'dd if=/dev/zero of=/tmp/big bs=1M count=400 &amp;&amp; sync'
+$ docker stats --no-stream reader
+CONTAINER  MEM USAGE / LIMIT   MEM %
+reader     402.1MiB / 512MiB   78.54%     ← "78% memory used" — by a sleeping shell
+
+$ docker exec reader cat /sys/fs/cgroup/memory.stat | head -3
+anon 1298432                              ← 1.2 MB actually anonymous (the real usage)
+file 419430400                            ← 400 MB page cache (reclaimable)
+kernel 1105920
+</pre>
+
+    <p>The alert this generates ("container at 94% of its memory limit!") is almost always this. Compute the
+       number that matters:</p>
+
+<pre>
+  real usage  =  memory.current  −  inactive_file
+  (cgroup v2: /sys/fs/cgroup/memory.current and memory.stat)
+
+$ docker exec reader sh -c \
+   'echo $(( ($(cat /sys/fs/cgroup/memory.current) - \
+              $(awk "/^inactive_file/{print \$2}" /sys/fs/cgroup/memory.stat)) / 1048576 ))MB'
+2MB                                       ← the honest figure
+
+$ docker exec reader sh -c 'dd if=/dev/zero of=/dev/null bs=1M count=600'
+   (memory pressure) → cache is reclaimed automatically, no OOM
+$ docker stats --no-stream reader
+reader     3.4MiB / 512MiB     0.66%      ← the "78%" evaporated on demand
+</pre>
+
+    <p>Swap deserves one clarification because the flag is counter-intuitive: <code>--memory-swap</code> is the
+       <strong>combined</strong> limit, not the swap portion.</p>
+
+    <table class="tbl">
+      <tr><th>Flags</th><th>RAM</th><th>Swap available</th></tr>
+      <tr><td><code>-m 512m</code> (default)</td><td>512 MB</td><td>512 MB (total 1 GB)</td></tr>
+      <tr><td><code>-m 512m --memory-swap=512m</code></td><td>512 MB</td><td><strong>None</strong> — swap disabled</td></tr>
+      <tr><td><code>-m 512m --memory-swap=2g</code></td><td>512 MB</td><td>1.5 GB</td></tr>
+      <tr><td><code>-m 512m --memory-swap=-1</code></td><td>512 MB</td><td>Unlimited</td></tr>
+    </table>
+
+    <p>Disabling swap (<code>--memory-swap</code> equal to <code>--memory</code>) is usually right for services:
+       a container that swaps is not working, it is dying slowly while producing terrible latency. Fail fast and
+       let the restart policy act.</p>
+
+    <h2>Part 3 — CPU: Quota Versus Weight</h2>
+
+    <p>Two mechanisms, constantly confused, with completely different behaviour under load:</p>
+
+    <table class="tbl">
+      <tr><th></th><th><code>--cpus=1.5</code> (quota)</th><th><code>--cpu-shares=512</code> (weight)</th></tr>
+      <tr><td>cgroup file</td><td><code>cpu.max</code> = <code>150000 100000</code></td><td><code>cpu.weight</code></td></tr>
+      <tr><td>Effect on an idle host</td><td><strong>Still capped at 1.5 cores</strong></td><td><strong>None</strong> — can use everything</td></tr>
+      <tr><td>Effect under contention</td><td>Capped at 1.5</td><td>Gets its proportional share</td></tr>
+      <tr><td>Predictable?</td><td>✅ Absolutely</td><td>❌ Depends on the neighbours</td></tr>
+      <tr><td>Wastes idle capacity?</td><td>✅ Yes, by design</td><td>❌ No</td></tr>
+      <tr><td>Causes throttling?</td><td><strong>✅ Yes — the whole point</strong></td><td>❌ Never</td></tr>
+    </table>
+
+<pre>
+$ docker run --rm --cpus=1.5 alpine cat /sys/fs/cgroup/cpu.max
+150000 100000                     ← 150 ms of CPU time per 100 ms period
+
+$ docker run --rm --cpu-shares=512 alpine cat /sys/fs/cgroup/cpu.weight
+20                                ← a weight; means nothing until someone competes
+</pre>
+
+    <h4>The throttling cliff</h4>
+
+    <p>Quota is enforced per 100 ms period. A container that exhausts its quota is <strong>stopped until the
+       next period begins</strong> — which is invisible in average CPU graphs and extremely visible in p99
+       latency, as measured in <a href="cgroups.html">cgroups</a>:</p>
+
+<pre>
+a request needing 200 ms of CPU across 4 threads, with --cpus=1:
+  period 1 (0–100ms):   100 ms of quota consumed by the 4 threads in 25 ms wall time
+  period 1 (25–100ms):  THROTTLED. All four threads frozen for 75 ms.
+  period 2 (100–200ms): another 100 ms of quota, consumed in 25 ms
+  period 2 (125–200ms): THROTTLED again
+  total wall time: 200 ms of work took 225 ms, with two 75 ms freezes
+
+$ docker exec app cat /sys/fs/cgroup/cpu.stat
+nr_periods 84021
+nr_throttled 31447            ← 37% of periods hit the cap
+throttled_usec 402910000      ← 403 seconds of frozen time
+</pre>
+
+    <table class="tbl">
+      <tr><th>Configuration</th><th>Average CPU</th><th>p50 latency</th><th>p99 latency</th><th>Throttled periods</th></tr>
+      <tr><td>No limit</td><td>62%</td><td>18 ms</td><td>41 ms</td><td>0%</td></tr>
+      <tr><td><code>--cpus=4</code></td><td>62%</td><td>18 ms</td><td>44 ms</td><td>0.2%</td></tr>
+      <tr><td><code>--cpus=2</code></td><td>62%</td><td>21 ms</td><td>96 ms</td><td>11%</td></tr>
+      <tr><td><code>--cpus=1</code></td><td>62%</td><td>34 ms</td><td><strong>488 ms</strong></td><td>37%</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Average CPU is identical in every row — 62% — while p99 grows 12×.</strong> This
+       is why "the container is only using 62% of its CPU, so the limit is fine" is wrong and why
+       <code>cpu.stat</code>'s <code>nr_throttled</code> belongs on your dashboard next to utilisation. A
+       latency-sensitive service should be sized so throttling is rare (target under ~1% of periods), or given a
+       weight instead of a quota so it can burst.</div>
+
+    <p><code>--cpuset-cpus</code> is the third option and a specialist one: it pins the container to specific
+       cores. It genuinely helps for NUMA locality and cache-sensitive workloads, and it hurts everywhere else by
+       preventing the scheduler from balancing. Use it when you have measured a benefit, not by default.</p>
+
+    <h2>Part 4 — The Process Inside Cannot See Your Limit</h2>
+
+    <p>This is the most expensive default in containerised runtimes. <code>/proc/cpuinfo</code> and
+       <code>/proc/meminfo</code> are <strong>not namespaced</strong> — as established in
+       <a href="namespaces.html">Namespaces</a>, the container sees the host's values. Every runtime that sizes
+       its thread pools or heap from those files sizes them wrong:</p>
+
+<pre>
+$ nproc                                   # on the host
+16
+$ free -g | awk '/^Mem/{print $2"GB"}'
+62GB
+
+$ docker run --rm --cpus=2 -m 512m alpine sh -c 'nproc; free -m | awk "/^Mem/{print \$2}"'
+16                                        ← sees 16 CPUs; it has 2
+64243                                     ← sees 62 GB; it has 0.5
+</pre>
+
+    <table class="tbl">
+      <tr><th>Runtime</th><th>Default behaviour</th><th>Consequence at <code>--cpus=2 -m 512m</code></th><th>Fix</th></tr>
+      <tr><td>JVM ≥ 10</td><td><code>UseContainerSupport</code> on: reads the cgroup</td><td>✅ Heap = 128 MB (¼ of the limit)</td><td>Tune with <code>-XX:MaxRAMPercentage=75</code></td></tr>
+      <tr><td>JVM 8 (old builds)</td><td>Reads the host</td><td><strong>Heap = 15 GB → OOM kill at 512 MB</strong></td><td>Upgrade, or set <code>-Xmx</code> explicitly</td></tr>
+      <tr><td>Go</td><td><code>GOMAXPROCS</code> = host CPUs</td><td>16 OS threads on a 2-core quota → heavy throttling</td><td><code>automaxprocs</code>, or set <code>GOMAXPROCS=2</code></td></tr>
+      <tr><td>Node.js</td><td>Heap default from host RAM; libuv pool = 4</td><td>Old-space can exceed the limit → OOM kill</td><td><code>--max-old-space-size=384</code></td></tr>
+      <tr><td>Python</td><td><code>os.cpu_count()</code> = host CPUs</td><td>16 gunicorn workers × 80 MB = 1.3 GB → OOM</td><td>Compute workers from the limit</td></tr>
+      <tr><td>nginx</td><td><code>worker_processes auto</code> = host CPUs</td><td>16 workers on 2 cores</td><td>Set it explicitly</td></tr>
+      <tr><td>.NET ≥ 3.0</td><td>Container-aware</td><td>✅ Correct</td><td>—</td></tr>
+    </table>
+
+<pre>
+$ docker run --rm -m 512m eclipse-temurin:21 java -XX:+PrintFlagsFinal -version \
+    | grep -E 'MaxHeapSize|ActiveProcessorCount'
+   size_t MaxHeapSize = 134217728    {product} {ergonomic}      ← 128 MB = ¼ of 512
+      int ActiveProcessorCount = -1  {product} {default}
+
+$ docker run --rm -m 512m eclipse-temurin:21 java \
+    -XX:MaxRAMPercentage=75 -XX:+PrintFlagsFinal -version | grep MaxHeapSize
+   size_t MaxHeapSize = 402653184                              ← 384 MB, deliberate
+</pre>
+
+    <div class="note">⚠️ <strong>A JVM heap set to 75% of the memory limit is not 25% of headroom — it is
+       barely enough.</strong> The container must also hold metaspace, thread stacks (1 MB each), code cache,
+       direct byte buffers, GC structures and the JVM itself, none of which count toward the heap. A heap at 100%
+       of the limit is a guaranteed exit 137 that looks like a memory leak and is not. The same arithmetic applies
+       to Node's <code>--max-old-space-size</code>: leave 25–30% for everything outside the managed heap.</div>
+
+    <h2>Part 5 — PIDs, File Descriptors and I/O</h2>
+
+    <p>Memory and CPU get the attention; the process table is what actually takes hosts down, because exhausting
+       it stops <em>everything</em> from forking, including your shell:</p>
+
+<pre>
+$ docker run --rm alpine sh -c ':(){ :|:& };:'        # a fork bomb — DO NOT run unlimited
+   → host process table exhausted; ssh cannot fork; reboot required
+
+$ docker run --rm --pids-limit=100 alpine sh -c ':(){ :|:& };:'
+sh: can't fork: Resource temporarily unavailable
+   → the container is stuck; the host is completely unaffected
+$ docker exec other-container echo ok
+ok
+</pre>
+
+    <p>A PID limit costs nothing and bounds an entire class of failure. It also catches thread leaks, which are
+       far more common than deliberate fork bombs — a thread is a task and counts against the limit:</p>
+
+<pre>
+$ docker run -d --pids-limit=200 --name app myapp
+$ docker exec app cat /sys/fs/cgroup/pids.current /sys/fs/cgroup/pids.max
+47
+200
+$ watch -n60 'docker exec app cat /sys/fs/cgroup/pids.current'
+47 ... 89 ... 143 ... 197        ← a thread leak, visible before it becomes an incident
+</pre>
+
+    <table class="tbl">
+      <tr><th>Limit</th><th>Reasonable value</th><th>Detects / prevents</th></tr>
+      <tr><td><code>--pids-limit</code></td><td>2–4× steady-state threads</td><td>Fork bombs, thread leaks</td></tr>
+      <tr><td><code>--ulimit nofile=65535:65535</code></td><td>Match expected connections</td><td><code>EMFILE: too many open files</code> under load</td></tr>
+      <tr><td><code>--ulimit nproc</code></td><td>Rarely needed</td><td>Per-UID, so it leaks across containers sharing a UID — prefer <code>--pids-limit</code></td></tr>
+      <tr><td><code>--device-read-bps</code> / <code>--device-write-bps</code></td><td>Only for known-abusive jobs</td><td>A backup job starving the database of IOPS</td></tr>
+      <tr><td><code>--shm-size</code></td><td>Default 64 MB is small</td><td>Chrome, PyTorch dataloaders, Postgres parallel workers</td></tr>
+    </table>
+
+<pre>
+The /dev/shm default catches people constantly:
+
+$ docker run --rm python:3.12 df -h /dev/shm | tail -1
+shm              64M     0   64M   0% /dev/shm      ← 64 MB regardless of -m
+
+$ docker run --rm --shm-size=1g python:3.12 df -h /dev/shm | tail -1
+shm             1.0G     0  1.0G   0% /dev/shm
+</pre>
+
+    <h2>Part 6 — Sizing Limits From Measurement</h2>
+
+    <p>Limits chosen by guesswork fail in both directions: too low and you get OOM kills or throttling under
+       normal load; too high and the limit never binds, which is the same as having none. The method is
+       mechanical:</p>
+
+<pre>
+① Run without a limit under REALISTIC load (production traffic replay, or a soak test)
+② Record the real numbers, not docker stats' inflated ones:
+     memory  = max over the window of (memory.current − inactive_file)
+     cpu     = p99 of utilisation, plus nr_throttled if any limit is already set
+③ Memory limit  = peak_anon × 1.5     (GC languages need headroom to avoid thrash)
+④ CPU limit     = p99 × 1.5, or omit the quota and use a weight for latency-critical
+   services that are allowed to burst
+⑤ PIDs limit    = steady_state_threads × 3
+⑥ Deploy, then WATCH: OOMKilled events, nr_throttled, and how close usage runs to
+   the cap. Re-derive quarterly — workloads change.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Diagnosis</th><th>Action</th></tr>
+      <tr><td>Exit 137, <code>OOMKilled=true</code></td><td>Limit genuinely exceeded</td><td>Raise the limit <em>or</em> fix the leak — check the trend first</td></tr>
+      <tr><td>Exit 137, <code>OOMKilled=false</code></td><td>Ignored SIGTERM, stop timeout expired</td><td><a href="process-model.html">Signal handling</a>, not memory</td></tr>
+      <tr><td>Memory climbs to the cap then flattens</td><td><strong>Normal for a JVM/Go/Node heap</strong></td><td>Nothing. Managed heaps grow to fill their budget.</td></tr>
+      <tr><td>Memory climbs across restarts, never flattens</td><td>A real leak</td><td>Heap dump; raising the limit only delays it</td></tr>
+      <tr><td>p99 latency spikes, average CPU low</td><td><strong>CFS throttling</strong></td><td>Check <code>nr_throttled</code>; raise the quota or use a weight</td></tr>
+      <tr><td>"94% of memory" alert on an idle service</td><td>Page cache counted as usage</td><td>Alert on <code>anon</code>, not <code>memory.current</code></td></tr>
+      <tr><td>Container <code>Up</code> but a worker vanished</td><td>OOM killed a child, PID 1 survived</td><td>One process per container; check <code>dmesg</code></td></tr>
+    </table>
+
+    <p>Two operational habits complete this. Alert on <strong>OOM kill events</strong> rather than on memory
+       percentage — the percentage is noisy and the kill is unambiguous. And set
+       <code>restart: unless-stopped</code> so that an OOM kill becomes a brief restart rather than a missing
+       service, while the alert makes sure it is still investigated rather than silently absorbed.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>No limits anywhere, because "the host has 64 GB and Kubernetes will handle it later".</strong>
+         A memory leak in a low-traffic reporting service climbs past 30 GB over a weekend. The host's page cache
+         is evicted first, so every other container's disk reads slow down and the database's p99 doubles for
+         reasons nobody can explain. When the global OOM killer finally fires it picks by <code>oom_score</code>,
+         which favours the largest resident process — so it kills Postgres, not the reporting service, and takes
+         the platform down. Elsewhere, someone did set <code>--cpus=1</code> on a four-thread API because "it only
+         uses 60% of a core on average", and its p99 is 488 ms with 37% of periods throttled, which the CPU
+         dashboard shows as a comfortable 62%. A Java 8 service reads the host's 62 GB and sizes a 15 GB heap
+         inside a 512 MB limit, dying at exit 137 on every deploy, and is written off as "a bad image". And an
+         alert fires nightly saying a sleeping container is at 94% memory, which is page cache, so the team
+         mutes it — along with the real alerts that later share the same rule.</p>
+      <p>✅ <strong>Set memory, CPU and PID limits on every container, derive them from measurement, and read
+         the right counters.</strong> Give every container a memory limit so an OOM is a <em>cgroup</em> kill that
+         removes the offender and leaves the host intact, and confirm it with
+         <code>State.OOMKilled</code> plus the "Memory cgroup out of memory" line in <code>dmesg</code>. Size it
+         at 1.5× measured peak <em>anonymous</em> memory — <code>memory.current − inactive_file</code>, not
+         <code>docker stats</code> — and alert on OOM kill events rather than a percentage that page cache
+         inflates. Tell the runtime what it actually has:
+         <code>-XX:MaxRAMPercentage=75</code>, <code>--max-old-space-size</code>, <code>automaxprocs</code>,
+         workers computed from the quota — because <code>/proc</code> reports the host. Put
+         <code>nr_throttled</code> on the dashboard next to utilisation, and for latency-sensitive services prefer
+         a weight over a quota so they may burst. Add <code>--pids-limit</code> at 3× steady-state threads, which
+         costs nothing and turns a fork bomb or a thread leak into one dead container instead of an unreachable
+         host.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>No memory limit</td><td>Global OOM killer picks a victim by size — often the database</td><td>Limit every container; the kill stays in the cgroup</td></tr>
+      <tr><td>Reading <code>docker stats</code> as real usage</td><td>Includes reclaimable page cache — 78% measured on a sleeping shell</td><td><code>memory.current − inactive_file</code></td></tr>
+      <tr><td>Alerting on memory percentage</td><td>Noisy from cache; teams mute the rule</td><td>Alert on OOM kill events</td></tr>
+      <tr><td>Treating exit 137 as a crash</td><td>It is SIGKILL — usually the OOM killer</td><td>Check <code>.State.OOMKilled</code> and <code>dmesg</code></td></tr>
+      <tr><td>Assuming 137 always means OOM</td><td>Also produced by a stop timeout on an ignored SIGTERM</td><td>The <code>OOMKilled</code> field disambiguates</td></tr>
+      <tr><td><code>--cpus=1</code> on a multithreaded service</td><td>p99 488 ms at 62% average CPU; 37% of periods throttled</td><td>Size from p99, watch <code>nr_throttled</code></td></tr>
+      <tr><td>Confusing <code>--cpu-shares</code> with a limit</td><td>A weight does nothing on an idle host</td><td><code>--cpus</code> to cap, shares to prioritise</td></tr>
+      <tr><td>Trusting <code>nproc</code> inside a container</td><td><code>/proc</code> is not namespaced — shows host cores</td><td><code>automaxprocs</code>, explicit worker counts</td></tr>
+      <tr><td>JVM 8 with no <code>-Xmx</code></td><td>Sizes a heap from host RAM → instant OOM kill</td><td>Modern JVM + <code>MaxRAMPercentage</code></td></tr>
+      <tr><td>Heap set to 100% of the limit</td><td>Metaspace, stacks and buffers live outside the heap</td><td>Heap ≈ 75% of the container limit</td></tr>
+      <tr><td>No <code>--pids-limit</code></td><td>A fork bomb or thread leak takes the host's process table</td><td>3× steady-state threads</td></tr>
+      <tr><td><code>--oom-kill-disable</code></td><td>Freezes the cgroup instead of killing — a hung container</td><td>Let it die; restart policy handles it</td></tr>
+      <tr><td>Leaving swap enabled for services</td><td>Swapping is dying slowly with terrible latency</td><td><code>--memory-swap</code> = <code>--memory</code></td></tr>
+      <tr><td>Default 64 MB <code>/dev/shm</code></td><td>Breaks Chrome, PyTorch loaders, parallel Postgres</td><td><code>--shm-size</code></td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does exit code 137 mean?</summary>
+      <p><strong>128 + 9 — the process was killed with SIGKILL.</strong> By far the most common cause is the
+         kernel OOM killer firing because the container hit its memory limit.</p>
+<pre>
+$ docker inspect app --format '{{.State.ExitCode}} {{.State.OOMKilled}}'
+137 true
+$ dmesg -T | grep -i 'cgroup out of memory' | tail -1
+Memory cgroup out of memory: Killed process 20481 (java) anon-rss:522104kB
+</pre>
+      <p><strong>The important nuance:</strong> 137 does <em>not</em> always mean OOM. It also appears when a
+         container ignores SIGTERM and Docker escalates to SIGKILL after the stop timeout
+         (<a href="process-model.html">Process Model</a>). <code>State.OOMKilled</code> is what tells the two
+         apart, and answering that distinction is what separates a memorised answer from an understood one.</p>
+      <table class="tbl">
+        <tr><th>Code</th><th>Signal</th><th>Meaning</th></tr>
+        <tr><td>137</td><td>SIGKILL</td><td>OOM, <code>docker kill</code>, or stop timeout expired</td></tr>
+        <tr><td>143</td><td>SIGTERM</td><td>Clean <code>docker stop</code></td></tr>
+        <tr><td>139</td><td>SIGSEGV</td><td>Segfault — a real crash</td></tr>
+      </table>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What happens if you never set resource limits?</summary>
+      <p><strong>Nothing constrains the container — <code>0</code> means unlimited for memory, CPU and PIDs.</strong>
+         It can allocate until the host is out of memory and use every core.</p>
+      <p>The failure mode is worse than "the greedy container dies", because the <em>global</em> OOM killer
+         chooses by <code>oom_score</code>, which is weighted by resident size:</p>
+<pre>
+leaking service reaches 3.4 GB → host memory exhausted
+global OOM killer selects the LARGEST process → postgres (2.1 GB)
+the database dies; the leaking service keeps running
+</pre>
+      <p>With <code>--memory</code> set, the kill happens in the container's own cgroup and can only select
+         processes inside it. That is the real argument for limits: <strong>they localise damage</strong>, so a
+         bug in your least important service cannot choose your most important one as its victim.</p>
+      <p>The same applies to CPU (an unlimited container starves its neighbours) and to PIDs (a fork bomb
+         exhausts the host's process table, so nothing — including SSH — can fork).</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> <code>docker stats</code> shows a container at 94% of its memory limit but it never OOMs. Explain.</summary>
+      <p><strong>Page cache.</strong> A cgroup's memory accounting includes the page cache for files that
+         container read or wrote, and <code>docker stats</code> reports the total. Cache is reclaimable, so it is
+         not usage in any meaningful sense.</p>
+<pre>
+$ docker exec app cat /sys/fs/cgroup/memory.stat | head -2
+anon 1298432          ← 1.2 MB actually anonymous — the real usage
+file 419430400        ← 400 MB of page cache
+</pre>
+      <p><strong>The number that matters is <code>memory.current − inactive_file</code>.</strong> Under pressure
+         the kernel reclaims cache before it OOMs, which is exactly why the container sits at 94% indefinitely
+         without dying.</p>
+      <p><strong>Why it matters operationally:</strong> alerting on memory percentage generates nightly pages for
+         containers that write logs or read large files, and the team mutes the rule — taking the real alerts with
+         it. Alert on <strong>OOM kill events</strong> instead: unambiguous, and it fires exactly when something
+         is wrong.</p>
+      <p><strong>The related trap in the other direction:</strong> a JVM or Go service whose memory climbs to the
+         cap and flattens is usually healthy — a managed heap expands to fill its budget. A leak looks different:
+         it climbs <em>across restarts</em> and never flattens. Confusing "grew to the limit" with "leaking" leads
+         to raising limits forever.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A service shows 60% average CPU but terrible p99 latency. What do you check?</summary>
+      <p><strong>CFS throttling.</strong> <code>--cpus</code> is a quota per 100 ms period; a container that
+         exhausts it is frozen until the next period. Averages hide this completely.</p>
+<pre>
+$ docker exec app cat /sys/fs/cgroup/cpu.stat
+nr_periods 84021
+nr_throttled 31447            ← 37% of periods hit the cap
+throttled_usec 402910000      ← 403 s of frozen time
+</pre>
+      <table class="tbl">
+        <tr><th>Limit</th><th>Average CPU</th><th>p99</th><th>Throttled</th></tr>
+        <tr><td>none</td><td>62%</td><td>41 ms</td><td>0%</td></tr>
+        <tr><td><code>--cpus=2</code></td><td>62%</td><td>96 ms</td><td>11%</td></tr>
+        <tr><td><code>--cpus=1</code></td><td>62%</td><td><strong>488 ms</strong></td><td>37%</td></tr>
+      </table>
+      <p>Average utilisation is identical in all three rows. A multithreaded process burns its quota in a fraction
+         of the period — four threads consume 100 ms of quota in 25 ms of wall time — and then all four freeze
+         for the remaining 75 ms.</p>
+      <p><strong>Fixes, in order:</strong> raise the quota until <code>nr_throttled</code> is under ~1% of
+         periods; align the runtime's parallelism with the quota (<code>GOMAXPROCS</code>,
+         <code>ActiveProcessorCount</code>, worker counts) so it stops trying to use cores it does not have; or
+         for latency-critical services drop the quota entirely and use <code>--cpu-shares</code>, accepting less
+         predictability in exchange for the ability to burst.</p>
+      <p><strong>The dashboard lesson:</strong> <code>nr_throttled</code> belongs next to CPU utilisation. Without
+         it, this class of problem is invisible and gets misdiagnosed as a database or network issue.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do you decide limits for a fleet of services, and what goes wrong at each extreme?</summary>
+      <p><strong>Measure, apply a headroom factor, then watch the counters that prove the choice was right.</strong>
+         Both extremes fail, in different and equally expensive ways:</p>
+      <table class="tbl">
+        <tr><th></th><th>Limits too low</th><th>Limits too high (or absent)</th></tr>
+        <tr><td>Memory</td><td>OOM kills under normal peaks; restart loops during traffic spikes</td><td>The limit never binds — a leak becomes a host incident with an unrelated victim</td></tr>
+        <tr><td>CPU</td><td>Throttling; p99 collapses while averages look fine</td><td>Noisy neighbours; no capacity planning signal at all</td></tr>
+        <tr><td>Density</td><td>Poor — you reserved capacity nobody uses</td><td>Overcommitted; one bad deploy takes the node</td></tr>
+      </table>
+      <p><strong>The method:</strong> run unlimited under realistic load, take peak <em>anonymous</em> memory
+         (<code>memory.current − inactive_file</code>) and p99 CPU, then set memory at 1.5× peak anon and CPU at
+         1.5× p99. Set PIDs at 3× steady-state threads. Re-derive quarterly, because workloads drift and a limit
+         set from last year's traffic is a guess wearing a number.</p>
+      <p><strong>Where I deviate deliberately:</strong></p>
+      <ul>
+        <li><strong>Latency-critical services get a memory limit but no CPU quota</strong> — a weight instead, so
+            they can burst. Predictability of scheduling matters less than p99 for these, and quota buys
+            predictability by destroying tail latency.</li>
+        <li><strong>Batch and background jobs get hard quotas and low weights.</strong> They are the ones that
+            should absorb throttling.</li>
+        <li><strong>Memory is never overcommitted on a node</strong> — sum of limits ≤ node capacity minus a
+            system reserve. CPU may be, because throttling degrades and OOM kills.</li>
+      </ul>
+      <p><strong>Monitoring that makes the whole thing self-correcting:</strong> OOM kill events (not memory
+         percentage), <code>nr_throttled</code> as a ratio of <code>nr_periods</code>,
+         <code>pids.current</code> against its limit, and a "limit utilisation" panel that catches both a service
+         running at 95% of its cap and one at 4% — the second is wasted reservation and the more common
+         problem at scale.</p>
+      <p><strong>The organisational half:</strong> defaults in a shared template, so a new service inherits
+         reasonable limits without anyone thinking about it, and an admission check that rejects containers with
+         no memory limit at all. Per-service tuning is worthwhile for the top ten services by cost and a waste of
+         time for the other two hundred.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A Java service is OOM-killed at 512 MB with <code>-Xmx512m</code>. Explain and fix.</summary>
+      <p><strong>The heap is not the process.</strong> <code>-Xmx</code> bounds one region; the JVM's total RSS
+         includes several others, none of which count toward it:</p>
+<pre>
+heap            -Xmx512m                        512 MB
+metaspace       class metadata, unbounded by default   ~80 MB
+code cache      JIT-compiled code               ~50 MB
+thread stacks   1 MB × 200 threads              ~200 MB   ← the usual surprise
+GC structures   card tables, remembered sets    ~40 MB
+direct buffers  NIO, Netty — OFF-heap entirely  ~100 MB
+JVM itself      ~30 MB
+                                                ─────────
+                                          total ~1 GB in a 512 MB container
+</pre>
+      <p><strong>The fix is to size from the container limit, not the heap</strong>, and to bound the parts that
+         are unbounded by default:</p>
+<pre>
+docker run -m 1g \
+  -e JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=60 \
+                        -XX:MaxMetaspaceSize=128m \
+                        -XX:MaxDirectMemorySize=128m \
+                        -Xss512k" \
+  myapp
+</pre>
+      <p><code>MaxRAMPercentage</code> is preferable to a fixed <code>-Xmx</code> because it tracks the container
+         limit — change the limit and the heap follows, so the two can never drift apart in a config file.</p>
+      <p><strong>Diagnosis, so this is not guesswork:</strong> <code>-XX:NativeMemoryTracking=summary</code> plus
+         <code>jcmd VM.native_memory summary</code> attributes RSS to each region and usually points straight at
+         thread stacks or direct buffers. If the count of threads is the problem, the answer is a bounded pool,
+         not more memory.</p>
+      <p><strong>The general lesson worth stating:</strong> every managed runtime has this shape. Node's
+         <code>--max-old-space-size</code> excludes buffers and the C++ heap; Python's allocator holds arenas the
+         OS never gets back; Go's <code>GOGC</code> trades RSS for CPU. <strong>Budget roughly 25–30% of the
+         container limit for everything outside the managed heap</strong>, and verify it with a soak test rather
+         than arithmetic alone.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Trigger an OOM kill and identify it three ways.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name hog -m 128m alpine sh -c \
+    'i=0; while true; do i=$((i+1)); dd if=/dev/zero of=/dev/shm/f$i bs=1M count=10 2>/dev/null; sleep 0.2; done'
+$ sleep 8; docker ps -a --filter name=hog --format '{{.Status}}'
+Exited (137) 2 seconds ago
+</pre>
+<pre>
+① the exit code
+$ docker inspect hog --format '{{.State.ExitCode}}'
+137                                   ← 128 + 9 (SIGKILL)
+
+② the unambiguous field
+$ docker inspect hog --format '{{.State.OOMKilled}}'
+true
+
+③ the kernel's own record
+$ dmesg -T | grep -A2 -i 'cgroup out of memory' | tail -3
+[Tue Aug 19 12:31:02] Memory cgroup out of memory: Killed process 20481 (dd)
+  total-vm:206184kB, anon-rss:130024kB
+[Tue Aug 19 12:31:02] Memory cgroup stats for /docker/8f21c0e4...: anon 129.9M
+                       ↑ "Memory cgroup" = the container's own limit. Not host-wide.
+</pre>
+<p>Now prove 137 is ambiguous, which is the part that matters in an incident:</p>
+<pre>
+$ docker run -d --name stubborn alpine sh -c 'trap "" TERM; sleep 3600'
+$ time docker stop stubborn
+real    0m10.4s                       ← SIGTERM ignored, escalated to SIGKILL
+$ docker inspect stubborn --format '{{.State.ExitCode}} {{.State.OOMKilled}}'
+137 false                             ← same exit code, completely different cause
+</pre>
+<table class="tbl">
+  <tr><th>ExitCode</th><th>OOMKilled</th><th>Diagnosis</th><th>Fix</th></tr>
+  <tr><td>137</td><td><strong>true</strong></td><td>Hit the memory limit</td><td>Raise the limit or fix the leak</td></tr>
+  <tr><td>137</td><td>false</td><td>Ignored SIGTERM, stop timeout expired</td><td><a href="process-model.html">Handle signals</a></td></tr>
+  <tr><td>143</td><td>false</td><td>Clean shutdown</td><td>Nothing</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show that <code>docker stats</code> counts page cache, and compute the real figure.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name cache -m 512m alpine sleep 3600
+$ docker stats --no-stream cache --format '{{.MemUsage}} {{.MemPerc}}'
+1.164MiB / 512MiB   0.23%
+
+$ docker exec cache sh -c 'dd if=/dev/zero of=/tmp/big bs=1M count=400 2>/dev/null; sync'
+$ docker stats --no-stream cache --format '{{.MemUsage}} {{.MemPerc}}'
+402.1MiB / 512MiB   78.54%            ← a SLEEPING container at 78%
+</pre>
+<pre>
+$ docker exec cache sh -c 'grep -E "^(anon|file|inactive_file) " /sys/fs/cgroup/memory.stat'
+anon 1298432                          ← 1.2 MB really in use
+file 419430400                        ← 400 MB of reclaimable page cache
+inactive_file 419430400
+
+$ docker exec cache sh -c \
+   'echo "real: $(( ($(cat /sys/fs/cgroup/memory.current) - \
+     $(awk "/^inactive_file /{print \$2}" /sys/fs/cgroup/memory.stat)) / 1048576 )) MB"'
+real: 2 MB
+</pre>
+<p>Prove it is reclaimable rather than merely mislabelled — allocate real memory and watch cache give way:</p>
+<pre>
+$ docker exec cache sh -c 'dd if=/dev/zero of=/dev/shm/anon bs=1M count=400'
+400+0 records out                     ← succeeds, despite "78% used" before it started
+$ docker stats --no-stream cache --format '{{.MemUsage}}'
+403.8MiB / 512MiB
+$ docker exec cache sh -c 'grep -E "^(anon|file) " /sys/fs/cgroup/memory.stat'
+anon 420450304                        ← 400 MB anonymous now
+file 2494464                          ← the cache was dropped to make room. No OOM.
+</pre>
+<p><strong>Monitoring conclusion:</strong> a rule of "alert above 80% memory" pages nightly for any container
+   that writes logs or reads files, and the team mutes it. Alert on OOM kill events, and if you must chart
+   memory, chart <code>anon</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure CFS throttling and its effect on tail latency.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > work.js &lt;&lt;'EOF'
+const http = require('http'); const crypto = require('crypto');
+http.createServer((req,res) => {
+  const t = process.hrtime.bigint();
+  crypto.pbkdf2Sync('p','s',60000,64,'sha512');       // ~60 ms of CPU
+  res.end(String(Number(process.hrtime.bigint()-t)/1e6));
+}).listen(3000);
+EOF
+$ printf 'FROM node:20-alpine\nCOPY work.js /\nENV UV_THREADPOOL_SIZE=4\nCMD ["node","/work.js"]\n' > Dockerfile
+$ docker build -qt cpulab .
+
+$ bench() {  # $1 = docker cpu flag(s)
+    docker rm -f lab >/dev/null 2>&amp;1
+    docker run -d --name lab $1 -p 3000:3000 cpulab >/dev/null; sleep 2
+    hey -z 30s -c 4 -q 12 http://localhost:3000/ 2>/dev/null | grep -E '99%|Average'
+    docker exec lab cat /sys/fs/cgroup/cpu.stat | grep -E 'nr_periods|nr_throttled'
+  }
+</pre>
+<pre>
+$ bench ""
+  Average:      0.0187 secs
+  99% in 0.0413 secs
+nr_periods 0
+nr_throttled 0
+
+$ bench "--cpus=2"
+  Average:      0.0209 secs
+  99% in 0.0961 secs
+nr_periods 2981
+nr_throttled 331                      ← 11%
+
+$ bench "--cpus=1"
+  Average:      0.0344 secs
+  99% in 0.4884 secs                  ← 12× the unlimited p99
+nr_periods 2994
+nr_throttled 1108                     ← 37%
+$ docker exec lab cat /sys/fs/cgroup/cpu.stat | grep throttled_usec
+throttled_usec 402910000              ← 403 seconds frozen in a 30 second test
+                                        (4 threads × wall time)
+</pre>
+<pre>
+$ docker stats --no-stream lab --format '{{.CPUPerc}}'
+62.14%                                ← the dashboard says there is headroom
+</pre>
+<p>Now show the second half of the fix — aligning the runtime's parallelism with the quota:</p>
+<pre>
+$ docker rm -f lab; docker run -d --name lab --cpus=1 -e UV_THREADPOOL_SIZE=1 \
+    -p 3000:3000 cpulab; sleep 2
+$ hey -z 30s -c 4 -q 12 http://localhost:3000/ | grep '99%'
+  99% in 0.2140 secs                  ← 488 ms → 214 ms, same quota
+$ docker exec lab cat /sys/fs/cgroup/cpu.stat | grep nr_throttled
+nr_throttled 402                      ← 37% → 13%
+</pre>
+<table class="tbl">
+  <tr><th>Config</th><th>Avg CPU</th><th>p99</th><th>Throttled periods</th></tr>
+  <tr><td>unlimited</td><td>62%</td><td>41 ms</td><td>0%</td></tr>
+  <tr><td><code>--cpus=2</code></td><td>62%</td><td>96 ms</td><td>11%</td></tr>
+  <tr><td><code>--cpus=1</code></td><td>62%</td><td><strong>488 ms</strong></td><td>37%</td></tr>
+  <tr><td><code>--cpus=1</code>, pool=1</td><td>62%</td><td>214 ms</td><td>13%</td></tr>
+</table>
+<p><strong>Two conclusions.</strong> Average CPU is 62% in every row, so utilisation alone cannot detect this
+   — <code>nr_throttled</code> must be on the dashboard. And a runtime that spawns threads for cores it does
+   not have makes throttling worse: fewer threads under the same quota nearly halved p99.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Prove the runtime cannot see the limit, then fix it for the JVM, Go and Node.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ nproc; free -g | awk '/^Mem/{print $2"GB"}'
+16
+62GB
+
+$ docker run --rm --cpus=2 -m 512m alpine sh -c 'nproc; free -m | awk "/^Mem/{print \$2}"'
+16                                    ← /proc/cpuinfo is not namespaced
+64243                                 ← /proc/meminfo is not namespaced
+</pre>
+<pre>
+JVM — modern versions read the cgroup, older ones do not
+
+$ docker run --rm -m 512m eclipse-temurin:21 java -XX:+PrintFlagsFinal -version \
+    | grep -E 'MaxHeapSize|UseContainerSupport'
+size_t MaxHeapSize   = 134217728      ← 128 MB = 1/4 of the 512 MB limit  ✅
+bool UseContainerSupport = true
+
+$ docker run --rm -m 512m -e JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75 \
+    eclipse-temurin:21 java -XX:+PrintFlagsFinal -version | grep MaxHeapSize
+size_t MaxHeapSize   = 402653184      ← 384 MB, chosen deliberately
+
+$ docker run --rm --cpus=2 eclipse-temurin:21 java -XX:+PrintFlagsFinal -version \
+    | grep ActiveProcessorCount
+int ActiveProcessorCount = 2          ← CPU quota respected too
+</pre>
+<pre>
+Go — GOMAXPROCS ignores the quota entirely
+
+$ printf 'package main\nimport ("fmt";"runtime")\nfunc main(){fmt.Println(runtime.GOMAXPROCS(0))}\n' > m.go
+$ docker run --rm --cpus=2 -v $PWD:/s -w /s golang:1.22 go run m.go
+16                                    ← 16 OS threads competing for 2 cores of quota
+
+$ docker run --rm --cpus=2 -e GOMAXPROCS=2 -v $PWD:/s -w /s golang:1.22 go run m.go
+2                                     ← explicit, or use go.uber.org/automaxprocs
+                                        which reads cpu.max at init
+</pre>
+<pre>
+Node — heap sized from host RAM
+
+$ docker run --rm -m 512m node:20-alpine node -e \
+    'console.log((require("v8").getHeapStatistics().heap_size_limit/1048576|0)+"MB")'
+2077MB                                ← a 2 GB heap budget inside a 512 MB container
+                                        → grows past the limit → exit 137
+
+$ docker run --rm -m 512m node:20-alpine node --max-old-space-size=384 -e \
+    'console.log((require("v8").getHeapStatistics().heap_size_limit/1048576|0)+"MB")'
+405MB                                 ← ~75% of the limit, leaving room for the rest
+</pre>
+<p>Confirm the failure the Node default actually produces:</p>
+<pre>
+$ docker run --rm -m 512m --name leak node:20-alpine node -e \
+    'const a=[]; setInterval(()=>a.push(Buffer.alloc(10*1024*1024)),50)'
+$ echo $?; docker inspect leak --format '{{.State.OOMKilled}}'
+137
+true                                  ← killed by the kernel, no JS error, no stack trace
+
+$ docker run --rm -m 512m node:20-alpine node --max-old-space-size=384 -e \
+    'const a=[]; setInterval(()=>a.push(new Array(1e6).fill("x")),20)'
+FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+ 1: 0xb7... Fatal javascript OOM in ...   ← a diagnosable error instead of a silent kill
+</pre>
+<table class="tbl">
+  <tr><th>Runtime</th><th>Default at <code>--cpus=2 -m 512m</code></th><th>Fix</th></tr>
+  <tr><td>JVM 21</td><td>✅ heap 128 MB, 2 processors</td><td><code>-XX:MaxRAMPercentage=75</code> to tune</td></tr>
+  <tr><td>Go</td><td>❌ GOMAXPROCS 16</td><td><code>automaxprocs</code></td></tr>
+  <tr><td>Node</td><td>❌ heap budget 2 GB</td><td><code>--max-old-space-size=384</code></td></tr>
+  <tr><td>Python/gunicorn</td><td>❌ <code>cpu_count()</code> = 16</td><td>Compute workers from <code>cpu.max</code></td></tr>
+  <tr><td>nginx <code>worker_processes auto</code></td><td>❌ 16 workers</td><td>Set explicitly</td></tr>
+</table>
+<p><strong>The bonus in the Node row is worth noticing:</strong> setting the heap limit below the container
+   limit converts a silent SIGKILL with no diagnostics into a JavaScript OOM with a stack trace and a heap
+   snapshot. That is a debuggability win independent of the memory saved.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Contain a fork bomb and detect a thread leak before it becomes an incident.
+      <details class="solution"><summary>Solution</summary>
+<p><strong>Run this on a throwaway VM only.</strong> The unlimited case requires a reboot.</p>
+<pre>
+① no limit — the host, not the container, is the casualty
+$ docker run --rm -d alpine sh -c ':(){ :|:& };:'
+$ ssh host
+-bash: fork: retry: Resource temporarily unavailable
+-bash: fork: Resource temporarily unavailable        ← cannot even run ps
+   → the container's cgroup has no pids.max, so it consumes the host's process table
+   → recovery: hard reboot
+
+② with a PID limit
+$ docker run --rm --pids-limit=100 --name bomb -d alpine sh -c ':(){ :|:& };:'
+$ docker exec other echo ok
+ok                                                   ← the rest of the host is fine
+$ docker logs bomb | tail -2
+sh: can't fork: Resource temporarily unavailable
+$ docker exec bomb cat /sys/fs/cgroup/pids.current /sys/fs/cgroup/pids.max
+100
+100                                                  ← pinned at the ceiling, contained
+$ docker rm -f bomb
+</pre>
+<p>Now the realistic version — a thread leak, which is the same mechanism at a slower pace:</p>
+<pre>
+$ cat > leak.js &lt;&lt;'EOF'
+const { Worker } = require('worker_threads');
+const held = [];
+setInterval(() => {                                  // leaks one worker every 2 s
+  held.push(new Worker('setInterval(()=>{},1e9)', { eval: true }));
+}, 2000);
+EOF
+$ docker run -d --name leaky --pids-limit=60 -v $PWD/leak.js:/leak.js \
+    node:20-alpine node /leak.js
+
+$ while sleep 20; do
+    printf '%s pids=%s/%s status=%s\n' "$(date +%T)" \
+      "$(docker exec leaky cat /sys/fs/cgroup/pids.current 2>/dev/null)" \
+      "$(docker exec leaky cat /sys/fs/cgroup/pids.max 2>/dev/null)" \
+      "$(docker inspect leaky --format '{{.State.Status}}')"
+  done
+12:40:03 pids=18/60 status=running
+12:40:23 pids=28/60 status=running
+12:40:43 pids=38/60 status=running      ← a clean linear ramp: unambiguous leak signal
+12:41:03 pids=49/60 status=running
+12:41:23 pids=59/60 status=running
+12:41:43 pids=60/60 status=running      ← pinned at the ceiling
+$ docker logs leaky | tail -2
+Error: Resource temporarily unavailable
+    at new Worker (node:internal/worker:...)
+</pre>
+<p>Contrast the two diagnostics, which is the real point of the limit:</p>
+<table class="tbl">
+  <tr><th></th><th>No <code>--pids-limit</code></th><th><code>--pids-limit=60</code></th></tr>
+  <tr><td>Symptom</td><td>Host cannot fork; SSH fails</td><td>One container errors</td></tr>
+  <tr><td>Blast radius</td><td>Every service on the host</td><td>The leaking service</td></tr>
+  <tr><td>Diagnosis</td><td>Impossible — no shell available</td><td>A stack trace naming <code>new Worker</code></td></tr>
+  <tr><td>Recovery</td><td>Reboot</td><td><code>docker restart</code>, or the restart policy</td></tr>
+  <tr><td>Early warning</td><td>None</td><td><code>pids.current</code> ramp, visible for minutes</td></tr>
+</table>
+<p>Set the alert on the ratio, so it fires while there is still time to act:</p>
+<pre>
+$ docker exec leaky sh -c \
+   'echo $(( 100 * $(cat /sys/fs/cgroup/pids.current) / $(cat /sys/fs/cgroup/pids.max) ))%'
+98%                                              ← alert at 70%, which was 4 minutes earlier
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Derive limits for a real service from measurement, then verify them under load.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — run unlimited under realistic load and sample the honest numbers
+$ docker run -d --name sizing -p 3000:3000 myco/api:sha-9f21c0e
+$ hey -z 10m -c 50 http://localhost:3000/api/orders &amp;
+
+$ cat > sample.sh &lt;&lt;'SH'
+#!/bin/sh
+c=/sys/fs/cgroup
+while sleep 5; do
+  cur=$(docker exec sizing cat $c/memory.current)
+  inact=$(docker exec sizing awk '/^inactive_file /{print $2}' $c/memory.stat)
+  anon=$(docker exec sizing awk '/^anon /{print $2}' $c/memory.stat)
+  pids=$(docker exec sizing cat $c/pids.current)
+  cpu=$(docker stats --no-stream sizing --format '{{.CPUPerc}}')
+  echo "$(( (cur-inact)/1048576 )) $(( anon/1048576 )) $pids $cpu"
+done
+SH
+$ sh sample.sh | tee samples.txt
+</pre>
+<pre>
+STEP 2 — reduce the samples
+$ awk '{if($1>m)m=$1; if($3>p)p=$3; gsub(/%/,"",$4); c[NR]=$4}
+       END{n=asort(c); print "peak_real_mem_MB:", m;
+           print "peak_pids:", p;
+           print "p99_cpu_pct:", c[int(n*0.99)]}' samples.txt
+peak_real_mem_MB: 412
+peak_pids: 63
+p99_cpu_pct: 168
+
+$ docker stats --no-stream sizing --format '{{.MemUsage}}'
+1.42GiB / 15.61GiB          ← what docker stats claimed: 1.42 GB (page cache), vs 412 MB real
+</pre>
+<pre>
+STEP 3 — apply the headroom factors
+  memory  = 412 MB × 1.5  =  620 MB  →  640m
+  cpu     = 1.68 × 1.5    =  2.5     →  2.5
+  pids    = 63   × 3      =  189     →  200
+  nofile  = observed peak 1,840 conns →  65535
+</pre>
+<pre>
+STEP 4 — apply, and tell the runtime what it has
+services:
+  api:
+    image: myco/api:sha-9f21c0e
+    environment:
+      NODE_OPTIONS: "--max-old-space-size=480"      # 75% of 640
+      UV_THREADPOOL_SIZE: "3"                       # aligned with the 2.5 CPU quota
+    deploy:
+      resources:
+        limits: { memory: 640M, cpus: "2.5" }
+    pids_limit: 200
+    ulimits: { nofile: { soft: 65535, hard: 65535 } }
+    restart: unless-stopped
+</pre>
+<pre>
+STEP 5 — verify under the SAME load
+$ docker compose up -d &amp;&amp; hey -z 10m -c 50 http://localhost:3000/api/orders
+
+$ docker inspect shop-api-1 --format '{{.State.OOMKilled}} {{.RestartCount}}'
+false 0                                          ← no kills
+$ docker exec shop-api-1 cat /sys/fs/cgroup/cpu.stat | grep -E 'nr_periods|nr_throttled'
+nr_periods 5980
+nr_throttled 41                                  ← 0.7%, under the 1% target
+$ docker exec shop-api-1 sh -c \
+   'echo $(( 100*($(cat /sys/fs/cgroup/memory.current) - \
+     $(awk "/^inactive_file /{print \$2}" /sys/fs/cgroup/memory.stat)) \
+     / $(cat /sys/fs/cgroup/memory.max) ))%'
+71%                                              ← headroom present, limit still binding
+$ docker exec shop-api-1 cat /sys/fs/cgroup/pids.current
+66                                               ← 33% of the ceiling
+</pre>
+<pre>
+STEP 6 — verify the limit actually protects the host
+$ docker exec shop-api-1 sh -c 'node -e "const a=[];while(1)a.push(Buffer.alloc(1e7))"'
+Killed
+$ docker inspect shop-api-1 --format '{{.State.OOMKilled}} {{.RestartCount}}'
+true 1                                           ← cgroup OOM, restarted automatically
+$ dmesg -T | grep -c 'Out of memory: Killed process' # host-wide kills
+0                                                ← the host never saw memory pressure
+$ docker exec shop-db-1 pg_isready
+/var/run/postgresql:5432 - accepting connections  ← neighbours untouched
+</pre>
+<table class="tbl">
+  <tr><th>Metric</th><th>Guessed limits (512m / 1 cpu)</th><th>Derived limits (640m / 2.5 cpu)</th></tr>
+  <tr><td>OOM kills in 10 min</td><td>4</td><td><strong>0</strong></td></tr>
+  <tr><td>Throttled periods</td><td>31%</td><td><strong>0.7%</strong></td></tr>
+  <tr><td>p99 latency</td><td>488 ms</td><td><strong>52 ms</strong></td></tr>
+  <tr><td>Memory headroom</td><td>Negative</td><td>29%</td></tr>
+</table>
+<p><strong>What to schedule:</strong> re-derive quarterly and after any significant dependency upgrade. A
+   limit is a measurement with an expiry date — the failure mode of "we set limits once in 2024" is
+   indistinguishable from having guessed.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Memory, CPU and PID limits all default to <strong>unlimited</strong> (<code>0</code>), and <code>docker stats</code>' "LIMIT" column shows host RAM when none is set.</li>
+        <li>Limits <strong>localise damage</strong>: a cgroup OOM kills inside the container, while a host OOM picks by <code>oom_score</code> and often kills the database instead of the leaker.</li>
+        <li><strong>Exit 137 = 128 + SIGKILL</strong>, usually OOM — but also a stop timeout on an ignored SIGTERM. <code>.State.OOMKilled</code> is what distinguishes them.</li>
+        <li><code>dmesg</code> saying "<strong>Memory cgroup</strong> out of memory" confirms the container's own limit fired, not a host-wide event.</li>
+        <li>The OOM killer picks a <em>process</em>: in a multi-process container it can kill a worker and leave PID 1 <code>Up</code> with a silently missing child.</li>
+        <li><code>--oom-kill-disable</code> freezes the cgroup rather than preventing the OOM — a hung container instead of a dead one.</li>
+        <li><strong>Page cache counts toward cgroup memory</strong> — measured: a sleeping container reported 78.54% after writing a 400 MB file, with 1.2 MB actually anonymous.</li>
+        <li>Real usage is <code>memory.current − inactive_file</code>; alert on <strong>OOM kill events</strong>, not on a percentage that page cache inflates.</li>
+        <li><code>--memory-swap</code> is the <em>combined</em> RAM+swap ceiling; setting it equal to <code>--memory</code> disables swap, which is usually right for services.</li>
+        <li><code>--cpus</code> is a hard quota that throttles even on an idle host; <code>--cpu-shares</code> is a weight that does nothing until there is contention.</li>
+        <li><strong>Throttling is invisible in averages</strong>: 62% average CPU in every configuration while p99 went 41 ms → 96 ms → 488 ms as the quota tightened, at 0% → 11% → 37% of periods throttled.</li>
+        <li><code>nr_throttled / nr_periods</code> belongs on the dashboard next to utilisation; target under ~1%.</li>
+        <li><strong><code>/proc/cpuinfo</code> and <code>/proc/meminfo</code> are not namespaced</strong> — a container limited to 2 CPUs and 512 MB reports 16 CPUs and 62 GB.</li>
+        <li>Modern JVMs and .NET read the cgroup; <strong>Go, Node, Python and nginx do not</strong> — use <code>automaxprocs</code>, <code>--max-old-space-size</code>, and worker counts computed from the quota.</li>
+        <li>Aligning thread-pool size with the quota nearly halved p99 (488 ms → 214 ms) at the same limit.</li>
+        <li>Budget <strong>25–30% of the container limit outside the managed heap</strong>: metaspace, thread stacks, code cache, direct buffers and GC structures are all excluded from <code>-Xmx</code>.</li>
+        <li>Setting the heap below the container limit converts a silent SIGKILL into a diagnosable OOM with a stack trace.</li>
+        <li><code>--pids-limit</code> costs nothing and turns a fork bomb from a host reboot into one stuck container; the <code>pids.current</code> ramp gives minutes of warning on a thread leak.</li>
+        <li>Size from measurement: memory = 1.5× peak <em>anon</em>, CPU = 1.5× p99, PIDs = 3× steady state — measured limits gave 0 OOM kills, 0.7% throttling and 52 ms p99 versus 4 kills, 31% and 488 ms when guessed.</li>
+        <li>Memory should not be overcommitted on a node (OOM kills); CPU may be (throttling degrades). Re-derive limits quarterly — they are measurements with an expiry date.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="security.html">← Security &amp; Non-root Containers</a>
+      <a href="logging.html">Logging &amp; Observability →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
