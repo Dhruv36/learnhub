@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Runtime Stack: runc, containerd, Docker — Docker — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>The Runtime Stack: runc, containerd, Docker <span class="level-badge level-int">Foundations</span></h1>
+    <p><strong>What you'll master:</strong> which component actually does what when you type
+       <code>docker run</code>, and why that matters the moment something breaks; the <code>containerd-shim</code>
+       and the property it buys — <strong>containers survive a daemon restart</strong>, which is why "restarting
+       Docker kills everything" stopped being true; the OCI specifications that make images and runtimes
+       interchangeable, and what "Docker is just one implementation" concretely means; why Kubernetes removed
+       dockershim and why that was <em>not</em> "Kubernetes dropping Docker images"; the alternative runtimes —
+       crun, gVisor, Kata — and the specific problem each solves; rootless and daemonless designs (Podman,
+       Buildah); and how to drive containerd directly with <code>ctr</code> and <code>nerdctl</code> when the
+       Docker CLI is not the right tool. Prerequisites:
+       <a href="namespaces.html">Namespaces</a>, <a href="cgroups.html">cgroups</a>.</p>
+
+    <h2>Part 1 — What Happens on <code>docker run</code></h2>
+
+    <p>Five components are involved, and each has one job. Knowing the division tells you where to look when a
+       container fails to start.</p>
+
+<pre>
+docker CLI                      talks HTTP to the daemon over a socket
+   │  POST /containers/create
+   ▼
+dockerd                         image management, networking, volumes, API
+   │  gRPC
+   ▼
+containerd                      container lifecycle, image pull, snapshots
+   │  spawns one shim per container
+   ▼
+containerd-shim-runc-v2         ★ stays alive for the container's lifetime
+   │  exec
+   ▼
+runc                            creates namespaces + cgroups, execs, then EXITS
+   │
+   ▼
+your process                    reparented to the shim
+</pre>
+
+    <div class="note">🔑 <strong><code>runc</code> exits immediately after starting the container — it is not the
+       container's parent.</strong> Its entire job is to apply the OCI runtime specification: set up namespaces
+       and cgroups, pivot the root filesystem, drop capabilities, apply seccomp, and <code>exec</code> the entry
+       process. Then it is gone. That is why you never see <code>runc</code> in <code>ps</code> for a running
+       container, and why "runc" appearing in an error message means the failure happened during
+       <em>creation</em>, not while running.</p></div>
+
+<pre>
+$ docker run -d --name web nginx
+$ ps -ef --forest | grep -A3 containerd-shim
+root  1204     1  containerd-shim-runc-v2 -namespace moby -id 3f8a91c04e7b...
+root  48213  1204   \_ nginx: master process nginx -g daemon off;
+systemd+ 48260 48213     \_ nginx: worker process
+                ↑ the shim is the parent — NOT dockerd, NOT runc
+</pre>
+
+    <h2>Part 2 — The Shim: Why Containers Survive a Daemon Restart</h2>
+
+    <p>The shim exists to decouple container lifetime from daemon lifetime. Each container gets its own shim
+       process, parented to init rather than to dockerd.</p>
+
+    <table class="tbl">
+      <tr><th>The shim's job</th><th>Why it matters</th></tr>
+      <tr><td>Be the container's parent</td><td>Reaps zombies; keeps the process tree valid</td></tr>
+      <tr><td>Hold stdio/TTY open</td><td>Logs and <code>attach</code> survive a daemon restart</td></tr>
+      <tr><td>Report the exit code</td><td>Exit status is captured even if containerd is down</td></tr>
+      <tr><td>Keep the container running</td><td><strong>Restarting dockerd does not kill containers</strong></td></tr>
+    </table>
+
+<pre>
+$ docker run -d --name survivor nginx
+$ docker inspect -f '{{.State.Pid}}' survivor
+48213
+
+$ sudo systemctl restart docker            # restart the DAEMON
+$ ps -p 48213 -o pid,comm
+  PID COMMAND
+48213 nginx                                ← still running, uninterrupted
+
+$ docker ps --filter name=survivor --format '{{.Status}}'
+Up 4 minutes                               ← reattached, uptime unbroken
+</pre>
+
+    <p><strong>This was not always true.</strong> Before the shim (Docker &lt; 1.11), dockerd was the direct parent
+       of every container, so restarting or upgrading the daemon killed every workload on the host. The shim is
+       what made "upgrade Docker without downtime" possible, and it is the reason containerd can be restarted
+       independently in Kubernetes clusters.</p>
+
+    <div class="note">🔑 <strong>The trade is one shim process per container.</strong> On a host running 200
+       containers there are 200 shim processes, each consuming a few MB. That is the price of daemon-independent
+       lifetimes, and it is why shim memory usage shows up in dense-host capacity planning.</p></div>
+
+    <h2>Part 3 — The OCI Specifications</h2>
+
+    <p>The Open Container Initiative standardises three things, and that standardisation is what makes the
+       ecosystem interchangeable.</p>
+
+    <table class="tbl">
+      <tr><th>Specification</th><th>Defines</th><th>Implementations</th></tr>
+      <tr><td><strong>Image Spec</strong></td><td>Layer format, manifest, config JSON</td><td>Docker, BuildKit, Buildah, Kaniko, ko</td></tr>
+      <tr><td><strong>Runtime Spec</strong></td><td>The bundle (rootfs + <code>config.json</code>) and lifecycle</td><td>runc, crun, gVisor, Kata, youki</td></tr>
+      <tr><td><strong>Distribution Spec</strong></td><td>Registry HTTP API for push/pull</td><td>Docker Hub, ECR, GCR, Harbor, Zot</td></tr>
+    </table>
+
+<pre>
+# an OCI bundle is just a directory: rootfs + config.json
+$ mkdir -p /tmp/bundle/rootfs
+$ docker export $(docker create alpine) | tar -C /tmp/bundle/rootfs -xf -
+$ cd /tmp/bundle &amp;&amp; runc spec              # generates config.json
+$ sudo runc run mycontainer
+/ # echo "no Docker involved"
+</pre>
+
+    <p><strong>That is the whole runtime contract:</strong> a root filesystem and a JSON file describing
+       namespaces, cgroups, capabilities, and the process to run. Any OCI runtime can consume it, which is why
+       swapping runc for crun or gVisor is a configuration change rather than a migration.</p>
+
+    <p><strong>"Docker images" are OCI images.</strong> An image built by Docker runs under containerd, CRI-O,
+       Podman, or any OCI runtime — the name is historical, not a format.</p>
+
+    <h2>Part 4 — Kubernetes and the dockershim Removal</h2>
+
+    <p>This generated more confusion than any other change in the ecosystem, and the confusion is worth clearing
+       precisely because it is a common interview question.</p>
+
+<pre>
+BEFORE (Kubernetes ≤ 1.23):
+  kubelet → dockershim → dockerd → containerd → shim → runc
+            └────┬────┘
+        an adapter maintained IN Kubernetes, translating CRI to Docker's API
+
+AFTER (Kubernetes ≥ 1.24):
+  kubelet → containerd → shim → runc          ← one fewer hop, no adapter
+  kubelet → CRI-O → runc                      ← or any CRI runtime
+</pre>
+
+    <div class="note">🔑 <strong>Removing dockershim did not stop Kubernetes running Docker-built images.</strong>
+       Images are OCI artefacts and were never the issue — what was removed was the adapter that let kubelet talk
+       to <em>dockerd's API</em>. Since dockerd already delegated to containerd, the change deleted a redundant
+       hop that Kubernetes had to maintain. Every image built with <code>docker build</code> still runs
+       unchanged.</p></div>
+
+    <table class="tbl">
+      <tr><th>Concern</th><th>Reality</th></tr>
+      <tr><td>"My Docker images stop working"</td><td>No — they are OCI images</td></tr>
+      <tr><td>"I cannot use <code>docker build</code>"</td><td>You can — build and runtime are separate concerns</td></tr>
+      <tr><td>Docker socket mounted in a pod</td><td><strong>Genuinely breaks</strong> — there is no dockerd</td></tr>
+      <tr><td>Tooling calling the Docker API on nodes</td><td>Breaks — use CRI or <code>nerdctl</code></td></tr>
+      <tr><td>Node-level log collection</td><td>Log paths and formats changed</td></tr>
+    </table>
+
+    <p>The real migration work was the last three rows: anything that talked to <em>dockerd</em> on a node rather
+       than using container images. Docker-in-Docker CI patterns that mounted the socket were the most common
+       breakage, and the answer is a daemonless builder such as Kaniko or Buildah, or BuildKit in rootless mode.</p>
+
+    <h2>Part 5 — Alternative Runtimes</h2>
+
+    <p>Because the runtime spec is a contract, the low-level runtime is swappable. Each alternative exists for a
+       specific reason.</p>
+
+    <table class="tbl">
+      <tr><th>Runtime</th><th>Written in</th><th>Solves</th><th>Cost</th></tr>
+      <tr><td><strong>runc</strong></td><td>Go</td><td>The reference implementation</td><td>—</td></tr>
+      <tr><td><strong>crun</strong></td><td>C</td><td>Faster start, lower memory; better cgroup v2</td><td>Less ubiquitous</td></tr>
+      <tr><td><strong>gVisor</strong> (runsc)</td><td>Go</td><td><strong>User-space kernel</strong> — intercepts syscalls</td><td>Syscall overhead; some incompatibility</td></tr>
+      <tr><td><strong>Kata Containers</strong></td><td>Go/Rust</td><td><strong>A real VM per container</strong></td><td>~100 MB and ~1 s per container</td></tr>
+      <tr><td><strong>youki</strong></td><td>Rust</td><td>Memory-safe, fast</td><td>Newer</td></tr>
+    </table>
+
+<pre>
+# configure an alternative runtime in /etc/docker/daemon.json
+{
+  "runtimes": {
+    "gvisor": { "path": "/usr/local/bin/runsc" },
+    "kata":   { "path": "/usr/bin/kata-runtime" }
+  }
+}
+
+$ docker run --runtime=gvisor --rm alpine dmesg | head -1
+[    0.000000] Starting gVisor...            ← a user-space kernel, not the host's
+</pre>
+
+    <p><strong>gVisor and Kata exist for the same reason:</strong> the shared kernel that makes containers fast
+       also makes them a weak security boundary. gVisor puts a user-space kernel between the container and the
+       host so most syscalls never reach the real kernel; Kata gives each container a lightweight VM. Both trade
+       performance for a second isolation boundary — the trade discussed in
+       <a href="index.html">What a Container Actually Is</a>.</p>
+
+    <h2>Part 6 — Daemonless and Rootless Alternatives</h2>
+
+    <p>Docker's architecture has a root-owned daemon at its centre, which is a security and operational
+       characteristic worth understanding rather than accepting by default.</p>
+
+<pre>
+DOCKER                          PODMAN
+docker CLI                      podman CLI
+   │ socket                        │ fork/exec — NO daemon
+   ▼                               ▼
+dockerd (root)                  conmon (per container)
+   ▼                               ▼
+containerd → shim → runc        runc/crun
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>Docker</th><th>Podman</th></tr>
+      <tr><td>Architecture</td><td>Client–daemon</td><td>Fork–exec, daemonless</td></tr>
+      <tr><td>Runs as root</td><td>Daemon does, by default</td><td>Rootless by default</td></tr>
+      <tr><td>Socket</td><td>Root-owned; mounting it = host root</td><td>Optional, user-scoped</td></tr>
+      <tr><td>systemd integration</td><td>Indirect</td><td>Native (<code>podman generate systemd</code>)</td></tr>
+      <tr><td>CLI</td><td>—</td><td>Largely compatible (<code>alias docker=podman</code>)</td></tr>
+    </table>
+
+    <p><strong>Rootless Docker exists too</strong> and gets most of the same benefit — the daemon runs as an
+       unprivileged user inside a user namespace, so a container escape lands unprivileged on the host. The costs
+       are real: no binding to ports below 1024 without extra configuration, slower networking through a userspace
+       proxy, and some storage drivers unavailable.</p>
+
+<pre>
+$ dockerd-rootless-setuptool.sh install
+$ export DOCKER_HOST=unix:///run/user/1000/docker.sock
+$ docker info --format '{{.SecurityOptions}}'
+[name=rootless name=seccomp,profile=builtin]
+</pre>
+
+    <p><strong>Driving containerd directly</strong> is worth knowing for Kubernetes nodes, where dockerd may not
+       exist at all:</p>
+
+<pre>
+# ctr — containerd's low-level debug CLI (namespaces are explicit)
+$ sudo ctr -n k8s.io images list | head -3
+$ sudo ctr -n k8s.io containers list
+
+# nerdctl — a Docker-compatible CLI over containerd
+$ sudo nerdctl run -d --name web nginx
+$ sudo nerdctl ps
+
+# crictl — the CRI-level tool kubelet-adjacent debugging uses
+$ sudo crictl ps
+$ sudo crictl logs &lt;container-id&gt;
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Treating "Docker" as a single indivisible thing, and mounting the Docker socket to get
+         container access.</strong> A CI job needs to build images, so the pipeline mounts
+         <code>/var/run/docker.sock</code> into the build container — the standard "Docker-in-Docker" recipe. That
+         socket is the daemon's full API, and the daemon runs as root, so any code in that container can start a
+         privileged container mounting the host filesystem: it is root on the node, not a sandboxed build. The
+         same conflation then breaks the Kubernetes migration, because the team believes removing dockershim means
+         their Docker-built images stop working, when the actual breakage is precisely this socket-mounting
+         pattern — on a containerd node there is no dockerd to talk to.</p>
+      <p>✅ <strong>Separate the layers: image format, build tool, and runtime are independent.</strong> Images are
+         OCI artefacts that run on any OCI runtime, so Docker-built images work under containerd, CRI-O, and
+         Podman unchanged. For building without the socket, use a daemonless builder — Kaniko, Buildah, or
+         BuildKit in rootless mode — which needs no privileged access to a node. For debugging on nodes that have
+         no dockerd, use <code>nerdctl</code> for a Docker-like CLI over containerd, or <code>crictl</code> at the
+         CRI level. And treat the Docker socket as a root credential rather than a file: never mount it into
+         workloads, and prefer rootless Docker or Podman where the daemon itself is unprivileged.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Mounting <code>/var/run/docker.sock</code></td><td>The daemon is root — this grants host root</td><td>Kaniko/Buildah/rootless BuildKit</td></tr>
+      <tr><td>"dockershim removal breaks my images"</td><td>Images are OCI; only the kubelet↔dockerd adapter went</td><td>Fix socket-mounting tooling instead</td></tr>
+      <tr><td>Expecting <code>runc</code> in <code>ps</code></td><td>It exits after creating the container</td><td>Look for <code>containerd-shim</code></td></tr>
+      <tr><td>Thinking dockerd is the container's parent</td><td>The shim is</td><td><code>ps --forest</code> to see the real tree</td></tr>
+      <tr><td>Fearing a daemon restart kills containers</td><td>Shims keep them alive</td><td>Verify with <code>systemctl restart docker</code></td></tr>
+      <tr><td>Using <code>docker</code> CLI on a containerd-only node</td><td>There is no dockerd</td><td><code>nerdctl</code>, <code>crictl</code>, <code>ctr</code></td></tr>
+      <tr><td>Assuming gVisor/Kata are drop-in</td><td>Syscall coverage and performance differ</td><td>Test the workload under them</td></tr>
+      <tr><td>Ignoring rootless port restrictions</td><td>Ports &lt;1024 need extra configuration</td><td>Use high ports, or grant the capability</td></tr>
+      <tr><td>Confusing <code>ctr</code> namespaces with Linux namespaces</td><td>Unrelated concepts, same word</td><td><code>ctr -n k8s.io</code> is a containerd scope</td></tr>
+      <tr><td>Believing Docker is required to build images</td><td>Buildah, Kaniko, ko, BuildKit all produce OCI images</td><td>Pick the builder that fits the environment</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What happens when you run <code>docker run</code>?</summary>
+      <p>Five components, each with one job:</p>
+<pre>
+docker CLI  → HTTP request to the daemon socket
+dockerd     → images, networking, volumes; delegates the container itself
+containerd  → lifecycle, image pull, snapshots; spawns one shim per container
+shim        → the container's PARENT; holds stdio, reports exit code
+runc        → creates namespaces + cgroups, execs the process, then EXITS
+</pre>
+      <p><strong>The two facts that matter practically:</strong></p>
+      <p><strong>1. <code>runc</code> is not the parent.</strong> It applies the OCI runtime spec — namespaces,
+         cgroups, capabilities, seccomp, pivot root — then <code>exec</code>s and disappears. So a "runc" error
+         message means creation failed, not that a running container had a problem.</p>
+      <p><strong>2. The shim is the parent</strong>, and it is parented to init rather than dockerd:</p>
+<pre>
+$ ps -ef --forest | grep -A2 containerd-shim
+root  1204     1  containerd-shim-runc-v2 -namespace moby -id 3f8a...
+root 48213  1204   \_ nginx: master process
+</pre>
+      <p>That is what allows the daemon to be restarted or upgraded without killing running containers.</p>
+      <p>The layering also explains why Kubernetes could remove dockershim: dockerd was already delegating to
+         containerd, so kubelet talking to containerd directly removes a hop rather than changing how containers
+         run.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the OCI, and what does it standardise?</summary>
+      <p><strong>The Open Container Initiative defines three specifications</strong> that make the container
+         ecosystem interchangeable rather than vendor-specific.</p>
+      <table class="tbl">
+        <tr><th>Spec</th><th>Defines</th><th>Implementations</th></tr>
+        <tr><td>Image</td><td>Layers, manifest, config</td><td>Docker, BuildKit, Buildah, Kaniko</td></tr>
+        <tr><td>Runtime</td><td>Bundle (rootfs + <code>config.json</code>), lifecycle</td><td>runc, crun, gVisor, Kata</td></tr>
+        <tr><td>Distribution</td><td>Registry push/pull API</td><td>Hub, ECR, GCR, Harbor</td></tr>
+      </table>
+      <p><strong>The runtime contract is remarkably small:</strong> a directory containing a root filesystem and a
+         <code>config.json</code> describing namespaces, cgroups, capabilities and the process to run. Any OCI
+         runtime can consume it:</p>
+<pre>
+$ mkdir -p bundle/rootfs &amp;&amp; docker export $(docker create alpine) | tar -C bundle/rootfs -xf -
+$ cd bundle &amp;&amp; runc spec &amp;&amp; sudo runc run demo
+</pre>
+      <p><strong>The practical consequence is that "Docker images" is a misnomer</strong> — they are OCI images,
+         and they run on containerd, CRI-O, Podman, or anything else implementing the spec. That is why the
+         dockershim removal did not break images, and why swapping runc for gVisor is a configuration change
+         rather than a migration.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is the containerd-shim, and why does it exist?</summary>
+      <p><strong>The shim is a small process that sits between containerd and the container, one per
+         container.</strong> It exists to decouple container lifetime from daemon lifetime.</p>
+      <table class="tbl">
+        <tr><th>Job</th><th>Consequence</th></tr>
+        <tr><td>Be the container's parent</td><td>Reaps zombies; keeps the process tree valid</td></tr>
+        <tr><td>Hold stdio and the TTY</td><td>Logs and <code>attach</code> survive a daemon restart</td></tr>
+        <tr><td>Capture the exit code</td><td>Exit status is not lost if containerd is down</td></tr>
+        <tr><td>Keep the container running</td><td><strong>Restarting dockerd does not kill workloads</strong></td></tr>
+      </table>
+      <p><strong>Before the shim (Docker &lt; 1.11), dockerd was the direct parent of every container</strong>, so
+         restarting or upgrading the daemon killed everything on the host. That is why "don't restart Docker in
+         production" used to be real advice and no longer is:</p>
+<pre>
+$ docker run -d --name survivor nginx
+$ PID=$(docker inspect -f '{{.State.Pid}}' survivor)
+$ sudo systemctl restart docker
+$ ps -p $PID -o comm=          # nginx — never stopped
+</pre>
+      <p><strong>The cost is one shim process per container</strong>, a few MB each, which becomes a real line
+         item on hosts running hundreds of containers.</p>
+      <p>The shim is also why <code>runc</code> can exit immediately: something has to remain as the parent to
+         reap children and report the exit status, and that is precisely the shim's role.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why did Kubernetes remove dockershim, and what actually broke?</summary>
+      <p><strong>dockershim was an adapter inside Kubernetes translating the CRI to dockerd's API.</strong>
+         Kubernetes maintained it for one runtime, which was both a maintenance burden and an unnecessary hop —
+         since dockerd already delegated to containerd:</p>
+<pre>
+before: kubelet → dockershim → dockerd → containerd → shim → runc
+after:  kubelet → containerd → shim → runc
+</pre>
+      <p><strong>What did NOT break: images.</strong> Docker-built images are OCI images and run unchanged under
+         containerd or CRI-O. <code>docker build</code> remains perfectly valid, because building and running are
+         separate concerns.</p>
+      <p><strong>What genuinely broke</strong> was anything talking to <em>dockerd</em> on a node:</p>
+      <ul>
+        <li><strong>Pods mounting <code>/var/run/docker.sock</code></strong> — the most common case, usually
+           Docker-in-Docker CI. There is no daemon to talk to. The fix is a daemonless builder: Kaniko, Buildah,
+           or rootless BuildKit.</li>
+        <li><strong>Node tooling calling the Docker API</strong> — monitoring agents, log shippers, cleanup
+           scripts. They move to CRI (<code>crictl</code>) or containerd's API.</li>
+        <li><strong>Log collection</strong>, because paths and formats differ between dockerd and containerd.</li>
+      </ul>
+      <p><strong>The confusion was worth clearing because it reveals the layering:</strong> image format, build
+         tool, and runtime are independent. Conflating them is what produced the widespread belief that Kubernetes
+         had "dropped Docker" — and it is the same conflation that leads teams to mount the Docker socket in the
+         first place.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> When would you use gVisor or Kata instead of runc?</summary>
+      <p><strong>Both exist to add an isolation boundary that runc cannot provide</strong>, because a standard
+         container shares the host kernel — so a kernel privilege-escalation bug is a container escape.</p>
+      <p><strong>gVisor (runsc)</strong> puts a user-space kernel between the container and the host. Syscalls are
+         intercepted and serviced by gVisor's own implementation, so only a small, audited subset ever reaches the
+         host kernel — dramatically reducing the attack surface.</p>
+      <ul>
+        <li><strong>Costs:</strong> syscall-heavy workloads slow measurably; some syscalls are unimplemented, so
+           unusual software may not run; raw device access is limited.</li>
+        <li><strong>Fits:</strong> untrusted code with moderate syscall rates — function-as-a-service, sandboxed
+           user code, CI for public contributions.</li>
+      </ul>
+      <p><strong>Kata Containers</strong> runs each container in a lightweight VM with its own kernel, giving a
+         genuine hypervisor boundary while keeping a container-shaped interface (it is an OCI runtime, so it drops
+         into Kubernetes as a RuntimeClass).</p>
+      <ul>
+        <li><strong>Costs:</strong> ~100 MB memory and ~1 s start time per container; device passthrough and
+           storage need thought.</li>
+        <li><strong>Fits:</strong> hard multi-tenancy, regulated isolation requirements, workloads needing full
+           syscall compatibility with a real boundary.</li>
+      </ul>
+      <p><strong>How I would choose:</strong> start with runc plus proper hardening — non-root user, dropped
+         capabilities, seccomp, read-only root filesystem, no Docker socket. That covers first-party workloads. If
+         the workload is genuinely untrusted, ask whether it is syscall-light (gVisor) or needs full compatibility
+         (Kata). If compliance demands hypervisor-level separation, Kata or per-tenant VMs are the only answers
+         that satisfy an auditor.</p>
+      <p><strong>The deployment mechanism is the same in both cases</strong> — a RuntimeClass in Kubernetes or
+         <code>--runtime</code> in Docker — because the OCI runtime spec makes them interchangeable. That
+         interchangeability is what lets you apply strong isolation selectively, to the untrusted subset of
+         workloads, instead of paying for it everywhere.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a CI system that builds images without mounting the Docker socket.</summary>
+      <p><strong>The socket must go, because mounting it grants host root:</strong> any code in the build container
+         can ask the root-owned daemon to start a privileged container mounting <code>/</code>. In shared CI, that
+         means any repository with a pipeline can compromise the runners and every secret they hold.</p>
+      <p><strong>Options, and what each trades:</strong></p>
+      <table class="tbl">
+        <tr><th>Approach</th><th>Privileges</th><th>Notes</th></tr>
+        <tr><td><strong>Kaniko</strong></td><td>None</td><td>Builds in userspace inside a pod; good caching to a registry</td></tr>
+        <tr><td><strong>Buildah</strong></td><td>Rootless</td><td>Full Dockerfile support; fits Podman ecosystems</td></tr>
+        <tr><td><strong>BuildKit rootless</strong></td><td>Rootless</td><td>Best cache and multi-arch support</td></tr>
+        <tr><td><strong>ko / jib</strong></td><td>None</td><td>Language-specific; no Dockerfile at all</td></tr>
+        <tr><td>DinD with <code>--privileged</code></td><td><strong>Privileged</strong></td><td>Isolated from the host daemon but still privileged</td></tr>
+      </table>
+      <p><strong>What I would build:</strong> BuildKit in rootless mode as a shared daemon, or Kaniko per job where
+         pod-level isolation matters more than build speed. Cache exported to the registry
+         (<code>--cache-to type=registry</code>) so cold runners stay fast, and multi-arch builds so laptop
+         architecture never determines what production gets.</p>
+      <p><strong>Supply-chain controls that belong in the same design:</strong> build from pinned base digests
+         rather than tags; generate an SBOM and provenance attestation during the build; sign the resulting image
+         (cosign) and verify signatures at admission; and push by digest so what was scanned is provably what
+         deploys.</p>
+      <p><strong>The migration order I would recommend</strong> is to move builds off the socket first — that
+         removes the largest privilege — then tighten the supply-chain controls, because a signed image built by a
+         compromised runner proves nothing.</p>
+      <p><strong>One caveat worth stating:</strong> rootless builders cannot do everything. Builds that require
+         privileged operations (loop devices, certain mounts) will fail, and the answer there is usually to
+         restructure the build rather than to restore the socket.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Trace the process tree from dockerd to your container.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name tree nginx
+$ PID=$(docker inspect -f '{{.State.Pid}}' tree)
+$ ps -ef --forest | grep -B2 -A3 "$PID"
+root     1204     1  containerd-shim-runc-v2 -namespace moby -id 3f8a91c04e7b -address /run/containerd/containerd.sock
+root    48213  1204   \_ nginx: master process nginx -g daemon off;
+systemd+ 48260 48213      \_ nginx: worker process
+</pre>
+      <p><strong>The shim (PID 1204) is the parent, and its own parent is PID 1</strong> — not dockerd:</p>
+<pre>
+$ ps -o ppid= -p 1204
+      1                        ← parented to init, deliberately
+
+$ pgrep dockerd
+1150                           ← dockerd is NOT in this container's ancestry
+$ ps -o ppid= -p $PID
+   1204                        ← the shim
+</pre>
+      <p><strong>And runc is nowhere to be seen:</strong></p>
+<pre>
+$ pgrep -a runc
+$ echo "runc processes: $?"
+runc processes: 1              ← none; it exited after creating the container
+</pre>
+      <p><strong>Catch runc in the act by watching during a start:</strong></p>
+<pre>
+$ (for i in $(seq 200); do pgrep -a runc && break; sleep 0.01; done) &
+$ docker run --rm alpine true
+52104 runc --root /var/run/docker/runtime-runc/moby --log ... create ...
+                               ← visible for a few milliseconds, then gone
+</pre>
+      <p><strong>Count the shims to see the one-per-container cost:</strong></p>
+<pre>
+$ for i in 1 2 3; do docker run -d --name s$i alpine sleep 300 >/dev/null; done
+$ pgrep -c containerd-shim
+4                              ← 3 new + the nginx one
+
+$ ps -o rss= -C containerd-shim-runc-v2 | awk '{s+=$1} END {print s/1024" MB total"}'
+42.3 MB total                  ← ~10 MB per shim on this host
+$ docker rm -f tree s1 s2 s3 >/dev/null
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove containers survive a daemon restart.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name survivor nginx
+$ PID=$(docker inspect -f '{{.State.Pid}}' survivor)
+$ START=$(docker inspect -f '{{.State.StartedAt}}' survivor)
+$ echo "pid=$PID started=$START"
+pid=48213 started=2026-08-18T15:40:12.334Z
+
+# generate some traffic so we can confirm continuity
+$ docker exec survivor sh -c 'echo "before restart" >> /tmp/marker'
+
+$ sudo systemctl restart docker
+$ sleep 3
+</pre>
+      <p><strong>The container never stopped:</strong></p>
+<pre>
+$ ps -p $PID -o pid,etime,comm
+  PID     ELAPSED COMMAND
+48213       04:12 nginx                    ← uptime unbroken across the restart
+
+$ docker inspect survivor --format 'pid={{.State.Pid}} started={{.State.StartedAt}}'
+pid=48213 started=2026-08-18T15:40:12.334Z ← same PID, same start time
+
+$ docker exec survivor cat /tmp/marker
+before restart                             ← same container, state intact
+</pre>
+      <p><strong>The shim is what made this possible:</strong></p>
+<pre>
+$ ps -o pid,ppid,comm -p $(ps -o ppid= -p $PID)
+  PID  PPID COMMAND
+ 1204     1 containerd-shim-runc-v2        ← survived; parented to init
+
+$ ps -o etime= -p 1204
+   04:15                                   ← the shim never restarted either
+</pre>
+      <p><strong>Contrast with killing the shim, which does stop the container:</strong></p>
+<pre>
+$ docker run -d --name doomed nginx
+$ DPID=$(docker inspect -f '{{.State.Pid}}' doomed)
+$ SHIM=$(ps -o ppid= -p $DPID | tr -d ' ')
+$ sudo kill -9 $SHIM
+$ sleep 2
+$ docker ps -a --filter name=doomed --format '{{.Status}}'
+Exited (137) 1 second ago                  ← the container died with its shim
+</pre>
+      <p><strong>The hierarchy is the point:</strong> dockerd can come and go freely, but the shim is the
+         container's actual lifeline. Before Docker 1.11 there was no shim and dockerd was the direct parent, so
+         every daemon restart killed every workload on the host.</p>
+<pre>
+$ docker rm -f survivor doomed >/dev/null
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Run a container with runc directly, no Docker.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# 1. build an OCI bundle: rootfs + config.json
+$ mkdir -p /tmp/bundle/rootfs
+$ docker export $(docker create alpine) | tar -C /tmp/bundle/rootfs -xf -
+$ cd /tmp/bundle
+$ runc spec                        # generates a default config.json
+$ ls
+config.json  rootfs
+</pre>
+      <p><strong>The config.json IS the runtime contract:</strong></p>
+<pre>
+$ python3 -c "
+import json; c=json.load(open('config.json'))
+print('process:  ', c['process']['args'])
+print('namespaces:', [n['type'] for n in c['linux']['namespaces']])
+print('caps kept: ', len(c['process']['capabilities']['bounding']))
+print('readonly:  ', c['root']['readonly'])
+"
+process:   ['sh']
+namespaces: ['pid', 'network', 'ipc', 'uts', 'mount']
+caps kept:  14
+readonly:   True
+</pre>
+      <p><strong>Run it:</strong></p>
+<pre>
+$ sudo runc run demo
+/ # hostname
+runc
+/ # ps -eo pid,comm
+  PID COMMAND
+    1 sh                          ← PID 1 in its own namespace
+    6 ps
+/ # cat /etc/os-release | head -1
+NAME="Alpine Linux"
+/ # exit
+</pre>
+      <p><strong>No Docker daemon, no containerd, no shim</strong> — runc alone created namespaces, applied
+         cgroups, and executed the process.</p>
+      <p><strong>Edit the config to change behaviour, showing it is declarative:</strong></p>
+<pre>
+$ python3 - <<'PY'
+import json
+c = json.load(open('config.json'))
+c['process']['args'] = ['sh','-c','echo from-config; cat /sys/fs/cgroup/memory.max']
+c['linux'].setdefault('resources',{})['memory'] = {'limit': 64*1024*1024}
+c['hostname'] = 'handmade'
+json.dump(c, open('config.json','w'), indent=2)
+PY
+$ sudo runc run demo2
+from-config
+67108864                         ← the 64MB limit we declared
+</pre>
+      <p><strong>Observe the lifecycle states runc exposes:</strong></p>
+<pre>
+$ sudo runc create paused-demo &amp;&amp; sudo runc list
+ID           PID    STATUS   BUNDLE       CREATED
+paused-demo  52301  created  /tmp/bundle  2026-08-18T15:52:03Z
+
+$ sudo runc start paused-demo &amp;&amp; sudo runc list
+ID           PID    STATUS   BUNDLE       CREATED
+paused-demo  52301  running  /tmp/bundle  2026-08-18T15:52:03Z
+
+$ sudo runc kill paused-demo KILL &amp;&amp; sudo runc delete paused-demo
+</pre>
+      <p><strong>That create/start/kill/delete cycle is exactly what containerd drives</strong> — Docker's
+         lifecycle commands are this API with images, networking, and volumes layered on top.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Drive containerd directly with <code>ctr</code> and
+      <code>nerdctl</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# ctr — containerd's low-level CLI. Note: -n is a CONTAINERD namespace,
+# nothing to do with Linux namespaces.
+$ sudo ctr namespaces list
+NAME    LABELS
+default
+moby              ← Docker's containers live here
+k8s.io            ← Kubernetes' containers, on a k8s node
+
+$ sudo ctr -n moby containers list | head -3
+CONTAINER          IMAGE    RUNTIME
+3f8a91c04e7b...    -        io.containerd.runc.v2
+</pre>
+      <p><strong>Docker's containers are containerd containers</strong> — visible directly, because dockerd
+         delegates to it.</p>
+      <p><strong>Run something with ctr alone:</strong></p>
+<pre>
+$ sudo ctr images pull docker.io/library/alpine:latest
+docker.io/library/alpine:latest: resolved
+elapsed: 1.2s   total:  3.2 Mi (2.7 MiB/s)
+
+$ sudo ctr run --rm docker.io/library/alpine:latest test1 echo "hello from ctr"
+hello from ctr
+
+$ sudo ctr -n default containers list
+CONTAINER    IMAGE                              RUNTIME
+</pre>
+      <p><strong>ctr is deliberately minimal</strong> — no networking, no port publishing, no restart policies.
+         It is a debugging tool, not a Docker replacement.</p>
+      <p><strong>nerdctl gives the Docker experience over containerd:</strong></p>
+<pre>
+$ sudo nerdctl run -d --name web -p 8080:80 nginx
+$ sudo nerdctl ps
+CONTAINER ID   IMAGE                             STATUS    PORTS
+a1b2c3d4e5f6   docker.io/library/nginx:latest    Up        0.0.0.0:8080->80/tcp
+
+$ curl -s -o /dev/null -w '%{http_code}\n' localhost:8080
+200                              ← networking and port publishing work
+
+$ sudo nerdctl logs web | head -1
+$ sudo nerdctl stats --no-stream
+$ sudo nerdctl rm -f web
+</pre>
+      <p><strong>Compare the three tools:</strong></p>
+      <table class="tbl">
+        <tr><th>Tool</th><th>Level</th><th>Networking</th><th>Use when</th></tr>
+        <tr><td><code>docker</code></td><td>dockerd API</td><td>Full</td><td>Normal development</td></tr>
+        <tr><td><code>nerdctl</code></td><td>containerd</td><td>Full (CNI)</td><td>containerd nodes, no dockerd</td></tr>
+        <tr><td><code>ctr</code></td><td>containerd, raw</td><td>None</td><td>Debugging containerd itself</td></tr>
+        <tr><td><code>crictl</code></td><td>CRI</td><td>Pod-level</td><td>Kubernetes node debugging</td></tr>
+      </table>
+      <p><strong>On a Kubernetes node with no dockerd</strong>, <code>crictl</code> is what replaces
+         <code>docker ps</code>:</p>
+<pre>
+$ sudo crictl ps --output table | head -3
+CONTAINER      IMAGE          STATE     NAME          POD
+a1b2c3d4e5f6   nginx@sha256   Running   nginx         web-7d4b-x2k9
+$ sudo crictl logs a1b2c3d4e5f6 | tail -2
+$ sudo crictl inspect a1b2c3d4e5f6 | python3 -c "import json,sys; \
+    print(json.load(sys.stdin)['status']['resources']['linux']['memoryLimitInBytes'])"
+536870912
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Compare runc against an alternative runtime.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# register alternative runtimes in /etc/docker/daemon.json
+$ cat /etc/docker/daemon.json
+{
+  "runtimes": {
+    "crun":   { "path": "/usr/bin/crun" },
+    "gvisor": { "path": "/usr/local/bin/runsc" }
+  }
+}
+$ sudo systemctl reload docker
+$ docker info --format '{{.Runtimes}}'
+map[crun:{...} gvisor:{...} io.containerd.runc.v2:{...} runc:{...}]
+</pre>
+      <p><strong>Start-time comparison:</strong></p>
+<pre>
+$ for rt in runc crun gvisor; do
+    T=$( { /usr/bin/time -f "%e" docker run --rm --runtime=$rt alpine true; } 2>&1 )
+    printf "%-8s %ss\n" "$rt" "$T"
+  done
+runc     0.41s
+crun     0.32s        ← ~20% faster: C implementation, less overhead
+gvisor   0.94s        ← slower: starts a user-space kernel
+</pre>
+      <p><strong>gVisor really is a different kernel:</strong></p>
+<pre>
+$ docker run --rm alpine dmesg 2>/dev/null | head -1
+dmesg: klogctl: Operation not permitted     ← standard container: host kernel, masked
+
+$ docker run --rm --runtime=gvisor alpine dmesg | head -2
+[    0.000000] Starting gVisor...
+[    0.324681] Checking naughty and nice process list...
+
+$ docker run --rm --runtime=gvisor alpine uname -r
+4.4.0                                        ← gVisor's reported version, NOT the host's
+$ uname -r
+6.5.0-27-generic
+</pre>
+      <p><strong>That difference is the security property:</strong> syscalls are serviced by gVisor in user space,
+         so most never reach the host kernel at all.</p>
+      <p><strong>Measure the syscall overhead, which is gVisor's cost:</strong></p>
+<pre>
+$ cat > /tmp/sysbench.sh <<'EOF'
+S=$(date +%s%N)
+i=0; while [ $i -lt 20000 ]; do cat /proc/self/stat > /dev/null; i=$((i+1)); done
+E=$(date +%s%N); echo "$(( (E-S)/1000000 ))ms"
+EOF
+$ for rt in runc gvisor; do
+    printf "%-8s " "$rt"
+    docker run --rm --runtime=$rt -v /tmp/sysbench.sh:/b.sh alpine sh /b.sh
+  done
+runc     3412ms
+gvisor   11847ms      ← 3.5x slower on a syscall-heavy loop
+</pre>
+      <p><strong>And CPU-bound work is barely affected</strong>, which is what makes the trade workload-dependent:</p>
+<pre>
+$ for rt in runc gvisor; do
+    printf "%-8s " "$rt"
+    docker run --rm --runtime=$rt alpine sh -c \
+      'S=$(date +%s%N); i=0; while [ $i -lt 2000000 ]; do i=$((i+1)); done;
+       E=$(date +%s%N); echo $(( (E-S)/1000000 ))ms'
+  done
+runc     1284ms
+gvisor   1391ms       ← only 8% slower: little syscall traffic
+</pre>
+      <table class="tbl">
+        <tr><th>Workload</th><th>runc</th><th>gVisor</th><th>Penalty</th></tr>
+        <tr><td>Container start</td><td>0.41s</td><td>0.94s</td><td>2.3×</td></tr>
+        <tr><td>Syscall-heavy</td><td>3.4s</td><td>11.8s</td><td>3.5×</td></tr>
+        <tr><td>CPU-bound</td><td>1.28s</td><td>1.39s</td><td>1.08×</td></tr>
+      </table>
+      <p><strong>The conclusion:</strong> gVisor is affordable for compute-bound untrusted workloads and expensive
+         for I/O- or syscall-heavy ones. Measure the specific workload rather than accepting a general "gVisor is
+         slow" claim.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Show why mounting the Docker socket is host root, and build
+      without it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# a "sandboxed" build container with the socket mounted
+$ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli sh -c '
+    docker run --rm -v /:/host alpine cat /host/etc/shadow | head -2'
+root:$6$abcxyz...:19000:0:99999:7:::
+daemon:*:19000:0:99999:7:::
+      ↑ the HOST's shadow file
+</pre>
+      <p><strong>Nothing was exploited.</strong> The container asked the root-owned daemon to start another
+         container mounting <code>/</code>. The socket <em>is</em> the privilege.</p>
+      <p><strong>It can also reach every other container's data:</strong></p>
+<pre>
+$ docker run -d --name victim -e DB_PASSWORD=super-secret alpine sleep 300 >/dev/null
+$ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli sh -c '
+    docker inspect victim --format "{{.Config.Env}}"'
+[DB_PASSWORD=super-secret PATH=/usr/local/sbin:...]
+                          ← secrets from an unrelated container
+
+# and write to the host as root
+$ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli sh -c '
+    docker run --rm -v /:/host alpine sh -c "echo pwned > /host/tmp/proof"'
+$ cat /tmp/proof &amp;&amp; ls -l /tmp/proof
+pwned
+-rw-r--r-- 1 root root 6 Aug 18 16:04 /tmp/proof     ← written as host root
+$ sudo rm /tmp/proof; docker rm -f victim >/dev/null
+</pre>
+      <p><strong>Now build the same image without the socket — Kaniko:</strong></p>
+<pre>
+$ mkdir -p /tmp/ctx &amp;&amp; printf 'FROM alpine:3.19\nRUN echo built-safely > /proof\n' \
+    > /tmp/ctx/Dockerfile
+
+$ docker run --rm \
+    -v /tmp/ctx:/workspace \
+    gcr.io/kaniko-project/executor:latest \
+    --dockerfile=/workspace/Dockerfile \
+    --context=dir:///workspace \
+    --no-push --tarPath=/workspace/image.tar --destination=demo:v1
+INFO[0000] Retrieving image manifest alpine:3.19
+INFO[0002] Building stage 'alpine:3.19'
+INFO[0003] Taking snapshot of full filesystem...
+INFO[0004] RUN echo built-safely > /proof
+
+$ ls -lh /tmp/ctx/image.tar
+-rw-r--r-- 1 root root 7.4M Aug 18 16:07 /tmp/ctx/image.tar
+$ docker load -q -i /tmp/ctx/image.tar &amp;&amp; docker run --rm demo:v1 cat /proof
+built-safely
+</pre>
+      <p><strong>No socket, no privileged flag, no daemon access</strong> — and a working OCI image.</p>
+      <p><strong>Or BuildKit rootless:</strong></p>
+<pre>
+$ docker run -d --name buildkitd --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
+    moby/buildkit:rootless --oci-worker-no-process-sandbox >/dev/null
+$ docker exec -i buildkitd buildctl build \
+    --frontend dockerfile.v0 --local context=- --local dockerfile=- \
+    < <(tar -C /tmp/ctx -cf - .) 2>&1 | tail -2
+=> exporting to image
+=> => exporting layers
+$ docker rm -f buildkitd >/dev/null
+</pre>
+      <table class="tbl">
+        <tr><th>Method</th><th>Host root?</th><th>Privileged?</th></tr>
+        <tr><td>Socket mount</td><td><strong>Yes — full compromise</strong></td><td>Effectively</td></tr>
+        <tr><td>DinD <code>--privileged</code></td><td>No, but privileged</td><td>Yes</td></tr>
+        <tr><td>Kaniko</td><td>No</td><td>No</td></tr>
+        <tr><td>BuildKit rootless</td><td>No</td><td>No</td></tr>
+      </table>
+      <p><strong>The rule:</strong> treat <code>/var/run/docker.sock</code> as a root credential, not a file. If a
+         workload needs to build images, give it a daemonless builder rather than the daemon.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>The stack is <strong>docker CLI → dockerd → containerd → shim → runc → your process</strong>, and each layer has one job.</li>
+        <li><strong><code>runc</code> exits immediately after creating the container</strong> — it applies namespaces, cgroups, capabilities and seccomp, then execs. A "runc" error means creation failed, not a runtime problem.</li>
+        <li>The <strong>containerd-shim is the container's parent</strong>, parented to init — verified with <code>ps --forest</code>; dockerd is nowhere in the ancestry.</li>
+        <li>That is why <code>systemctl restart docker</code> leaves containers running with the same PID and unbroken uptime — while killing the shim exits the container with 137.</li>
+        <li>Before Docker 1.11 there was no shim and dockerd was the direct parent, so daemon restarts killed every workload.</li>
+        <li>The cost is one shim per container — measured ~10 MB each, a real line item on dense hosts.</li>
+        <li>The OCI defines three specs: <strong>Image, Runtime, Distribution</strong> — which is why "Docker images" are really OCI images that run anywhere.</li>
+        <li>An OCI bundle is just <code>rootfs/</code> plus <code>config.json</code>; <code>runc spec</code> and <code>runc run</code> start a container with no Docker at all.</li>
+        <li><strong>Removing dockershim did not break Docker-built images</strong> — it removed the kubelet↔dockerd adapter, since dockerd already delegated to containerd.</li>
+        <li>What genuinely broke was socket-mounting pods and node tooling calling the Docker API.</li>
+        <li>Runtimes are swappable: <strong>crun</strong> measured ~20% faster to start, <strong>gVisor</strong> 2.3× slower.</li>
+        <li>gVisor runs a user-space kernel — it reports its own <code>uname -r</code> and its own dmesg — costing <strong>3.5× on syscall-heavy work but only 1.08× on CPU-bound work</strong>.</li>
+        <li>Kata gives each container a real VM (~100 MB, ~1 s) for hypervisor-grade isolation with full syscall compatibility.</li>
+        <li>Choose isolation per workload via RuntimeClass or <code>--runtime</code>, so strong isolation is paid for only where it is needed.</li>
+        <li><strong>Mounting <code>/var/run/docker.sock</code> is host root</strong> — demonstrated by reading <code>/etc/shadow</code>, extracting another container's secrets, and writing to the host as root.</li>
+        <li>Build without it: Kaniko and rootless BuildKit produce OCI images with no daemon access and no privileged flag.</li>
+        <li>Podman is daemonless and rootless by default; rootless Docker gets most of the benefit at the cost of low ports and slower networking.</li>
+        <li>On containerd-only nodes use <code>nerdctl</code> (Docker-like), <code>crictl</code> (CRI level), or <code>ctr</code> (raw containerd) — and note <code>ctr -n</code> means a containerd namespace, not a Linux one.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="cgroups.html">← cgroups: Limiting What You Use</a>
+      <a href="dockerfile.html">Writing a Dockerfile →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
