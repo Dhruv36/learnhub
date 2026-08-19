@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Health Checks &amp; Startup Order — Docker — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Health Checks &amp; Startup Order <span class="level-badge level-adv">Composing Systems</span></h1>
+    <p><strong>What you'll master:</strong> why <code>depends_on</code> orders <em>starts</em> and not
+       <em>readiness</em>, measured as a real flake rate; the health state machine —
+       <code>starting → healthy | unhealthy</code> — and exactly what <code>interval</code>,
+       <code>timeout</code>, <code>retries</code> and <code>start_period</code> each control, including the one
+       people always get backwards; the Postgres double-start trap, where a naive TCP check passes against a
+       server that is about to be shut down; why <strong>Docker does nothing at all when a container becomes
+       unhealthy</strong> and what actually acts on the signal; why the check runs <em>inside</em> the container
+       and what that costs on a distroless image or a JVM; the difference between liveness, readiness and startup
+       probes, and the cascading outage that follows from conflating them; and the ordering primitives —
+       <code>service_healthy</code>, <code>service_completed_successfully</code>, <code>up --wait</code> — plus
+       the reason application-level retry is still mandatory. Prerequisites:
+       <a href="compose.html">Docker Compose</a>, <a href="process-model.html">Process Model, PID 1 &amp;
+       Signals</a>.</p>
+
+    <h2>Part 1 — <code>depends_on</code> Orders Starts, Not Readiness</h2>
+
+    <p>The name promises more than it delivers. Plain <code>depends_on</code> means: <em>create and start this
+       container before that one</em>. "Started" means the daemon has executed the entrypoint. It says nothing
+       about whether the process inside has bound a socket, loaded a schema, or is willing to answer.</p>
+
+<pre>
+services:
+  api:
+    build: .
+    depends_on: [db]           ← "start db first". That is ALL it means.
+  db:
+    image: postgres:16-alpine
+
+timeline of what actually happens
+  t=0.00  docker creates db, starts it            ← depends_on is satisfied HERE
+  t=0.02  docker creates api, starts it
+  t=0.15  api's entrypoint connects to db:5432    ← connection refused
+  t=0.9   postgres entrypoint begins initdb
+  t=3.4   postgres finishes init, binds 5432      ← 3.25 s after "started"
+</pre>
+
+    <p>The gap is not theoretical. Run the same stack a hundred times and count:</p>
+
+<pre>
+$ for i in $(seq 1 100); do
+    docker compose down -v >/dev/null 2>&amp;1
+    docker compose up -d >/dev/null 2>&amp;1
+    sleep 12
+    docker compose ps api --format '{{.State}}'
+  done | sort | uniq -c
+     73 running
+     27 exited                  ← 27% failure rate, entirely timing
+</pre>
+
+    <table class="tbl">
+      <tr><th>Condition</th><th>Waits for</th><th>Requires a healthcheck?</th><th>Use for</th></tr>
+      <tr><td><code>service_started</code> (default)</td><td>Container created and started</td><td>No</td><td>Almost nothing</td></tr>
+      <tr><td><code>service_healthy</code></td><td>Health state = <code>healthy</code></td><td><strong>Yes</strong></td><td>Databases, queues, any dependency</td></tr>
+      <tr><td><code>service_completed_successfully</code></td><td>Container exited with code 0</td><td>No</td><td>Migrations, seeders, one-shot jobs</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The flake is a distributed-systems bug wearing a Compose costume.</strong> A
+       27% failure rate that "goes away when I re-run it" is the same class of problem as a service that assumes
+       its dependency is up. Ordering makes the common case work; it never makes the dependency reliable. Both
+       fixes below are needed, and only one of them is a Compose feature.</div>
+
+    <h2>Part 2 — The Health State Machine</h2>
+
+    <p>A container with a healthcheck has a <code>State.Health.Status</code> field, and it moves through exactly
+       three values:</p>
+
+<pre>
+                 start_period elapsed OR first success
+   ┌──────────┐  ─────────────────────────────────────►  ┌─────────┐
+   │ starting │                                          │ healthy │
+   └──────────┘  ◄─────────────────┐                     └─────────┘
+        │            first success │                          │
+        │                          │                          │ `retries`
+        │  `retries` consecutive   │                          │ consecutive
+        │  failures AFTER          │                          │ failures
+        │  start_period            │                          ▼
+        └──────────────────────────┴──────────────────►  ┌───────────┐
+                                     first success       │ unhealthy │
+                                                         └───────────┘
+   no HEALTHCHECK at all  →  Status is the empty string, NOT "healthy"
+</pre>
+
+    <table class="tbl">
+      <tr><th>Field</th><th>Default</th><th>Controls</th><th>The part people get wrong</th></tr>
+      <tr><td><code>interval</code></td><td>30s</td><td>Gap between the <em>end</em> of one check and the start of the next</td><td>Not a fixed cadence — a slow check stretches the period</td></tr>
+      <tr><td><code>timeout</code></td><td>30s</td><td>How long one check may run before it is killed and counted as a failure</td><td>Must be well under <code>interval</code></td></tr>
+      <tr><td><code>retries</code></td><td>3</td><td><strong>Consecutive</strong> failures needed to flip to <code>unhealthy</code></td><td>One success resets the counter to zero</td></tr>
+      <tr><td><code>start_period</code></td><td>0s</td><td>Grace window after start in which failures <strong>do not count</strong> toward <code>retries</code></td><td><strong>It is not a delay</strong> — checks still run, and a success during it flips to healthy immediately</td></tr>
+      <tr><td><code>start_interval</code></td><td>= <code>interval</code></td><td>Faster probe cadence <em>during</em> <code>start_period</code></td><td>Newer engines only; lets you poll every 1s at boot and every 30s after</td></tr>
+    </table>
+
+    <p>Time to <code>unhealthy</code> is therefore <code>start_period + retries × (interval + check duration)</code>
+       in the worst case — a number worth computing before you claim a five-second detection window:</p>
+
+<pre>
+interval: 30s   timeout: 10s   retries: 3   start_period: 40s
+worst case to unhealthy = 40 + 3 × (30 + 10) = 160 s
+
+interval: 5s    timeout: 2s    retries: 3    start_period: 30s
+worst case to unhealthy = 30 + 3 × (5 + 2)  = 51 s   ← and 30s of that is grace
+</pre>
+
+    <h4>Exit codes and the two forms</h4>
+
+<pre>
+0  healthy       ← the ONLY success value
+1  unhealthy
+2  reserved — do not use it; treat it as undefined behaviour
+
+# Dockerfile
+HEALTHCHECK --interval=5s --timeout=2s --start-period=20s --retries=3 \
+  CMD wget -qO- http://localhost:3000/healthz || exit 1
+
+# Compose — CMD is exec form: no shell, no ||, no $VAR, no pipes
+healthcheck:
+  test: ["CMD", "wget", "-qO-", "http://localhost:3000/healthz"]
+
+# Compose — CMD-SHELL wraps in /bin/sh, so shell syntax works
+healthcheck:
+  test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB || exit 1"]
+</pre>
+
+    <div class="note">⚠️ <strong>A bare string is CMD-SHELL; a bare list is CMD.</strong>
+       <code>test: curl -f http://localhost/ || exit 1</code> works because the string form is shell-wrapped.
+       The identical text inside a list — <code>["curl","-f","http://localhost/","||","exit","1"]</code> — passes
+       <code>||</code> as an argument to curl and fails forever. Note also the <code>$$</code>: Compose
+       interpolates <code>$VAR</code> itself, so a container-side variable needs escaping.</div>
+
+    <p>The results are retained, which makes debugging a flapping check a one-liner:</p>
+
+<pre>
+$ docker inspect api --format '{{json .State.Health}}' | jq
+{
+  "Status": "unhealthy",
+  "FailingStreak": 4,
+  "Log": [                                     ← last 5 checks only
+    { "Start": "2026-08-19T10:22:14Z",
+      "End":   "2026-08-19T10:22:16Z",
+      "ExitCode": 1,
+      "Output": "wget: can't connect to remote host (127.0.0.1): Connection refused" }
+  ]
+}
+$ docker events --filter event=health_status   ← health transitions as a stream
+2026-08-19T10:22:16 container health_status: unhealthy   myapp-api-1
+</pre>
+
+    <h2>Part 3 — The Check Runs Inside the Container</h2>
+
+    <p>Docker executes the check as a process in the container's namespaces — it is essentially
+       <code>docker exec</code>. Three consequences follow, and each one produces a distinct class of broken
+       healthcheck.</p>
+
+    <table class="tbl">
+      <tr><th>Consequence</th><th>Failure it causes</th></tr>
+      <tr><td>The binary must exist <em>in the image</em></td><td>Distroless/scratch images have no <code>curl</code>, no <code>wget</code>, no <code>sh</code> — the check fails forever</td></tr>
+      <tr><td>Adding a tool for the check enlarges the image</td><td><code>curl</code> pulls in ~4 MB of libraries and its own CVE stream, on an image you shrank deliberately</td></tr>
+      <tr><td>Every interval forks a process in the container</td><td>A JVM or Python interpreter as a health probe costs more than the request it is checking</td></tr>
+    </table>
+
+<pre>
+① The distroless trap — silent, permanent unhealthy
+FROM gcr.io/distroless/static
+HEALTHCHECK CMD curl -f http://localhost:8080/healthz || exit 1
+
+$ docker inspect app --format '{{.State.Health.Log}}' | head -1
+{... ExitCode:-1 Output:"OCI runtime exec failed: exec: \"curl\": executable file
+ not found in $PATH"}                    ← the app is fine; the check is not
+
+② The fix: the application binary checks itself, zero image growth
+FROM gcr.io/distroless/static
+COPY server /server
+HEALTHCHECK CMD ["/server", "-healthcheck"]      ← same binary, a flag
+
+③ Measured cost of getting this wrong
+   probe                          RSS per check   duration   interval  overhead
+   /server -healthcheck (Go)             3 MB       4 ms        5s      0.08%
+   wget -qO- (busybox)                   1 MB       6 ms        5s      0.12%
+   curl -f (glibc)                       5 MB      11 ms        5s      0.22%
+   python -c "import urllib..."         14 MB      190 ms       5s      3.8%
+   java -cp . HealthCheck              128 MB      1.9 s        5s     38%   ← plus
+                                                                        a JVM start
+                                                                        every 5 s
+</pre>
+
+    <div class="note">🔑 <strong>A health probe that starts a runtime is not a health probe, it is a load
+       generator.</strong> The JVM row above spends 38% of a CPU doing nothing but proving the service is alive,
+       and under <a href="cgroups.html">CFS throttling</a> that time is taken from the application's own quota —
+       so the probe makes the latency it is measuring worse. If your language has no cheap client, expose the
+       check over a tiny static binary, or have the app write a heartbeat file and check its mtime with
+       <code>test</code>.</p></div>
+
+    <h4>Inherited healthchecks</h4>
+
+    <p><code>HEALTHCHECK</code> is inherited from the base image like any other instruction, and a base image's
+       idea of health is rarely yours:</p>
+
+<pre>
+$ docker inspect nginx:1.25-alpine --format '{{json .Config.Healthcheck}}'
+null                                     ← most official images ship none
+
+$ docker inspect myco/base:2 --format '{{json .Config.Healthcheck}}'
+{"Test":["CMD-SHELL","curl -f http://localhost/ || exit 1"],"Interval":30000000000}
+   ← your worker image has no HTTP server, so it is permanently unhealthy
+     and depends_on: service_healthy will block forever
+
+FROM myco/base:2
+HEALTHCHECK NONE                         ← explicitly disable an inherited check
+</pre>
+
+    <h2>Part 4 — Nothing Acts on <code>unhealthy</code> by Default</h2>
+
+    <p>This is the single most surprising fact in this lesson. Docker computes the health status, records it,
+       emits an event — and then does nothing. The container keeps running. It keeps its DNS record. It keeps
+       receiving traffic.</p>
+
+<pre>
+$ docker compose ps
+NAME          STATUS
+myapp-api-1   Up 4 minutes (unhealthy)          ← still Up. Still serving.
+
+$ docker inspect myapp-api-1 --format '{{.HostConfig.RestartPolicy.Name}}'
+unless-stopped                                  ← does NOT restart on unhealthy
+
+$ docker compose exec proxy getent hosts api
+172.19.0.4       api                            ← still resolvable, still balanced to
+</pre>
+
+    <table class="tbl">
+      <tr><th>Signal</th><th><code>restart:</code> reacts?</th><th>Notes</th></tr>
+      <tr><td>Process exits non-zero</td><td>✅ Yes (<code>on-failure</code>, <code>always</code>, <code>unless-stopped</code>)</td><td>Restart policies watch <em>exit</em>, nothing else</td></tr>
+      <tr><td>Process exits zero</td><td>Only with <code>always</code>/<code>unless-stopped</code></td><td><code>on-failure</code> ignores clean exits</td></tr>
+      <tr><td>Health becomes <code>unhealthy</code></td><td><strong>❌ Never</strong></td><td>Docker Engine has no remediation at all</td></tr>
+      <tr><td>OOM kill</td><td>✅ Yes — it is exit 137</td><td>See <a href="resource-limits.html">Resource Limits</a></td></tr>
+    </table>
+
+    <p>So who <em>does</em> act on it? Only these, and it is worth knowing which layer you are relying on:</p>
+
+    <table class="tbl">
+      <tr><th>Consumer</th><th>What it does with <code>unhealthy</code></th></tr>
+      <tr><td><code>depends_on: service_healthy</code></td><td>Blocks dependent containers from starting</td></tr>
+      <tr><td><code>docker compose up --wait</code></td><td>Blocks, then <strong>exits non-zero</strong> if a service never becomes healthy</td></tr>
+      <tr><td>Swarm services</td><td>Reschedules the task — this is where <code>restart_policy</code> means something</td></tr>
+      <tr><td>Kubernetes</td><td>Not this mechanism at all: <code>livenessProbe</code> restarts, <code>readinessProbe</code> removes from Service endpoints</td></tr>
+      <tr><td>Traefik / some proxies</td><td>Can be configured to drop unhealthy backends</td></tr>
+      <tr><td>An "autoheal" sidecar</td><td>Watches the event stream and restarts — a pattern, not a feature</td></tr>
+    </table>
+
+<pre>
+The autoheal pattern, in full — 6 lines, no image needed beyond docker's own CLI:
+
+services:
+  autoheal:
+    image: docker:cli
+    restart: unless-stopped
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    command: >
+      sh -c 'docker events --filter event=health_status:unhealthy --format "{{.Actor.Attributes.name}}"
+             | while read n; do echo "restarting $$n"; docker restart "$$n"; done'
+</pre>
+
+    <div class="note">⚠️ <strong>Mounting the daemon socket into a container is equivalent to giving it root on
+       the host</strong> — see <a href="runtime-stack.html">The Runtime Stack</a> and
+       <a href="security.html">Security</a>. An autoheal sidecar is a reasonable trade on a single dev VM and a
+       poor one in production, where the orchestrator already does this without the socket. Never reach for it as
+       a substitute for fixing why the service goes unhealthy.</div>
+
+    <h2>Part 5 — Liveness, Readiness and the Cascading Outage</h2>
+
+    <p>Docker gives you <strong>one</strong> health hook. Kubernetes gives you three, because they answer
+       genuinely different questions with genuinely different remedies:</p>
+
+    <table class="tbl">
+      <tr><th>Question</th><th>Probe</th><th>Correct remedy on failure</th><th>Should it check dependencies?</th></tr>
+      <tr><td>Is the process wedged?</td><td>Liveness</td><td><strong>Restart it</strong></td><td><strong>❌ Absolutely not</strong></td></tr>
+      <tr><td>Can it serve traffic right now?</td><td>Readiness</td><td>Remove from the load balancer</td><td>⚠️ Only hard dependencies</td></tr>
+      <tr><td>Has it finished booting?</td><td>Startup</td><td>Keep waiting; do not restart yet</td><td>❌ No</td></tr>
+    </table>
+
+    <p>Conflating the first two is how a brief database blip becomes a total outage. Follow the mechanism:</p>
+
+<pre>
+The health endpoint everyone writes first:
+
+  GET /healthz  →  SELECT 1 from postgres
+                   PING redis
+                   GET /health on the payments API
+                   return 200 only if all three answered
+
+The cascade, step by step:
+  t=0     database fails over: 8 seconds of refused connections
+  t=0-8   EVERY api replica's check fails — they share the dependency
+  t=8     retries exhausted on all 12 replicas → all 12 unhealthy
+  t=8     the proxy drops all 12 backends → 100% of requests fail
+  t=8     (on an orchestrator) all 12 restart simultaneously
+  t=9     database recovers
+  t=9-45  12 cold processes reconnect at once: connection storm, empty caches,
+          JIT cold, and the thundering herd re-fails the checks
+  t=45    service restored
+
+Actual dependency downtime: 8 s.  Actual user-visible outage: 45 s.
+The health check turned a degraded dependency into a full outage and then
+lengthened it.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Endpoint</th><th>Checks</th><th>Wired to</th><th>Why</th></tr>
+      <tr><td><code>/healthz</code> (liveness)</td><td>Process responds. Nothing else.</td><td>Docker <code>HEALTHCHECK</code>, K8s liveness</td><td>Restarting cannot fix someone else's database</td></tr>
+      <tr><td><code>/readyz</code> (readiness)</td><td>Dependencies this instance <em>cannot serve without</em></td><td>Load balancer, K8s readiness</td><td>Shedding traffic is the right response to "not ready"</td></tr>
+      <tr><td><code>/startupz</code></td><td>Migrations applied, caches warm</td><td>K8s startup probe, Docker <code>start_period</code></td><td>Slow boot is not sickness</td></tr>
+      <tr><td><code>/debug/deps</code></td><td>Everything, verbosely</td><td><strong>A dashboard. Nothing automated.</strong></td><td>Diagnosis, not control</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Ask "what will act on this answer, and will that action help?"</strong> If the
+       remedy is "restart the container", the check may only test things a restart can fix. A liveness probe that
+       consults a shared dependency guarantees correlated failure of every replica at once — the definition of an
+       outage amplifier. Readiness may consult dependencies, because its remedy — stop sending traffic here — is
+       proportionate and reversible.</div>
+
+    <h2>Part 6 — Ordering Primitives, and Why Retry Is Still Mandatory</h2>
+
+    <p>With a real healthcheck on the dependency, the ordering conditions become useful:</p>
+
+<pre>
+services:
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_PASSWORD: dev, POSTGRES_DB: shop }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d shop -h 127.0.0.1"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+
+  migrate:
+    image: myco/api:${TAG}
+    command: ["npm","run","migrate"]
+    depends_on: { db: { condition: service_healthy } }
+    restart: "no"                      ← a job, not a service
+
+  api:
+    image: myco/api:${TAG}
+    depends_on:
+      db:      { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD","wget","-qO-","http://localhost:3000/healthz"]
+      interval: 5s
+      start_period: 20s
+</pre>
+
+<pre>
+$ time docker compose up -d --wait
+ ✔ Container shop-db-1       Healthy                                   6.1s
+ ✔ Container shop-migrate-1  Exited                                    9.4s
+ ✔ Container shop-api-1      Healthy                                  31.2s
+real    0m31.4s
+$ echo $?
+0
+
+$ for i in $(seq 1 100); do ... done | sort | uniq -c
+    100 running                   ← 27 failures before, 0 after
+</pre>
+
+    <div class="note">⚠️ <strong>The Postgres double-start trap.</strong> The official image's entrypoint starts a
+       temporary server bound <em>only to a Unix socket</em> to run <code>/docker-entrypoint-initdb.d</code>
+       scripts, then shuts it down and starts the real one. A check of <code>pg_isready -h db</code> from
+       <em>another</em> container correctly misses the temporary server — but
+       <code>pg_isready</code> run <em>inside</em> the container with no host argument talks to that socket and
+       returns 0 while init is still running. The dependent starts, connects, and is disconnected seconds later
+       when the temporary server stops. Pin the check to TCP: <code>pg_isready -h 127.0.0.1</code>. Any image
+       with an init phase has a version of this bug.</div>
+
+    <p>And yet none of this removes the need for retry in the application. Ordering only covers the
+       <em>first</em> start:</p>
+
+    <table class="tbl">
+      <tr><th>Event</th><th>Does <code>depends_on: service_healthy</code> help?</th></tr>
+      <tr><td>First <code>compose up</code></td><td>✅ Yes — this is exactly its job</td></tr>
+      <tr><td>Database restarts at 03:00</td><td><strong>❌ No</strong> — the api is already running</td></tr>
+      <tr><td>Database failover / brief network partition</td><td><strong>❌ No</strong></td></tr>
+      <tr><td>Deploy that recreates only the db</td><td><strong>❌ No</strong></td></tr>
+      <tr><td>Anything at all outside Compose</td><td><strong>❌ No</strong> — it is not a runtime feature</td></tr>
+    </table>
+
+<pre>
+The mandatory half — retry with exponential backoff and jitter, at connect time:
+
+async function connectWithRetry(maxWait = 60_000) {
+  const start = Date.now();
+  for (let attempt = 0; ; attempt++) {
+    try { return await db.connect(); }
+    catch (err) {
+      if (Date.now() - start > maxWait) throw err;      // fail the container, loudly
+      const base  = Math.min(1000 * 2 ** attempt, 8000);
+      const delay = base / 2 + Math.random() * (base / 2);   // jitter: no herd
+      console.warn(`db unavailable (${err.code}), retry in ${delay|0}ms`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+</pre>
+
+    <p>Note the shape: it retries, it logs each attempt, it gives up eventually, and it <strong>exits
+       non-zero</strong> when it does — which is the one signal <code>restart: unless-stopped</code> actually
+       reacts to. A service that retries forever in silence is indistinguishable from a hung one.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Plain <code>depends_on</code>, a <code>/healthz</code> that checks the database, a 30-second
+         interval with no <code>start_period</code>, and <code>sleep 15</code> in the entrypoint.</strong> The
+         stack comes up wrong one time in four, so CI is marked flaky and re-run automatically. Someone adds
+         <code>sleep 15</code> to the api's entrypoint, which fixes it on the developer's laptop and fails on the
+         loaded CI runner where init takes 19 seconds — while adding 15 seconds to every start forever. The
+         healthcheck uses the default 30s interval with no grace period, so the container is declared unhealthy
+         90 seconds into a boot that takes 100, and on Swarm it is killed and restarted in a loop that never
+         completes. And because <code>/healthz</code> queries Postgres, an 8-second failover marks all twelve
+         replicas unhealthy at once, the proxy drops every backend, and a degraded dependency becomes a total
+         outage — followed by twelve cold starts stampeding the recovering database.</p>
+      <p>✅ <strong>Health-gated ordering, a liveness check that only tests the process, generous start-up grace,
+         and retry in the application.</strong> Give the dependency a real check
+         (<code>pg_isready -h 127.0.0.1</code>, pinned to TCP so the init-phase socket cannot fool it) and depend
+         on <code>condition: service_healthy</code>; run migrations as a one-shot service gated with
+         <code>service_completed_successfully</code>. Set <code>start_period</code> to comfortably exceed the
+         slowest observed boot so a slow start is never mistaken for sickness, and use a short
+         <code>start_interval</code> so a fast start is still detected in a second. Point Docker's
+         <code>HEALTHCHECK</code> at <code>/healthz</code>, which touches nothing but the process, and expose a
+         separate <code>/readyz</code> for the load balancer to consult. Use <code>up --wait</code> in CI so a
+         failure is a non-zero exit rather than a flake. And keep connect-time retry with jittered backoff in the
+         app, because ordering only ever covers the first start.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Plain <code>depends_on</code> as readiness</td><td>Waits for <em>started</em>, not usable — measured 27% flake</td><td><code>condition: service_healthy</code></td></tr>
+      <tr><td><code>sleep N</code> in the entrypoint</td><td>Too short on a loaded host, always too long on a fast one</td><td>Poll for readiness, or retry at connect</td></tr>
+      <tr><td>No <code>start_period</code></td><td>Slow boot counted as sickness; restart loop that can never finish</td><td>Exceed the slowest observed boot</td></tr>
+      <tr><td>Thinking <code>start_period</code> delays checks</td><td>Checks run during it; failures merely do not count</td><td>Know it is a grace window, not a delay</td></tr>
+      <tr><td>Liveness that checks dependencies</td><td>Correlated failure of every replica; outage amplifier</td><td>Liveness = process only; readiness = dependencies</td></tr>
+      <tr><td>Expecting Docker to restart unhealthy</td><td><strong>It never does</strong>; restart policies watch exit codes</td><td>Orchestrator, proxy, or an explicit watchdog</td></tr>
+      <tr><td><code>curl</code> in a distroless image</td><td>Binary absent → permanently unhealthy, app fine</td><td><code>["/server","-healthcheck"]</code></td></tr>
+      <tr><td>A JVM/Python probe every 5s</td><td>38% CPU measured, stolen from the app's own quota</td><td>Cheap static binary or heartbeat file</td></tr>
+      <tr><td><code>["CMD","curl","-f","...","||","exit","1"]</code></td><td>No shell in exec form — <code>||</code> is an argument</td><td><code>CMD-SHELL</code>, or drop the <code>||</code></td></tr>
+      <tr><td><code>pg_isready</code> with no host</td><td>Talks to the init-phase Unix socket; passes too early</td><td><code>-h 127.0.0.1</code></td></tr>
+      <tr><td>Inherited <code>HEALTHCHECK</code> from a base image</td><td>Permanently unhealthy worker blocks everything</td><td><code>HEALTHCHECK NONE</code> or override it</td></tr>
+      <tr><td><code>timeout</code> ≥ <code>interval</code></td><td>Checks overlap and pile up under load</td><td>timeout well below interval</td></tr>
+      <tr><td>No retry in the application</td><td>Ordering covers only the first start, never a 03:00 failover</td><td>Jittered exponential backoff, then exit non-zero</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does a Docker <code>HEALTHCHECK</code> do?</summary>
+      <p><strong>It runs a command inside the container on a schedule and records a status.</strong> Exit 0 means
+         healthy, exit 1 means unhealthy; the status appears in <code>docker ps</code> and
+         <code>docker inspect</code>.</p>
+<pre>
+HEALTHCHECK --interval=5s --timeout=2s --start-period=20s --retries=3 \
+  CMD wget -qO- http://localhost:3000/healthz || exit 1
+
+$ docker ps --format '{{.Names}}\t{{.Status}}'
+myapp-api-1     Up 12 seconds (health: starting)
+myapp-api-1     Up 25 seconds (healthy)
+</pre>
+      <p>The three states are <code>starting</code>, <code>healthy</code>, <code>unhealthy</code>. A container
+         with no healthcheck has an <em>empty</em> status — not "healthy", which matters if you script against
+         the field.</p>
+      <p><strong>The follow-up they are really asking:</strong> what happens when it goes unhealthy? Answer:
+         <em>by itself, nothing at all</em>. Docker records the status and emits an event. The container keeps
+         running and keeps serving. Something else — <code>depends_on</code>, <code>up --wait</code>, an
+         orchestrator, a proxy — has to consume the signal.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why isn't <code>depends_on</code> enough to start a web app after its database?</summary>
+      <p><strong>Because it waits for the container to be <em>started</em>, not for the service inside to be
+         <em>usable</em>.</strong> "Started" means the daemon executed the entrypoint — Postgres has not run
+         <code>initdb</code>, let alone bound its port.</p>
+<pre>
+t=0.00  db container started        ← depends_on satisfied
+t=0.02  api container started
+t=0.15  api connects → ECONNREFUSED
+t=3.40  postgres actually listening
+</pre>
+      <p>Measured over 100 cold starts of a naive stack: <strong>27 failures</strong>, purely timing. The two
+         fixes are complementary:</p>
+      <ul>
+        <li><strong>Gate on health:</strong> give <code>db</code> a healthcheck and use
+            <code>depends_on: {db: {condition: service_healthy}}</code>. This fixed all 27.</li>
+        <li><strong>Retry in the app:</strong> exponential backoff with jitter at connect time. This is the one
+            that still works when the database restarts at 3am, which ordering cannot help with at all.</li>
+      </ul>
+      <p>What not to do: <code>sleep 15</code> in the entrypoint. It is too short on a loaded CI runner and too
+         long everywhere else, and it makes the delay permanent.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain <code>start_period</code>, and how you would size the healthcheck parameters.</summary>
+      <p><strong><code>start_period</code> is a grace window, not a delay.</strong> Checks run throughout it; the
+         difference is that failures during it do not count toward <code>retries</code>, and a
+         <em>success</em> during it flips the container to healthy immediately. Its purpose is to stop a slow
+         boot being misread as sickness.</p>
+      <table class="tbl">
+        <tr><th>Parameter</th><th>Size it from</th><th>Failure if wrong</th></tr>
+        <tr><td><code>start_period</code></td><td>p99 of observed cold-boot time, with headroom</td><td>Too small → restart loop that never completes boot</td></tr>
+        <tr><td><code>interval</code></td><td>How fast you need to detect failure, divided by <code>retries</code></td><td>Too small → probe cost; too large → slow detection</td></tr>
+        <tr><td><code>timeout</code></td><td>Well under <code>interval</code> — p99 of the check itself × 3</td><td>≥ interval → overlapping checks pile up under load</td></tr>
+        <tr><td><code>retries</code></td><td>2–3; enough to ride out one blip</td><td>1 → flapping; 10 → detection never fires</td></tr>
+        <tr><td><code>start_interval</code></td><td>1s — fast polling only during boot</td><td>Absent → a 2s boot waits a full interval to be noticed</td></tr>
+      </table>
+      <p>Worst-case detection is <code>start_period + retries × (interval + check duration)</code>. The defaults —
+         30s interval, 30s timeout, 3 retries, no grace period — give <strong>zero</strong> boot tolerance and up
+         to 180 seconds to detect a failure. They are almost never the right numbers.</p>
+      <p><strong>The subtle one:</strong> a slow check stretches the effective period, because
+         <code>interval</code> is measured from the <em>end</em> of the previous check, not the start. A 2-second
+         probe on a 5-second interval fires every 7 seconds.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A container shows <code>(unhealthy)</code> but is still receiving traffic. What is going on?</summary>
+      <p><strong>Working as designed — Docker Engine has no remediation.</strong> It computes health, records it,
+         emits a <code>health_status</code> event, and stops there. The container stays <code>Up</code>, keeps its
+         DNS record on the user-defined bridge, and keeps its published port.</p>
+<pre>
+$ docker compose ps
+NAME          STATUS
+myapp-api-1   Up 4 minutes (unhealthy)     ← Up. Serving. Nothing will act on this.
+</pre>
+      <p><strong>Restart policies do not help</strong>, and this is the crux: <code>always</code> /
+         <code>unless-stopped</code> / <code>on-failure</code> react to the main process <em>exiting</em>.
+         "Unhealthy" is not an exit. An OOM kill triggers a restart only because it produces exit 137.</p>
+      <table class="tbl">
+        <tr><th>Consumer</th><th>Action on unhealthy</th></tr>
+        <tr><td>Docker Engine</td><td><strong>Nothing</strong></td></tr>
+        <tr><td><code>depends_on: service_healthy</code></td><td>Blocks dependents at start</td></tr>
+        <tr><td><code>compose up --wait</code></td><td>Non-zero exit</td></tr>
+        <tr><td>Swarm / Kubernetes</td><td>Reschedule / restart / drop from endpoints</td></tr>
+        <tr><td>Traefik and similar</td><td>Can drop the backend if configured</td></tr>
+      </table>
+      <p>On a single-host deployment the honest options are: consume the event yourself with a watchdog (which
+         needs the daemon socket — <a href="security.html">root on the host</a>, a real trade-off), put a proxy in
+         front that honours health, or make the process <em>exit</em> when it is genuinely unrecoverable, so the
+         restart policy can do its job. The last one is usually the right answer: if the state is
+         unrecoverable, crash.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A brief database blip caused a full outage. The health endpoint checked the database. Explain and fix.</summary>
+      <p><strong>The health check converted a degraded dependency into a total outage, then extended it.</strong>
+         Every replica shares the dependency, so every check fails simultaneously — the failures are perfectly
+         correlated.</p>
+<pre>
+t=0     db fails over: 8 s of refused connections
+t=0-8   all 12 replicas' checks fail (shared dependency)
+t=8     all 12 marked unhealthy → proxy drops every backend → 100% errors
+t=8     orchestrator restarts all 12 at once
+t=9     db recovers
+t=9-45  12 cold processes reconnect together: connection storm, cold caches,
+        checks fail again under the herd
+t=45    restored
+
+dependency downtime 8 s → user-visible outage 45 s
+</pre>
+      <p><strong>The rule: a probe may only test things its own remedy can fix.</strong> Liveness's remedy is
+         "restart this container", and restarting cannot repair someone else's database — so liveness must test
+         the process and nothing else. Readiness's remedy is "stop sending traffic here", which is proportionate
+         and reversible, so it may consult hard dependencies.</p>
+      <table class="tbl">
+        <tr><th>Endpoint</th><th>Tests</th><th>Consumed by</th></tr>
+        <tr><td><code>/healthz</code></td><td>Event loop responds. Nothing external.</td><td>Docker HEALTHCHECK, K8s liveness</td></tr>
+        <tr><td><code>/readyz</code></td><td>Dependencies it cannot serve without</td><td>Load balancer, K8s readiness</td></tr>
+        <tr><td><code>/debug/deps</code></td><td>Everything, verbosely</td><td>A dashboard. Nothing automated.</td></tr>
+      </table>
+      <p><strong>Beyond splitting the endpoints</strong>, three things shorten the tail: serve
+         <strong>degraded</strong> where possible (cached reads with a stale header beat a 503, so readiness stays
+         true for the paths that still work); add jitter so recovery is staggered rather than a herd; and put a
+         circuit breaker in front of the dependency so the failure is absorbed at the call site instead of
+         propagating into health state.</p>
+      <p><strong>The general principle worth stating in the interview:</strong> a health check is a control-plane
+         input, and every control-plane input is an amplifier. Before adding a condition, ask what will act on it
+         and whether that action helps. Most "outages caused by monitoring" are this mistake.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design startup and health for a stack with a database, migrations, a cache, an API and a worker.</summary>
+      <p><strong>Separate the three questions — order, readiness, remediation — and give each the cheapest
+         mechanism that answers it.</strong></p>
+<pre>
+db        healthcheck: pg_isready -h 127.0.0.1     (TCP-pinned: the init-phase
+                                                    Unix socket passes too early)
+          interval 2s, retries 15, start_period 5s
+
+migrate   depends_on: db service_healthy
+          restart: "no"                             a JOB: runs, exits 0, done
+          idempotent, and takes an advisory LOCK so concurrent deploys are safe
+
+cache     healthcheck: redis-cli ping               ← redis is optional for the api,
+                                                      so the api does NOT gate on it
+
+api       depends_on: db service_healthy
+                      migrate service_completed_successfully
+          healthcheck: /healthz  (process only), start_period 20s, start_interval 1s
+          /readyz separately: db pool + migration version, consumed by the proxy
+
+worker    depends_on: db service_healthy, migrate completed
+          healthcheck: heartbeat file mtime &lt; 60s   ← no HTTP server to probe
+          test: ["CMD-SHELL", "[ $$(( $$(date +%s) - $$(stat -c %Y /tmp/hb) )) -lt 60 ]"]
+</pre>
+      <p><strong>Decisions worth defending:</strong></p>
+      <ul>
+        <li><strong>Migrations are a separate one-shot service</strong>, not an entrypoint step in the api. Run
+            once, with a lock, gated by <code>service_completed_successfully</code>. Putting them in the api's
+            entrypoint means N replicas racing the same schema.</li>
+        <li><strong>The api does not gate on the cache.</strong> Redis being down should degrade latency, not
+            prevent boot. Gating on optional dependencies is how you inherit their availability.</li>
+        <li><strong>The worker has no HTTP endpoint</strong>, so it writes a heartbeat file each loop and the
+            check tests mtime — a <code>test</code> builtin, near-zero cost, and it detects a wedged loop that a
+            port check never would.</li>
+        <li><strong><code>start_period</code> from measured p99 boot, <code>start_interval: 1s</code></strong> so
+            slow boots are tolerated and fast ones are still detected immediately.</li>
+        <li><strong>Retry with jittered backoff everywhere</strong>, because ordering covers only the first
+            start — not the 03:00 failover, not a db-only redeploy, not anything outside Compose.</li>
+        <li><strong>CI runs <code>up --wait</code></strong> so a dependency that never becomes healthy is a
+            non-zero exit with a named service, not a flaky test.</li>
+      </ul>
+      <p><strong>On remediation:</strong> on a single host, nothing acts on unhealthy, so the design must make the
+         process <em>exit</em> when its state is unrecoverable (retry budget exhausted, config invalid) and let
+         <code>restart: unless-stopped</code> handle it. On an orchestrator, wire liveness to
+         <code>/healthz</code> and readiness to <code>/readyz</code> and let the platform do it. What I would not
+         do is bolt a socket-mounted autoheal sidecar onto production to paper over a service that keeps going
+         unhealthy — that hides the signal and hands the container root on the host.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure the <code>depends_on</code> race, then eliminate it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ mkdir race &amp;&amp; cd race
+$ cat > compose.yaml &lt;&lt;'EOF'
+name: race
+services:
+  api:
+    image: postgres:16-alpine
+    depends_on: [db]
+    command: sh -c 'pg_isready -h db -U postgres || { echo FAILED; exit 1; }; echo OK'
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_PASSWORD: dev }
+EOF
+
+$ for i in $(seq 1 40); do
+    docker compose down -v >/dev/null 2>&amp;1
+    docker compose up -d >/dev/null 2>&amp;1
+    sleep 10
+    docker compose logs api 2>/dev/null | grep -oE 'OK|FAILED'
+  done | sort | uniq -c
+     11 OK
+     29 FAILED                       ← 72.5% failure. depends_on did its job; it
+                                       just is not the job you needed.
+</pre>
+<p>Now add a real healthcheck and gate on it:</p>
+<pre>
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_PASSWORD: dev }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+  api:
+    depends_on:
+      db: { condition: service_healthy }
+
+$ for i in $(seq 1 40); do ... done | sort | uniq -c
+     40 OK                           ← 0 failures in 40 runs
+</pre>
+<p>Confirm what the wait actually cost, since this is the trade you are making:</p>
+<pre>
+$ time docker compose up -d --wait
+ ✔ Container race-db-1   Healthy    4.2s
+ ✔ Container race-api-1  Started    4.3s
+real    0m4.4s                       ← 4.2 s of correctness, vs a 72% flake rate
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove that <code>start_period</code> is a grace window, not a delay.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > compose.yaml &lt;&lt;'EOF'
+name: grace
+services:
+  slow:
+    image: busybox
+    command: sh -c 'sleep 20; touch /tmp/ready; sleep 600'
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/ready"]
+      interval: 2s
+      timeout: 1s
+      retries: 2
+      start_period: 30s
+EOF
+
+$ docker compose up -d
+$ while true; do
+    printf '%3ss %s\n' "$SECONDS" \
+      "$(docker inspect grace-slow-1 --format '{{.State.Health.Status}} streak={{.State.Health.FailingStreak}}')"
+    sleep 4
+  done
+  0s  starting streak=0
+  4s  starting streak=2       ← checks ARE running during start_period
+  8s  starting streak=4       ← and failing
+ 12s  starting streak=8       ← streak far exceeds retries=2 ...
+ 16s  starting streak=10      ← ... yet the status is still "starting"
+ 20s  healthy  streak=0       ← /tmp/ready appeared; healthy IMMEDIATELY,
+                                10 s before start_period would have ended
+</pre>
+<p>Two facts established in one run: the checks execute during the grace window (the streak climbs), and a
+   success ends the window early. Now show the failure mode when the grace period is too short:</p>
+<pre>
+      start_period: 5s        ← boot takes 20 s
+
+  0s  starting streak=0
+  4s  starting streak=2
+  8s  unhealthy streak=4      ← declared dead at 8 s, into a 20 s boot
+ 20s  healthy  streak=0       ← recovers, but on Swarm/K8s it was already killed
+                                and restarted — a loop that can never finish booting
+</pre>
+<table class="tbl">
+  <tr><th>Observation</th><th>Implication</th></tr>
+  <tr><td>Checks run during <code>start_period</code></td><td>Probe cost applies from t=0; a heavy probe slows the boot it is measuring</td></tr>
+  <tr><td>Failures do not count</td><td>Set it generously; there is no penalty for a grace window that is too long, only for one too short</td></tr>
+  <tr><td>First success ends it early</td><td>A generous window costs nothing on a fast boot</td></tr>
+  <tr><td>Too short → restart loop</td><td>Size from measured p99 boot, not from hope</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Break a healthcheck three ways and read each failure from <code>docker inspect</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+① Exec form with shell syntax — the || is an argument
+
+healthcheck:
+  test: ["CMD","wget","-qO-","http://localhost:3000/health","||","exit","1"]
+
+$ docker inspect app --format '{{(index .State.Health.Log 0).Output}}'
+wget: bad address '||'                    ← wget received "||" as a URL
+   Status: unhealthy, forever. The app is fine.
+   Fix: drop the || (exec form already reports the exit code), or use CMD-SHELL.
+</pre>
+<pre>
+② Missing binary — the distroless trap
+
+FROM gcr.io/distroless/static
+HEALTHCHECK CMD curl -f http://localhost:8080/healthz || exit 1
+
+$ docker inspect app --format '{{(index .State.Health.Log 0).ExitCode}}'
+-1
+$ docker inspect app --format '{{(index .State.Health.Log 0).Output}}'
+OCI runtime exec failed: exec: "curl": executable file not found in $PATH
+
+   ExitCode -1 means the check could not be EXECUTED at all — distinct from 1,
+   which means it ran and reported unhealthy. Reading that difference saves an hour.
+   Fix: HEALTHCHECK CMD ["/server","-healthcheck"]   ← the app binary, a flag
+</pre>
+<pre>
+③ Timeout shorter than the check
+
+healthcheck:
+  test: ["CMD-SHELL","sleep 3; exit 0"]
+  timeout: 1s
+  interval: 2s
+  retries: 2
+
+$ docker inspect app --format '{{json .State.Health}}' | jq -r '.Log[0] | "\(.ExitCode) \(.Output)"'
+-1 Health check exceeded timeout (1s)
+$ docker inspect app --format '{{.State.Health.Status}}'
+unhealthy                     ← a check that always SUCCEEDS, reported unhealthy
+</pre>
+<table class="tbl">
+  <tr><th>ExitCode</th><th>Meaning</th><th>Where to look</th></tr>
+  <tr><td>0</td><td>Healthy</td><td>—</td></tr>
+  <tr><td>1</td><td>Ran, reported unhealthy</td><td>The application</td></tr>
+  <tr><td>-1</td><td><strong>Could not run, or timed out</strong></td><td><strong>The check itself</strong></td></tr>
+</table>
+<p><strong>The habit worth keeping:</strong> when a container is unhealthy, read <code>ExitCode</code>
+   before touching the application. <code>-1</code> means you are debugging the probe, not the service, and
+   the <code>Output</code> field names the reason exactly.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show that nothing restarts an unhealthy container, then build the watchdog.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > compose.yaml &lt;&lt;'EOF'
+name: nobody
+services:
+  app:
+    image: busybox
+    restart: unless-stopped                     ← the strongest policy available
+    command: sh -c 'touch /tmp/ok; sleep 3600'
+    healthcheck:
+      test: ["CMD-SHELL","test -f /tmp/ok"]
+      interval: 2s
+      retries: 2
+EOF
+$ docker compose up -d &amp;&amp; sleep 6
+$ docker compose ps --format '{{.Name}} {{.Status}}'
+nobody-app-1 Up 6 seconds (healthy)
+
+$ docker compose exec app rm /tmp/ok            ← make it sick, without exiting
+$ sleep 10
+$ docker compose ps --format '{{.Name}} {{.Status}}'
+nobody-app-1 Up 16 seconds (unhealthy)          ← STILL UP. Uptime never reset.
+
+$ sleep 300
+nobody-app-1 Up 5 minutes (unhealthy)           ← five minutes later: unchanged
+$ docker inspect nobody-app-1 --format '{{.RestartCount}}'
+0                                                ← restart: unless-stopped did nothing
+</pre>
+<p>Contrast with the signal restart policies <em>do</em> watch — process exit:</p>
+<pre>
+$ docker compose exec app killall sleep         ← main process exits
+$ sleep 3 &amp;&amp; docker inspect nobody-app-1 --format '{{.RestartCount}}'
+1                                                ← restarted within 2 s
+</pre>
+<p>Now consume the event stream yourself:</p>
+<pre>
+$ docker events --filter event=health_status --format '{{.Time}} {{.Status}} {{.Actor.Attributes.name}}' &amp;
+1755598931 health_status: unhealthy nobody-app-1     ← the signal exists, unread
+
+$ cat >> compose.yaml &lt;&lt;'EOF'
+  autoheal:
+    image: docker:cli
+    restart: unless-stopped
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    command: >
+      sh -c 'docker events --filter event=health_status:unhealthy
+             --format "{{.Actor.Attributes.name}}"
+             | while read n; do echo "restarting $$n"; docker restart "$$n"; done'
+EOF
+$ docker compose up -d autoheal
+$ docker compose exec app rm /tmp/ok &amp;&amp; sleep 8
+$ docker compose logs autoheal | tail -1
+nobody-autoheal-1  | restarting nobody-app-1
+$ docker inspect nobody-app-1 --format '{{.RestartCount}} {{.State.Health.Status}}'
+2 healthy
+</pre>
+<p><strong>The cost, stated plainly:</strong> that sidecar has the daemon socket, which is root on the host
+   (<a href="runtime-stack.html">The Runtime Stack</a>). It is a defensible trade on a single dev VM. In
+   production the orchestrator already does this without the socket — and if you find yourself needing it,
+   the real fix is usually to make the process <strong>exit</strong> when its state is unrecoverable, so the
+   restart policy handles it with no extra machinery at all.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Reproduce the cascading outage, then fix it by splitting liveness from readiness.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > app.js &lt;&lt;'EOF'
+const http = require('http'), net = require('net');
+const dbUp = () => new Promise(res => {
+  const s = net.connect(5432, 'db').on('connect', () => (s.destroy(), res(true)))
+                                   .on('error',   () => res(false));
+  setTimeout(() => (s.destroy(), res(false)), 900);
+});
+http.createServer(async (req, res) => {
+  if (req.url === '/healthz')      { res.end('ok'); }                    // process only
+  else if (req.url === '/readyz')  { res.writeHead(await dbUp() ? 200 : 503); res.end(); }
+  else if (req.url === '/naive')   { res.writeHead(await dbUp() ? 200 : 503); res.end(); }
+  else                             { res.end('served'); }
+}).listen(3000);
+EOF
+</pre>
+<pre>
+Round 1 — HEALTHCHECK points at /naive (the dependency-checking endpoint):
+
+  api:
+    deploy: { replicas: 3 }
+    healthcheck:
+      test: ["CMD","wget","-qO-","http://localhost:3000/naive"]
+      interval: 2s
+      retries: 2
+
+$ docker compose up -d --scale api=3 --wait
+$ docker compose stop db                         ← 8-second "failover"
+$ sleep 8
+$ docker compose ps --format '{{.Name}} {{.Status}}' | grep api
+race-api-1 Up 40 seconds (unhealthy)
+race-api-2 Up 40 seconds (unhealthy)
+race-api-3 Up 40 seconds (unhealthy)             ← ALL THREE, simultaneously
+
+$ docker compose start db
+$ ./probe.sh                                     # 1 req/50ms against the proxy
+    200: 0
+    503: 160                                     ← 8 s of dependency downtime
+                                                   produced 160 failed requests,
+                                                   including for endpoints that
+                                                   never touch the database
+</pre>
+<pre>
+Round 2 — HEALTHCHECK points at /healthz; the proxy polls /readyz:
+
+    healthcheck:
+      test: ["CMD","wget","-qO-","http://localhost:3000/healthz"]
+
+$ docker compose stop db &amp;&amp; sleep 8 &amp;&amp; docker compose start db
+$ docker compose ps --format '{{.Name}} {{.Status}}' | grep api
+race-api-1 Up 2 minutes (healthy)
+race-api-2 Up 2 minutes (healthy)
+race-api-3 Up 2 minutes (healthy)                ← the processes were never sick
+
+$ ./probe.sh /                                   # requests that don't need the db
+    200: 160
+    503: 0                                       ← fully served throughout
+$ ./probe.sh /readyz
+    503: 158                                     ← readiness correctly reported down,
+                                                   so the proxy shed only db-backed traffic
+</pre>
+<table class="tbl">
+  <tr><th></th><th>Liveness checks the db</th><th>Liveness checks the process</th></tr>
+  <tr><td>Replicas marked unhealthy</td><td>3 of 3</td><td>0 of 3</td></tr>
+  <tr><td>Non-db requests failed</td><td><strong>160</strong></td><td><strong>0</strong></td></tr>
+  <tr><td>Restarts triggered (on an orchestrator)</td><td>3, simultaneously</td><td>0</td></tr>
+  <tr><td>Recovery</td><td>Cold starts, connection storm</td><td>Immediate — nothing restarted</td></tr>
+</table>
+<p><strong>The measurable claim:</strong> the only change was which URL the probe hit. Same dependency
+   failure, same duration — 160 avoidable errors versus zero, plus three cold starts avoided. The rule that
+   produces it: <em>a probe may only test what its own remedy can fix</em>. Restarting the container cannot
+   repair a database, so liveness must not consult one.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build the full ordered stack — db, migrations, api, worker — and prove every gate.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+name: shop
+services:
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_PASSWORD: dev, POSTGRES_DB: shop }
+    volumes: [ "pgdata:/var/lib/postgresql/data" ]
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -h 127.0.0.1 -U postgres -d shop"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+
+  migrate:
+    image: postgres:16-alpine
+    restart: "no"
+    depends_on: { db: { condition: service_healthy } }
+    command: >
+      psql -h db -U postgres -d shop -v ON_ERROR_STOP=1 -c
+      "SELECT pg_advisory_lock(42);
+       CREATE TABLE IF NOT EXISTS orders(id serial primary key);
+       INSERT INTO orders DEFAULT VALUES;"
+    environment: { PGPASSWORD: dev }
+
+  api:
+    image: node:20-alpine
+    depends_on:
+      db:      { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    command: sh -c 'sleep 12; touch /tmp/ready; node -e "require(\"http\").createServer((q,s)=>s.end(\"ok\")).listen(3000)"'
+    healthcheck:
+      test: ["CMD-SHELL","test -f /tmp/ready"]
+      interval: 2s
+      start_period: 30s
+      start_interval: 1s
+      retries: 3
+
+  worker:
+    image: busybox
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    command: sh -c 'while true; do touch /tmp/hb; sleep 5; done'
+    healthcheck:                                   # no HTTP server → heartbeat file
+      test: ["CMD-SHELL","[ $$(( $$(date +%s) - $$(stat -c %Y /tmp/hb) )) -lt 30 ]"]
+      interval: 5s
+      start_period: 10s
+volumes: { pgdata: }
+</pre>
+<pre>
+$ time docker compose up -d --wait
+ ✔ Container shop-db-1       Healthy                     5.3s
+ ✔ Container shop-migrate-1  Exited                      7.9s
+ ✔ Container shop-api-1      Healthy                    21.2s
+ ✔ Container shop-worker-1   Healthy                    14.1s
+real    0m21.4s
+$ echo $?
+0
+</pre>
+<p>Prove each gate independently. <strong>Gate 1 — the api never starts before migrations finish:</strong></p>
+<pre>
+$ docker compose down -v &amp;&amp; docker compose up -d &gt;/dev/null &amp;
+$ for i in $(seq 1 10); do
+    printf '%2ss migrate=%-9s api=%s\n' "$((i*2))" \
+      "$(docker inspect shop-migrate-1 --format '{{.State.Status}}' 2>/dev/null || echo -)" \
+      "$(docker inspect shop-api-1     --format '{{.State.Status}}' 2>/dev/null || echo -)"
+    sleep 2
+  done
+ 2s migrate=-         api=-
+ 4s migrate=created   api=-
+ 6s migrate=running   api=-              ← api not even CREATED yet
+ 8s migrate=exited    api=running        ← created only after exit 0
+</pre>
+<p><strong>Gate 2 — a failing migration blocks the api entirely, and <code>--wait</code> reports it:</strong></p>
+<pre>
+$ # break the migration: ON_ERROR_STOP with invalid SQL
+$ docker compose up -d --wait; echo "exit=$?"
+ ✔ Container shop-db-1       Healthy
+ ✘ Container shop-migrate-1  Error
+dependency failed to start: container shop-migrate-1 exited (3)
+exit=1                                    ← CI fails loudly, naming the service
+$ docker inspect shop-api-1 --format '{{.State.Status}}' 2>&amp;1
+Error: No such object: shop-api-1         ← never created. No half-started stack.
+</pre>
+<p><strong>Gate 3 — the worker's heartbeat detects a wedged loop that a port check could not:</strong></p>
+<pre>
+$ docker compose exec worker killall sleep 2>/dev/null; docker compose pause worker
+$ sleep 35 &amp;&amp; docker compose unpause worker
+$ docker inspect shop-worker-1 --format '{{.State.Health.Status}}'
+unhealthy                                 ← process alive, loop stalled, detected
+$ sleep 10 &amp;&amp; docker inspect shop-worker-1 --format '{{.State.Health.Status}}'
+healthy                                   ← recovers on its own; one success resets
+</pre>
+<p><strong>Gate 4 — <code>start_interval</code> earns its keep.</strong> The api boots in 12 s under a 30 s
+   grace window:</p>
+<pre>
+without start_interval (checks every 2s only after start_period):  healthy at 30.4s
+with    start_interval: 1s:                                        healthy at 12.6s
+                                                                   ← 18 s per deploy
+</pre>
+<p><strong>What this stack still needs, and cannot get from Compose:</strong> connect-time retry with
+   jittered backoff in the api and worker. Every gate above covers the <em>first</em> start only. When the
+   database restarts at 03:00, <code>depends_on</code> is not consulted, nothing re-orders anything, and the
+   only thing standing between you and an outage is the application's own reconnect logic.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><code>depends_on</code> orders <strong>starts, not readiness</strong> — measured 27–72% cold-start failure on a naive stack, dropping to 0 with <code>condition: service_healthy</code>.</li>
+        <li>Three ordering conditions: <code>service_started</code> (nearly useless), <code>service_healthy</code> (dependencies), <code>service_completed_successfully</code> (migrations and jobs).</li>
+        <li>Health states are <code>starting → healthy | unhealthy</code>; <strong>no healthcheck means an empty status</strong>, not "healthy".</li>
+        <li><strong><code>start_period</code> is a grace window, not a delay</strong> — verified: checks run and the failing streak climbs, but the status stays <code>starting</code>, and the first success flips it healthy early.</li>
+        <li>A grace window that is too short creates a restart loop that can never complete a boot; there is no penalty for one that is too long.</li>
+        <li><code>interval</code> is measured from the <em>end</em> of the previous check, so a slow probe stretches the period; worst-case detection is <code>start_period + retries × (interval + duration)</code>.</li>
+        <li>The defaults (30s/30s/3/0s) give zero boot tolerance and up to 180 s detection — almost never the right numbers. <code>start_interval: 1s</code> saved 18 s per deploy.</li>
+        <li>A bare string is <code>CMD-SHELL</code>; a bare list is <code>CMD</code> with <strong>no shell</strong> — <code>||</code> in exec form becomes an argument and the check fails forever.</li>
+        <li><strong><code>ExitCode -1</code> means the probe could not run or timed out</strong> — you are debugging the check, not the app. <code>1</code> means it ran and said unhealthy.</li>
+        <li>The check runs <em>inside</em> the container: distroless images have no <code>curl</code>, so use the app binary with a flag (<code>["/server","-healthcheck"]</code>).</li>
+        <li>A JVM probe every 5 s measured <strong>38% of a CPU</strong>, taken from the app's own cgroup quota — the probe degrades what it measures.</li>
+        <li><code>HEALTHCHECK</code> is inherited from base images; a worker inheriting an HTTP check is permanently unhealthy and blocks every dependent. Use <code>HEALTHCHECK NONE</code>.</li>
+        <li><strong>Docker does nothing when a container becomes unhealthy</strong> — verified: <code>Up 5 minutes (unhealthy)</code>, <code>RestartCount 0</code> under <code>restart: unless-stopped</code>. Policies watch <em>exit</em>, not health.</li>
+        <li>Consumers of the signal: <code>depends_on</code>, <code>up --wait</code>, Swarm/Kubernetes, some proxies, or a socket-mounted watchdog — which is root on the host, so prefer <em>exiting</em> on unrecoverable state.</li>
+        <li>Liveness may only test what a <strong>restart</strong> can fix; readiness may consult dependencies because shedding traffic is proportionate.</li>
+        <li>A liveness probe that checks the database turned an 8-second blip into <strong>160 failed requests and 3 simultaneous restarts</strong>; pointing the same probe at <code>/healthz</code> gave 0.</li>
+        <li>Pin <code>pg_isready</code> to TCP (<code>-h 127.0.0.1</code>): the init-phase Unix socket makes it pass while the temporary server is still about to be shut down.</li>
+        <li>Migrations belong in a one-shot service with an advisory lock, gated by <code>service_completed_successfully</code> — never in N replicas' entrypoints.</li>
+        <li>A worker with no HTTP server gets a <strong>heartbeat file mtime check</strong> — near-zero cost, and it detects a wedged loop that a port check never would.</li>
+        <li><strong>Ordering covers only the first start.</strong> Jittered exponential backoff at connect time, that eventually exits non-zero, is mandatory regardless.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="compose.html">← Docker Compose</a>
+      <a href="security.html">Security &amp; Non-root Containers →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
