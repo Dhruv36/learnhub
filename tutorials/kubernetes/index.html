@@ -3,147 +3,887 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kubernetes Architecture — LearnHub</title>
+<title>Architecture &amp; the Reconciliation Loop — Kubernetes — LearnHub</title>
 <link rel="stylesheet" href="../../css/style.css">
 </head>
 <body>
 
 <header class="site-header">
   <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
-  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a></nav>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
 </header>
 
 <div class="tutorial-layout">
   <aside class="sidebar" id="sidebar"></aside>
 
   <main class="content">
-    <h1>Kubernetes Architecture <span class="level-badge level-basic">Basics</span></h1>
-    <p>Kubernetes (K8s) is a <strong>container orchestrator</strong>: you declare the desired state of your
-       application, and Kubernetes continuously works to make reality match it — scheduling containers across
-       a fleet of machines, restarting failed ones, scaling, and rolling out updates. Understanding its
-       architecture — the control plane, the nodes, and the reconciliation loop — makes everything else make
-       sense. Prerequisite: the <a href="../docker/index.html">Docker track</a> (K8s runs containers).</p>
+    <h1>Architecture &amp; the Reconciliation Loop <span class="level-badge level-basic">Foundations</span></h1>
+    <p><strong>What you'll master:</strong> the one idea the whole system is built on — Kubernetes is a
+       <strong>database with control loops attached</strong>, and nothing is ever "executed", only reconciled;
+       why being <strong>level-triggered rather than edge-triggered</strong> is the design decision that makes it
+       self-healing, and what it costs you; what each component actually does, including the surprise that
+       <strong>the scheduler's entire job is writing one string field</strong>; the complete path of a
+       <code>kubectl apply</code> from your terminal to a running container, with the measured timings of each
+       hop; what genuinely breaks when the control plane is down (much less than people expect — running pods
+       are unaffected) and what silently stops working; etcd's quorum arithmetic, including why a two-member
+       cluster is <em>worse</em> than a single member; and why deletion is a request rather than a command, which
+       is how a namespace ends up stuck in <code>Terminating</code> forever.</p>
 
-    <h2>The Big Idea: Declarative + Reconciliation</h2>
-    <pre>// You don't tell Kubernetes HOW to do things step by step. You declare the DESIRED STATE:
-apiVersion: apps/v1
-kind: Deployment
+    <h2>Part 1 — It Is a Database With Control Loops</h2>
+
+    <p>Strip away the vocabulary and Kubernetes is three things: a consistent key-value store (etcd), one process
+       allowed to write to it (the API server), and a collection of independent loops that each watch some part of
+       it and try to make reality match. Every feature in this track is an instance of that pattern.</p>
+
+<pre>
+        kubectl / controllers / kubelets
+                    │  (all traffic, without exception)
+                    ▼
+        ┌───────────────────────┐
+        │   kube-apiserver      │  the ONLY component that talks to etcd
+        │  auth → admission →   │
+        │  validation → write   │
+        └───────────┬───────────┘
+                    ▼
+               ┌─────────┐
+               │  etcd   │  the entire cluster state. Everything else is
+               └─────────┘  a cache or a process acting on it.
+
+  and around it, loops that all do the same thing:
+
+     for ever:
+        desired = read from API           ← what the YAML says
+        actual  = observe the world       ← what is really running
+        if desired != actual: act, then write status back
+</pre>
+
+    <table class="tbl">
+      <tr><th>Controller</th><th>Watches</th><th>Acts by</th></tr>
+      <tr><td>Deployment controller</td><td>Deployments</td><td>Creating/scaling ReplicaSets</td></tr>
+      <tr><td>ReplicaSet controller</td><td>ReplicaSets, Pods</td><td>Creating/deleting Pods</td></tr>
+      <tr><td>Scheduler</td><td>Pods with no <code>nodeName</code></td><td><strong>Writing <code>spec.nodeName</code></strong></td></tr>
+      <tr><td>Kubelet</td><td>Pods assigned to <em>its</em> node</td><td>Calling the container runtime</td></tr>
+      <tr><td>Endpoints/EndpointSlice controller</td><td>Services, Pods</td><td>Maintaining the endpoint list</td></tr>
+      <tr><td>Node controller</td><td>Node heartbeats</td><td>Marking nodes <code>NotReady</code>, evicting</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>No component talks to another component.</strong> The scheduler does not tell the
+       kubelet anything; it writes a field, and the kubelet — which was watching for pods bound to its node —
+       notices. This indirection is why you can restart any controller at any time, why adding a new controller
+       requires changing nothing, and why the API server is both the single point of coordination and the single
+       point of failure.</div>
+
+    <h2>Part 2 — Level-Triggered, Not Edge-Triggered</h2>
+
+    <p>An edge-triggered system reacts to <em>events</em>: "a pod was deleted, therefore create one". A
+       level-triggered system reacts to <em>state</em>: "I want 3, I see 2, therefore create one". Kubernetes is
+       level-triggered, and almost every desirable property follows from that single choice.</p>
+
+    <table class="tbl">
+      <tr><th></th><th>Edge-triggered</th><th>Level-triggered (Kubernetes)</th></tr>
+      <tr><td>A missed event</td><td><strong>Permanent divergence</strong></td><td>Corrected on the next pass</td></tr>
+      <tr><td>Controller restarts</td><td>Must replay history</td><td>Reads current state and continues</td></tr>
+      <tr><td>Duplicate events</td><td>Must be deduplicated</td><td>Harmless — the second pass is a no-op</td></tr>
+      <tr><td>Manual interference</td><td>Undetected</td><td><strong>Reverted automatically</strong></td></tr>
+      <tr><td>Watch connection drops</td><td>Lost work</td><td>Re-list and resync</td></tr>
+    </table>
+
+<pre>
+$ kubectl get rs web-7d4b9c
+NAME         DESIRED   CURRENT   READY   AGE
+web-7d4b9c   3         3         3       4m
+
+$ kubectl delete pod web-7d4b9c-x8k2p
+pod "web-7d4b9c-x8k2p" deleted
+$ kubectl get pods -l app=web --sort-by=.metadata.creationTimestamp
+web-7d4b9c-m4j1q   1/1  Running   0   4m
+web-7d4b9c-p9v3w   1/1  Running   0   4m
+web-7d4b9c-t2h8n   1/1  Running   0   1s      ← replaced in about a second
+
+$ kubectl scale rs web-7d4b9c --replicas=5    # against a Deployment's ReplicaSet
+$ sleep 5; kubectl get rs web-7d4b9c
+DESIRED   CURRENT   READY
+3         3         3        ← the DEPLOYMENT controller reconciled your edit away
+</pre>
+
+    <div class="note">⚠️ <strong>"It reverted my change" is the system working.</strong> Every object with an owner
+       is continuously driven back to what its owner specifies. Editing a ReplicaSet under a Deployment, or a Pod
+       under a ReplicaSet, is writing to a cache — the fix is always to change the <em>top</em> of the ownership
+       chain. The same mechanic is what GitOps tools use deliberately: they become the outermost loop, and drift
+       from Git is corrected the same way.</div>
+
+    <p>The cost is real and worth stating plainly: <strong>nothing is ever "done"</strong>. There is no return
+       code for "the deploy succeeded", because <code>kubectl apply</code> only records intent. Whether it
+       <em>worked</em> is a separate observation — which is why <code>kubectl rollout status</code> exists and why
+       CI pipelines that stop at <code>apply</code> report green for deployments that never became healthy.</p>
+
+    <h2>Part 3 — The Components, and What They Really Do</h2>
+
+    <table class="tbl">
+      <tr><th>Component</th><th>Runs on</th><th>Actual job</th><th>If it dies</th></tr>
+      <tr><td><code>etcd</code></td><td>Control plane</td><td>Stores all state; Raft consensus</td><td><strong>Cluster is read-only, then unavailable</strong></td></tr>
+      <tr><td><code>kube-apiserver</code></td><td>Control plane</td><td>AuthN → AuthZ → admission → validation → persist</td><td>No changes possible; running pods unaffected</td></tr>
+      <tr><td><code>kube-scheduler</code></td><td>Control plane</td><td><strong>Sets <code>spec.nodeName</code> on unscheduled pods</strong></td><td>New pods stay <code>Pending</code>; everything else fine</td></tr>
+      <tr><td><code>kube-controller-manager</code></td><td>Control plane</td><td>Runs ~30 built-in control loops</td><td>No self-healing, no scaling, no endpoint updates</td></tr>
+      <tr><td><code>kubelet</code></td><td>Every node</td><td><strong>The only thing that starts containers</strong></td><td>That node's pods keep running but are unmanaged</td></tr>
+      <tr><td><code>kube-proxy</code></td><td>Every node</td><td>Programs iptables/IPVS for Service VIPs</td><td>Service routing goes stale on that node</td></tr>
+      <tr><td>CNI plugin</td><td>Every node</td><td>Gives pods IPs and connectivity</td><td>New pods fail with <code>ContainerCreating</code></td></tr>
+      <tr><td>CRI runtime</td><td>Every node</td><td>containerd/CRI-O actually runs containers</td><td>Nothing starts or stops on that node</td></tr>
+    </table>
+
+<pre>
+The scheduler's whole contribution, demonstrated — bypass it entirely:
+
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: { name: manual }
 spec:
-  replicas: 3          // "I want 3 copies running"
-// Kubernetes' controllers constantly compare desired vs ACTUAL state and act to close the gap.
-// A pod dies? Actual (2) ≠ desired (3) → it starts a new one. This CONTROL LOOP is the heart of K8s.</pre>
-    <div class="note">🔁 <strong>Reconciliation is the single most important concept.</strong> Every
-      Kubernetes object is managed by a controller running a loop: observe actual state → compare to desired
-      state → take action to converge. This is why K8s self-heals, and why you manage infrastructure by
-      editing declarative YAML (the desired state) rather than running imperative commands. "Desired state,
-      reconciled continuously" explains nearly all K8s behavior.</p></div>
+  nodeName: worker-2          ← we set it ourselves
+  containers: [{ name: c, image: nginx:alpine }]
+EOF
+pod/manual created
+$ kubectl get pod manual -o wide
+NAME     READY   STATUS    NODE
+manual   1/1     Running   worker-2      ← the scheduler was never involved
 
-    <h2>The Control Plane (the brain)</h2>
+$ kubectl -n kube-system scale deploy/kube-scheduler --replicas=0   # (kubeadm: move the manifest)
+$ kubectl run test --image=nginx:alpine
+$ kubectl get pod test
+NAME   READY   STATUS    AGE
+test   0/1     Pending   45s          ← no nodeName, so no kubelet claims it
+$ kubectl get pod test -o jsonpath='{.spec.nodeName}'
+                                       ← empty. That is the entire missing piece.
+</pre>
+
+    <p>Two consequences worth carrying forward. The scheduler makes a <strong>one-time placement decision</strong>
+       — it never moves a running pod, no matter how unbalanced the cluster later becomes (rebalancing needs a
+       separate tool such as <em>descheduler</em>). And the kubelet is <strong>node-local and independent</strong>:
+       it keeps its pods running with no control plane at all, because it caches its assigned pods and talks
+       directly to the container runtime.</p>
+
+    <h2>Part 4 — What Actually Happens on <code>kubectl apply</code></h2>
+
+<pre>
+$ kubectl apply -f deployment.yaml    #  ~9 hops, all through the API server
+
+ ①  kubectl        reads ~/.kube/config, resolves the GVK against /openapi,
+                   POSTs to /apis/apps/v1/namespaces/default/deployments
+ ②  apiserver      AUTHENTICATION   (cert / token / OIDC)                    ~1 ms
+ ③  apiserver      AUTHORIZATION    (RBAC: can this SA create Deployments?)  ~1 ms
+ ④  apiserver      MUTATING ADMISSION  (defaults, sidecar injection, ...)    ~2-40 ms
+ ⑤  apiserver      VALIDATION + VALIDATING ADMISSION (schema, policy)        ~1-20 ms
+ ⑥  apiserver      WRITE to etcd, fsync, Raft commit to a quorum             ~5-25 ms
+     ── the request returns here. "deployment.apps/web created" ──
+ ⑦  deployment ctrl  sees the new Deployment → creates a ReplicaSet          ~10 ms
+ ⑧  replicaset ctrl  sees the ReplicaSet → creates 3 Pods (no nodeName)      ~10 ms
+ ⑨  scheduler        filters + scores nodes → writes spec.nodeName           ~5-50 ms
+ ⑩  kubelet          sees a pod bound to it → CNI, image pull, CRI start     0.5 s – minutes
+ ⑪  kubelet          writes status back; probes pass → Ready
+ ⑫  endpoint ctrl    sees a Ready pod matching a Service → adds an endpoint  ~10 ms
+</pre>
+
     <table class="tbl">
-      <tr><th>Component</th><th>Role</th></tr>
-      <tr><td><strong>kube-apiserver</strong></td><td>The front door — the REST API everything talks to; validates and persists all objects. The ONLY thing that writes to etcd.</td></tr>
-      <tr><td><strong>etcd</strong></td><td>The cluster's database — a consistent key-value store holding all cluster state (the source of truth).</td></tr>
-      <tr><td><strong>kube-scheduler</strong></td><td>Decides WHICH node an unscheduled Pod runs on (based on resources, affinity, taints).</td></tr>
-      <tr><td><strong>kube-controller-manager</strong></td><td>Runs the control loops (Deployment, ReplicaSet, Node controllers, etc.) that reconcile state.</td></tr>
-      <tr><td><strong>cloud-controller-manager</strong></td><td>Integrates with the cloud provider (load balancers, volumes, nodes).</td></tr>
+      <tr><th>Observation</th><th>Why it matters</th></tr>
+      <tr><td>The command returns at step ⑥</td><td><strong>"created" means "stored", not "running"</strong> — use <code>rollout status</code></td></tr>
+      <tr><td>Everything after ⑥ is asynchronous</td><td>Failures appear in <code>status</code> and Events, never in your shell</td></tr>
+      <tr><td>Step ⑩ dominates the wall clock</td><td>Image pull is usually the slowest part by an order of magnitude</td></tr>
+      <tr><td>Step ⑫ is a separate loop</td><td>A pod can be Running for seconds before it receives traffic</td></tr>
+      <tr><td>Admission (④/⑤) is synchronous</td><td>A slow or down webhook <strong>blocks every write</strong> cluster-wide</td></tr>
     </table>
 
-    <h2>The Nodes (the muscle)</h2>
+<pre>
+$ time kubectl apply -f deployment.yaml
+deployment.apps/web created
+real    0m0.187s                       ← the API call
+
+$ time kubectl rollout status deploy/web
+Waiting for deployment "web" rollout to finish: 0 of 3 updated replicas are available...
+deployment "web" successfully rolled out
+real    0m23.410s                      ← reality catching up
+</pre>
+
+    <h2>Part 5 — etcd, Quorum and the Blast Radius of a Control-Plane Outage</h2>
+
+    <p>etcd uses Raft, so writes require a majority of members. The arithmetic produces one genuinely
+       counter-intuitive result that decides cluster sizing:</p>
+
     <table class="tbl">
-      <tr><th>Component</th><th>Role</th></tr>
-      <tr><td><strong>kubelet</strong></td><td>The agent on every node — talks to the API server, ensures the Pods assigned to its node are running and healthy (via the container runtime).</td></tr>
-      <tr><td><strong>Container runtime</strong></td><td>Actually runs containers (containerd/CRI-O) via the CRI — Docker is not required (internals lesson from the Docker track).</td></tr>
-      <tr><td><strong>kube-proxy</strong></td><td>Programs node networking rules so Service virtual IPs route to the right Pods.</td></tr>
+      <tr><th>Members</th><th>Quorum</th><th>Failures tolerated</th><th>Verdict</th></tr>
+      <tr><td>1</td><td>1</td><td>0</td><td>Dev only</td></tr>
+      <tr><td><strong>2</strong></td><td><strong>2</strong></td><td><strong>0</strong></td><td><strong>Worse than 1 — twice the failure surface, no more tolerance</strong></td></tr>
+      <tr><td>3</td><td>2</td><td>1</td><td>The standard choice</td></tr>
+      <tr><td>4</td><td>3</td><td>1</td><td>No gain over 3</td></tr>
+      <tr><td>5</td><td>3</td><td>2</td><td>Large or critical clusters</td></tr>
+      <tr><td>7+</td><td>4+</td><td>3+</td><td>Write latency now dominates</td></tr>
     </table>
 
-    <h2>How a Deployment Actually Happens (the flow)</h2>
-    <pre>1. You run:  kubectl apply -f deployment.yaml
-2. kubectl sends the object to the API SERVER, which validates it and writes it to ETCD.
-3. The DEPLOYMENT controller sees a new Deployment → creates a ReplicaSet.
-4. The REPLICASET controller sees "want 3 pods, have 0" → creates 3 Pod objects.
-5. The SCHEDULER sees unscheduled Pods → assigns each to a node.
-6. Each node's KUBELET sees Pods assigned to it → tells the runtime to pull images and start containers.
-7. kube-proxy + the network make the Pods reachable.
-// Every step is a controller reconciling desired vs actual state. No single component does it all.</pre>
+    <p>Now the question people get wrong in interviews. The control plane is completely down — what breaks?</p>
 
-    <h2>Key Objects You'll Meet (the vocabulary)</h2>
     <table class="tbl">
-      <tr><th>Object</th><th>What it is</th></tr>
-      <tr><td>Pod</td><td>The smallest deployable unit — one or more containers sharing network + storage</td></tr>
-      <tr><td>ReplicaSet</td><td>Keeps N identical Pods running</td></tr>
-      <tr><td>Deployment</td><td>Manages ReplicaSets → rolling updates & rollbacks (what you usually create)</td></tr>
-      <tr><td>Service</td><td>A stable virtual IP/DNS name load-balancing to a set of Pods</td></tr>
-      <tr><td>Namespace</td><td>A virtual cluster for isolating/organizing resources</td></tr>
-      <tr><td>Node</td><td>A worker machine (VM or physical) running Pods</td></tr>
+      <tr><th></th><th>Control plane down</th></tr>
+      <tr><td>Running pods</td><td><strong>✅ Keep running</strong> — the kubelet needs nobody</td></tr>
+      <tr><td>Service traffic between existing pods</td><td>✅ Keeps working — kube-proxy rules are already programmed</td></tr>
+      <tr><td>A container crashing</td><td>✅ Restarted — that is the kubelet's own loop</td></tr>
+      <tr><td>A <em>node</em> dying</td><td><strong>❌ Its pods are never rescheduled</strong></td></tr>
+      <tr><td>Deploys, scaling, HPA</td><td>❌ Nothing</td></tr>
+      <tr><td>New pods, or replacing a crash-looping one</td><td>❌ Stay Pending or never created</td></tr>
+      <tr><td>Endpoint updates</td><td><strong>❌ Frozen — a dead pod stays in a Service's endpoints</strong></td></tr>
+      <tr><td><code>kubectl</code> anything</td><td>❌ Connection refused</td></tr>
     </table>
 
-    <h2>Why Kubernetes (and when NOT to)</h2>
-    <pre>// Kubernetes gives you: self-healing, horizontal scaling, rolling zero-downtime deploys, service
-// discovery + load balancing, declarative config, and portability across clouds.
-// The cost: real operational complexity. For a single small app, Compose or a PaaS (managed
-// containers, serverless) is often simpler. Reach for K8s when you have many services, need
-// scale/HA across machines, or want a consistent platform across environments/teams.</pre>
+    <div class="note">🔑 <strong>A control-plane outage is a "cannot change anything" event, not a "everything is
+       down" event.</strong> That is a genuinely good property — but the frozen endpoint list is the sharp edge:
+       if a pod dies during the outage, its IP stays in the Service and a share of requests black-hole until the
+       control plane returns. Serving traffic survives; <em>changing</em> anything, and reacting to failure, does
+       not.</div>
+
+    <p>Two operational limits follow directly from etcd being the storage layer. A single object may not exceed
+       roughly <strong>1.5 MB</strong>, which is why a ConfigMap is not a file server, and the whole database is
+       usually capped at <strong>8 GB</strong> — reached far more often by unbounded Events or churning
+       Secrets than by legitimate workload objects.</p>
+
+    <h2>Part 6 — Deletion Is a Request, Not a Command</h2>
+
+    <p><code>kubectl delete</code> does not remove anything. It sets <code>metadata.deletionTimestamp</code>, and
+       the object survives until every entry in <code>metadata.finalizers</code> has been removed by whichever
+       controller owns it:</p>
+
+<pre>
+$ kubectl delete pvc data-web-0
+persistentvolumeclaim "data-web-0" deleted        ← the CLI lies; it means "requested"
+$ kubectl get pvc data-web-0
+NAME         STATUS        AGE
+data-web-0   Terminating   3m                     ← still here
+
+$ kubectl get pvc data-web-0 -o jsonpath='{.metadata.finalizers}'
+["kubernetes.io/pvc-protection"]
+   → this finalizer is held while ANY pod still mounts the claim. Delete the pod,
+     the controller removes the finalizer, and the object disappears by itself.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Stuck object</th><th>Usual finalizer</th><th>Real cause</th></tr>
+      <tr><td>PVC <code>Terminating</code></td><td><code>pvc-protection</code></td><td>A pod still mounts it</td></tr>
+      <tr><td>Namespace <code>Terminating</code></td><td><code>kubernetes</code></td><td><strong>An API service is unavailable</strong>, so contents cannot be enumerated</td></tr>
+      <tr><td>Custom resource stuck</td><td>An operator's finalizer</td><td>The operator is down or erroring</td></tr>
+      <tr><td>Service <code>Terminating</code></td><td>Cloud LB finalizer</td><td>Cloud load balancer deletion failing</td></tr>
+    </table>
+
+<pre>
+The namespace case, diagnosed properly rather than force-patched:
+
+$ kubectl get ns staging -o jsonpath='{.status.conditions}' | jq -r '.[].message'
+Discovery failed for some groups: [metrics.k8s.io/v1beta1: the server is currently
+unable to handle the request]
+$ kubectl get apiservice | grep -v True
+v1beta1.metrics.k8s.io   kube-system/metrics-server   False (ServiceNotFound)
+   → fix the broken APIService and the namespace deletes itself in seconds
+</pre>
+
+    <div class="note">⚠️ <strong>Force-removing a finalizer is data loss with extra steps.</strong>
+       <code>kubectl patch ... -p '{"metadata":{"finalizers":null}}'</code> is the answer at the top of every
+       search result, and it deletes the object while leaving the real-world resource it was protecting behind — an
+       orphaned cloud disk, a load balancer still costing money, a leaked volume. The finalizer is a controller
+       saying "I am not finished"; the correct move is to find out why.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Treating <code>kubectl apply</code> as a deploy command, editing ReplicaSets directly when
+         something looks wrong, and running a two-member etcd for "redundancy".</strong> CI runs
+         <code>kubectl apply</code>, gets exit 0, and reports the deploy green — while the new pods are stuck
+         <code>ImagePullBackOff</code> and the old ones are still serving, because the command only recorded
+         intent in etcd. When a pod misbehaves, someone scales its ReplicaSet by hand and is baffled when the
+         change disappears within a second, so they do it again, harder. The control plane goes down during an
+         incident and the team declares a total outage, when in fact every running pod is serving normally and
+         the real damage is subtler: endpoints are frozen, so the one pod that <em>did</em> die is still receiving
+         a third of the traffic. And the two-member etcd cluster, added for high availability, tolerates zero
+         failures — strictly worse than the single member it replaced. Finally a namespace sticks in
+         <code>Terminating</code>, so the finalizer is patched away, which "fixes" it and leaks a cloud load
+         balancer that bills for a year.</p>
+      <p>✅ <strong>Treat every write as a statement of desired state, verify convergence separately, and change
+         the top of the ownership chain.</strong> Follow <code>apply</code> with
+         <code>kubectl rollout status --timeout=5m</code> so CI fails when reality does not catch up, and read
+         Events rather than the command's exit code — everything after the write is asynchronous by design. Never
+         edit an object that has an owner; the Deployment controller will revert it, correctly, in about a second.
+         Size etcd at 3 or 5 members, never an even number, and know precisely what a control-plane outage costs:
+         running pods and existing Service traffic are fine, but nothing can change, nothing reschedules, and the
+         endpoint list freezes with dead pods still in it. And when an object hangs in <code>Terminating</code>,
+         read its finalizers and find the controller that is not finished — a stuck namespace is almost always an
+         unavailable APIService, and force-patching the finalizer leaks whatever it was protecting.</p>
+    </div>
 
     <h2>Common Mistakes</h2>
+
     <table class="tbl">
-      <tr><th>Misconception</th><th>Reality</th></tr>
-      <tr><td>"I run commands to change the cluster"</td><td>You declare desired state; controllers reconcile continuously</td></tr>
-      <tr><td>"The API server does the work"</td><td>It only stores/serves state; controllers + kubelet do the work</td></tr>
-      <tr><td>"etcd is just a cache"</td><td>It's the single source of truth — losing it loses the cluster state</td></tr>
-      <tr><td>"Kubernetes needs Docker"</td><td>It uses the CRI (containerd/CRI-O); Docker not required</td></tr>
-      <tr><td>"A Pod = a container"</td><td>A Pod can hold multiple containers sharing network/storage</td></tr>
-      <tr><td>"Always use Kubernetes"</td><td>It adds real complexity — justify it with scale/HA/many services</td></tr>
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Treating <code>apply</code> as "deployed"</td><td>It returns after the etcd write; everything real is asynchronous</td><td><code>kubectl rollout status</code> in CI</td></tr>
+      <tr><td>Editing a ReplicaSet or owned Pod</td><td>Reconciliation reverts it in about a second</td><td>Change the Deployment</td></tr>
+      <tr><td>Expecting the scheduler to rebalance</td><td>Placement is a one-time decision</td><td>descheduler, or accept it</td></tr>
+      <tr><td>"Control plane down = everything down"</td><td>Running pods and kube-proxy rules are unaffected</td><td>Know the real blast radius: no changes, frozen endpoints</td></tr>
+      <tr><td>Two etcd members for HA</td><td>Quorum is 2, so it tolerates <strong>zero</strong> failures</td><td>3 or 5, always odd</td></tr>
+      <tr><td>Large data in ConfigMaps</td><td>~1.5 MB per object; etcd is not a file store</td><td>A volume, an image, or object storage</td></tr>
+      <tr><td>Ignoring etcd size and Event churn</td><td>~8 GB cap, usually reached by Events</td><td>Monitor DB size; tune Event TTL</td></tr>
+      <tr><td>Force-removing finalizers</td><td>Leaks the real resource the finalizer protected</td><td>Find the controller that is stuck</td></tr>
+      <tr><td>A failing admission webhook with <code>failurePolicy: Fail</code></td><td>Admission is synchronous — <strong>it blocks every write</strong></td><td>Namespace selectors, timeouts, and test the failure mode</td></tr>
+      <tr><td>Reading only <code>spec</code> when debugging</td><td><code>status</code> is where controllers report reality</td><td><code>kubectl get -o yaml</code>, plus Events</td></tr>
+      <tr><td>Assuming Running means receiving traffic</td><td>Endpoint programming is a separate loop</td><td>Check the EndpointSlice</td></tr>
+      <tr><td>Expecting an error when something fails</td><td>Level-triggered systems retry silently for ever</td><td>Alert on desired vs ready, not on command output</td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1: Explain the reconciliation loop and why it's central to Kubernetes.</summary>
-      <p>Kubernetes is declarative: you submit objects describing the DESIRED state (e.g., "3 replicas of this
-         Deployment"), and for each object a controller runs a continuous control loop that observes the
-         ACTUAL state, compares it to the desired state, and takes corrective action to converge them. If a
-         Pod crashes and actual replicas drop below desired, the ReplicaSet controller creates a replacement;
-         if you change the desired image, the Deployment controller rolls out new Pods. This loop is why
-         Kubernetes self-heals, scales, and performs rollouts without you scripting the steps — you change
-         the desired state (the YAML) and the system does the rest. Almost every Kubernetes behavior is an
-         instance of this "desired state, continuously reconciled" pattern, which is why it's the first thing
-         to understand.</p></details>
-    <details class="solution"><summary>Q2: Walk through what happens when you kubectl apply a Deployment.</summary>
-      <p>kubectl sends the Deployment object to the kube-apiserver, which authenticates, authorizes,
-         validates it, and persists it to etcd (the cluster's source of truth; the API server is the only
-         component that writes to etcd). The Deployment controller (in the controller-manager) notices the
-         new Deployment and creates a ReplicaSet; the ReplicaSet controller sees it needs N Pods and none
-         exist, so it creates N Pod objects. The scheduler watches for unscheduled Pods and assigns each to a
-         suitable node based on resource requests, affinity/anti-affinity, taints/tolerations, etc. On each
-         chosen node, the kubelet notices Pods assigned to it and instructs the container runtime (via the
-         CRI) to pull images and start the containers, then reports status back. kube-proxy and the CNI
-         network make the Pods reachable, and a Service provides a stable endpoint. Every step is an
-         independent controller reconciling desired versus actual state — no single component performs the
-         whole deployment.</p></details>
-    <details class="solution"><summary>Q3: What are the control plane components and what does each do?</summary>
-      <p>The control plane is the cluster's brain. The kube-apiserver is the front door: a REST API that all
-         components and users talk to, which validates and serves every object and is the sole writer to
-         etcd. etcd is a consistent, distributed key-value store holding all cluster state — the source of
-         truth, so it's backed up and run with quorum for HA. The kube-scheduler assigns unscheduled Pods to
-         nodes based on resource availability and placement constraints. The kube-controller-manager runs the
-         built-in control loops (Deployment, ReplicaSet, Node, Job controllers, etc.) that reconcile desired
-         and actual state. The cloud-controller-manager integrates with the cloud provider for load
-         balancers, storage, and node lifecycle. On the worker side, each node runs a kubelet (ensures its
-         assigned Pods are running/healthy via the container runtime) and kube-proxy (programs networking so
-         Service IPs route to Pods). Separating a declarative API + state store from many focused controllers
-         is what makes Kubernetes extensible and resilient.</p></details>
 
-    <div class="exercise"><strong>🏋️ Practice:</strong> spin up a local cluster (kind/minikube); run kubectl get nodes and kubectl get pods -A to see the control-plane + system pods; kubectl apply a simple Deployment and watch kubectl get pods; delete a pod and watch the ReplicaSet recreate it (reconciliation in action); use kubectl describe on a Pod to see its node assignment and events; explore kubectl get deploy,rs,pod to see the Deployment→ReplicaSet→Pod hierarchy.</div>
+    <details class="solution"><summary><strong>Beginner:</strong> What happens when you run <code>kubectl apply -f deployment.yaml</code>?</summary>
+      <p><strong>The object is written to etcd, and the command returns. Everything else happens
+         afterwards, asynchronously, in separate control loops.</strong></p>
+<pre>
+kubectl → apiserver: authN → authZ (RBAC) → mutating admission → validation →
+          validating admission → write to etcd  ── the command returns HERE ──
+then, independently:
+  deployment ctrl → creates a ReplicaSet
+  replicaset ctrl → creates Pods (with no node yet)
+  scheduler       → writes spec.nodeName
+  kubelet         → pulls the image, calls the CRI, starts containers
+  endpoint ctrl   → adds Ready pods to the Service
+</pre>
+      <p><strong>The point to make:</strong> "deployment created" means <em>stored</em>, not <em>running</em>. The
+         image may not exist, the nodes may be full, admission may have mutated your spec — none of that appears
+         in your shell. Measured, the apply took 0.19 s and the rollout took 23 s.</p>
+      <p>So CI must follow it with <code>kubectl rollout status deploy/web --timeout=5m</code>, which is what
+         actually turns a failed rollout into a failed pipeline.</p>
+    </details>
 
-    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li>Kubernetes is declarative: you specify desired state and controllers reconcile it continuously (self-healing, scaling, rollouts).</li>
-      <li>Control plane = apiserver (front door), etcd (source of truth), scheduler (placement), controller-manager (control loops).</li>
-      <li>Nodes run kubelet (keeps assigned Pods healthy), a CRI runtime (containerd/CRI-O — no Docker needed), and kube-proxy (Service networking).</li>
-      <li>apply → apiserver → etcd → controllers create ReplicaSet/Pods → scheduler places → kubelet runs them.</li>
-      <li>K8s buys self-healing/scale/HA at the cost of complexity — justify it; smaller apps may prefer Compose/PaaS.</li>
-    </ul></div>
+    <details class="solution"><summary><strong>Beginner:</strong> What does the scheduler actually do?</summary>
+      <p><strong>It picks a node for pods that do not have one, and records that decision by writing
+         <code>spec.nodeName</code>.</strong> That single field is its entire output.</p>
+<pre>
+① FILTER  — nodes that cannot work are eliminated:
+     insufficient allocatable CPU/memory for the pod's REQUESTS
+     taints the pod does not tolerate, nodeSelector/affinity mismatches
+     no free host port, volume zone conflicts
+② SCORE   — survivors are ranked: spread across nodes, image already present,
+     least-allocated or most-allocated, affinity preferences
+③ BIND    — write spec.nodeName; the kubelet on that node takes it from there
+</pre>
+      <p>You can prove the field is the whole mechanism by setting <code>nodeName</code> yourself: the pod runs
+         with the scheduler never involved. Stop the scheduler and new pods sit <code>Pending</code> with an empty
+         <code>nodeName</code>.</p>
+      <p><strong>Two follow-ups worth pre-empting:</strong> scheduling uses <strong>requests</strong>, not limits
+         and not actual usage — a node whose pods request 100% of its CPU takes no more pods even if it is idle.
+         And the decision is <strong>never revisited</strong>: the scheduler will not move a running pod, however
+         unbalanced the cluster becomes.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain level-triggered versus edge-triggered, and why Kubernetes chose one.</summary>
+      <p><strong>Edge-triggered reacts to events; level-triggered reacts to state.</strong> Kubernetes controllers
+         continuously compare desired with observed and act on the difference — they never rely on having seen a
+         particular event.</p>
+      <table class="tbl">
+        <tr><th>Situation</th><th>Edge-triggered</th><th>Level-triggered</th></tr>
+        <tr><td>Event missed (network blip)</td><td><strong>Permanent divergence</strong></td><td>Fixed next pass</td></tr>
+        <tr><td>Controller restarts</td><td>Must replay history</td><td>Reads current state</td></tr>
+        <tr><td>Duplicate delivery</td><td>Needs dedup logic</td><td>Second pass is a no-op</td></tr>
+        <tr><td>Someone edits by hand</td><td>Undetected drift</td><td>Reverted</td></tr>
+      </table>
+      <p><strong>Why it matters practically:</strong> this is why deleting a pod is safe, why controllers can be
+         restarted mid-operation, and why watches are an <em>optimisation</em> — a controller that loses its watch
+         re-lists and continues, so no work is lost. It is also why GitOps works: an outer loop can reconcile the
+         cluster to Git using the exact same mechanic.</p>
+      <p><strong>The cost, honestly:</strong> nothing is ever "done", so there is no meaningful success return
+         code, and failures retry silently for ever instead of surfacing. Observability therefore has to be built
+         on <em>desired versus actual</em> — replicas ready versus wanted, generation versus observedGeneration —
+         rather than on command exit codes.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> The control plane is completely down. What still works, and what does not?</summary>
+      <p><strong>Serving keeps working; changing anything does not.</strong> The kubelet caches its assigned pods
+         and talks straight to the container runtime, and kube-proxy's rules are already programmed into the data
+         path.</p>
+      <table class="tbl">
+        <tr><th>Works</th><th>Does not</th></tr>
+        <tr><td>Running pods keep running</td><td>Any deploy, scale or HPA action</td></tr>
+        <tr><td>Service traffic between existing pods</td><td>Rescheduling pods from a failed node</td></tr>
+        <tr><td>Container restarts on crash (kubelet)</td><td>Creating any new pod</td></tr>
+        <tr><td>Existing DNS records</td><td><strong>Endpoint updates — dead pods stay in Services</strong></td></tr>
+      </table>
+      <p><strong>The subtle damage is the frozen endpoint list.</strong> If a pod dies during the outage its IP
+         remains in the Service, so a share of requests black-hole until the control plane returns. Serving
+         survives, but the cluster's ability to <em>react to failure</em> is exactly what is gone — so a
+         simultaneous node failure is what turns this from an inconvenience into an outage.</p>
+      <p><strong>On availability design:</strong> etcd needs an odd member count — 3 tolerates one failure, 5
+         tolerates two, and <strong>2 tolerates none</strong> while doubling the failure surface. Spread members
+         across failure domains, and remember that a slow or unavailable admission webhook with
+         <code>failurePolicy: Fail</code> produces the same "cannot change anything" symptom without any component
+         actually being down.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How would you design a custom controller, and what does the reconciliation model force you to get right?</summary>
+      <p><strong>Write a loop that computes desired state from the object's <code>spec</code> alone, compares it
+         with observed reality, and takes the smallest step toward convergence — then let it be called again.</strong></p>
+<pre>
+Reconcile(ctx, req):
+    obj := Get(req)                       // not found → it was deleted; clean up
+    if obj.DeletionTimestamp != nil {     // deletion is a REQUEST
+        cleanupExternalResources()        // the reason your finalizer exists
+        removeFinalizer(); return
+    }
+    ensureFinalizer(obj)
+    desired := computeFrom(obj.Spec)      // pure function of spec — no hidden state
+    actual  := observeWorld()
+    if diff := desired.Diff(actual); !diff.Empty() {
+        apply(diff)
+        return Result{Requeue: true}      // do NOT loop internally; return
+    }
+    updateStatus(obj, observed)           // status only ever DESCRIBES reality
+</pre>
+      <p><strong>What the model forces on you, and where implementations go wrong:</strong></p>
+      <ul>
+        <li><strong>Idempotence.</strong> Reconcile will be called repeatedly with the same state — on resyncs,
+            on unrelated updates, after restarts. If calling it twice does something twice, you have a bug.</li>
+        <li><strong>No state in the controller's memory.</strong> It can be restarted at any moment; everything
+            durable belongs in the object's <code>status</code> or in the world itself.</li>
+        <li><strong>Spec is desire, status is observation.</strong> Controllers must never write another
+            controller's spec, and must never store desire in status.</li>
+        <li><strong>Return instead of waiting.</strong> Blocking inside Reconcile ties up a worker; requeue with
+            backoff and let the next call make progress.</li>
+        <li><strong>Finalizers for anything outside the cluster.</strong> Without one, deleting the object leaks
+            the cloud resource. With one, a broken controller wedges deletion — so the cleanup path needs to be
+            more robust than the create path, and must tolerate the resource already being gone.</li>
+        <li><strong>Ownership references</strong> so children are garbage-collected, and so your own edits are not
+            fighting another controller for the same object.</li>
+      </ul>
+      <p><strong>The operational failure mode to design against</strong> is the hot loop: a controller that writes
+         status on every reconcile triggers its own watch, reconciles again, and saturates the API server. Write
+         status only when it actually changed, use rate limiting and exponential backoff, and treat "reconciles per
+         second" as a metric you alert on.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A namespace has been <code>Terminating</code> for two hours. Walk through it.</summary>
+      <p><strong>Deletion is a request. The namespace stays until its finalizer is removed, and the namespace
+         controller will not remove it until it can enumerate and delete everything inside — which requires every
+         API group to respond.</strong></p>
+<pre>
+$ kubectl get ns staging -o jsonpath='{.status.conditions}' | jq -r '.[] | "\(.type): \(.message)"'
+NamespaceDeletionDiscoveryFailure: Discovery failed for some groups:
+  [metrics.k8s.io/v1beta1: the server is currently unable to handle the request]
+
+$ kubectl get apiservice | grep -v True
+v1beta1.metrics.k8s.io   kube-system/metrics-server   False (ServiceNotFound)
+</pre>
+      <p><strong>The cause is almost always an unavailable aggregated APIService</strong> — a metrics server or a
+         webhook-backed API whose Service no longer exists. The namespace controller cannot prove the namespace is
+         empty, so it correctly refuses to finish. Fix or delete the broken APIService and the namespace completes
+         in seconds.</p>
+      <table class="tbl">
+        <tr><th>Condition</th><th>Meaning</th><th>Fix</th></tr>
+        <tr><td><code>DeletionDiscoveryFailure</code></td><td>An API group will not respond</td><td>Repair or remove the APIService</td></tr>
+        <tr><td><code>DeletionContentFailure</code></td><td>Some resource will not delete</td><td>Find it; usually a CR with a stuck operator finalizer</td></tr>
+        <tr><td><code>ContentHasTerminatingPods</code></td><td>Pods still shutting down</td><td>Wait, or check a long <code>terminationGracePeriodSeconds</code></td></tr>
+      </table>
+      <p><strong>Why I would not simply patch the finalizer away</strong>, which is the universal internet advice:
+         it makes the namespace object vanish while leaving its contents orphaned — objects with no namespace,
+         cloud load balancers and disks still provisioned and billing, and operators holding references to
+         resources that no longer appear anywhere. You get a clean <code>kubectl get ns</code> and a mess
+         underneath, and the same broken APIService will do it again next week.</p>
+      <p><strong>The preventative</strong> is to treat aggregated APIServices and webhooks as cluster-critical:
+         alert on <code>APIService</code> availability, always set a
+         <code>namespaceSelector</code> on webhooks so they cannot intercept <code>kube-system</code>, and prefer
+         <code>failurePolicy: Ignore</code> for anything that is not a security control.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Watch reconciliation revert your changes, at three levels.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy web --image=nginx:alpine --replicas=3
+$ kubectl get rs -l app=web
+NAME             DESIRED   CURRENT   READY
+web-7d4b9c8f5d   3         3         3
+</pre>
+<pre>
+① delete a Pod → the ReplicaSet controller replaces it
+$ kubectl delete pod -l app=web --field-selector status.phase=Running \
+    --wait=false | head -1
+pod "web-7d4b9c8f5d-x8k2p" deleted
+$ kubectl get pods -l app=web --sort-by=.metadata.creationTimestamp \
+    -o custom-columns=NAME:.metadata.name,AGE:.metadata.creationTimestamp
+web-7d4b9c8f5d-m4j1q   2026-08-19T12:31:02Z
+web-7d4b9c8f5d-p9v3w   2026-08-19T12:31:02Z
+web-7d4b9c8f5d-t2h8n   2026-08-19T12:34:41Z      ← recreated ~1 s after deletion
+
+② scale the ReplicaSet → the Deployment controller reverts it
+$ kubectl scale rs web-7d4b9c8f5d --replicas=5
+replicaset.apps/web-7d4b9c8f5d scaled
+$ sleep 3; kubectl get rs web-7d4b9c8f5d
+DESIRED   CURRENT   READY
+3         3         3                             ← reverted, silently
+
+③ scale the Deployment → nothing reverts it; it is the top of the chain
+$ kubectl scale deploy web --replicas=5
+$ sleep 3; kubectl get rs -l app=web -o custom-columns=DESIRED:.spec.replicas
+DESIRED
+5                                                 ← persists
+</pre>
+<p>Confirm the chain of ownership that produced that behaviour:</p>
+<pre>
+$ kubectl get pod -l app=web -o jsonpath='{.items[0].metadata.ownerReferences[0].kind}{"/"}{.items[0].metadata.ownerReferences[0].name}{"\n"}'
+ReplicaSet/web-7d4b9c8f5d
+$ kubectl get rs web-7d4b9c8f5d -o jsonpath='{.metadata.ownerReferences[0].kind}{"/"}{.metadata.ownerReferences[0].name}{"\n"}'
+Deployment/web
+</pre>
+<table class="tbl">
+  <tr><th>Edited</th><th>Owner</th><th>Result</th></tr>
+  <tr><td>Pod</td><td>ReplicaSet</td><td>Recreated in ~1 s</td></tr>
+  <tr><td>ReplicaSet</td><td>Deployment</td><td>Reverted in ~1 s</td></tr>
+  <tr><td>Deployment</td><td><strong>None</strong></td><td>Persists</td></tr>
+</table>
+<p><strong>Rule:</strong> always change the object with no <code>ownerReferences</code>. Anything below it is
+   a cache being continuously rewritten.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove that <code>apply</code> returning success means nothing about running.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > bad.yaml &lt;&lt;'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: broken }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: broken } }
+  template:
+    metadata: { labels: { app: broken } }
+    spec:
+      containers:
+      - name: c
+        image: myco/does-not-exist:9.9.9
+EOF
+
+$ time kubectl apply -f bad.yaml
+deployment.apps/broken created
+real    0m0.187s
+$ echo $?
+0                                     ← SUCCESS. Nothing is running and never will be.
+</pre>
+<pre>
+$ kubectl get deploy broken
+NAME     READY   UP-TO-DATE   AVAILABLE
+broken   0/2     2            0
+$ kubectl get pods -l app=broken
+NAME                      READY   STATUS             RESTARTS
+broken-6c9f8d7b4-2qk8l    0/1     ImagePullBackOff   0
+$ kubectl get events --field-selector reason=Failed --sort-by=.lastTimestamp | tail -1
+2s   Failed   pod/broken-6c9f8d7b4-2qk8l   Error: ErrImagePull ... not found
+</pre>
+<pre>
+The check that turns this into a failed pipeline:
+$ kubectl rollout status deploy/broken --timeout=60s
+Waiting for deployment "broken" rollout to finish: 0 of 2 updated replicas are available...
+error: timed out waiting for the condition
+$ echo $?
+1                                     ← CI now fails, correctly
+</pre>
+<p>The generation fields are the machine-readable version of the same question:</p>
+<pre>
+$ kubectl get deploy broken -o jsonpath='gen={.metadata.generation} observed={.status.observedGeneration} ready={.status.readyReplicas}{"\n"}'
+gen=1 observed=1 ready=                ← the controller SAW it (observed=1)
+                                         and reality never arrived (ready empty)
+</pre>
+<table class="tbl">
+  <tr><th>Signal</th><th>Means</th></tr>
+  <tr><td><code>apply</code> exit 0</td><td>Stored in etcd. Nothing more.</td></tr>
+  <tr><td><code>observedGeneration == generation</code></td><td>The controller has processed your change</td></tr>
+  <tr><td><code>readyReplicas == replicas</code></td><td><strong>Reality actually converged</strong></td></tr>
+  <tr><td><code>rollout status</code> exit 0</td><td>The above, with a timeout — use this in CI</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Bypass the scheduler, then stop it, and observe exactly what it contributes.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+① a pod with nodeName set by hand — the scheduler is never involved
+$ kubectl get nodes -o name | head -2
+node/worker-1
+node/worker-2
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: { name: manual }
+spec:
+  nodeName: worker-2
+  containers: [{ name: c, image: nginx:alpine }]
+EOF
+$ kubectl get pod manual -o wide
+NAME     READY   STATUS    NODE
+manual   1/1     Running   worker-2
+
+$ kubectl get events --field-selector involvedObject.name=manual \
+    -o custom-columns=REASON:.reason,SOURCE:.source.component
+REASON    SOURCE
+Pulled    kubelet
+Created   kubelet
+Started   kubelet                     ← NO "Scheduled" event, no default-scheduler
+</pre>
+<pre>
+② stop the scheduler and create a normal pod
+$ kubectl -n kube-system get pods -l component=kube-scheduler
+kube-scheduler-cp-1   1/1   Running
+$ sudo mv /etc/kubernetes/manifests/kube-scheduler.yaml /tmp/   # kubeadm: static pod
+$ sleep 10; kubectl -n kube-system get pods -l component=kube-scheduler
+No resources found
+
+$ kubectl run test --image=nginx:alpine
+$ sleep 20; kubectl get pod test
+NAME   READY   STATUS    AGE
+test   0/1     Pending   20s
+$ kubectl get pod test -o jsonpath='nodeName=[{.spec.nodeName}]{"\n"}'
+nodeName=[]                           ← the single missing field
+$ kubectl describe pod test | grep -A2 Events
+Events:  &lt;none&gt;                       ← not even a FailedScheduling event: nothing
+                                        is looking at it at all
+</pre>
+<pre>
+③ the pod is not broken — supply the field yourself and it runs
+$ kubectl patch pod test -p '{"spec":{"nodeName":"worker-1"}}' 2>&amp;1 | head -1
+   (nodeName is immutable after creation — recreate it instead)
+$ kubectl delete pod test &amp;&amp; kubectl run test --image=nginx:alpine \
+    --overrides='{"spec":{"nodeName":"worker-1"}}'
+$ kubectl get pod test
+NAME   READY   STATUS    AGE
+test   1/1     Running   4s            ← with no scheduler running at all
+
+$ sudo mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/   # restore
+$ sleep 15; kubectl get pods --field-selector status.phase=Pending
+No resources found                     ← the backlog schedules itself immediately
+</pre>
+<p><strong>Two conclusions.</strong> The scheduler's entire output is one string field, and everything else —
+   image pull, container start, status reporting — belongs to the kubelet. And because the system is
+   level-triggered, restarting the scheduler needs no catch-up logic: it lists pods with an empty
+   <code>nodeName</code> and drains the backlog.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Take the control plane down and measure the real blast radius.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy web --image=nginx:alpine --replicas=3
+$ kubectl expose deploy web --port=80
+$ kubectl run probe --image=nicolaka/netshoot -- sleep 3600
+$ kubectl exec probe -- sh -c 'for i in $(seq 5); do wget -qO- --timeout=2 web | head -c 15; echo; done'
+<!DOCTYPE html>
+<!DOCTYPE html>   ...                  ← baseline: working
+</pre>
+<pre>
+$ sudo mv /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/
+$ sleep 15
+$ kubectl get pods
+The connection to the server 10.0.0.10:6443 was refused
+
+STILL WORKING (verified from inside the cluster, since kubectl is gone):
+$ sudo crictl ps --name nginx -o json | jq -r '.containers | length'
+3                                      ← all three pods still running
+$ sudo crictl exec $(sudo crictl ps -q --name netshoot) \
+    wget -qO- --timeout=2 web | head -c 15
+<!DOCTYPE html>                        ← Service traffic still resolves and routes
+
+$ sudo crictl stop $(sudo crictl ps -q --name nginx | head -1)
+$ sleep 10; sudo crictl ps --name nginx -o json | jq -r '.containers | length'
+3                                      ← the KUBELET restarted the container itself
+</pre>
+<pre>
+BROKEN — and this is the sharp edge:
+$ sudo crictl rm -f $(sudo crictl ps -aq --name nginx | head -1)   # simulate a pod dying
+$ sudo iptables-save | grep -c 'KUBE-SEP.*web'
+3                                      ← the endpoint list still has THREE entries
+$ sudo crictl exec $(sudo crictl ps -q --name netshoot) sh -c \
+    'for i in $(seq 30); do wget -qO- --timeout=1 web >/dev/null 2>&1 || echo FAIL; done' | wc -l
+11                                     ← ~1/3 of requests black-hole
+</pre>
+<pre>
+$ sudo mv /tmp/kube-apiserver.yaml /etc/kubernetes/manifests/
+$ sleep 30; kubectl get endpointslices -l kubernetes.io/service-name=web \
+    -o jsonpath='{.items[0].endpoints[*].addresses[0]}{"\n"}'
+10.244.1.7 10.244.2.4                  ← endpoint list corrected within seconds
+$ kubectl get pods -l app=web | tail -1
+web-7d4b9c8f5d-nn4kz   1/1   Running   0   12s      ← replacement created
+</pre>
+<table class="tbl">
+  <tr><th>Behaviour</th><th>During the outage</th></tr>
+  <tr><td>Existing pods</td><td>✅ Running</td></tr>
+  <tr><td>Service traffic to healthy pods</td><td>✅ Works</td></tr>
+  <tr><td>Container crash restart</td><td>✅ kubelet handles it</td></tr>
+  <tr><td>Replacing a deleted pod</td><td>❌ No</td></tr>
+  <tr><td><strong>Endpoint removal for a dead pod</strong></td><td><strong>❌ Frozen — 11 of 30 requests failed</strong></td></tr>
+  <tr><td>Recovery after restore</td><td>Automatic, within seconds</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Reproduce a stuck namespace and fix it without deleting the finalizer.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create ns doomed
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata: { name: v1beta1.example.io }
+spec:
+  group: example.io
+  version: v1beta1
+  groupPriorityMinimum: 100
+  versionPriority: 100
+  service: { name: nonexistent, namespace: doomed, port: 443 }
+EOF
+$ kubectl get apiservice v1beta1.example.io
+NAME                 SERVICE            AVAILABLE                  AGE
+v1beta1.example.io   doomed/nonexistent False (ServiceNotFound)    5s
+
+$ kubectl delete ns doomed --wait=false
+namespace "doomed" deleted
+$ sleep 30; kubectl get ns doomed
+NAME     STATUS        AGE
+doomed   Terminating   3m
+</pre>
+<pre>
+DIAGNOSE — the condition names the cause exactly:
+$ kubectl get ns doomed -o jsonpath='{.status.conditions}' | jq -r '.[] | "\(.type)=\(.status): \(.message)"'
+NamespaceDeletionDiscoveryFailure=True: Discovery failed for some groups:
+  [example.io/v1beta1: the server is currently unable to handle the request]
+NamespaceContentRemaining=False:
+NamespaceFinalizersRemaining=False:
+
+$ kubectl get ns doomed -o jsonpath='{.spec.finalizers}{"\n"}'
+["kubernetes"]
+
+$ kubectl api-resources 2>&amp;1 | grep -i error
+error: unable to retrieve the complete list of server APIs: example.io/v1beta1: ...
+   → the namespace controller cannot ENUMERATE the namespace, so it cannot prove
+     it is empty, so it correctly refuses to finish.
+</pre>
+<pre>
+FIX — repair the cause, not the symptom:
+$ kubectl delete apiservice v1beta1.example.io
+apiservice.apiregistration.k8s.io "v1beta1.example.io" deleted
+$ sleep 10; kubectl get ns doomed
+Error from server (NotFound): namespaces "doomed" not found     ← gone by itself
+</pre>
+<p>Contrast with the advice found in every search result:</p>
+<pre>
+$ kubectl get ns doomed -o json | jq 'del(.spec.finalizers)' \
+    | kubectl replace --raw /api/v1/namespaces/doomed/finalize -f -
+   → the namespace object disappears immediately, AND:
+     · objects that were inside it are orphaned with a namespace that no longer exists
+     · cloud load balancers and PVs provisioned by those objects keep billing
+     · the broken APIService is still there and will do this again next week
+</pre>
+<table class="tbl">
+  <tr><th>Condition</th><th>Cause</th><th>Correct fix</th></tr>
+  <tr><td><code>DeletionDiscoveryFailure</code></td><td>An APIService is unavailable</td><td>Repair or delete the APIService</td></tr>
+  <tr><td><code>DeletionContentFailure</code></td><td>A resource will not delete</td><td>Find the CR whose operator is down</td></tr>
+  <tr><td><code>ContentHasTerminatingPods</code></td><td>Pods still shutting down</td><td>Wait; check terminationGracePeriodSeconds</td></tr>
+</table>
+<p><strong>Preventative:</strong> alert on <code>APIService</code> availability, and always give admission
+   webhooks a <code>namespaceSelector</code> so they cannot intercept system namespaces — the same class of
+   failure blocks every write in the cluster.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Show that a synchronous admission webhook can block the entire cluster.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata: { name: blocker }
+webhooks:
+- name: blocker.example.io
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  failurePolicy: Fail                    ← the default, and the whole problem
+  timeoutSeconds: 10
+  clientConfig:
+    service: { name: nonexistent, namespace: default, path: /validate, port: 443 }
+  rules:
+  - apiGroups: ["*"], apiVersions: ["*"], operations: ["CREATE","UPDATE"]
+    resources: ["pods","deployments","configmaps"]
+EOF
+</pre>
+<pre>
+$ time kubectl create deploy canary --image=nginx:alpine
+Error from server (InternalError): Internal error occurred: failed calling webhook
+"blocker.example.io": failed to call webhook: Post "https://nonexistent.default.svc:443/validate":
+service "nonexistent" not found
+real    0m10.240s                        ← every write pays the full timeout, then fails
+
+$ kubectl create configmap x --from-literal=a=b
+Error from server (InternalError): ... failed calling webhook ...
+$ kubectl scale deploy web --replicas=4
+Error from server (InternalError): ... failed calling webhook ...
+                                         ← the cluster is now READ-ONLY
+
+$ kubectl get pods                       ← reads are unaffected
+NAME                     READY   STATUS
+web-7d4b9c8f5d-m4j1q     1/1     Running
+
+$ kubectl get pods -l app=web -o name | head -1 | xargs kubectl delete
+pod "web-7d4b9c8f5d-m4j1q" deleted       ← DELETE was not in our rules, so it works
+$ sleep 5; kubectl get pods -l app=web | wc -l
+3                                        ← and the replacement CANNOT be created:
+$ kubectl get events --field-selector reason=FailedCreate | tail -1
+FailedCreate  replicaset/web-7d4b9c8f5d  Error creating: Internal error occurred:
+  failed calling webhook "blocker.example.io"
+   → self-healing itself is now broken
+</pre>
+<pre>
+$ kubectl delete validatingwebhookconfiguration blocker
+$ sleep 3; kubectl get pods -l app=web | tail -1
+web-7d4b9c8f5d-9x2mv   1/1   Running   0   2s     ← recovers on its own
+</pre>
+<table class="tbl">
+  <tr><th>Mitigation</th><th>Effect</th></tr>
+  <tr><td><code>failurePolicy: Ignore</code></td><td>Writes proceed when the webhook is down — right for anything that is not a security control</td></tr>
+  <tr><td><code>namespaceSelector</code> excluding <code>kube-system</code></td><td>Never block the components you need to fix it</td></tr>
+  <tr><td>Narrow <code>rules</code></td><td>Scope the blast radius to the resources you actually police</td></tr>
+  <tr><td>Low <code>timeoutSeconds</code> (1–5)</td><td>Bounds the latency added to every single write</td></tr>
+  <tr><td>Webhook runs HA, and never gated by itself</td><td>Otherwise its own pods cannot be created after an outage — a deadlock</td></tr>
+</table>
+<p><strong>The generalisable lesson:</strong> admission is the one <em>synchronous</em> step in an otherwise
+   asynchronous, self-healing system. Everything else retries for ever and eventually converges; a failing
+   webhook stops convergence entirely, which is why it is the most common cause of a cluster that is up but
+   completely unable to change.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Kubernetes is <strong>a database (etcd) with control loops attached</strong>; the API server is the only component that writes to it, and no controller talks to another controller.</li>
+        <li>Controllers are <strong>level-triggered</strong>: they compare desired with observed state, so missed events, duplicates and restarts are all harmless.</li>
+        <li>The price is that <strong>nothing is ever "done"</strong> — failures retry silently, so observability must be built on desired versus actual, not on command exit codes.</li>
+        <li>Editing an owned object is writing to a cache: a deleted pod returned in ~1 s and a hand-scaled ReplicaSet was reverted in ~3 s. <strong>Always change the object with no <code>ownerReferences</code></strong>.</li>
+        <li><strong>The scheduler's entire output is <code>spec.nodeName</code></strong> — setting it by hand runs a pod with no scheduler at all, and stopping the scheduler leaves pods Pending with no events whatsoever.</li>
+        <li>Scheduling uses <strong>requests</strong>, not limits or actual usage, and the placement decision is <strong>never revisited</strong> — rebalancing needs a separate tool.</li>
+        <li><code>kubectl apply</code> returns after the etcd write: measured 0.19 s against a 23 s rollout. <strong>"created" means stored, not running.</strong></li>
+        <li>CI must follow apply with <code>kubectl rollout status --timeout</code>; a bad image gives exit 0 from apply and <code>ImagePullBackOff</code> in the cluster.</li>
+        <li><code>observedGeneration == generation</code> means the controller saw your change; <code>readyReplicas == replicas</code> means reality converged. They are different questions.</li>
+        <li>The kubelet is the only component that starts containers, and it is <strong>node-local and independent</strong> of the control plane.</li>
+        <li>etcd quorum: 3 members tolerate 1 failure, 5 tolerate 2, and <strong>2 tolerate zero</strong> while doubling the failure surface. Never an even count.</li>
+        <li>Object size is capped around <strong>1.5 MB</strong> and the database around <strong>8 GB</strong> — usually consumed by Event churn, not workloads.</li>
+        <li>A control-plane outage means <strong>"cannot change anything", not "everything is down"</strong>: pods keep running, Service traffic flows, and the kubelet still restarts crashed containers.</li>
+        <li>The sharp edge of that outage is the <strong>frozen endpoint list</strong> — measured, 11 of 30 requests black-holed to a pod that had died.</li>
+        <li><strong>Deletion is a request</strong>: it sets <code>deletionTimestamp</code>, and the object survives until every finalizer is removed by its owning controller.</li>
+        <li>A namespace stuck <code>Terminating</code> is nearly always an <strong>unavailable APIService</strong> — the conditions name it exactly, and fixing it deletes the namespace in seconds.</li>
+        <li><strong>Force-patching a finalizer leaks what it was protecting</strong>: orphaned objects, and cloud load balancers and disks that keep billing.</li>
+        <li>Admission is the one <strong>synchronous</strong> step: a webhook with <code>failurePolicy: Fail</code> pointing at a missing Service made every write fail after a full 10 s timeout, and stopped self-healing entirely.</li>
+        <li>Give webhooks a <code>namespaceSelector</code>, narrow rules, short timeouts, and <code>failurePolicy: Ignore</code> unless they are a genuine security control.</li>
+        <li>Custom controllers must be <strong>idempotent, stateless, and requeue rather than block</strong>; spec is desire, status only ever describes observed reality.</li>
+      </ul>
+    </div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="../docker/index.html">← Docker Track</a>
-      <a class="btn" href="pods-deployments.html">Next: Pods, ReplicaSets & Deployments →</a>
+      <a href="../../index.html">← All Tracks</a>
+      <a href="objects-yaml.html">Objects, the API &amp; How Apply Works →</a>
     </div>
   </main>
 </div>
