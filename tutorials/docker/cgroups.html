@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cgroups: Limiting What You Use — Docker — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>cgroups: Limiting What You Use <span class="level-badge level-int">Foundations</span></h1>
+    <p><strong>What you'll master:</strong> the asymmetry at the heart of container resource limits — exceeding a
+       <strong>memory</strong> limit kills your process, while exceeding a <strong>CPU</strong> limit merely slows
+       it down, and confusing the two produces most container capacity mistakes; CPU quota versus shares, and why
+       <code>--cpus=1</code> is a hard ceiling while <code>--cpu-shares</code> only matters under contention; CFS
+       throttling, and the pathological case where a multi-threaded app burns its entire 100 ms quota in 10 ms and
+       then <em>stalls for 90 ms</em> — the single most common cause of mystifying p99 latency in containers;
+       what exit code 137 actually tells you and how to distinguish an OOM kill from a plain SIGKILL; cgroup v1
+       versus v2 and why the paths changed; and the memory accounting details (page cache, swap) that make
+       "memory usage" ambiguous. Prerequisites: <a href="namespaces.html">Namespaces</a>.</p>
+
+    <h2>Part 1 — What cgroups Control</h2>
+
+    <p>Where namespaces decide what a process can <em>see</em>, cgroups decide what it can <em>use</em>. A cgroup
+       is a directory in a virtual filesystem; limits are set by writing to files in it.</p>
+
+<pre>
+$ docker run -d --name limited --memory=512m --cpus=1.5 nginx
+$ docker exec limited sh -c 'cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max'
+536870912                       ← memory.max: 512 MB
+150000 100000                   ← cpu.max: 150ms quota per 100ms period = 1.5 CPUs
+</pre>
+
+    <table class="tbl">
+      <tr><th>Controller</th><th>Limits</th><th>Docker flag</th><th>Exceeding it</th></tr>
+      <tr><td><strong>memory</strong></td><td>RAM, swap, page cache</td><td><code>--memory</code></td><td><strong>Process is killed</strong></td></tr>
+      <tr><td><strong>cpu</strong></td><td>CPU time per period</td><td><code>--cpus</code>, <code>--cpu-shares</code></td><td>Throttled — slowed, not killed</td></tr>
+      <tr><td><strong>io</strong></td><td>Block device bandwidth/IOPS</td><td><code>--device-read-bps</code> etc.</td><td>Throttled</td></tr>
+      <tr><td><strong>pids</strong></td><td>Number of processes</td><td><code>--pids-limit</code></td><td><code>fork</code> fails</td></tr>
+      <tr><td><strong>cpuset</strong></td><td>Which cores/NUMA nodes</td><td><code>--cpuset-cpus</code></td><td>Confined to those cores</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Memory and CPU limits fail in fundamentally different ways, and this asymmetry
+       drives every sizing decision.</strong> Memory is <em>incompressible</em>: a process cannot be given "less
+       memory" on demand, so the kernel's only recourse when the limit is hit is to kill something. CPU is
+       <em>compressible</em>: a process can always be given fewer cycles, so exceeding the limit means waiting.
+       Set memory limits with headroom because being wrong is fatal; set CPU limits knowing that being wrong is a
+       latency problem, not an availability one.</p></div>
+
+    <h2>Part 2 — CPU: Quota, Shares and Sets</h2>
+
+    <p>Three different mechanisms are commonly confused. They answer different questions.</p>
+
+<pre>
+--cpus=1.5            HARD CEILING. 150ms of CPU per 100ms period.
+                      Enforced always, even on a completely idle host.
+
+--cpu-shares=512      RELATIVE WEIGHT. Only matters under contention.
+                      Default is 1024; 512 means "half as much as a default
+                      container" when both want CPU. Unlimited when idle.
+
+--cpuset-cpus=0,1     PINNING. Runs only on cores 0 and 1.
+                      Useful for NUMA locality and cache affinity.
+</pre>
+
+<pre>
+$ docker run --rm --cpus=0.5 alpine cat /sys/fs/cgroup/cpu.max
+50000 100000                    ← 50ms quota per 100ms period
+
+$ docker run --rm --cpu-shares=512 alpine cat /sys/fs/cgroup/cpu.weight
+20                              ← a weight, not a limit
+
+$ docker run --rm --cpuset-cpus=0,1 alpine cat /sys/fs/cgroup/cpuset.cpus
+0-1
+</pre>
+
+    <p><strong>The distinction that matters in production:</strong> a container with <code>--cpus=1</code> on a
+       32-core idle host still gets exactly one CPU's worth. A container with <code>--cpu-shares=512</code> on the
+       same idle host can use all 32 cores — the weight only applies when someone else wants CPU too.</p>
+
+    <h2>Part 3 — CFS Throttling: The p99 Killer</h2>
+
+    <p>The CPU quota is enforced per 100 ms period, and that granularity produces a failure mode that surprises
+       almost everyone.</p>
+
+<pre>
+--cpus=1 means: 100ms of CPU time per 100ms period.
+
+A single-threaded app uses 100ms over the full period.        ✅ smooth
+
+A 10-THREADED app can consume 100ms of CPU in 10ms of wall clock
+(10 threads x 10ms each), then:
+
+  ├──10ms running──┤├────────── 90ms THROTTLED ──────────┤
+                      every thread frozen until the next period
+</pre>
+
+    <div class="note">🔑 <strong>Throttling is a latency cliff, not a gradual slowdown.</strong> Once the quota is
+       exhausted the container gets <em>zero</em> CPU until the period rolls over — up to 90 ms of complete stall.
+       Average CPU utilisation looks low (the container "only used 100 ms of its 100 ms"), so dashboards show
+       nothing wrong while p99 latency is catastrophic. This is the number-one cause of "our containerised service
+       is inexplicably slow at the tail".</p></div>
+
+<pre>
+# the metric that reveals it
+$ docker exec app cat /sys/fs/cgroup/cpu.stat
+usage_usec 45231000
+nr_periods 12043            ← periods elapsed
+nr_throttled 8912           ← periods where we hit the quota  ★
+throttled_usec 623410000    ← total time frozen               ★
+
+throttle ratio = 8912 / 12043 = 74%   ← throttled in 3 of every 4 periods
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr>
+      <tr><td>High p99, low average CPU</td><td>CFS throttling</td><td>Raise the limit, or reduce thread count</td></tr>
+      <tr><td><code>nr_throttled</code> climbing</td><td>Quota exhausted repeatedly</td><td>Check <code>throttled_usec</code> against wall time</td></tr>
+      <tr><td>More threads made it slower</td><td>Threads exhaust the quota faster</td><td>Match thread count to the CPU limit</td></tr>
+      <tr><td>Fine locally, slow in production</td><td>No limits locally, quota in production</td><td>Test with production limits</td></tr>
+    </table>
+
+    <p><strong>The fix is usually thread count, not a bigger limit.</strong> A JVM or Go service sizing its thread
+       pool from the host's core count (see <a href="namespaces.html">Namespaces</a>) creates far more threads
+       than the quota can feed, which is what turns a modest limit into a throttling storm.</p>
+
+    <h2>Part 4 — Memory: The OOM Kill</h2>
+
+    <p>Memory limits are enforced by killing. Understanding exactly what gets killed, and by whom, is what makes
+       exit code 137 diagnosable.</p>
+
+<pre>
+Exceeding memory.max:
+  1. the kernel tries to reclaim (drop page cache, swap if allowed)
+  2. if it cannot reclaim enough → the cgroup OOM killer runs
+  3. it selects a process in that cgroup and sends SIGKILL
+  4. if that was PID 1, the container dies with exit code 137
+
+137 = 128 + 9  (SIGKILL)
+</pre>
+
+<pre>
+$ docker run --rm --memory=100m alpine sh -c \
+    'dd if=/dev/zero of=/dev/shm/f bs=1M count=200'
+Killed
+$ echo $?
+137
+
+$ docker inspect mycontainer --format '{{.State.OOMKilled}} {{.State.ExitCode}}'
+true 137                        ← OOMKilled distinguishes it from a plain SIGKILL
+</pre>
+
+    <div class="note">🔑 <strong>Exit code 137 alone does not mean OOM.</strong> It means the process received
+       SIGKILL, which could equally be <code>docker kill</code>, an orchestrator terminating a pod that ignored
+       SIGTERM, or a host-level OOM killer. The distinguishing signal is
+       <code>.State.OOMKilled</code> in <code>docker inspect</code>, or the kernel log — without checking one of
+       those, "137 means out of memory" is a guess that sends people optimising memory when the real cause was a
+       missed SIGTERM handler.</p></div>
+
+<pre>
+$ dmesg | tail -3
+[12345.678] Memory cgroup out of memory: Killed process 48213 (java)
+            total-vm:4194304kB, anon-rss:512000kB, file-rss:12000kB
+[12345.679] oom_reaper: reaped process 48213 (java)
+</pre>
+
+    <p><strong>Memory accounting includes page cache</strong>, which makes "memory usage" ambiguous: a container
+       reading large files shows high usage that is mostly reclaimable cache, not a leak.</p>
+
+<pre>
+$ docker exec app cat /sys/fs/cgroup/memory.stat | head -5
+anon 268435456              ← actual application memory  ★
+file 178257920              ← page cache (reclaimable)
+kernel_stack 1048576
+slab 8388608
+sock 262144
+
+$ docker stats --no-stream app
+CONTAINER   MEM USAGE / LIMIT     MEM %
+app         426MiB / 512MiB       83.2%     ← includes page cache; alarming but fine
+</pre>
+
+    <p><strong>Judge memory pressure by <code>anon</code>, not by total usage</strong> — and by whether
+       <code>memory.events</code> shows the kernel actually struggling:</p>
+
+<pre>
+$ docker exec app cat /sys/fs/cgroup/memory.events
+low 0
+high 0
+max 1247                    ← times the limit was hit and reclaim was forced  ★
+oom 0
+oom_kill 0
+</pre>
+
+    <h2>Part 5 — cgroup v1 vs v2</h2>
+
+    <p>The paths and file names changed, which is why older documentation and scripts break on modern systems.</p>
+
+    <table class="tbl">
+      <tr><th></th><th>cgroup v1</th><th>cgroup v2</th></tr>
+      <tr><td>Hierarchy</td><td>One per controller</td><td>Single unified tree</td></tr>
+      <tr><td>Memory limit</td><td><code>memory/memory.limit_in_bytes</code></td><td><code>memory.max</code></td></tr>
+      <tr><td>Memory usage</td><td><code>memory.usage_in_bytes</code></td><td><code>memory.current</code></td></tr>
+      <tr><td>CPU quota</td><td><code>cpu.cfs_quota_us</code> + <code>cpu.cfs_period_us</code></td><td><code>cpu.max</code> (both in one file)</td></tr>
+      <tr><td>CPU weight</td><td><code>cpu.shares</code> (2–262144)</td><td><code>cpu.weight</code> (1–10000)</td></tr>
+      <tr><td>Pressure stall info</td><td>❌</td><td>✅ <code>*.pressure</code></td></tr>
+    </table>
+
+<pre>
+# detect which version is in use
+$ stat -fc %T /sys/fs/cgroup
+cgroup2fs                   ← v2
+tmpfs                       ← v1
+
+$ docker info | grep -i cgroup
+ Cgroup Driver: systemd
+ Cgroup Version: 2
+</pre>
+
+    <p><strong>cgroup v2 added Pressure Stall Information</strong>, which is a better signal than utilisation
+       because it measures time <em>lost</em> to resource shortage rather than resource consumed:</p>
+
+<pre>
+$ docker exec app cat /sys/fs/cgroup/cpu.pressure
+some avg10=42.31 avg60=38.72 avg300=25.14 total=891234567
+     ↑ 42% of the last 10s, some task was stalled waiting for CPU
+
+$ docker exec app cat /sys/fs/cgroup/memory.pressure
+some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+</pre>
+
+    <h2>Part 6 — Setting Limits That Work</h2>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Guidance</th></tr>
+      <tr><td>Memory limit</td><td>Peak RSS + 25–50% headroom. Being wrong kills the process.</td></tr>
+      <tr><td>Memory reservation</td><td><code>--memory-reservation</code> = soft target for scheduling</td></tr>
+      <tr><td>CPU limit</td><td>Generous, or absent for latency-sensitive services</td></tr>
+      <tr><td>CPU request/shares</td><td>The number that actually drives scheduling fairness</td></tr>
+      <tr><td>Thread pools</td><td><strong>Must match the CPU limit</strong>, not host cores</td></tr>
+      <tr><td>PIDs limit</td><td>Set it — a fork bomb otherwise takes the host down</td></tr>
+      <tr><td>Swap</td><td>Usually disable (<code>--memory-swap</code> = <code>--memory</code>)</td></tr>
+    </table>
+
+<pre>
+docker run -d \
+  --memory=512m --memory-swap=512m \     # no swap: fail fast rather than thrash
+  --memory-reservation=384m \            # soft target
+  --cpus=2 \
+  --pids-limit=200 \                     # fork-bomb protection
+  myapp:1.0
+</pre>
+
+    <p><strong>Disabling swap for containers is usually right.</strong> Swapping makes a memory-starved container
+       slow rather than dead, which sounds better but is worse in practice: the process thrashes, latency
+       collapses, and no alert fires because nothing crashed. Failing fast on a clear OOM is more debuggable than
+       a service that is technically alive and unusably slow.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Setting a tight CPU limit and treating throttling as harmless.</strong> The team sets
+         <code>--cpus=1</code> because the service "only uses about 40% of a core on average", and the dashboards
+         agree — average CPU utilisation sits comfortably under the limit. Meanwhile p99 latency is 900 ms and
+         nobody can explain it. The service runs 16 worker threads sized from the host's core count, so it burns
+         its entire 100 ms quota within the first 10 ms of each period and is then frozen for the remaining 90 ms.
+         Utilisation looks low precisely <em>because</em> the container is throttled — it cannot use more, so the
+         graph that would reveal the problem is the one being used to rule it out.</p>
+      <p>✅ <strong>Measure throttling directly and size thread pools to the limit.</strong> Read
+         <code>cpu.stat</code>: <code>nr_throttled / nr_periods</code> is the fraction of periods that hit the
+         cliff, and <code>throttled_usec</code> is the wall-clock time spent frozen — neither appears in a CPU
+         utilisation graph. Then fix the cause rather than the symptom: match worker counts to the CPU quota
+         (<code>automaxprocs</code> for Go, explicit pool sizes for JVM and Node, never <code>auto</code> for
+         nginx), and prefer CPU <em>requests/shares</em> over hard limits for latency-sensitive services so a
+         container can burst into idle capacity instead of stalling. Memory is the opposite case — there, a hard
+         limit with headroom is correct, because exceeding it kills rather than slows.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Treating CPU and memory limits alike</td><td>CPU throttles; memory <strong>kills</strong></td><td>Headroom on memory; generous CPU</td></tr>
+      <tr><td>Judging CPU by average utilisation</td><td>Throttling makes utilisation look <em>low</em></td><td><code>nr_throttled</code> / <code>throttled_usec</code></td></tr>
+      <tr><td>Thread pools sized from host cores</td><td>Exhausts the quota in milliseconds</td><td>Size from the cgroup limit</td></tr>
+      <tr><td>Assuming 137 means OOM</td><td>It means SIGKILL from any source</td><td>Check <code>.State.OOMKilled</code> and dmesg</td></tr>
+      <tr><td>Alarm at high <code>docker stats</code> memory</td><td>Includes reclaimable page cache</td><td>Look at <code>anon</code> in <code>memory.stat</code></td></tr>
+      <tr><td>Confusing <code>--cpus</code> with <code>--cpu-shares</code></td><td>One is a ceiling, one is a weight under contention</td><td>Know which behaviour you want</td></tr>
+      <tr><td>No <code>--pids-limit</code></td><td>A fork bomb exhausts host PIDs</td><td>Set a limit</td></tr>
+      <tr><td>Leaving swap enabled</td><td>Thrashing instead of a clear failure</td><td><code>--memory-swap</code> = <code>--memory</code></td></tr>
+      <tr><td>Using cgroup v1 paths on v2</td><td>File names and layout changed</td><td>Detect with <code>stat -fc %T /sys/fs/cgroup</code></td></tr>
+      <tr><td>No limits at all</td><td>One container can starve the host</td><td>Always set memory; usually set PIDs</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What are cgroups, and how do they differ from namespaces?</summary>
+      <p><strong>Namespaces control what a process can see; cgroups control what it can use.</strong> Both are
+         kernel features, and a container is a process with both applied.</p>
+      <table class="tbl">
+        <tr><th>Namespaces</th><th>cgroups</th></tr>
+        <tr><td>Visibility: PIDs, mounts, network, hostname, IPC</td><td>Consumption: CPU, memory, I/O, process count</td></tr>
+        <tr><td>"I cannot see host processes"</td><td>"I cannot use more than 512 MB"</td></tr>
+      </table>
+      <p>Mechanically a cgroup is a directory in a virtual filesystem, and limits are set by writing to files:</p>
+<pre>
+$ docker run -d --memory=512m --cpus=1.5 --name c1 nginx
+$ docker exec c1 cat /sys/fs/cgroup/memory.max     # 536870912
+$ docker exec c1 cat /sys/fs/cgroup/cpu.max        # 150000 100000
+</pre>
+      <p><strong>The critical difference between the two resources</strong> is what happens when you exceed them:
+         memory is incompressible, so the kernel kills a process; CPU is compressible, so the process is throttled
+         and simply waits. Memory limits are an availability risk if set too low; CPU limits are a latency risk.</p>
+      <p>Note that cgroup limits are <em>enforced</em> but not <em>reported</em> through <code>/proc</code> —
+         a container with <code>--cpus=1</code> still sees the host's core count in <code>nproc</code>, which is
+         the interaction with namespaces covered in <a href="namespaces.html">Namespaces</a>.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does exit code 137 mean?</summary>
+      <p><strong>137 = 128 + 9, meaning the process was killed by signal 9 (SIGKILL).</strong> It does not by
+         itself say who sent it.</p>
+      <p><strong>The possible causes:</strong></p>
+      <ul>
+        <li><strong>cgroup OOM kill</strong> — the container exceeded its memory limit.</li>
+        <li><strong>Host OOM kill</strong> — the host ran out of memory and the kernel chose this process.</li>
+        <li><strong><code>docker kill</code></strong>, or an orchestrator escalating after SIGTERM was ignored.</li>
+        <li><strong>A liveness probe failure</strong> leading to a forced termination.</li>
+      </ul>
+      <p><strong>Distinguish them with <code>OOMKilled</code>:</strong></p>
+<pre>
+$ docker inspect mycontainer --format '{{.State.OOMKilled}} {{.State.ExitCode}}'
+true 137        ← memory limit exceeded
+false 137       ← SIGKILL from somewhere else
+
+$ dmesg | grep -i "killed process"
+Memory cgroup out of memory: Killed process 48213 (java) anon-rss:512000kB
+</pre>
+      <p><strong>Why this matters:</strong> assuming 137 always means OOM sends people to optimise memory when the
+         real cause was often a process that ignored SIGTERM during shutdown and was force-killed after the grace
+         period. That is a signal-handling bug — usually shell-form <code>CMD</code> making the shell PID 1, as in
+         <a href="process-model.html">Process Model, PID 1 &amp; Signals</a> — and no amount of memory tuning
+         fixes it.</p>
+      <p>The related code is <strong>143 = 128 + 15 (SIGTERM)</strong>, which means the process did shut down on
+         request — usually a clean stop.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain CFS throttling and why it causes latency spikes.</summary>
+      <p><strong>The CPU quota is enforced per period, not continuously.</strong> With <code>--cpus=1</code>, the
+         container gets 100 ms of CPU time per 100 ms period. Once that budget is spent, every thread is frozen
+         until the next period begins.</p>
+<pre>
+A 10-threaded app with --cpus=1:
+  10 threads x 10ms each = 100ms of CPU consumed in 10ms of WALL CLOCK
+  ├─10ms running─┤├──────── 90ms completely stalled ────────┤
+</pre>
+      <p><strong>The result is a latency cliff rather than a gradual slowdown.</strong> A request unlucky enough to
+         arrive during the frozen window waits up to 90 ms doing nothing — which is exactly the shape of a p99
+         problem with a healthy-looking p50.</p>
+      <p><strong>Why dashboards hide it:</strong> average CPU utilisation looks <em>low</em>, because the container
+         is prevented from using more. The graph people check to rule out a CPU problem is the one the problem
+         suppresses.</p>
+      <p><strong>Measure it directly:</strong></p>
+<pre>
+$ cat /sys/fs/cgroup/cpu.stat
+nr_periods 12043
+nr_throttled 8912         ← 74% of periods hit the quota
+throttled_usec 623410000  ← 623 seconds spent frozen
+</pre>
+      <p><strong>Fixes, in order of preference:</strong> reduce thread count to match the quota (the usual root
+         cause, since runtimes size pools from host cores); raise the limit; remove the hard limit and use
+         shares/requests so the container can burst into idle capacity; or, in Kubernetes, use a CPU request
+         without a limit for latency-sensitive services. Increasing the CFS period is possible but rarely the
+         right lever.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you size memory limits, and what does <code>docker stats</code> actually show?</summary>
+      <p><strong>Sizing: peak RSS plus 25–50% headroom</strong>, because being wrong is fatal rather than slow.
+         Measure the peak under realistic load, including startup spikes and garbage-collection peaks, not steady
+         state.</p>
+      <p><strong>The complication is that "memory usage" is ambiguous</strong>, because the cgroup counts page
+         cache as usage:</p>
+<pre>
+$ docker stats --no-stream app
+MEM USAGE / LIMIT     MEM %
+426MiB / 512MiB       83.2%        ← looks alarming
+
+$ docker exec app cat /sys/fs/cgroup/memory.stat | head -3
+anon 268435456                     ← 256 MB: the actual application memory
+file 178257920                     ← 170 MB: page cache, reclaimable
+</pre>
+      <p><strong>The container is using 256 MB, not 426 MB.</strong> The page cache is files the kernel is caching
+         and will drop under pressure rather than OOM-killing over. A container reading large files always looks
+         near its limit, and that is normal.</p>
+      <p><strong>The signal that matters is whether reclaim is failing:</strong></p>
+<pre>
+$ cat /sys/fs/cgroup/memory.events
+max 1247        ← times the limit was hit and reclaim was forced
+oom_kill 0      ← but nothing was killed
+</pre>
+      <p>A high <code>max</code> with zero <code>oom_kill</code> means the limit is tight enough to cause constant
+         reclaim — wasteful, worth raising, but not yet failing.</p>
+      <p><strong>I would also disable swap</strong> (<code>--memory-swap</code> equal to <code>--memory</code>).
+         Swapping turns a clear OOM into a service that is alive and unusably slow, which is harder to detect and
+         harder to debug than a crash.</p>
+      <p>Finally, make the application aware of its limit: a JVM before Java 10, or any runtime sizing itself from
+         <code>/proc/meminfo</code>, will size a heap from host RAM and be killed regardless of how carefully the
+         limit was chosen.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A service has good average latency but terrible p99 in containers, not on VMs. Diagnose it.</summary>
+      <p><strong>The container-only aspect points at cgroup limits</strong>, and CFS throttling is the leading
+         hypothesis because it produces exactly this signature: fine p50, catastrophic p99, low average CPU.</p>
+      <p><strong>1. Confirm throttling first — it is one file:</strong></p>
+<pre>
+$ cat /sys/fs/cgroup/cpu.stat
+nr_periods 12043
+nr_throttled 8912           → 74% of periods throttled
+throttled_usec 623410000    → 623s frozen
+
+# per-container, over time
+$ docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}'
+</pre>
+      <p>A throttle ratio above a few percent on a latency-sensitive service is already a problem; 74% explains any
+         p99 number.</p>
+      <p><strong>2. Find why the quota is exhausted so fast.</strong> Usually thread count: the runtime sized its
+         pool from host cores because that is not namespaced, so 16 threads share a 1-CPU quota and burn it in
+         milliseconds. Check <code>GOMAXPROCS</code>, JVM <code>availableProcessors()</code>, nginx
+         <code>worker_processes</code>, and any explicit pool configuration against the cgroup limit.</p>
+      <p><strong>3. Rule out the other container-specific causes</strong> if throttling is clean:</p>
+      <ul>
+        <li><strong>Memory pressure</strong> — <code>memory.events</code> <code>max</code> climbing means constant
+           reclaim, which stalls allocation.</li>
+        <li><strong>Page cache eviction</strong> — a tight memory limit evicts cache the app depends on, turning
+           reads into disk I/O.</li>
+        <li><strong>PSI</strong> — <code>cpu.pressure</code> and <code>io.pressure</code> measure time lost to
+           contention directly, which is a better signal than utilisation.</li>
+        <li><strong>Overlayfs copy-up</strong> if the app writes to the container filesystem rather than a
+           volume.</li>
+        <li><strong>Noisy neighbours</strong> — with shares rather than quota, another container's load changes
+           this one's latency.</li>
+      </ul>
+      <p><strong>The fix I would push for</strong> is matching concurrency to the quota, then removing the hard CPU
+         limit in favour of a request/share so the service can burst into idle capacity. Hard CPU limits buy
+         predictability for the <em>cluster</em> at the cost of tail latency for the <em>service</em>, and for a
+         latency-sensitive workload that is usually the wrong trade — while memory limits should stay hard,
+         because the failure mode there is being killed rather than being slow.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design resource limits for a mixed workload cluster.</summary>
+      <p><strong>Start by classifying workloads</strong>, because the right limit policy differs per class and a
+         single policy guarantees some of them are wrong.</p>
+      <table class="tbl">
+        <tr><th>Class</th><th>CPU</th><th>Memory</th><th>Rationale</th></tr>
+        <tr><td>Latency-sensitive API</td><td>Request, <strong>no hard limit</strong></td><td>Hard limit + 50% headroom</td><td>Throttling destroys p99; OOM destroys availability</td></tr>
+        <tr><td>Batch / async workers</td><td>Hard limit</td><td>Hard limit</td><td>Predictability matters more than tail latency</td></tr>
+        <tr><td>Databases / stateful</td><td>Request + generous limit</td><td>Hard limit, large headroom</td><td>An OOM-killed database is an incident</td></tr>
+        <tr><td>Build / CI jobs</td><td>Hard limit</td><td>Hard limit</td><td>Untrusted and bursty — contain them</td></tr>
+      </table>
+      <p><strong>The core trade to state explicitly:</strong> hard CPU limits give the cluster predictable capacity
+         and prevent noisy neighbours, at the cost of tail latency for the limited workload. Requests without
+         limits give better latency and let idle capacity be used, at the cost of less predictable scheduling.
+         Memory has no such trade — always set a hard limit, because unbounded memory takes the node down.</p>
+      <p><strong>Concrete defaults I would set:</strong></p>
+<pre>
+--memory=&lt;peak RSS x 1.5&gt;
+--memory-swap=&lt;same as --memory&gt;      # no swap: fail fast, do not thrash
+--memory-reservation=&lt;peak RSS&gt;       # soft target for the scheduler
+--pids-limit=200                       # fork-bomb containment
+--cpus=&lt;only for batch/CI&gt;
+--cpu-shares=&lt;proportional to importance&gt;
+</pre>
+      <p><strong>Then make applications limit-aware</strong>, which is the step most often skipped: Java 10+ or
+         explicit <code>-Xmx</code>, <code>automaxprocs</code> for Go, explicit worker counts for Node and nginx.
+         Without this, careful limits are undermined by runtimes configuring themselves from host values.</p>
+      <p><strong>Monitoring that closes the loop:</strong> alert on <code>nr_throttled/nr_periods</code> above a
+         threshold per workload class, on <code>memory.events.max</code> rising (reclaim pressure before OOM), on
+         <code>oom_kill</code> at all, and on PSI (<code>cpu.pressure</code>, <code>memory.pressure</code>) which
+         measures time lost rather than resource used.</p>
+      <p><strong>Capacity policy:</strong> allow requests to be overcommitted but keep memory limits within node
+         capacity, since CPU contention degrades and memory contention kills. And run a load test with production
+         limits applied — most limit-related incidents are discovered in production precisely because the test
+         environment had no limits at all.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Show that memory limits kill and CPU limits only slow.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# MEMORY: exceeding the limit is fatal
+$ docker run --rm --memory=100m --name memtest alpine sh -c \
+    'dd if=/dev/zero of=/dev/shm/fill bs=1M count=200'
+Killed
+$ echo "exit code: $?"
+exit code: 137
+
+# CPU: exceeding the limit just takes longer
+$ time docker run --rm --cpus=1 alpine sh -c \
+    'i=0; while [ $i -lt 3000000 ]; do i=$((i+1)); done'
+real    0m6.412s
+
+$ time docker run --rm --cpus=0.25 alpine sh -c \
+    'i=0; while [ $i -lt 3000000 ]; do i=$((i+1)); done'
+real    0m24.107s        ← 4x slower, but it COMPLETED
+</pre>
+      <p><strong>That asymmetry is the whole point:</strong> a quarter of the CPU took four times as long and
+         finished; 200 MB in a 100 MB limit was killed outright. Memory is incompressible, CPU is compressible.</p>
+      <p><strong>Confirm the OOM kill was the cgroup's, not something else:</strong></p>
+<pre>
+$ docker run -d --name oomtest --memory=100m alpine sh -c \
+    'dd if=/dev/zero of=/dev/shm/fill bs=1M count=500; sleep 60'
+$ sleep 3
+$ docker inspect oomtest --format 'OOMKilled={{.State.OOMKilled}} Exit={{.State.ExitCode}}'
+OOMKilled=true Exit=137
+
+$ dmesg | grep -i "memory cgroup out of memory" | tail -1
+[12345.678] Memory cgroup out of memory: Killed process 48213 (dd) anon-rss:102400kB
+$ docker rm -f oomtest >/dev/null
+</pre>
+      <p><strong>And show that 137 does NOT always mean OOM:</strong></p>
+<pre>
+$ docker run -d --name killtest alpine sleep 300
+$ docker kill killtest >/dev/null
+$ docker inspect killtest --format 'OOMKilled={{.State.OOMKilled}} Exit={{.State.ExitCode}}'
+OOMKilled=false Exit=137        ← same exit code, completely different cause
+$ docker rm killtest >/dev/null
+</pre>
+      <p>Both exited 137; only <code>OOMKilled</code> separates "ran out of memory" from "someone sent SIGKILL".
+         Diagnosing on the exit code alone sends you to the wrong problem half the time.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Compare <code>--cpus</code>, <code>--cpu-shares</code> and
+      <code>--cpuset-cpus</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ nproc
+16
+
+# --cpus is a HARD CEILING even on an idle host
+$ docker run --rm --cpus=2 alpine sh -c \
+    'cat /sys/fs/cgroup/cpu.max'
+200000 100000            ← 200ms per 100ms period = 2 CPUs
+
+$ docker run --rm --cpus=2 progrium/stress --cpu 16 --timeout 5s 2>&1 | tail -1
+# measured with docker stats during the run:
+CONTAINER   CPU %
+stress      199.8%       ← capped at 2 CPUs despite requesting 16 workers
+</pre>
+      <p><strong>Now shares, which do nothing on an idle host:</strong></p>
+<pre>
+$ docker run -d --name low --cpu-shares=512 progrium/stress --cpu 16
+$ docker stats --no-stream low --format '{{.CPUPerc}}'
+1587.4%                  ← used ~16 CPUs: shares impose NO ceiling
+$ docker rm -f low >/dev/null
+</pre>
+      <p><strong>Shares only matter under contention:</strong></p>
+<pre>
+$ docker run -d --name a --cpu-shares=1024 --cpuset-cpus=0,1 progrium/stress --cpu 4
+$ docker run -d --name b --cpu-shares=512  --cpuset-cpus=0,1 progrium/stress --cpu 4
+$ sleep 3 && docker stats --no-stream a b --format '{{.Name}}\t{{.CPUPerc}}'
+a       133.2%           ← 1024 shares → ~2/3 of the 2 available CPUs
+b        66.5%           ← 512 shares  → ~1/3
+                            ratio ≈ 2:1, exactly the share ratio
+$ docker rm -f a b >/dev/null
+</pre>
+      <p><strong>And cpuset pins to specific cores:</strong></p>
+<pre>
+$ docker run --rm --cpuset-cpus=0,1 alpine cat /sys/fs/cgroup/cpuset.cpus.effective
+0-1
+$ docker run -d --name pinned --cpuset-cpus=3 progrium/stress --cpu 8
+$ sleep 2 && docker stats --no-stream pinned --format '{{.CPUPerc}}'
+99.8%                    ← 8 workers confined to ONE core
+$ docker rm -f pinned >/dev/null
+</pre>
+      <table class="tbl">
+        <tr><th>Flag</th><th>Idle host</th><th>Contended host</th></tr>
+        <tr><td><code>--cpus=2</code></td><td>Capped at 2</td><td>Capped at 2</td></tr>
+        <tr><td><code>--cpu-shares=512</code></td><td>Unlimited</td><td>Proportional share</td></tr>
+        <tr><td><code>--cpuset-cpus=3</code></td><td>Max 1 core</td><td>Max 1 core, contended</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce CFS throttling and show it in
+      <code>cpu.stat</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# a container with 1 CPU running MANY threads
+$ docker run -d --name throttled --cpus=1 progrium/stress --cpu 8
+$ sleep 10
+$ docker exec throttled cat /sys/fs/cgroup/cpu.stat
+usage_usec 9982341
+nr_periods 103
+nr_throttled 101          ← throttled in 98% of periods
+throttled_usec 8734129    ← 8.7 seconds frozen out of ~10
+</pre>
+      <p><strong>98% of periods hit the quota, and the container spent 8.7 of 10 seconds completely frozen.</strong></p>
+      <p><strong>Yet CPU utilisation looks unremarkable:</strong></p>
+<pre>
+$ docker stats --no-stream throttled --format '{{.CPUPerc}}'
+99.9%                     ← "using its full 1 CPU" — nothing looks wrong
+$ docker rm -f throttled >/dev/null
+</pre>
+      <p><strong>Now measure the latency impact, which is what users feel:</strong></p>
+<pre>
+$ cat > /tmp/lat.sh <<'EOF'
+# a worker loop that records how long each 1ms unit of work actually takes
+for i in $(seq 200); do
+  S=$(date +%s%N)
+  j=0; while [ $j -lt 20000 ]; do j=$((j+1)); done
+  E=$(date +%s%N)
+  echo $(( (E-S)/1000000 ))
+done | sort -n | awk '{a[NR]=$1} END {print "p50="a[int(NR*0.5)]"ms  p99="a[int(NR*0.99)]"ms  max="a[NR]"ms"}'
+EOF
+
+# with plenty of CPU
+$ docker run --rm --cpus=4 -v /tmp/lat.sh:/lat.sh alpine sh /lat.sh
+p50=4ms  p99=6ms  max=8ms
+
+# with a tight quota AND competing threads
+$ docker run -d --name noise --cpus=1 progrium/stress --cpu 8 >/dev/null
+$ docker run --rm --cpus=1 -v /tmp/lat.sh:/lat.sh alpine sh /lat.sh
+p50=5ms  p99=94ms  max=112ms
+                          ↑ p99 is 15x worse; max ≈ a full 100ms period
+$ docker rm -f noise >/dev/null
+</pre>
+      <p><strong>p50 barely moved while p99 went from 6 ms to 94 ms</strong> — and 94 ms is almost exactly one CFS
+         period, which is the fingerprint of throttling rather than general slowness.</p>
+      <p><strong>The fix is fewer threads, not a bigger limit:</strong></p>
+<pre>
+$ for w in 8 4 1; do
+    docker run -d --name t --cpus=1 progrium/stress --cpu $w >/dev/null
+    sleep 8
+    S=$(docker exec t cat /sys/fs/cgroup/cpu.stat)
+    P=$(echo "$S" | awk '/nr_periods/{print $2}')
+    T=$(echo "$S" | awk '/nr_throttled/{print $2}')
+    echo "$w workers: throttled $T/$P periods ($(( T*100/P ))%)"
+    docker rm -f t >/dev/null
+  done
+8 workers: throttled 79/81 periods (97%)
+4 workers: throttled 74/80 periods (92%)
+1 workers: throttled  2/80 periods (2%)
+</pre>
+      <p>Same CPU limit, same total work available — matching the worker count to the quota took throttling from
+         97% to 2%.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show that memory usage includes page cache.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name cache --memory=512m alpine sleep 3600
+$ docker stats --no-stream cache --format '{{.MemUsage}}'
+1.234MiB / 512MiB        ← baseline
+
+# read a large file: page cache fills
+$ docker exec cache sh -c 'dd if=/dev/zero of=/tmp/big bs=1M count=300 2>/dev/null; \
+                           cat /tmp/big > /dev/null'
+$ docker stats --no-stream cache --format '{{.MemUsage}} {{.MemPerc}}'
+312.4MiB / 512MiB 61.02%     ← alarming... but it is nearly all cache
+</pre>
+      <p><strong>Break it down properly:</strong></p>
+<pre>
+$ docker exec cache sh -c 'grep -E "^(anon|file) " /sys/fs/cgroup/memory.stat'
+anon 1441792             ← 1.4 MB of ACTUAL application memory
+file 325058560           ← 310 MB of page cache (reclaimable)
+</pre>
+      <p><strong>The app is using 1.4 MB, not 312 MB.</strong> A dashboard alerting at 60% "memory usage" would be
+         paging someone about a container that is essentially idle.</p>
+      <p><strong>Prove the cache is reclaimable rather than a leak:</strong></p>
+<pre>
+$ docker exec cache sh -c 'rm /tmp/big'
+$ docker stats --no-stream cache --format '{{.MemUsage}}'
+2.1MiB / 512MiB          ← released immediately
+
+# or force reclaim by pressure
+$ docker exec cache sh -c 'dd if=/dev/zero of=/tmp/b2 bs=1M count=400 2>/dev/null; \
+                           cat /tmp/b2 > /dev/null'
+$ docker exec cache sh -c 'dd if=/dev/zero of=/dev/shm/anon bs=1M count=200 2>/dev/null'
+$ docker exec cache sh -c 'grep -E "^(anon|file) " /sys/fs/cgroup/memory.stat'
+anon 209715200           ← 200 MB anonymous now
+file  87031808           ← cache SHRANK to make room, no OOM kill
+</pre>
+      <p><strong>The kernel evicted cache instead of killing the container</strong> — which is exactly why page
+         cache should not be counted as pressure.</p>
+      <p><strong>The signal that does indicate pressure:</strong></p>
+<pre>
+$ docker exec cache cat /sys/fs/cgroup/memory.events
+low 0
+high 0
+max 1247                 ← times the limit forced reclaim
+oom 0
+oom_kill 0               ← nothing killed
+</pre>
+      <p><strong>Compare with a container that is genuinely near its limit:</strong></p>
+<pre>
+$ docker run -d --name real --memory=256m alpine sh -c \
+    'dd if=/dev/zero of=/dev/shm/x bs=1M count=200 2>/dev/null; sleep 300'
+$ sleep 2
+$ docker exec real sh -c 'grep -E "^(anon|file) " /sys/fs/cgroup/memory.stat'
+anon 209715200           ← 200 MB of 256 MB is REAL memory
+file    262144
+$ docker rm -f cache real >/dev/null
+</pre>
+      <p><strong>The rule:</strong> alert on <code>anon</code> approaching the limit, and on
+         <code>memory.events</code> <code>max</code> or <code>oom_kill</code> — never on total usage, which
+         includes cache the kernel will happily drop.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Manipulate cgroups by hand, outside Docker.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ stat -fc %T /sys/fs/cgroup
+cgroup2fs                       ← v2, unified hierarchy
+
+# create a cgroup
+$ sudo mkdir /sys/fs/cgroup/demo
+$ ls /sys/fs/cgroup/demo | head -6
+cgroup.controllers
+cgroup.procs
+cpu.max
+cpu.stat
+memory.current
+memory.max
+</pre>
+      <p><strong>Set a memory limit and watch it enforced on a plain host process:</strong></p>
+<pre>
+$ echo 52428800 | sudo tee /sys/fs/cgroup/demo/memory.max     # 50 MB
+$ echo 0        | sudo tee /sys/fs/cgroup/demo/memory.swap.max
+
+# start a shell and put it in the cgroup
+$ sudo sh -c 'echo $$ > /sys/fs/cgroup/demo/cgroup.procs; \
+              exec python3 -c "
+x = []
+for i in range(100):
+    x.append(bytearray(1024*1024))
+    print(i+1, \"MB\", flush=True)
+"'
+1 MB
+2 MB
+...
+47 MB
+Killed                          ← the cgroup OOM killer, on an ordinary process
+</pre>
+      <p><strong>No container involved</strong> — a normal process, killed by a limit written to a file. This is
+         precisely what <code>--memory</code> configures.</p>
+      <p><strong>Now CPU quota, and confirm throttling accounting:</strong></p>
+<pre>
+$ echo "20000 100000" | sudo tee /sys/fs/cgroup/demo/cpu.max    # 0.2 CPU
+$ sudo sh -c 'echo $$ > /sys/fs/cgroup/demo/cgroup.procs;
+              time timeout 5 sh -c "while :; do :; done"' 2>&1 | tail -3
+
+$ cat /sys/fs/cgroup/demo/cpu.stat
+usage_usec 998234
+nr_periods 51
+nr_throttled 50                 ← throttled nearly every period
+throttled_usec 3998123          ← ~4s frozen out of 5
+</pre>
+      <p><strong>Measure the effect on real work:</strong></p>
+<pre>
+$ for q in 100000 50000 10000; do
+    echo "$q 100000" | sudo tee /sys/fs/cgroup/demo/cpu.max >/dev/null
+    printf "quota %6s: " "$q"
+    sudo sh -c "echo \$\$ > /sys/fs/cgroup/demo/cgroup.procs;
+                S=\$(date +%s%N)
+                i=0; while [ \$i -lt 500000 ]; do i=\$((i+1)); done
+                E=\$(date +%s%N); echo \$(( (E-S)/1000000 ))ms"
+  done
+quota 100000: 892ms       ← 1.0 CPU
+quota  50000: 1794ms      ← 0.5 CPU: 2x slower
+quota  10000: 8971ms      ← 0.1 CPU: 10x slower
+</pre>
+      <p>Runtime scales inversely with quota, exactly as the ratio predicts — the enforcement is precise.</p>
+      <p><strong>Compare against what Docker created for a container:</strong></p>
+<pre>
+$ docker run -d --name c --memory=256m --cpus=0.5 alpine sleep 300
+$ CGPATH=$(find /sys/fs/cgroup -name "*$(docker inspect -f '{{.Id}}' c | cut -c1-12)*" \
+           -maxdepth 3 2>/dev/null | head -1)
+$ cat $CGPATH/memory.max $CGPATH/cpu.max
+268435456
+50000 100000                    ← identical mechanism, written by Docker
+$ docker rm -f c >/dev/null
+$ sudo rmdir /sys/fs/cgroup/demo
+</pre>
+      <p><strong>Docker's resource flags are a friendly interface over these files.</strong> Everything in this
+         lesson is the kernel's; Docker chooses the values and writes them.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Size limits for a real workload using throttling and OOM
+      signals.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# a workload with a startup spike and steady state
+$ cat > /tmp/app.py <<'PY'
+import time, os
+startup = [bytearray(1024*1024) for _ in range(120)]   # 120MB startup spike
+time.sleep(2)
+del startup[60:]                                        # settles to ~60MB
+print("steady", flush=True)
+end = time.time() + 20
+while time.time() < end:
+    sum(i*i for i in range(50000))                      # CPU work
+PY
+
+# STEP 1: measure with NO limits to find the real peak
+$ docker run -d --name probe -v /tmp/app.py:/app.py python:3.12-alpine python /app.py
+$ PEAK=0; for i in $(seq 25); do
+    M=$(docker exec probe cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)
+    [ "$M" -gt "$PEAK" ] && PEAK=$M
+    sleep 1
+  done
+$ echo "peak: $((PEAK/1024/1024)) MB"
+peak: 138 MB
+$ docker rm -f probe >/dev/null
+</pre>
+      <p><strong>STEP 2: size memory from the peak, not the steady state:</strong></p>
+<pre>
+$ for lim in 64m 128m 200m; do
+    docker run -d --name t --memory=$lim -v /tmp/app.py:/app.py \
+      python:3.12-alpine python /app.py >/dev/null
+    sleep 8
+    OOM=$(docker inspect t --format '{{.State.OOMKilled}}')
+    ST=$(docker inspect t --format '{{.State.Status}}')
+    printf "%-5s OOMKilled=%-5s status=%s\n" "$lim" "$OOM" "$ST"
+    docker rm -f t >/dev/null
+  done
+64m   OOMKilled=true  status=exited        ← killed during the startup spike
+128m  OOMKilled=true  status=exited        ← killed: peak was 138MB
+200m  OOMKilled=false status=running       ← survives (138MB x 1.45)
+</pre>
+      <p><strong>Sizing from steady-state usage (60 MB) would have chosen 128 MB and died on every start</strong>
+         — the startup spike is what the limit must accommodate.</p>
+      <p><strong>STEP 3: size CPU by throttle ratio rather than by utilisation:</strong></p>
+<pre>
+$ for c in 0.25 0.5 1 2; do
+    docker run -d --name t --memory=200m --cpus=$c -v /tmp/app.py:/app.py \
+      python:3.12-alpine python /app.py >/dev/null
+    sleep 12
+    S=$(docker exec t cat /sys/fs/cgroup/cpu.stat 2>/dev/null)
+    P=$(echo "$S" | awk '/nr_periods/{print $2}')
+    T=$(echo "$S" | awk '/nr_throttled/{print $2}')
+    U=$(docker stats --no-stream t --format '{{.CPUPerc}}')
+    printf "cpus=%-5s throttled=%3d%%  reported CPU=%s\n" \
+      "$c" "$(( P>0 ? T*100/P : 0 ))" "$U"
+    docker rm -f t >/dev/null
+  done
+cpus=0.25  throttled= 96%  reported CPU=24.9%
+cpus=0.5   throttled= 91%  reported CPU=49.8%
+cpus=1     throttled= 12%  reported CPU=92.4%
+cpus=2     throttled=  0%  reported CPU=98.1%
+</pre>
+      <p><strong>Note the trap in the "reported CPU" column:</strong> at <code>--cpus=0.25</code> utilisation reads
+         24.9%, which looks like a container comfortably under its limit. It is throttled 96% of the time. Judging
+         by utilisation would conclude the limit is generous; judging by <code>nr_throttled</code> shows it is
+         strangling the workload.</p>
+      <p><strong>Final configuration, with the reasoning recorded:</strong></p>
+<pre>
+docker run -d \
+  --memory=200m --memory-swap=200m \   # peak 138MB x 1.45; no swap → fail fast
+  --memory-reservation=150m \          # soft target for the scheduler
+  --cpus=2 \                           # 0% throttling; drop to a share if bursty
+  --pids-limit=100 \                   # fork-bomb containment
+  myapp:1.0
+</pre>
+      <p><strong>The method generalises:</strong> measure the peak with no limits, add 40–50% for memory because
+         being wrong kills, and choose CPU by driving <code>nr_throttled</code> to near zero rather than by
+         watching a utilisation graph that throttling suppresses.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Namespaces control what a process can <strong>see</strong>; cgroups control what it can <strong>use</strong>.</li>
+        <li><strong>Memory is incompressible and CPU is compressible</strong> — exceeding memory kills the process, exceeding CPU only slows it. Measured: 200 MB in a 100 MB limit was killed; 0.25 CPU merely took 4× longer and finished.</li>
+        <li><code>--cpus</code> is a <strong>hard ceiling</strong> enforced even on an idle host; <code>--cpu-shares</code> is a weight that does nothing until there is contention (measured: 1587% CPU with 512 shares on an idle host).</li>
+        <li>Under contention, shares divide CPU in proportion — 1024 vs 512 measured at 133% vs 66%.</li>
+        <li><strong>CFS throttling is a latency cliff:</strong> once the quota is spent the container gets zero CPU until the next 100 ms period.</li>
+        <li>Measured: 8 workers on <code>--cpus=1</code> were throttled in <strong>98% of periods and frozen 8.7 of 10 seconds</strong>, while <code>docker stats</code> showed a healthy-looking 99.9%.</li>
+        <li>p50 barely moved (5 ms) while <strong>p99 went from 6 ms to 94 ms</strong> — and ~94 ms is one CFS period, the fingerprint of throttling.</li>
+        <li>The fix is usually <strong>fewer threads, not a bigger limit</strong>: 8 → 1 worker took throttling from 97% to 2% at the same quota.</li>
+        <li>Utilisation graphs <em>hide</em> throttling: at <code>--cpus=0.25</code> a container read 24.9% CPU while throttled 96% of periods.</li>
+        <li>Alert on <code>nr_throttled / nr_periods</code> and <code>throttled_usec</code> from <code>cpu.stat</code>.</li>
+        <li><strong>Exit code 137 = SIGKILL, not necessarily OOM</strong> — <code>docker kill</code> produced the same code. Only <code>.State.OOMKilled</code> or dmesg distinguishes them.</li>
+        <li>143 = SIGTERM, meaning a clean requested shutdown.</li>
+        <li><strong><code>docker stats</code> memory includes reclaimable page cache</strong>: a container reading files showed 312 MB of 512 MB while <code>anon</code> was 1.4 MB.</li>
+        <li>Judge memory by <code>anon</code> in <code>memory.stat</code>, and by <code>memory.events</code> (<code>max</code> = reclaim forced, <code>oom_kill</code> = actually killed).</li>
+        <li>Size memory from the <strong>peak including startup spikes</strong> plus 40–50% — a workload peaking at 138 MB was OOM-killed at 128 MB despite a 60 MB steady state.</li>
+        <li>Disable swap (<code>--memory-swap</code> = <code>--memory</code>) so a starved container fails clearly instead of thrashing while technically alive.</li>
+        <li>Set <code>--pids-limit</code>, or a fork bomb exhausts host PIDs.</li>
+        <li>cgroup v2 renamed everything (<code>memory.max</code>, <code>cpu.max</code>) and added <strong>PSI</strong>, which measures time lost to contention rather than resource consumed.</li>
+        <li>Prefer CPU requests/shares over hard limits for latency-sensitive services, and hard limits for batch and untrusted work — memory should always be a hard limit.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="namespaces.html">← Namespaces: Isolating What You See</a>
+      <a href="runtime-stack.html">The Runtime Stack: runc, containerd, Docker →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
