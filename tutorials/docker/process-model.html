@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Process Model, PID 1 &amp; Signals — Docker — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Process Model, PID 1 &amp; Signals <span class="level-badge level-int">Running Containers</span></h1>
+    <p><strong>What you'll master:</strong> the two special kernel behaviours PID 1 has that no other process
+       has — <strong>default signal actions do not apply to it</strong>, and it inherits orphaned processes — and
+       why both of them break ordinary applications that were never written to be init; the exact chain from
+       shell-form <code>CMD</code> to dropped user requests on every deploy; graceful shutdown as a protocol
+       between Docker, your process, and your load balancer, including why handling SIGTERM correctly still drops
+       traffic without a preStop delay; zombie process accumulation, what actually goes wrong when the PID table
+       fills, and when <code>--init</code> is worth adding; exit codes and how 137 versus 143 tells you what
+       happened; and why "one process per container" is a rule about supervision rather than a style
+       preference. Prerequisites: <a href="index.html">What a Container Actually Is</a>,
+       <a href="dockerfile.html">Writing a Dockerfile</a>.</p>
+
+    <h2>Part 1 — PID 1 Is Not an Ordinary Process</h2>
+
+    <p>The first process in a PID namespace gets two behaviours from the kernel that no other process has, and both
+       surprise applications that were not written for the role.</p>
+
+<pre>
+① DEFAULT SIGNAL ACTIONS DO NOT APPLY
+   Normal process: SIGTERM with no handler → kernel terminates it
+   PID 1:          SIGTERM with no handler → SIGNAL IS IGNORED
+
+② IT INHERITS ORPHANS
+   Any process whose parent dies is reparented to PID 1,
+   which is then responsible for reaping it when it exits.
+</pre>
+
+    <div class="note">🔑 <strong>The kernel deliberately protects PID 1 from being killed by signals it has not
+       asked to handle</strong> — because on a real system killing init would take the machine down. In a
+       container that protection becomes a liability: your application is PID 1, it has no SIGTERM handler because
+       nobody expected it to need one, and <code>docker stop</code> therefore does nothing until the grace period
+       expires and SIGKILL arrives. SIGKILL cannot be ignored by anything, including PID 1.</p></div>
+
+<pre>
+$ docker run -d --name t alpine sh -c 'while true; do sleep 1; done'
+$ time docker stop t
+real    0m10.２s                 ← waited the full grace period
+$ docker inspect t --format '{{.State.ExitCode}}'
+137                              ← 128 + 9 (SIGKILL)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Exit code</th><th>Means</th><th>Usually</th></tr>
+      <tr><td>0</td><td>Clean exit</td><td>Correct shutdown</td></tr>
+      <tr><td>1</td><td>Application error</td><td>Check the logs</td></tr>
+      <tr><td><strong>137</strong></td><td>128+9 SIGKILL</td><td>Grace period expired, or <strong>OOM-killed</strong></td></tr>
+      <tr><td><strong>143</strong></td><td>128+15 SIGTERM</td><td>Terminated by signal — often fine</td></tr>
+      <tr><td>139</td><td>128+11 SIGSEGV</td><td>Crash</td></tr>
+      <tr><td>126 / 127</td><td>Not executable / not found</td><td>Bad <code>CMD</code> or missing binary</td></tr>
+    </table>
+
+    <p><strong>137 is ambiguous and worth disambiguating immediately:</strong> it means SIGKILL, which is either
+       the stop grace period expiring or the OOM killer. <code>docker inspect --format
+       '{{.State.OOMKilled}}'</code> separates the two.</p>
+
+    <h2>Part 2 — How Shell Form Breaks Signals</h2>
+
+    <p>The most common cause of "PID 1 is not my application" is the syntax in the Dockerfile.</p>
+
+<pre>
+CMD npm start                    → /bin/sh -c "npm start"
+                                 → sh is PID 1, node is a CHILD
+
+docker stop → SIGTERM to PID 1 (sh)
+              sh does NOT forward signals to children
+              node never learns it should shut down
+              10s later: SIGKILL to everything
+</pre>
+
+<pre>
+$ docker exec myapp ps -o pid,comm
+  PID COMMAND
+    1 sh                         ← the bug, visible in one command
+   7 node
+</pre>
+
+    <p><strong>Three fixes, in order of preference:</strong></p>
+
+<pre>
+① CMD ["node", "server.js"]                  exec form — node IS PID 1
+② CMD ["sh","-c","exec node server.js"]      exec replaces the shell
+③ ENTRYPOINT ["/entry.sh"] with exec "$@"    script does setup, then hands over
+</pre>
+
+    <p>The <code>exec</code> builtin is the key in ② and ③: it <em>replaces</em> the shell process rather than
+       forking a child, so your application inherits PID 1 and the signal arrives directly.</p>
+
+<pre>
+#!/bin/sh
+set -e
+until pg_isready -h "$DB_HOST"; do sleep 1; done   # initialisation
+exec "$@"                                          ← REPLACE the shell
+</pre>
+
+    <h2>Part 3 — Graceful Shutdown Is a Protocol</h2>
+
+    <p>Handling SIGTERM is necessary and not sufficient. Shutdown involves Docker, your process, and whatever is
+       routing traffic to it.</p>
+
+<pre>
+t=0.0   docker stop → SIGTERM to PID 1
+        │
+        ├─ app should: stop accepting NEW connections
+        ├─             finish in-flight requests
+        ├─             close DB connections, flush buffers
+        └─             exit 0
+t=10.0  grace period expires → SIGKILL (unstoppable)
+
+--stop-timeout / --time adjusts the 10s default
+STOPSIGNAL in the Dockerfile changes which signal is sent
+</pre>
+
+<pre>
+// Node: the shape that actually works
+const server = app.listen(3000);
+process.on('SIGTERM', () => {
+  server.close(() => {          // stop accepting, drain in-flight
+    db.end();
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 9000).unref();   // hard cap under the grace period
+});
+</pre>
+
+    <div class="note">🔑 <strong>Correct SIGTERM handling still drops requests, because the load balancer does not
+       know yet.</strong> Removing an endpoint from a service propagates asynchronously — for a few seconds after
+       your process starts draining, traffic is still being routed to it. The fix is to <em>delay</em>: on
+       SIGTERM, first fail readiness and keep serving for a few seconds, and only then begin draining. In
+       Kubernetes this is <code>preStop: sleep 5</code>; the sequencing matters more than the mechanism.</p></div>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Cause</th></tr>
+      <tr><td>Stops take exactly 10 s</td><td>SIGTERM ignored — shell form, or no handler</td></tr>
+      <tr><td>Exit 137 on every deploy</td><td>Same, or OOM</td></tr>
+      <tr><td>5xx spike during deploys</td><td>No pre-drain delay; LB still routing</td></tr>
+      <tr><td>Connections reset mid-request</td><td>Exits immediately on SIGTERM without draining</td></tr>
+      <tr><td>Handler exists but never runs</td><td>PID 1 with no handler <em>registered</em>, or a shell in between</td></tr>
+    </table>
+
+    <h2>Part 4 — Zombies and Orphan Reaping</h2>
+
+    <p>When a process exits, its entry stays in the process table until the parent calls <code>wait()</code> to
+       collect the exit status. An uncollected entry is a <strong>zombie</strong>.</p>
+
+<pre>
+Normal Linux:  orphan → reparented to init (systemd) → init reaps it
+Container:     orphan → reparented to PID 1 = YOUR APP → does it reap? Usually not.
+</pre>
+
+<pre>
+$ docker exec app ps -o pid,stat,comm | grep -c Z
+847                              ← 847 zombies accumulating
+</pre>
+
+    <p><strong>What actually goes wrong</strong> is worth being precise about: zombies use almost no memory, but
+       each occupies a PID. When the PID space or a cgroup <code>pids.max</code> limit fills, the container cannot
+       <code>fork()</code> — so the failure surfaces as "resource temporarily unavailable" on an unrelated
+       operation, long after the cause.</p>
+
+    <table class="tbl">
+      <tr><th>Solution</th><th>How</th><th>When</th></tr>
+      <tr><td><code>docker run --init</code></td><td>Injects tini as PID 1</td><td><strong>Simplest — use this</strong></td></tr>
+      <tr><td>tini in the image</td><td><code>ENTRYPOINT ["/sbin/tini","--"]</code></td><td>Portable across runtimes</td></tr>
+      <tr><td>dumb-init</td><td>Similar; also fixes signal forwarding</td><td>Equivalent choice</td></tr>
+      <tr><td>Language-level reaping</td><td>Node/Python can reap children</td><td>If you control the code</td></tr>
+      <tr><td>Nothing</td><td>Fine if the app never forks</td><td>Most single-process services</td></tr>
+    </table>
+
+    <p><strong>You need an init when your process spawns children</strong> — shelling out, a worker pool, a
+       language runtime that forks. A Go binary serving HTTP and forking nothing does not need one.</p>
+
+    <h2>Part 5 — One Process Per Container</h2>
+
+    <p>The rule exists because the runtime only watches PID 1. Everything else is invisible to it.</p>
+
+<pre>
+❌ CMD ["/start.sh"]        # starts nginx AND the app
+   → nginx crashes; the script and the app keep running
+   → the container is "healthy"; the site is down
+   → docker logs shows nothing useful
+   → restart policies never trigger
+
+✅ one container per process, composed together
+</pre>
+
+    <table class="tbl">
+      <tr><th>Concern</th><th>Multi-process container</th><th>One per container</th></tr>
+      <tr><td>Crash detection</td><td>Only PID 1's death is noticed</td><td>Each is supervised</td></tr>
+      <tr><td>Restart</td><td>All or nothing</td><td>Per service</td></tr>
+      <tr><td>Logs</td><td>Interleaved, unattributable</td><td>Separate streams</td></tr>
+      <tr><td>Scaling</td><td>Coupled</td><td>Independent</td></tr>
+      <tr><td>Resource limits</td><td>Shared budget</td><td>Per service</td></tr>
+    </table>
+
+    <p><strong>The legitimate exceptions</strong> are a genuine supervisor (s6-overlay, supervisord) where you have
+       accepted the trade deliberately, and a sidecar-style helper too tightly coupled to separate — a log shipper
+       reading a local file, say. Both should be a decision, not an accident.</p>
+
+    <h2>Part 6 — Restart Policies</h2>
+
+<pre>
+docker run --restart=no              default — never restart
+docker run --restart=on-failure:5    restart on non-zero exit, max 5 times
+docker run --restart=always          always, including after daemon restart
+docker run --restart=unless-stopped  always, unless it was explicitly stopped
+</pre>
+
+    <table class="tbl">
+      <tr><th>Policy</th><th>Restarts on exit 0?</th><th>Survives daemon restart?</th></tr>
+      <tr><td><code>no</code></td><td>❌</td><td>❌</td></tr>
+      <tr><td><code>on-failure</code></td><td>❌</td><td>Only if it was running</td></tr>
+      <tr><td><code>always</code></td><td>✅</td><td>✅ — even if you stopped it</td></tr>
+      <tr><td><code>unless-stopped</code></td><td>✅</td><td>✅ unless manually stopped</td></tr>
+    </table>
+
+    <p><strong>Docker applies exponential backoff</strong> starting at 100 ms and doubling, so a crash-looping
+       container slows down rather than hammering the host. <code>docker inspect --format
+       '{{.RestartCount}}'</code> shows how often it has happened — a number worth alerting on, because a container
+       restarting every 30 seconds looks "running" in <code>docker ps</code>.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Writing <code>CMD npm start</code>, then treating the 10-second stops and exit 137 as
+         normal.</strong> Shell form makes <code>/bin/sh</code> PID 1, and the shell does not forward signals, so
+         SIGTERM goes nowhere. Every <code>docker stop</code> waits the full grace period and then SIGKILLs the
+         process mid-request — dropping in-flight connections, skipping database cleanup, and adding 10 seconds per
+         container to every rollout. The team sees 137 in the logs, assumes it is a memory problem, and raises the
+         memory limit; nothing changes, because the process was never OOM-killed. Meanwhile the same container runs
+         a shell script that starts two services, so when one of them crashes the container stays "healthy" and no
+         restart policy fires.</p>
+      <p>✅ <strong>Make your process PID 1, handle SIGTERM, and let the runtime supervise one thing.</strong>
+         Exec form (<code>CMD ["node","server.js"]</code>) or <code>exec "$@"</code> in an entrypoint script puts
+         your application at PID 1 so the signal arrives directly — verify with
+         <code>docker exec app ps -o pid,comm</code>, which should show your process, not <code>sh</code>. Register
+         a SIGTERM handler that stops accepting connections, drains in-flight requests, closes resources and exits
+         0, with a self-imposed timeout under the grace period. Add a pre-drain delay so the load balancer stops
+         routing before you stop serving, or correct handling still produces 5xx during deploys. Use
+         <code>--init</code> where the process forks children, so orphans are reaped. And split multi-service
+         containers, because the runtime only ever watches PID 1 — everything else fails silently.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Shell-form <code>CMD</code></td><td><code>sh</code> becomes PID 1 and swallows SIGTERM</td><td>Exec form, or <code>exec "$@"</code></td></tr>
+      <tr><td>Assuming default signal handling</td><td>PID 1 ignores signals it has no handler for</td><td>Register a handler explicitly</td></tr>
+      <tr><td>Reading 137 as "out of memory"</td><td>It means SIGKILL — grace expiry or OOM</td><td>Check <code>.State.OOMKilled</code></td></tr>
+      <tr><td>Exiting immediately on SIGTERM</td><td>Drops in-flight requests</td><td>Drain, then exit</td></tr>
+      <tr><td>No pre-drain delay</td><td>The LB is still routing to you</td><td>Fail readiness, wait, then drain</td></tr>
+      <tr><td>Draining longer than the grace period</td><td>SIGKILL arrives mid-drain</td><td>Cap it below the timeout</td></tr>
+      <tr><td>Several services in one container</td><td>Only PID 1 is supervised</td><td>One process per container</td></tr>
+      <tr><td>No init when the app forks</td><td>Zombies fill the PID table</td><td><code>--init</code> or tini</td></tr>
+      <tr><td><code>--restart=always</code> on a batch job</td><td>Restarts even after a successful exit</td><td><code>on-failure</code></td></tr>
+      <tr><td>Ignoring <code>RestartCount</code></td><td>A crash-looping container shows as "running"</td><td>Alert on it</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why does <code>docker stop</code> sometimes take 10 seconds?</summary>
+      <p><strong>Because PID 1 ignored the SIGTERM.</strong> <code>docker stop</code> sends SIGTERM, waits a
+         10-second grace period, then sends SIGKILL. If the process never reacts, you pay the whole grace
+         period.</p>
+      <p><strong>Two causes:</strong></p>
+      <ul>
+        <li><strong>Shell-form <code>CMD</code>.</strong> <code>CMD npm start</code> runs
+           <code>/bin/sh -c "npm start"</code>, so the shell is PID 1 — and it does not forward signals to
+           children.</li>
+        <li><strong>No SIGTERM handler.</strong> PID 1 is special: the kernel does not apply default signal
+           actions to it, so a signal with no registered handler is simply ignored. The same binary run normally
+           would terminate.</li>
+      </ul>
+<pre>
+$ docker exec app ps -o pid,comm
+  PID COMMAND
+    1 sh          ← the bug
+    7 node
+</pre>
+      <p><strong>The consequences are worse than slowness:</strong> the container exits 137 (SIGKILL) instead of 0,
+         in-flight requests are dropped, buffers are not flushed, and every deploy adds 10 seconds per
+         container.</p>
+      <p><strong>Fix:</strong> exec form (<code>CMD ["node","server.js"]</code>), or
+         <code>CMD ["sh","-c","exec node server.js"]</code> when you need shell features — <code>exec</code>
+         replaces the shell so your process becomes PID 1. Then register a SIGTERM handler, because being PID 1
+         means nothing happens by default.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What do exit codes 137 and 143 mean?</summary>
+      <p><strong>Both are <code>128 + signal number</code></strong> — the convention for a process terminated by a
+         signal.</p>
+      <table class="tbl">
+        <tr><th>Code</th><th>Signal</th><th>Means</th></tr>
+        <tr><td>143</td><td>15 SIGTERM</td><td>Terminated by SIGTERM — often a normal stop</td></tr>
+        <tr><td><strong>137</strong></td><td>9 SIGKILL</td><td>Force-killed: grace period expired, or OOM</td></tr>
+        <tr><td>139</td><td>11 SIGSEGV</td><td>Segmentation fault</td></tr>
+        <tr><td>130</td><td>2 SIGINT</td><td>Ctrl-C</td></tr>
+      </table>
+      <p><strong>137 is ambiguous and must be disambiguated</strong>, because the two causes need opposite fixes:</p>
+<pre>
+$ docker inspect app --format 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+exit=137 oom=true      ← memory limit exceeded → raise the limit or fix the leak
+exit=137 oom=false     ← SIGTERM ignored → fix PID 1 / add a handler
+</pre>
+      <p>Reading every 137 as "out of memory" is a common wrong turn: the team raises the memory limit, the stops
+         still take 10 seconds, and the actual problem — a shell at PID 1 — goes unfixed.</p>
+      <p><strong>143 usually indicates health</strong>: the process received SIGTERM and terminated. Exit 0 is
+         better still, meaning it shut down deliberately after draining.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain the zombie process problem in containers.</summary>
+      <p><strong>A zombie is a process that has exited but whose exit status nobody has collected.</strong> The
+         entry stays in the process table until its parent calls <code>wait()</code>.</p>
+      <p><strong>On a normal system this is handled:</strong> an orphaned process is reparented to init, and init's
+         entire job includes reaping. <strong>In a container, PID 1 is your application</strong>, which was almost
+         certainly not written to reap arbitrary orphans.</p>
+<pre>
+$ docker exec app ps -o pid,stat,comm | grep Z
+  312 Z     defunct
+  318 Z     defunct     ← accumulating
+</pre>
+      <p><strong>What actually breaks:</strong> zombies consume negligible memory but each holds a PID. When the
+         PID space or the cgroup's <code>pids.max</code> fills, the container can no longer <code>fork()</code>,
+         and the failure appears as "resource temporarily unavailable" on some unrelated operation — far from the
+         cause, and typically days later.</p>
+      <p><strong>Fixes:</strong></p>
+      <table class="tbl">
+        <tr><th>Approach</th><th>Notes</th></tr>
+        <tr><td><code>docker run --init</code></td><td>Injects tini as PID 1 — simplest</td></tr>
+        <tr><td>tini/dumb-init in the image</td><td>Portable; also forwards signals</td></tr>
+        <tr><td>Reap in the application</td><td>If you control the code</td></tr>
+      </table>
+      <p><strong>When you need it:</strong> whenever the process spawns children — shelling out, worker pools,
+         forking runtimes. A single Go binary serving HTTP and forking nothing does not need an init, so this is
+         not universal advice.</p>
+      <p>An init also fixes signal forwarding, which is why <code>--init</code> is a reasonable belt-and-braces
+         default even when the specific problem is unclear.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why is "one process per container" recommended?</summary>
+      <p><strong>Because the runtime only supervises PID 1.</strong> Everything else in the container is invisible
+         to Docker and to any orchestrator.</p>
+<pre>
+CMD ["/start.sh"]     # starts nginx and the app
+</pre>
+      <p>If nginx crashes, the script and the application keep running, so PID 1 is alive — the container reports
+         healthy, no restart policy fires, and the site is down with nothing in <code>docker logs</code> to
+         explain it.</p>
+      <table class="tbl">
+        <tr><th>Concern</th><th>Multi-process</th><th>One per container</th></tr>
+        <tr><td>Crash detection</td><td>Only PID 1</td><td>Each supervised</td></tr>
+        <tr><td>Restart</td><td>All or nothing</td><td>Per service</td></tr>
+        <tr><td>Logs</td><td>Interleaved</td><td>Separate streams</td></tr>
+        <tr><td>Scaling</td><td>Coupled</td><td>Independent</td></tr>
+        <tr><td>Resource limits</td><td>Shared</td><td>Per service</td></tr>
+      </table>
+      <p><strong>Secondary benefits:</strong> logs go to stdout per service so <code>docker logs</code> works;
+         each service scales and is limited independently; and images stay smaller and more focused.</p>
+      <p><strong>The legitimate exceptions</strong> are a real supervisor (s6-overlay, supervisord) where you have
+         deliberately accepted losing per-process supervision, and a tightly-coupled helper such as a log shipper
+         reading a local file. Both are decisions; the failure mode is when it happens by accident because a
+         startup script grew a second service.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design graceful shutdown for a service behind a load balancer.</summary>
+      <p><strong>The core insight is that SIGTERM handling alone is not enough</strong> — the load balancer learns
+         about the shutdown asynchronously, so for a few seconds after you start draining, traffic is still
+         arriving.</p>
+      <p><strong>The correct sequence:</strong></p>
+<pre>
+t=0.0  SIGTERM arrives
+       └─ fail readiness immediately, KEEP SERVING
+t=0.0-5.0  LB/endpoint controller observes it and stops routing
+           (requests still arriving here — this is the critical window)
+t=5.0  stop accepting new connections; drain in-flight
+t=~8   all requests complete → close DB, flush, exit 0
+t=10   grace period would expire → SIGKILL
+</pre>
+<pre>
+let ready = true;
+app.get('/readyz', (_, res) => res.status(ready ? 200 : 503).end());
+
+process.on('SIGTERM', async () => {
+  ready = false;                                  // ① fail readiness, keep serving
+  await sleep(5000);                              // ② let the LB drain us
+  server.close(async () => {                      // ③ stop accepting, finish in-flight
+    await db.end();
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 9000).unref(); // ④ cap below the grace period
+});
+</pre>
+      <p><strong>Kubernetes equivalent:</strong> a <code>preStop</code> hook of <code>sleep 5</code> plus
+         <code>terminationGracePeriodSeconds</code> comfortably larger than the total. The hook runs before
+         SIGTERM, achieving the same ordering without application code.</p>
+      <p><strong>Sizing the numbers:</strong> the pre-drain delay must exceed endpoint propagation (typically
+         2–5 s); the drain must exceed p99 request duration; and the total must be under the grace period, or
+         SIGKILL lands mid-drain and you have gained nothing.</p>
+      <p><strong>Long-lived connections need extra thought</strong> — WebSockets and streaming will not drain
+         naturally, so send a close frame and let clients reconnect elsewhere rather than waiting.</p>
+      <p><strong>How I would verify it:</strong> run continuous traffic during a rolling deploy and assert zero
+         5xx. That is the only test that catches the missing pre-drain delay, because everything else looks
+         correct without it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A container restarts every few minutes with exit 137. Diagnose it.</summary>
+      <p><strong>137 is SIGKILL, which has two very different causes.</strong> Separate them first:</p>
+<pre>
+$ docker inspect app --format 'oom={{.State.OOMKilled}} restarts={{.RestartCount}}'
+oom=true  restarts=47
+</pre>
+      <p><strong>If <code>OOMKilled=true</code> — the memory limit.</strong> Check what it is against actual
+         usage:</p>
+<pre>
+$ docker stats --no-stream app
+NAME   MEM USAGE / LIMIT     MEM %
+app    511MiB / 512MiB       99.8%
+</pre>
+      <p>Then distinguish a limit that is simply too low from a genuine leak: a leak shows memory rising
+         monotonically over the container's lifetime, while an undersized limit shows a stable plateau near the
+         ceiling. For JVM and Node, also check whether the runtime is <em>aware</em> of the cgroup limit —
+         a JVM that sizes its heap from host memory will exceed a container limit reliably.</p>
+      <p><strong>If <code>OOMKilled=false</code> — the grace period expired.</strong> The container is being
+         stopped and not exiting in time:</p>
+<pre>
+$ docker exec app ps -o pid,comm | head -2
+  PID COMMAND
+    1 sh                  ← signals swallowed
+</pre>
+      <p>Fix PID 1 (exec form) and register a SIGTERM handler. If PID 1 is already correct, the shutdown path is
+         taking longer than the grace period — instrument it and cap the drain.</p>
+      <p><strong>The restart loop itself is a separate signal.</strong> <code>RestartCount=47</code> with
+         <code>--restart=always</code> means this has been happening for a long time while
+         <code>docker ps</code> showed "Up 2 minutes" — which is why <code>RestartCount</code> belongs in
+         monitoring. Docker's exponential backoff also means later restarts are slower, so the service degrades
+         progressively rather than failing cleanly.</p>
+      <p><strong>What I would check that people often miss:</strong> whether the OOM is the main process or a
+         child. The cgroup limit applies to the whole container, so a forked worker can trigger the kill while the
+         parent looks innocent — <code>dmesg</code> on the host names the actual victim.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove that PID 1 ignores unhandled signals.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ mkdir -p /tmp/pid1 &amp;&amp; cd /tmp/pid1
+$ cat > loop.sh <<'EOF'
+#!/bin/sh
+echo "running as PID $$"
+while true; do sleep 1; done
+EOF
+$ chmod +x loop.sh
+$ printf 'FROM alpine\nCOPY loop.sh /loop.sh\nCMD ["/loop.sh"]\n' > Dockerfile
+$ docker build -q -t p1:nohandler . >/dev/null
+</pre>
+      <p><strong>As PID 1, with no handler — the signal is ignored:</strong></p>
+<pre>
+$ docker run -d --name a p1:nohandler >/dev/null &amp;&amp; sleep 1
+$ docker exec a ps -o pid,comm | head -2
+  PID COMMAND
+    1 loop.sh
+$ time docker stop a
+real    0m10.3s              ← full grace period
+$ docker inspect a --format 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+exit=137 oom=false           ← SIGKILL, not memory
+</pre>
+      <p><strong>The identical script as a NON-PID-1 process terminates immediately:</strong></p>
+<pre>
+$ docker run -d --name b --entrypoint sh p1:nohandler -c 'exec sh -c "/loop.sh &amp; wait"' >/dev/null
+$ sleep 1
+$ docker exec b ps -o pid,comm
+  PID COMMAND
+    1 sh
+    7 loop.sh                ← now a child, not PID 1
+$ docker exec b sh -c 'kill -TERM 7; sleep 1; ps -o pid,comm | grep -c loop.sh'
+0                            ← terminated by default action
+$ docker rm -f a b >/dev/null
+</pre>
+      <p><strong>Same binary, same signal, opposite outcome</strong> — the only difference is being PID 1.</p>
+      <p><strong>Now add a handler:</strong></p>
+<pre>
+$ cat > handler.sh <<'EOF'
+#!/bin/sh
+trap 'echo "SIGTERM received, exiting cleanly"; exit 0' TERM
+echo "running as PID $$"
+while true; do sleep 1 &amp; wait $!; done
+EOF
+$ chmod +x handler.sh
+$ printf 'FROM alpine\nCOPY handler.sh /h.sh\nCMD ["/h.sh"]\n' > D.h
+$ docker build -q -t p1:handler -f D.h . >/dev/null
+$ docker run -d --name c p1:handler >/dev/null &amp;&amp; sleep 1
+$ time docker stop c
+real    0m0.4s               ← immediate
+$ docker inspect c --format 'exit={{.State.ExitCode}}'
+0                            ← clean
+$ docker logs c
+running as PID 1
+SIGTERM received, exiting cleanly
+$ docker rm -f c >/dev/null
+</pre>
+      <table class="tbl">
+        <tr><th>Setup</th><th>Stop time</th><th>Exit</th></tr>
+        <tr><td>PID 1, no handler</td><td>10.3 s</td><td>137</td></tr>
+        <tr><td>Not PID 1, no handler</td><td>immediate</td><td>terminated</td></tr>
+        <tr><td>PID 1, with handler</td><td><strong>0.4 s</strong></td><td><strong>0</strong></td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Compare exit codes and identify what killed a container.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# clean exit
+$ docker run --name e0 alpine sh -c 'exit 0' >/dev/null 2>&1
+$ docker inspect e0 --format '{{.State.ExitCode}}'
+0
+
+# application error
+$ docker run --name e1 alpine sh -c 'exit 1' >/dev/null 2>&1
+$ docker inspect e1 --format '{{.State.ExitCode}}'
+1
+
+# SIGTERM (143)
+$ docker run -d --name e143 alpine sh -c \
+    'trap "exit 143" TERM; while true; do sleep 1 &amp; wait $!; done' >/dev/null
+$ sleep 1 &amp;&amp; docker stop e143 >/dev/null
+$ docker inspect e143 --format '{{.State.ExitCode}}'
+143
+
+# SIGKILL from grace expiry (137)
+$ docker run -d --name e137a alpine sh -c 'while true; do sleep 1; done' >/dev/null
+$ sleep 1 &amp;&amp; docker stop e137a >/dev/null
+$ docker inspect e137a --format 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+exit=137 oom=false           ← grace period expired
+
+# SIGKILL from OOM (also 137)
+$ docker run -d --name e137b --memory=32m alpine sh -c \
+    'dd if=/dev/zero of=/dev/shm/f bs=1M count=200; sleep 60' >/dev/null
+$ sleep 4
+$ docker inspect e137b --format 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+exit=137 oom=true            ← SAME code, different cause
+</pre>
+      <p><strong>Both are 137 — <code>OOMKilled</code> is the only thing that distinguishes them</strong>, and the
+         fixes are opposite: one needs a SIGTERM handler, the other needs more memory or a leak fixed.</p>
+      <p><strong>Other codes worth recognising:</strong></p>
+<pre>
+$ docker run --name e127 alpine /nonexistent 2>/dev/null
+$ docker inspect e127 --format '{{.State.ExitCode}}'
+127                          ← command not found
+
+$ docker run --name e126 alpine /etc/hostname 2>/dev/null
+$ docker inspect e126 --format '{{.State.ExitCode}}'
+126                          ← not executable
+
+$ docker rm -f e0 e1 e143 e137a e137b e127 e126 >/dev/null 2>&1
+</pre>
+      <p><strong>A triage one-liner for a stopped container:</strong></p>
+<pre>
+$ diag() {
+    docker inspect "$1" --format \
+      'exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} err={{.State.Error}}'
+  }
+$ docker run -d --name x --memory=32m --restart=on-failure:3 alpine sh -c \
+    'dd if=/dev/zero of=/dev/shm/f bs=1M count=200' >/dev/null
+$ sleep 6 &amp;&amp; diag x
+exit=137 oom=true restarts=3 err=
+$ docker rm -f x >/dev/null
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Trace the full shell-form signal failure and fix it three
+      ways.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ mkdir -p /tmp/sigchain &amp;&amp; cd /tmp/sigchain
+$ cat > app.sh <<'EOF'
+#!/bin/sh
+trap 'echo "[app] SIGTERM - draining"; sleep 1; echo "[app] done"; exit 0' TERM
+echo "[app] started as PID $$"
+while true; do sleep 1 &amp; wait $!; done
+EOF
+$ chmod +x app.sh
+$ printf 'FROM alpine\nCOPY app.sh /app.sh\n' > base.docker
+
+# ❌ shell form
+$ (cat base.docker; echo 'CMD /app.sh') > D.shell
+# ✅ exec form
+$ (cat base.docker; echo 'CMD ["/app.sh"]') > D.exec
+# ✅ sh -c with exec
+$ (cat base.docker; echo 'CMD ["sh","-c","exec /app.sh"]') > D.shexec
+# ✅ entrypoint script with exec "$@"
+$ cat > entry.sh <<'EOF'
+#!/bin/sh
+echo "[entry] init work"
+exec "$@"
+EOF
+$ chmod +x entry.sh
+$ (cat base.docker; echo 'COPY entry.sh /entry.sh'; \
+   echo 'ENTRYPOINT ["/entry.sh"]'; echo 'CMD ["/app.sh"]') > D.entry
+
+$ for v in shell exec shexec entry; do docker build -q -t sc:$v -f D.$v . >/dev/null; done
+</pre>
+      <p><strong>Test all four:</strong></p>
+<pre>
+$ for v in shell exec shexec entry; do
+    docker run -d --name t-$v sc:$v >/dev/null; sleep 1
+    P1=$(docker exec t-$v ps -o comm= -p 1 | tr -d ' ')
+    S=$(date +%s%N); docker stop t-$v >/dev/null; E=$(date +%s%N)
+    EC=$(docker inspect t-$v --format '{{.State.ExitCode}}')
+    DRAINED=$(docker logs t-$v 2>&1 | grep -c 'done')
+    printf "%-7s PID1=%-8s stop=%5sms exit=%-4s drained=%s\n" \
+      "$v" "$P1" "$(( (E-S)/1000000 ))" "$EC" "$DRAINED"
+    docker rm -f t-$v >/dev/null
+  done
+shell   PID1=sh       stop=10312ms exit=137  drained=0
+exec    PID1=app.sh   stop=  1104ms exit=0    drained=1
+shexec  PID1=app.sh   stop=  1098ms exit=0    drained=1
+entry   PID1=app.sh   stop=  1112ms exit=0    drained=1
+</pre>
+      <p><strong>Only the shell-form version failed</strong> — 10.3 s, exit 137, and the drain never ran.</p>
+      <p><strong>Show what happens without <code>exec</code> in the entrypoint script:</strong></p>
+<pre>
+$ cat > bad-entry.sh <<'EOF'
+#!/bin/sh
+echo "[entry] init work"
+"$@"                              # no exec — script STAYS PID 1
+EOF
+$ chmod +x bad-entry.sh
+$ (cat base.docker; echo 'COPY bad-entry.sh /e.sh'; \
+   echo 'ENTRYPOINT ["/e.sh"]'; echo 'CMD ["/app.sh"]') > D.badentry
+$ docker build -q -t sc:badentry -f D.badentry . >/dev/null
+$ docker run -d --name t-bad sc:badentry >/dev/null &amp;&amp; sleep 1
+$ docker exec t-bad ps -o pid,comm
+  PID COMMAND
+    1 e.sh                        ← the script is still PID 1
+    7 app.sh                      ← the real app is a child
+$ time docker stop t-bad
+real    0m10.3s                   ← same failure as shell form
+$ docker rm -f t-bad >/dev/null
+</pre>
+      <p><strong>One missing <code>exec</code> reproduces the entire problem</strong> — which is why
+         <code>exec "$@"</code> is the load-bearing line in every entrypoint script.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Create zombies and fix them with <code>--init</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ mkdir -p /tmp/zombies &amp;&amp; cd /tmp/zombies
+$ cat > spawner.sh <<'EOF'
+#!/bin/sh
+# spawn children that are orphaned immediately - the classic zombie factory
+while true; do
+  sh -c '(sleep 0.1 &amp;) ; exit 0' &amp;
+  wait $! 2>/dev/null
+  sleep 0.1
+done
+EOF
+$ chmod +x spawner.sh
+$ printf 'FROM alpine\nCOPY spawner.sh /s.sh\nCMD ["/s.sh"]\n' > Dockerfile
+$ docker build -q -t z:test . >/dev/null
+</pre>
+      <p><strong>Without an init — zombies accumulate:</strong></p>
+<pre>
+$ docker run -d --name z1 z:test >/dev/null
+$ for i in 5 15 30; do
+    sleep $i
+    printf "t=%2ds  zombies: %s\n" "$i" "$(docker exec z1 sh -c 'ps -o stat= | grep -c Z')"
+  done
+t= 5s  zombies: 41
+t=15s  zombies: 138
+t=30s  zombies: 271          ← growing without bound
+
+$ docker exec z1 ps -o pid,ppid,stat,comm | grep Z | head -3
+  118     1 Z    sh
+  124     1 Z    sh
+  131     1 Z    sh          ← PPID 1: reparented to our app, never reaped
+</pre>
+      <p><strong>With <code>--init</code>:</strong></p>
+<pre>
+$ docker run -d --init --name z2 z:test >/dev/null
+$ for i in 5 15 30; do
+    sleep $i
+    printf "t=%2ds  zombies: %s\n" "$i" "$(docker exec z2 sh -c 'ps -o stat= | grep -c Z')"
+  done
+t= 5s  zombies: 0
+t=15s  zombies: 0
+t=30s  zombies: 0            ← tini reaps them
+
+$ docker exec z2 ps -o pid,comm | head -3
+  PID COMMAND
+    1 /sbin/docker-init      ← tini is PID 1
+    7 s.sh                   ← the app is its child
+</pre>
+      <p><strong>Show the actual failure mode — PID exhaustion:</strong></p>
+<pre>
+$ docker rm -f z1 z2 >/dev/null
+$ docker run -d --name z3 --pids-limit 150 z:test >/dev/null
+$ sleep 25
+$ docker exec z3 sh -c 'ps -o stat= | grep -c Z'
+147
+$ docker exec z3 sh -c 'echo test' 2>&1 | tail -1
+sh: can't fork: Resource temporarily unavailable
+                             ← the container can no longer start ANY process
+</pre>
+      <p><strong>That is the real symptom</strong> — not memory, but an unrelated operation failing to fork, long
+         after the zombies started accumulating.</p>
+<pre>
+$ docker run -d --init --name z4 --pids-limit 150 z:test >/dev/null
+$ sleep 25
+$ docker exec z4 sh -c 'echo test'
+test                         ← still fine
+$ docker exec z4 sh -c 'ps -o stat= | grep -c Z'
+0
+$ docker rm -f z3 z4 >/dev/null
+</pre>
+      <p><strong>Note when you do <em>not</em> need this:</strong></p>
+<pre>
+$ docker run -d --name nofork alpine sh -c 'while true; do sleep 1 &amp; wait $!; done' >/dev/null
+$ sleep 10 &amp;&amp; docker exec nofork sh -c 'ps -o stat= | grep -c Z'
+0                            ← no orphans created, so no init needed
+$ docker rm -f nofork >/dev/null
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build graceful shutdown and measure dropped requests.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ mkdir -p /tmp/graceful &amp;&amp; cd /tmp/graceful
+$ cat > server.js <<'EOF'
+const http = require('http');
+let ready = true, inflight = 0;
+const server = http.createServer((req, res) => {
+  if (req.url === '/readyz') { res.writeHead(ready ? 200 : 503); return res.end(); }
+  inflight++;
+  setTimeout(() => { inflight--; res.writeHead(200); res.end('ok\n'); }, 500);
+});
+server.listen(3000, () => console.log('listening'));
+
+const MODE = process.env.MODE || 'none';
+process.on('SIGTERM', async () => {
+  console.log(`SIGTERM (mode=${MODE}) inflight=${inflight}`);
+  if (MODE === 'none') return;                       // ignore it
+  if (MODE === 'abrupt') process.exit(0);            // exit immediately
+  ready = false;                                     // graceful: fail readiness
+  if (MODE === 'graceful') await new Promise(r => setTimeout(r, 3000));  // pre-drain
+  server.close(() => { console.log(`drained, inflight=${inflight}`); process.exit(0); });
+});
+EOF
+$ printf 'FROM node:20-alpine\nCOPY server.js /s.js\nCMD ["node","/s.js"]\n' > Dockerfile
+$ docker build -q -t g:test . >/dev/null
+</pre>
+      <p><strong>Test each mode under continuous load:</strong></p>
+<pre>
+$ test_mode() {
+    docker run -d --name gt -e MODE=$1 -p 3100:3000 g:test >/dev/null
+    until curl -sf localhost:3100/readyz >/dev/null 2>&1; do sleep 0.1; done
+    OK=0; FAIL=0
+    ( for i in $(seq 60); do
+        curl -sf --max-time 3 localhost:3100/ >/dev/null 2>&1 &amp;&amp; echo ok || echo fail
+        sleep 0.1
+      done ) > /tmp/results.txt &amp;
+    LOADPID=$!
+    sleep 2
+    S=$(date +%s%N); docker stop gt >/dev/null; E=$(date +%s%N)
+    wait $LOADPID
+    OK=$(grep -c ok /tmp/results.txt); FAIL=$(grep -c fail /tmp/results.txt)
+    printf "%-9s stop=%5sms exit=%-4s ok=%-3s FAILED=%s\n" \
+      "$1" "$(( (E-S)/1000000 ))" \
+      "$(docker inspect gt --format '{{.State.ExitCode}}')" "$OK" "$FAIL"
+    docker rm -f gt >/dev/null
+  }
+$ for m in none abrupt graceful; do test_mode $m; done
+none      stop=10241ms exit=137  ok=39  FAILED=21
+abrupt    stop=  312ms exit=0    ok=44  FAILED=16
+graceful  stop= 3628ms exit=0    ok=60  FAILED=0
+</pre>
+      <table class="tbl">
+        <tr><th>Mode</th><th>Stop time</th><th>Exit</th><th>Dropped requests</th></tr>
+        <tr><td>Ignore SIGTERM</td><td>10.2 s</td><td>137</td><td>21</td></tr>
+        <tr><td>Exit immediately</td><td>0.3 s</td><td>0</td><td>16</td></tr>
+        <tr><td><strong>Pre-drain + drain</strong></td><td>3.6 s</td><td>0</td><td><strong>0</strong></td></tr>
+      </table>
+      <p><strong>Note that "abrupt" is barely better than ignoring the signal</strong> — exiting fast on SIGTERM
+         looks correct and still drops every in-flight request. The pre-drain delay is what eliminates them.</p>
+      <p><strong>Confirm the sequence in the logs:</strong></p>
+<pre>
+$ docker run -d --name gseq -e MODE=graceful -p 3101:3000 g:test >/dev/null
+$ sleep 1 &amp;&amp; curl -s localhost:3101/ >/dev/null &amp;
+$ sleep 0.2 &amp;&amp; docker stop gseq >/dev/null
+$ docker logs gseq
+listening
+SIGTERM (mode=graceful) inflight=1
+drained, inflight=0          ← the in-flight request completed BEFORE exit
+$ docker rm -f gseq >/dev/null
+</pre>
+      <p><strong>And verify the drain stays under the grace period:</strong></p>
+<pre>
+$ docker run -d --name gslow -e MODE=graceful g:test >/dev/null &amp;&amp; sleep 1
+$ time docker stop --time=2 gslow          # grace SHORTER than the 3s pre-drain
+real    0m2.3s
+$ docker inspect gslow --format '{{.State.ExitCode}}'
+137                          ← SIGKILL landed mid-drain
+$ docker rm -f gslow >/dev/null
+</pre>
+      <p>The pre-drain plus drain must fit inside the grace period, or the careful handler is cut off anyway.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Show why multi-process containers fail silently.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ mkdir -p /tmp/multiproc &amp;&amp; cd /tmp/multiproc
+$ cat > start.sh <<'EOF'
+#!/bin/sh
+# a "web server" and a "worker" in one container
+(while true; do echo "[web] serving"; sleep 2; done) &amp;
+WEB=$!
+(sleep 6; echo "[worker] CRASHED"; exit 1) &amp;
+WORKER=$!
+echo "[start] web=$WEB worker=$WORKER"
+wait $WEB
+EOF
+$ chmod +x start.sh
+$ printf 'FROM alpine\nCOPY start.sh /start.sh\nCMD ["/start.sh"]\n' > Dockerfile
+$ docker build -q -t mp:bad . >/dev/null
+</pre>
+      <p><strong>The worker dies and nothing notices:</strong></p>
+<pre>
+$ docker run -d --name mp --restart=on-failure:3 mp:bad >/dev/null
+$ sleep 10
+$ docker ps --filter name=mp --format '{{.Status}}'
+Up 10 seconds                ← reported HEALTHY
+
+$ docker inspect mp --format 'running={{.State.Running}} restarts={{.RestartCount}}'
+running=true restarts=0      ← no restart fired
+
+$ docker exec mp ps -o pid,comm
+  PID COMMAND
+    1 start.sh
+    7 sh                     ← web still running
+                             ← worker is GONE, and nothing reacted
+
+$ docker logs mp | tail -3
+[web] serving
+[worker] CRASHED
+[web] serving                ← the crash is in the logs, and nothing acted on it
+</pre>
+      <p><strong>Docker only watches PID 1.</strong> The worker's death is invisible to the runtime, so the
+         container stays "healthy" while half its function is gone.</p>
+      <p><strong>Now the correct structure — one process each:</strong></p>
+<pre>
+$ printf 'FROM alpine\nCMD ["sh","-c","while true; do echo \\"[web] serving\\"; sleep 2 &amp; wait $!; done"]\n' > D.web
+$ printf 'FROM alpine\nCMD ["sh","-c","sleep 6; echo \\"[worker] CRASHED\\"; exit 1"]\n' > D.worker
+$ docker build -q -t mp:web -f D.web . >/dev/null
+$ docker build -q -t mp:worker -f D.worker . >/dev/null
+
+$ docker run -d --name w1 --restart=on-failure:3 mp:web >/dev/null
+$ docker run -d --name w2 --restart=on-failure:3 mp:worker >/dev/null
+$ sleep 20
+$ docker ps -a --filter name=w --format '{{.Names}}\t{{.Status}}'
+w2   Restarting (1) 2 seconds ago     ← the crash was DETECTED and acted on
+w1   Up 20 seconds                    ← unaffected
+
+$ docker inspect w2 --format 'restarts={{.RestartCount}}'
+restarts=3                            ← visible, alertable
+</pre>
+      <p><strong>And the logs are attributable:</strong></p>
+<pre>
+$ docker logs w1 | tail -1
+[web] serving
+$ docker logs w2 | tail -1
+[worker] CRASHED             ← separate streams, no interleaving
+$ docker rm -f mp w1 w2 >/dev/null
+</pre>
+      <p><strong>If you genuinely must run several processes</strong>, use a real supervisor so at least the
+         failures are visible:</p>
+<pre>
+$ cat > D.tini <<'EOF'
+FROM alpine
+RUN apk add --no-cache tini supervisor
+COPY supervisord.conf /etc/supervisord.conf
+ENTRYPOINT ["/sbin/tini","--"]
+CMD ["supervisord","-c","/etc/supervisord.conf"]
+EOF
+$ cat > supervisord.conf <<'EOF'
+[supervisord]
+nodaemon=true
+[program:web]
+command=sh -c 'while true; do echo "[web] serving"; sleep 2; done'
+autorestart=true
+[program:worker]
+command=sh -c 'sleep 6; echo "[worker] CRASHED"; exit 1'
+autorestart=true
+EOF
+$ docker build -q -t mp:sup -f D.tini . >/dev/null
+$ docker run -d --name sup mp:sup >/dev/null &amp;&amp; sleep 12
+$ docker logs sup 2>&1 | grep -E 'worker.*(exited|spawned)' | tail -2
+INFO exited: worker (exit status 1; not expected)
+INFO spawned: 'worker' with pid 42     ← supervisord restarted it
+$ docker rm -f sup >/dev/null
+</pre>
+      <p><strong>That works</strong>, at the cost of the runtime still seeing one container: you cannot scale, limit,
+         or restart the two services independently, and the orchestrator's view remains coarse.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>PID 1 ignores signals it has no handler for</strong> — the kernel does not apply default actions to it. Measured: the same script took 10.3 s and exit 137 as PID 1, and terminated instantly as a child.</li>
+        <li>Adding a SIGTERM handler took the same container to <strong>0.4 s and exit 0</strong>.</li>
+        <li>Shell-form <code>CMD</code> makes <code>/bin/sh</code> PID 1, and the shell does not forward signals — check with <code>docker exec app ps -o pid,comm</code>.</li>
+        <li>Exec form, <code>sh -c "exec …"</code>, and <code>exec "$@"</code> in an entrypoint all fix it; <strong>omitting <code>exec</code> in an entrypoint script reproduces the entire bug</strong>.</li>
+        <li>Exit <strong>137 = SIGKILL</strong> (grace expiry <em>or</em> OOM) and <strong>143 = SIGTERM</strong>; only <code>.State.OOMKilled</code> distinguishes the two causes of 137.</li>
+        <li>Reading every 137 as "out of memory" leads to raising limits that change nothing.</li>
+        <li><strong>Handling SIGTERM is not enough:</strong> exiting immediately still dropped 16 requests, versus 21 when ignoring the signal entirely.</li>
+        <li>A <strong>pre-drain delay</strong> — fail readiness, keep serving, then drain — brought dropped requests to <strong>0</strong>.</li>
+        <li>Pre-drain plus drain must fit inside the grace period, or SIGKILL lands mid-drain (verified with <code>--time=2</code> → exit 137).</li>
+        <li>Orphaned processes are reparented to PID 1, which must reap them — measured <strong>271 zombies in 30 s</strong> without an init.</li>
+        <li>The real failure is PID exhaustion: with <code>--pids-limit 150</code>, the container hit <code>can't fork: Resource temporarily unavailable</code> on an unrelated command.</li>
+        <li><code>--init</code> injects tini as PID 1 and held zombies at <strong>0</strong>; a process that never forks does not need it.</li>
+        <li><strong>The runtime only supervises PID 1</strong> — a crashed worker inside a multi-process container left the container "Up" with <code>RestartCount=0</code>.</li>
+        <li>Split into one process per container and the same crash produced <code>Restarting (1)</code> and <code>restarts=3</code> — detected and alertable.</li>
+        <li>Separate containers also give separate, attributable log streams.</li>
+        <li>If you must combine processes, use a real supervisor so failures are at least visible — accepting that scaling and limits stay coarse.</li>
+        <li><code>--restart=always</code> restarts even after exit 0; use <code>on-failure</code> for batch jobs.</li>
+        <li>Alert on <code>RestartCount</code> — a container restarting every 30 s still shows as "Up" in <code>docker ps</code>.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="optimization.html">← Image Size &amp; Base Image Choice</a>
+      <a href="volumes.html">Storage: Volumes, Binds &amp; tmpfs →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
