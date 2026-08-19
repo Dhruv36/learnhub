@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pods: The Unit of Scheduling — Kubernetes — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Pods: The Unit of Scheduling <span class="level-badge level-basic">Foundations</span></h1>
+    <p><strong>What you'll master:</strong> why the unit is a pod rather than a container — what is actually
+       shared (network and IPC namespaces, so containers reach each other on <code>localhost</code>) and what is
+       <em>not</em> (the filesystem, unless you mount a volume); the <strong>pause container</strong> that holds
+       those namespaces open, and why a container restart keeps the pod IP while a pod recreation does not;
+       <strong>phases versus conditions</strong>, and the gap between <code>Running</code> and <code>Ready</code>
+       that decides whether traffic arrives; <code>CrashLoopBackOff</code>'s exponential backoff, measured, and
+       what it is actually protecting; init containers, their sequential contract and the surprising way they
+       change a pod's <strong>effective resource request</strong>; the sidecar problem that leaves Jobs running
+       forever, and the native sidecar that fixes it; and why <strong>a bare pod is never rescheduled</strong>,
+       which is the difference between a pod and a workload. Prerequisites:
+       <a href="index.html">Architecture &amp; the Reconciliation Loop</a>,
+       <a href="objects-yaml.html">Objects &amp; the API</a>, and the container fundamentals in
+       <a href="../docker/namespaces.html">Docker: Namespaces</a>.</p>
+
+    <h2>Part 1 — What a Pod Shares, and What It Does Not</h2>
+
+    <p>A pod is a group of containers that share some Linux namespaces. That is the whole definition — everything
+       else follows from which namespaces are shared.</p>
+
+    <table class="tbl">
+      <tr><th>Namespace</th><th>Shared in a pod?</th><th>Consequence</th></tr>
+      <tr><td><strong>Network</strong></td><td>✅ Always</td><td>One IP; containers reach each other on <code>localhost</code>; <strong>ports must not collide</strong></td></tr>
+      <tr><td><strong>IPC</strong></td><td>✅ Always</td><td>Shared memory, semaphores</td></tr>
+      <tr><td><strong>UTS</strong></td><td>✅ Always</td><td>One hostname</td></tr>
+      <tr><td><strong>Mount</strong></td><td><strong>❌ Never</strong></td><td>Separate filesystems — sharing files needs a <code>volume</code></td></tr>
+      <tr><td><strong>PID</strong></td><td>⚠️ Opt-in (<code>shareProcessNamespace</code>)</td><td>Off by default: each container has its own PID 1</td></tr>
+      <tr><td>cgroup</td><td>Per container, under a pod-level parent</td><td>Limits are per container; the pod cgroup bounds the total</td></tr>
+    </table>
+
+<pre>
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: { name: two }
+spec:
+  containers:
+  - { name: web,     image: nginx:alpine }
+  - { name: sidecar, image: nicolaka/netshoot, command: ["sleep","3600"] }
+EOF
+
+$ kubectl exec two -c sidecar -- curl -s -o /dev/null -w '%{http_code}\n' localhost:80
+200                                    ← shared network namespace: localhost works
+
+$ kubectl exec two -c sidecar -- ls /usr/share/nginx/html
+ls: /usr/share/nginx/html: No such file or directory
+                                       ← separate MOUNT namespaces: no shared files
+
+$ kubectl exec two -c sidecar -- ps aux | wc -l
+2                                      ← separate PID namespaces by default
+$ kubectl exec two -c sidecar -- hostname
+two                                    ← shared UTS
+</pre>
+
+    <div class="note">🔑 <strong>The port-collision consequence catches everyone once.</strong> Two containers in
+       one pod cannot both listen on 8080 — they share one network namespace, so the second gets
+       <code>bind: address already in use</code>. This is also why a pod is the right unit for a "main process plus
+       its helper" and the wrong unit for two independent services: independent services should scale
+       independently, and containers in a pod never can.</div>
+
+    <p>The rule for what belongs together: put containers in one pod only when they must share a <em>lifecycle</em>
+       and a <em>network identity</em>. A log shipper reading a shared volume, a proxy sidecar terminating TLS on
+       localhost, a config-reloading helper — yes. An API and its database — no, ever.</p>
+
+    <h2>Part 2 — The Sandbox, the Pause Container and the Pod IP</h2>
+
+    <p>Something has to hold the shared namespaces open while individual containers come and go. That is the
+       <strong>pause container</strong> (the "sandbox"): a few hundred kilobytes of process that does nothing but
+       exist and reap orphans.</p>
+
+<pre>
+$ sudo crictl pods --name two
+POD ID       STATE   NAME   NAMESPACE
+9f21c0e4b1   Ready   two    default
+$ sudo crictl ps --pod 9f21c0e4b1 -o table
+CONTAINER    IMAGE                STATE     NAME
+4c88ba71e0   nginx:alpine         Running   web
+7a3d2f1994   nicolaka/netshoot    Running   sidecar
+$ sudo ctr -n k8s.io containers ls | grep pause | head -1
+1a2b3c...  registry.k8s.io/pause:3.9      ← the sandbox holding the namespaces
+</pre>
+
+    <table class="tbl">
+      <tr><th>Event</th><th>Sandbox</th><th>Pod IP</th></tr>
+      <tr><td>A container crashes and restarts</td><td>Survives</td><td><strong>Unchanged</strong></td></tr>
+      <tr><td>All containers restart</td><td>Survives</td><td>Unchanged</td></tr>
+      <tr><td>The pod is deleted and recreated</td><td>Destroyed and rebuilt</td><td><strong>New IP</strong></td></tr>
+      <tr><td>The node dies</td><td>Gone</td><td>New pod, new IP, possibly a new node</td></tr>
+    </table>
+
+<pre>
+$ kubectl get pod two -o jsonpath='{.status.podIP}{"\n"}'
+10.244.1.7
+$ kubectl exec two -c web -- kill 1          # crash the main container
+$ sleep 5; kubectl get pod two -o custom-columns=IP:.status.podIP,RESTARTS:.status.containerStatuses[0].restartCount
+IP           RESTARTS
+10.244.1.7   1                               ← same IP: the sandbox never went away
+
+$ kubectl delete pod two &amp;&amp; kubectl apply -f two.yaml
+$ kubectl get pod two -o jsonpath='{.status.podIP}{"\n"}'
+10.244.2.11                                  ← different IP. Never address a pod.
+</pre>
+
+    <div class="note">⚠️ <strong>Pod IPs are ephemeral, and nothing should ever be configured with one.</strong>
+       Every rolling update, node drain, eviction and crash-of-the-whole-pod produces new addresses. That is the
+       entire reason <a href="services.html">Services</a> exist — a stable virtual IP and DNS name in front of a
+       changing set of pods.</div>
+
+    <h2>Part 3 — Phases, Conditions, and Running ≠ Ready</h2>
+
+    <p><code>status.phase</code> is a coarse, five-value summary. Conditions are where the useful detail lives, and
+       the difference between them explains most "the pod is running but nothing works" confusion.</p>
+
+    <table class="tbl">
+      <tr><th>Phase</th><th>Means</th></tr>
+      <tr><td><code>Pending</code></td><td>Accepted, but not all containers are running — scheduling, image pull, or init containers</td></tr>
+      <tr><td><code>Running</code></td><td>Bound to a node; <strong>at least one</strong> container is running</td></tr>
+      <tr><td><code>Succeeded</code></td><td>All containers exited 0 and will not restart</td></tr>
+      <tr><td><code>Failed</code></td><td>All terminated, at least one non-zero</td></tr>
+      <tr><td><code>Unknown</code></td><td>The node stopped reporting</td></tr>
+    </table>
+
+<pre>
+$ kubectl get pod api -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
+PodScheduled=True        ← the scheduler chose a node
+Initialized=True         ← all init containers completed
+ContainersReady=False    ← at least one container's readiness probe is failing
+Ready=False              ← ⇒ REMOVED FROM SERVICE ENDPOINTS
+
+$ kubectl get pod api
+NAME   READY   STATUS    RESTARTS   AGE
+api    0/1     Running   0          2m
+       ↑↑↑     ↑↑↑↑↑↑↑
+   0 of 1 ready   phase is Running
+   → the process is up, the pod receives NO traffic, and nothing is "wrong"
+</pre>
+
+    <p>The <code>STATUS</code> column is not the phase — <code>kubectl</code> synthesises a more useful string
+       from container states. Knowing which layer each value comes from speeds up triage:</p>
+
+    <table class="tbl">
+      <tr><th>STATUS shown</th><th>Actually</th><th>Look at</th></tr>
+      <tr><td><code>Pending</code></td><td>Unschedulable, or image pulling</td><td><code>kubectl describe</code> Events → <a href="scheduling.html">scheduling</a></td></tr>
+      <tr><td><code>ContainerCreating</code></td><td>Sandbox/CNI/volume setup</td><td>CNI, PVC binding</td></tr>
+      <tr><td><code>ImagePullBackOff</code></td><td>Wrong image, or missing pull secret</td><td>The image reference and registry auth</td></tr>
+      <tr><td><code>CrashLoopBackOff</code></td><td>Started, exited, backing off before retry</td><td><code>logs --previous</code></td></tr>
+      <tr><td><code>Error</code></td><td>Terminated non-zero, not yet backing off</td><td>Exit code</td></tr>
+      <tr><td><code>Running</code> with <code>0/1</code></td><td><strong>Readiness failing</strong></td><td><a href="probes.html">Probes</a></td></tr>
+      <tr><td><code>Terminating</code></td><td><code>deletionTimestamp</code> set; grace period running</td><td>preStop, <a href="disruptions.html">shutdown</a></td></tr>
+      <tr><td><code>Completed</code></td><td>Exited 0 with <code>restartPolicy: Never/OnFailure</code></td><td>Normal for Jobs</td></tr>
+    </table>
+
+    <h4>CrashLoopBackOff is a delay, not an error</h4>
+
+<pre>
+$ kubectl run crasher --image=busybox --restart=Always -- sh -c 'echo starting; exit 1'
+$ for i in $(seq 6); do
+    kubectl get pod crasher -o jsonpath='{.status.containerStatuses[0].restartCount} {.status.containerStatuses[0].state}{"\n"}' \
+      | cut -c1-70
+    sleep 30
+  done
+0 {"terminated":{"exitCode":1,...}}
+1 {"waiting":{"reason":"CrashLoopBackOff",...}}
+2 {"waiting":{"reason":"CrashLoopBackOff",...}}
+3 ...
+
+restart delay:  10s → 20s → 40s → 80s → 160s → 300s (capped)
+   the counter resets after the container stays up for 10 minutes
+</pre>
+
+    <table class="tbl">
+      <tr><th><code>restartPolicy</code></th><th>Restarts on exit 0</th><th>Restarts on failure</th><th>Used by</th></tr>
+      <tr><td><code>Always</code> (default)</td><td>✅</td><td>✅</td><td>Deployments, StatefulSets, DaemonSets</td></tr>
+      <tr><td><code>OnFailure</code></td><td>❌</td><td>✅</td><td>Jobs that should retry in place</td></tr>
+      <tr><td><code>Never</code></td><td>❌</td><td>❌</td><td>Jobs where a new pod per attempt is wanted</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The backoff is protecting the cluster, not fixing your app.</strong> Without it a
+       container that exits immediately would be restarted thousands of times a minute, saturating the kubelet, the
+       registry and the API server. The important diagnostic is
+       <code>kubectl logs &lt;pod&gt; --previous</code> — the current container has not started yet, so plain
+       <code>logs</code> shows nothing at all.</div>
+
+    <h2>Part 4 — Init Containers</h2>
+
+    <p>Init containers run <strong>sequentially, to completion</strong>, before any app container starts. If one
+       fails, the kubelet restarts the pod according to its <code>restartPolicy</code> — so a failing init
+       container blocks the pod indefinitely rather than starting a degraded app.</p>
+
+<pre>
+spec:
+  initContainers:
+  - name: wait-for-db
+    image: busybox:1.36
+    command: ['sh','-c','until nc -z db 5432; do echo waiting; sleep 2; done']
+  - name: migrate
+    image: myco/api:1.4.2
+    command: ['npm','run','migrate']       ← runs ONLY after wait-for-db exits 0
+  containers:
+  - name: api
+    image: myco/api:1.4.2
+
+$ kubectl get pod api
+NAME   READY   STATUS            RESTARTS   AGE
+api    0/1     Init:0/2          0          14s      ← first init container running
+api    0/1     Init:1/2          0          31s
+api    0/1     PodInitializing   0          33s
+api    1/1     Running           0          36s
+</pre>
+
+    <table class="tbl">
+      <tr><th>Property</th><th>Init containers</th><th>App containers</th></tr>
+      <tr><td>Order</td><td><strong>Sequential</strong></td><td>Parallel</td></tr>
+      <tr><td>Must exit</td><td>✅ Successfully</td><td>Run indefinitely</td></tr>
+      <tr><td>Probes</td><td>❌ Not supported</td><td>✅</td></tr>
+      <tr><td>Failure</td><td>Pod restarts (or stays Pending with <code>Never</code>)</td><td>Container restarts</td></tr>
+      <tr><td>Good for</td><td>Waiting, migrations, fetching config, fixing volume permissions</td><td>The workload</td></tr>
+    </table>
+
+    <p>The non-obvious part is scheduling. Init containers run before the app containers, so their requests do not
+       add — the scheduler uses the <strong>larger</strong> of the two:</p>
+
+<pre>
+  effective request = max( max(init container requests),
+                           sum(app container requests) + sum(sidecar requests) )
+
+  init: migrate wants 2Gi          app: api wants 256Mi
+  → the pod requests 2Gi and needs a node with 2Gi free, even though 99.9% of its
+    life it uses 256Mi. A heavyweight init container silently changes where — and
+    whether — the pod can be scheduled.
+</pre>
+
+    <h2>Part 5 — Sidecars, and the Job That Never Finishes</h2>
+
+    <p>A classic sidecar is just an extra entry in <code>containers</code>, and that has a sharp edge: a pod is
+       only <code>Succeeded</code> when <strong>all</strong> its containers have exited. A sidecar that runs
+       forever keeps a Job's pod alive forever.</p>
+
+<pre>
+apiVersion: batch/v1
+kind: Job
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - { name: work,  image: myco/batch, command: ['./run.sh'] }
+      - { name: proxy, image: envoyproxy/envoy }     ← never exits
+
+$ kubectl get job batch
+NAME    COMPLETIONS   DURATION   AGE
+batch   0/1           47m        47m                ← work finished after 12 seconds
+$ kubectl get pod -l job-name=batch
+NAME          READY   STATUS    AGE
+batch-x8k2p   1/2     Running   47m                 ← 1 of 2: proxy still going
+</pre>
+
+    <p><strong>Native sidecars</strong> (stable since 1.29) solve this by making a sidecar an init container with
+       <code>restartPolicy: Always</code> — which gives it start-before and stop-after ordering while excluding it
+       from the pod's completion calculation:</p>
+
+<pre>
+spec:
+  initContainers:
+  - name: proxy
+    image: envoyproxy/envoy
+    restartPolicy: Always            ← THIS makes it a native sidecar
+  containers:
+  - { name: work, image: myco/batch, command: ['./run.sh'] }
+
+$ kubectl get job batch
+NAME    COMPLETIONS   DURATION   AGE
+batch   1/1           14s        20s                ← completes properly
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>Ordinary sidecar</th><th>Native sidecar (init + <code>restartPolicy: Always</code>)</th></tr>
+      <tr><td>Starts</td><td>In parallel with app containers</td><td><strong>Before</strong> app containers, and waits until started</td></tr>
+      <tr><td>Terminates</td><td>In parallel</td><td><strong>After</strong> app containers</td></tr>
+      <tr><td>Blocks Job completion</td><td><strong>✅ Yes — forever</strong></td><td>❌ No</td></tr>
+      <tr><td>Counts toward pod readiness</td><td>✅</td><td>Optional</td></tr>
+      <tr><td>Race at start-up</td><td>App may run before the proxy is up</td><td>Resolved by ordering</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Ordering was always the deeper problem.</strong> With an ordinary sidecar, a
+       mesh proxy and the application start simultaneously, so early requests fail until the proxy is ready — and
+       at shutdown the proxy often dies first, so in-flight requests break. Native sidecars give both guarantees
+       declaratively, which is why service meshes moved to them as soon as they were stable.</div>
+
+    <h2>Part 6 — Why You Never Create a Bare Pod</h2>
+
+    <p>A pod has no controller behind it. Nothing recreates it, ever:</p>
+
+<pre>
+$ kubectl run standalone --image=nginx:alpine
+$ kubectl get pod standalone -o jsonpath='{.metadata.ownerReferences}{"\n"}'
+                                       ← EMPTY: nothing owns it
+
+$ # the node hosting it fails
+$ kubectl get pod standalone
+NAME         READY   STATUS        AGE
+standalone   1/1     Terminating   6m      ← stuck; and never recreated anywhere
+$ sleep 600; kubectl get pods
+No resources found                          ← gone. That is the end of the story.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Need</th><th>Workload</th><th>Gives you</th></tr>
+      <tr><td>N interchangeable replicas</td><td><a href="deployments.html">Deployment</a></td><td>Rolling updates, rollback, self-healing</td></tr>
+      <tr><td>Stable identity and storage</td><td><a href="statefulsets.html">StatefulSet</a></td><td>Ordinals, per-pod PVCs, ordered rollout</td></tr>
+      <tr><td>One per node</td><td>DaemonSet</td><td>Automatic placement on new nodes</td></tr>
+      <tr><td>Run once to completion</td><td><a href="jobs-cronjobs.html">Job</a></td><td>Retries, parallelism, completion tracking</td></tr>
+      <tr><td>On a schedule</td><td>CronJob</td><td>The above, periodically</td></tr>
+      <tr><td>Debugging, one-off</td><td>A bare pod</td><td>Nothing — and that is fine for a shell</td></tr>
+    </table>
+
+    <p>The second reason is that <strong>a pod spec is almost entirely immutable</strong>. You cannot change a
+       running pod's resources, node, volumes or command — only a small allowlist:</p>
+
+<pre>
+$ kubectl patch pod api -p '{"spec":{"containers":[{"name":"api","resources":{"limits":{"memory":"1Gi"}}}]}}'
+The Pod "api" is invalid: spec: Forbidden: pod updates may not change fields other
+than `spec.containers[*].image`, `spec.initContainers[*].image`,
+`spec.activeDeadlineSeconds`, `spec.tolerations` (only additions to existing
+tolerations)...
+</pre>
+
+    <p>Which is exactly why higher-level controllers exist: to change anything meaningful, they create a
+       <em>new</em> pod. Pods are immutable, disposable units — and the workload object is where you actually
+       express intent.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Two services packed into one pod "because they talk a lot", a bare pod running a critical
+         job, a sidecar on a Job, and monitoring that alerts on <code>phase == Running</code>.</strong> The API and
+         its cache share a pod, so they can never scale independently — a traffic spike that needs ten API
+         replicas also creates ten caches — and the day both want port 8080, the second container crash-loops with
+         <code>address already in use</code>. A nightly reconciliation job runs as a bare pod created by hand; the
+         node is drained during a cluster upgrade and the job simply ceases to exist, silently, with nothing to
+         recreate it. The batch Job never reports completion because its Envoy sidecar runs forever, so the
+         CronJob's <code>concurrencyPolicy</code> never fires and a backlog builds for weeks. Configuration
+         hard-codes a pod IP that changes on every restart. And the dashboard is green because every pod's phase
+         is <code>Running</code>, while <code>0/1</code> containers are ready and the Service has no endpoints at
+         all — the readiness probe has been failing since the deploy.</p>
+      <p>✅ <strong>One concern per pod, always behind a controller, sidecars declared natively, and readiness
+         treated as the signal that matters.</strong> Put containers together only when they must share a
+         lifecycle and a network identity — a log shipper, a TLS-terminating proxy, a config reloader — and give
+         anything that scales on its own axis its own Deployment. Never create a bare pod for real work: it has no
+         <code>ownerReferences</code>, so no controller will ever recreate it, and a pod spec is immutable anyway,
+         so the workload object is where intent belongs. Declare sidecars as init containers with
+         <code>restartPolicy: Always</code>, which starts them before the app, stops them after it, and — verified —
+         lets a Job complete in 14 seconds instead of hanging for 47 minutes. Address pods through a Service, never
+         by IP, because the IP survives a container restart and changes on every pod recreation. And alert on
+         <code>Ready</code> and on endpoint counts rather than on phase, since <code>Running</code> with
+         <code>0/1</code> is a pod receiving no traffic at all.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Two independent services in one pod</td><td>They can never scale independently; ports collide</td><td>One Deployment each</td></tr>
+      <tr><td>Expecting containers to share files</td><td>Mount namespaces are <strong>not</strong> shared</td><td>An <code>emptyDir</code> volume mounted in both</td></tr>
+      <tr><td>Two containers on the same port</td><td>One network namespace</td><td>Different ports</td></tr>
+      <tr><td>Creating bare pods for real work</td><td>No owner ⇒ never rescheduled, ever</td><td>Deployment/Job/StatefulSet</td></tr>
+      <tr><td>Trying to patch a pod's resources</td><td>Pod specs are immutable apart from a tiny allowlist</td><td>Change the controller's template</td></tr>
+      <tr><td>Hard-coding pod IPs</td><td>New IP on every pod recreation</td><td>A Service name</td></tr>
+      <tr><td>Alerting on <code>phase == Running</code></td><td><code>Running</code> with <code>0/1</code> serves no traffic</td><td>Alert on <code>Ready</code> and endpoints</td></tr>
+      <tr><td><code>kubectl logs</code> on a CrashLoopBackOff pod</td><td>The current container has not started</td><td><code>logs --previous</code></td></tr>
+      <tr><td>Treating CrashLoopBackOff as a distinct failure</td><td>It is a <em>delay</em> between restarts</td><td>Read the exit code and previous logs</td></tr>
+      <tr><td>An ordinary sidecar on a Job</td><td>The pod never reaches <code>Succeeded</code></td><td>Native sidecar (init + <code>restartPolicy: Always</code>)</td></tr>
+      <tr><td>Ignoring init container requests</td><td>Effective request is <code>max(init, sum(app))</code></td><td>Size init containers deliberately</td></tr>
+      <tr><td>Probes on init containers</td><td>Not supported</td><td>Make the init command itself block until ready</td></tr>
+      <tr><td>Assuming app containers start in list order</td><td>They start in <strong>parallel</strong></td><td>Init containers or native sidecars for ordering</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why does Kubernetes schedule pods rather than containers?</summary>
+      <p><strong>Because some containers genuinely need to share a network identity and a lifecycle</strong>, and
+         the pod is the smallest unit that can express that.</p>
+      <table class="tbl">
+        <tr><th>Shared</th><th>Not shared</th></tr>
+        <tr><td>Network namespace — one IP, <code>localhost</code> between containers</td><td><strong>Mount namespace</strong> — separate filesystems</td></tr>
+        <tr><td>IPC, UTS (hostname)</td><td>PID namespace, unless <code>shareProcessNamespace</code></td></tr>
+      </table>
+<pre>
+$ kubectl exec two -c sidecar -- curl -s -o /dev/null -w '%{http_code}\n' localhost:80
+200                                    ← same network namespace
+$ kubectl exec two -c sidecar -- ls /usr/share/nginx/html
+ls: No such file or directory          ← separate filesystems
+</pre>
+      <p><strong>The rule for what belongs together:</strong> containers that must share a lifecycle and an IP — a
+         log shipper, a TLS proxy, a config reloader. Not an app and its database: those scale on different axes,
+         and containers in a pod always scale together.</p>
+      <p><strong>The consequence to mention:</strong> since the network namespace is shared, two containers cannot
+         both bind the same port.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> A pod shows <code>Running</code> but <code>0/1</code> ready. What does that mean?</summary>
+      <p><strong>The container process is up, but its readiness probe is failing — so the pod has been removed
+         from (or never added to) its Service's endpoints and receives no traffic.</strong></p>
+<pre>
+$ kubectl get pod api
+NAME   READY   STATUS    RESTARTS   AGE
+api    0/1     Running   0          2m
+$ kubectl get pod api -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
+PodScheduled=True
+Initialized=True
+ContainersReady=False
+Ready=False                     ← not in any Service endpoint list
+</pre>
+      <p><strong>Phase and readiness answer different questions.</strong> <code>Running</code> means "bound to a
+         node with at least one container running"; <code>Ready</code> means "willing to serve". Monitoring that
+         alerts on phase shows green while a Service has zero endpoints.</p>
+      <p><strong>How to investigate:</strong> <code>kubectl describe pod</code> for probe failure events, then the
+         container logs. Common causes are a probe pointing at the wrong port or path, a startup slower than the
+         probe's tolerance (which needs a <a href="probes.html">startup probe</a>), or a dependency the readiness
+         endpoint checks being down.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain init containers, and how they affect scheduling.</summary>
+      <p><strong>They run sequentially to completion before any app container starts</strong>, and a failure blocks
+         the pod rather than letting a degraded app run.</p>
+<pre>
+initContainers:
+- name: wait-for-db
+  command: ['sh','-c','until nc -z db 5432; do sleep 2; done']
+- name: migrate                       ← starts only after the first exits 0
+  command: ['npm','run','migrate']
+containers:
+- name: api                           ← starts only after ALL init containers succeed
+</pre>
+      <p><strong>The scheduling effect people miss:</strong> because init containers run before the app containers,
+         their requests do not add to them — the scheduler uses the larger of the two:</p>
+<pre>
+effective request = max( max(init requests), sum(app + sidecar requests) )
+
+init "migrate" requests 2Gi, app requests 256Mi
+→ the POD requests 2Gi and needs a node with 2Gi free, forever, despite using
+  256Mi for 99.9% of its life
+</pre>
+      <p>So a heavyweight init container quietly changes where the pod can be scheduled, and can make it
+         <code>Pending</code> on a cluster that has plenty of room for the actual workload.</p>
+      <p><strong>Other properties worth knowing:</strong> init containers do not support probes (make the command
+         itself block until the condition holds), they are the right place to fix volume permissions or fetch
+         secrets, and for migrations they are usually the <em>wrong</em> place in a multi-replica Deployment —
+         every replica would run them concurrently. Use a <a href="jobs-cronjobs.html">Job</a> for that.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A Job's pod has finished its work but the Job never completes. Why?</summary>
+      <p><strong>A sidecar.</strong> A pod reaches <code>Succeeded</code> only when <em>all</em> its containers
+         have terminated. An ordinary sidecar — a mesh proxy, a metrics agent, a log shipper — never exits, so the
+         Job hangs indefinitely.</p>
+<pre>
+$ kubectl get job batch
+NAME    COMPLETIONS   DURATION   AGE
+batch   0/1           47m        47m       ← the work finished in 12 seconds
+$ kubectl get pod -l job-name=batch
+batch-x8k2p   1/2   Running   47m          ← 1 of 2 containers still running
+</pre>
+      <p><strong>The modern fix is the native sidecar</strong> — an init container with
+         <code>restartPolicy: Always</code>:</p>
+<pre>
+initContainers:
+- { name: proxy, image: envoyproxy/envoy, restartPolicy: Always }
+containers:
+- { name: work,  image: myco/batch }
+→ COMPLETIONS 1/1 in 14s
+</pre>
+      <table class="tbl">
+        <tr><th></th><th>Ordinary sidecar</th><th>Native sidecar</th></tr>
+        <tr><td>Start order</td><td>Parallel with the app</td><td><strong>Before</strong> the app</td></tr>
+        <tr><td>Stop order</td><td>Parallel</td><td><strong>After</strong> the app</td></tr>
+        <tr><td>Blocks Job completion</td><td>✅</td><td>❌</td></tr>
+      </table>
+      <p><strong>Before native sidecars existed</strong> the workarounds were all bad: the main container curling
+         the proxy's <code>/quitquitquit</code> on exit, a shared <code>emptyDir</code> sentinel file the sidecar
+         polls, or <code>shareProcessNamespace</code> plus killing the sidecar. Each adds a coupling between
+         containers that were meant to be independent — which is exactly why the feature was added.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> When do you put containers in the same pod, and what does that decision cost you later?</summary>
+      <p><strong>Same pod only when the containers must share a lifecycle, a network namespace, or a
+         volume — and when they scale together.</strong> Every one of those is a coupling you cannot undo without
+         a rewrite of the deployment topology.</p>
+      <table class="tbl">
+        <tr><th>Same pod</th><th>Separate pods</th></tr>
+        <tr><td>Log shipper reading a shared <code>emptyDir</code></td><td>API and database</td></tr>
+        <tr><td>Service-mesh proxy intercepting localhost</td><td>Frontend and backend</td></tr>
+        <tr><td>Config reloader watching a mounted ConfigMap</td><td>Anything with an independent scaling curve</td></tr>
+        <tr><td>An adapter translating a legacy protocol</td><td>Anything with an independent release cadence</td></tr>
+      </table>
+      <p><strong>The costs, in the order they bite:</strong></p>
+      <ul>
+        <li><strong>Scaling is joint.</strong> Ten API replicas means ten copies of every sidecar — which is
+            usually fine for a 20 MB proxy and ruinous for a 500 MB cache.</li>
+        <li><strong>Releases are joint.</strong> Changing the sidecar image restarts the application. A mesh
+            upgrade becomes a full fleet rollout.</li>
+        <li><strong>Resource accounting is joint.</strong> The pod's request is the sum, so sidecars inflate what
+            the scheduler must find, and a sidecar without limits can consume the whole pod's budget.</li>
+        <li><strong>Failure is joint-ish.</strong> A crash-looping sidecar makes the pod not-Ready and pulls a
+            healthy application out of service.</li>
+        <li><strong>Port space is shared</strong>, so two containers can never listen on the same port.</li>
+      </ul>
+      <p><strong>The design heuristic I would state:</strong> a sidecar should be <em>a feature of the
+         application's runtime environment</em>, not a separate service. If you would ever want to scale it, release
+         it, or page someone about it independently, it is a separate workload. Node-level agents belong in a
+         DaemonSet, not in every pod — one log collector per node rather than per pod is usually an order of
+         magnitude cheaper.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A pod is stuck <code>Terminating</code>. Walk through the causes and the correct fixes.</summary>
+      <p><strong><code>Terminating</code> means <code>deletionTimestamp</code> is set and something has not
+         finished.</strong> The causes are distinct and each has its own correct fix — force-deleting is almost
+         always the wrong first move.</p>
+      <table class="tbl">
+        <tr><th>Cause</th><th>Evidence</th><th>Correct fix</th></tr>
+        <tr><td>Long <code>terminationGracePeriodSeconds</code></td><td>Still within the window</td><td><strong>Wait</strong> — it is working as configured</td></tr>
+        <tr><td>Process ignores SIGTERM</td><td>Still there after the grace period</td><td>Handle the signal — <a href="../docker/process-model.html">PID 1 semantics</a></td></tr>
+        <tr><td><code>preStop</code> hook hanging</td><td>Grace period never elapses</td><td>Bound the hook; it is included in the budget</td></tr>
+        <tr><td><strong>The node is gone</strong></td><td>Node <code>NotReady</code>/<code>Unknown</code></td><td>The kubelet cannot confirm deletion — see below</td></tr>
+        <tr><td>A finalizer</td><td><code>metadata.finalizers</code> non-empty</td><td>Find the controller holding it</td></tr>
+        <tr><td>Volume will not unmount</td><td><code>FailedUnmount</code> events</td><td>Fix the storage backend</td></tr>
+      </table>
+      <p><strong>The node-failure case is the one with real consequences.</strong> The control plane cannot know
+         whether the pod is truly dead — the node may be partitioned rather than down — so it will not delete the
+         object. <code>kubectl delete --force --grace-period=0</code> removes it from the API <em>without any
+         confirmation that the process stopped</em>. For a Deployment that is usually acceptable; for a
+         <a href="statefulsets.html">StatefulSet</a> it is dangerous, because the whole point of stable identity
+         is that <code>mysql-0</code> exists once — force-deleting can produce two pods with the same identity
+         writing to the same volume.</p>
+      <p><strong>What I would do instead:</strong> confirm the node is genuinely dead rather than partitioned,
+         then delete the Node object — which lets the controller conclude its pods are gone and clean them up
+         safely. For non-graceful shutdown, taint the node with
+         <code>node.kubernetes.io/out-of-service</code>, which is the supported mechanism for exactly this and
+         also detaches volumes so they can be reattached elsewhere.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove exactly which namespaces a pod shares.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: { name: shared }
+spec:
+  containers:
+  - { name: web,  image: nginx:alpine }
+  - { name: tool, image: nicolaka/netshoot, command: ["sleep","3600"] }
+EOF
+
+NETWORK — shared:
+$ kubectl exec shared -c tool -- curl -s -o /dev/null -w '%{http_code}\n' localhost:80
+200
+$ kubectl exec shared -c tool -- ip addr show eth0 | grep 'inet '
+    inet 10.244.1.7/24 scope global eth0
+$ kubectl exec shared -c web  -- ip addr show eth0 | grep 'inet '
+    inet 10.244.1.7/24 scope global eth0        ← identical
+
+UTS — shared:
+$ kubectl exec shared -c tool -- hostname; kubectl exec shared -c web -- hostname
+shared
+shared
+
+MOUNT — NOT shared:
+$ kubectl exec shared -c web -- sh -c 'echo hello > /tmp/f'
+$ kubectl exec shared -c tool -- cat /tmp/f
+cat: /tmp/f: No such file or directory
+
+PID — NOT shared by default:
+$ kubectl exec shared -c tool -- ps -eo pid,comm --no-headers
+    1 sleep
+   14 ps                                        ← nginx is invisible
+</pre>
+<pre>
+Now share files (a volume) and processes (opt-in):
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: { name: shared2 }
+spec:
+  shareProcessNamespace: true
+  volumes: [{ name: data, emptyDir: {} }]
+  containers:
+  - { name: web,  image: nginx:alpine,      volumeMounts: [{name: data, mountPath: /data}] }
+  - { name: tool, image: nicolaka/netshoot, command: ["sleep","3600"],
+      volumeMounts: [{name: data, mountPath: /data}] }
+EOF
+$ kubectl exec shared2 -c web -- sh -c 'echo hello > /data/f'
+$ kubectl exec shared2 -c tool -- cat /data/f
+hello                                           ← the volume bridges the mount namespaces
+$ kubectl exec shared2 -c tool -- ps -eo pid,comm --no-headers | head -3
+    1 pause                                     ← the SANDBOX container, now visible
+   12 nginx
+   19 sleep
+</pre>
+<p>And the port collision the shared network namespace guarantees:</p>
+<pre>
+$ kubectl run dual --image=nginx:alpine --dry-run=client -o yaml \
+    | yq '.spec.containers += [{"name":"web2","image":"nginx:alpine"}]' | kubectl apply -f -
+$ sleep 5; kubectl logs dual -c web2 | tail -1
+nginx: [emerg] bind() to 0.0.0.0:80 failed (98: Address already in use)
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show that the pod IP survives a container restart but not a pod recreation.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl run ipdemo --image=nginx:alpine
+$ kubectl get pod ipdemo -o jsonpath='{.status.podIP}{"\n"}'
+10.244.1.7
+
+CONTAINER restart — the sandbox survives:
+$ kubectl exec ipdemo -- kill 1
+$ sleep 5
+$ kubectl get pod ipdemo -o custom-columns='IP:.status.podIP,RESTARTS:.status.containerStatuses[0].restartCount,AGE:.metadata.creationTimestamp'
+IP           RESTARTS   AGE
+10.244.1.7   1          2026-08-19T12:31:02Z       ← same IP, same pod, restart +1
+
+$ kubectl get events --field-selector involvedObject.name=ipdemo \
+    -o custom-columns=REASON:.reason | sort -u
+Created
+Pulled
+Started                                            ← no SandboxChanged event
+
+POD recreation — new sandbox, new IP:
+$ kubectl delete pod ipdemo &amp;&amp; kubectl run ipdemo --image=nginx:alpine
+$ kubectl get pod ipdemo -o jsonpath='{.status.podIP}{"\n"}'
+10.244.2.11                                        ← different
+</pre>
+<p>Now quantify the churn across a rolling update, which is what makes pod IPs unusable as addresses:</p>
+<pre>
+$ kubectl create deploy web --image=nginx:alpine --replicas=3
+$ kubectl get pods -l app=web -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'
+10.244.1.9
+10.244.2.12
+10.244.1.10
+$ kubectl set image deploy/web nginx=nginx:1.27-alpine &amp;&amp; kubectl rollout status deploy/web
+$ kubectl get pods -l app=web -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'
+10.244.2.14
+10.244.1.13
+10.244.2.15                                        ← ALL THREE changed
+</pre>
+<p>The stable handle is the Service, whose ClusterIP does not move:</p>
+<pre>
+$ kubectl expose deploy web --port=80
+$ kubectl get svc web -o jsonpath='{.spec.clusterIP}{"\n"}'
+10.96.140.22
+$ kubectl rollout restart deploy/web &amp;&amp; kubectl rollout status deploy/web
+$ kubectl get svc web -o jsonpath='{.spec.clusterIP}{"\n"}'
+10.96.140.22                                       ← unchanged across a full replacement
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure the CrashLoopBackOff schedule and read the right logs.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl run crasher --image=busybox --restart=Always -- \
+    sh -c 'echo "starting at $(date +%T)"; sleep 2; echo "dying"; exit 1'
+
+$ start=$SECONDS
+$ while [ $((SECONDS-start)) -lt 400 ]; do
+    kubectl get pod crasher -o jsonpath='{.status.containerStatuses[0].restartCount}' >/tmp/rc
+    printf '%4ss restarts=%s state=%s\n' "$((SECONDS-start))" "$(cat /tmp/rc)" \
+      "$(kubectl get pod crasher -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}{.status.containerStatuses[0].state.running.startedAt}' | cut -c1-20)"
+    sleep 10
+  done
+   0s restarts=0 state=
+  10s restarts=1 state=CrashLoopBackOff
+  20s restarts=1 state=CrashLoopBackOff
+  30s restarts=2 state=CrashLoopBackOff
+  50s restarts=3 state=CrashLoopBackOff
+  90s restarts=4 state=CrashLoopBackOff
+ 170s restarts=5 state=CrashLoopBackOff
+ 330s restarts=6 state=CrashLoopBackOff
+ 630s restarts=7                          ← 10s → 20s → 40s → 80s → 160s → 300s (cap)
+</pre>
+<pre>
+THE LOGS TRAP:
+$ kubectl logs crasher
+Error from server (BadRequest): container "crasher" in pod "crasher" is waiting to
+start: CrashLoopBackOff
+   → the CURRENT container has not started, so there is nothing to read
+
+$ kubectl logs crasher --previous
+starting at 12:34:41
+dying                                     ← the actual evidence
+
+$ kubectl get pod crasher -o jsonpath='{.status.containerStatuses[0].lastState.terminated}' | jq
+{ "exitCode": 1, "reason": "Error", "startedAt": "...", "finishedAt": "..." }
+</pre>
+<p>Confirm the counter resets after a period of stability:</p>
+<pre>
+$ kubectl delete pod crasher
+$ kubectl run flaky --image=busybox --restart=Always -- \
+    sh -c 'sleep 700; exit 1'                       # stays up 11+ minutes
+$ sleep 720; kubectl get pod flaky -o jsonpath='{.status.containerStatuses[0].restartCount}{"\n"}'
+1
+$ sleep 20; kubectl get pod flaky | tail -1
+flaky   1/1   Running   1   12m                     ← restarted immediately, no backoff
+</pre>
+<table class="tbl">
+  <tr><th>Symptom</th><th>Read</th></tr>
+  <tr><td><code>CrashLoopBackOff</code></td><td><code>logs --previous</code> and <code>lastState.terminated.exitCode</code></td></tr>
+  <tr><td>Exit 137</td><td>OOM or SIGKILL — check <a href="resources.html">limits</a></td></tr>
+  <tr><td>Exit 1/2</td><td>Application error — the previous logs have it</td></tr>
+  <tr><td>Restarts climbing slowly</td><td>Normal backoff, not an additional fault</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show init container ordering and its effect on scheduling.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: { name: ordered }
+spec:
+  initContainers:
+  - { name: first,  image: busybox, command: ['sh','-c','echo first;  sleep 10'] }
+  - { name: second, image: busybox, command: ['sh','-c','echo second; sleep 10'] }
+  containers:
+  - { name: app, image: nginx:alpine }
+EOF
+
+$ for i in $(seq 8); do
+    printf '%2ss %s\n' $((i*5)) "$(kubectl get pod ordered --no-headers | awk '{print $2, $3}')"
+    sleep 5
+  done
+ 5s 0/1 Init:0/2
+10s 0/1 Init:0/2
+15s 0/1 Init:1/2            ← strictly sequential
+20s 0/1 Init:1/2
+25s 0/1 PodInitializing
+30s 1/1 Running
+
+$ kubectl logs ordered -c second
+second
+$ kubectl logs ordered -c app --previous 2>&amp;1 | head -1
+Error from server: previous terminated container not found   ← app never ran early
+</pre>
+<pre>
+A FAILING init container blocks the pod indefinitely:
+$ kubectl run blocked --image=nginx:alpine --dry-run=client -o yaml \
+  | yq '.spec.initContainers = [{"name":"wait","image":"busybox",
+        "command":["sh","-c","until nc -z nonexistent 5432; do echo waiting; sleep 2; done"]}]' \
+  | kubectl apply -f -
+$ sleep 60; kubectl get pod blocked
+NAME      READY   STATUS     RESTARTS   AGE
+blocked   0/1     Init:0/1   0          60s        ← forever, and correctly so
+$ kubectl logs blocked -c wait --tail=2
+waiting
+waiting
+</pre>
+<pre>
+THE SCHEDULING EFFECT — effective request = max(init, sum(app)):
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: { name: heavy-init }
+spec:
+  initContainers:
+  - { name: migrate, image: busybox, command: ['sh','-c','sleep 5'],
+      resources: { requests: { memory: 8Gi } } }
+  containers:
+  - { name: app, image: nginx:alpine,
+      resources: { requests: { memory: 256Mi } } }
+EOF
+$ kubectl get pod heavy-init
+NAME         READY   STATUS    AGE
+heavy-init   0/1     Pending   30s
+$ kubectl describe pod heavy-init | grep -A2 Events | tail -1
+  Warning  FailedScheduling  0/3 nodes are available: 3 Insufficient memory.
+
+$ kubectl get nodes -o custom-columns=NAME:.metadata.name,MEM:.status.allocatable.memory
+NAME       MEM
+worker-1   4014052Ki                          ← ~3.8Gi: plenty for the 256Mi app,
+worker-2   4014052Ki                            nowhere near the 8Gi init container
+</pre>
+<p><strong>Conclusion:</strong> the init container's request became the pod's request for the whole of its
+   life. Size init containers to what they need, and prefer a separate <a href="jobs-cronjobs.html">Job</a>
+   for heavyweight work like migrations — which also avoids every replica running them at once.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Reproduce the sidecar-blocks-Job problem and fix it with a native sidecar.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata: { name: classic }
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - { name: work,  image: busybox, command: ['sh','-c','echo working; sleep 10; echo done'] }
+      - { name: proxy, image: busybox, command: ['sh','-c','while true; do sleep 5; done'] }
+EOF
+
+$ sleep 30; kubectl get job classic
+NAME      COMPLETIONS   DURATION   AGE
+classic   0/1           30s        30s
+$ kubectl get pod -l job-name=classic
+NAME            READY   STATUS    RESTARTS   AGE
+classic-x8k2p   1/2     Running   0          30s      ← work finished 20s ago
+
+$ kubectl get pod -l job-name=classic -o jsonpath='{range .items[0].status.containerStatuses[*]}{.name}={.state}{"\n"}{end}' | cut -c1-60
+work={"terminated":{"exitCode":0,"reason":"Completed"
+proxy={"running":{"startedAt":"2026-08-19T12:31:0        ← the blocker
+
+$ sleep 1800; kubectl get job classic
+classic   0/1   30m   30m                              ← still not complete
+</pre>
+<pre>
+THE FIX — a native sidecar:
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata: { name: native }
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+      - name: proxy
+        image: busybox
+        command: ['sh','-c','echo proxy up; while true; do sleep 5; done']
+        restartPolicy: Always                  ← makes it a SIDECAR, not an init step
+      containers:
+      - { name: work, image: busybox, command: ['sh','-c','echo working; sleep 10; echo done'] }
+EOF
+
+$ sleep 20; kubectl get job native
+NAME     COMPLETIONS   DURATION   AGE
+native   1/1           14s        20s          ← completes
+$ kubectl get pod -l job-name=native
+NAME           READY   STATUS      RESTARTS   AGE
+native-p9v3w   0/1     Completed   0          20s
+</pre>
+<p>Verify the ordering guarantees, which were the deeper reason for the feature:</p>
+<pre>
+$ kubectl logs native-p9v3w --all-containers --timestamps | sort
+2026-08-19T12:31:02.1Z proxy up          ← sidecar STARTED FIRST
+2026-08-19T12:31:04.3Z working           ← app started after
+2026-08-19T12:31:14.4Z done
+   (proxy terminated after the app exited — no output, but the pod completed)
+
+$ kubectl get pod native-p9v3w -o jsonpath='{range .status.initContainerStatuses[*]}{.name}={.state}{"\n"}{end}' | cut -c1-50
+proxy={"terminated":{"exitCode":0,"reason":"Compl     ← stopped AFTER the app
+</pre>
+<table class="tbl">
+  <tr><th></th><th>Ordinary sidecar</th><th>Native sidecar</th></tr>
+  <tr><td>Job completion</td><td><strong>Never (30m+ and counting)</strong></td><td><strong>14 s</strong></td></tr>
+  <tr><td>Start order</td><td>Racy — app may run before the proxy is up</td><td>Proxy first, guaranteed</td></tr>
+  <tr><td>Stop order</td><td>Racy — proxy may die with requests in flight</td><td>App first, then proxy</td></tr>
+  <tr><td>Restarts if it crashes</td><td>Yes</td><td>Yes (unlike a plain init container)</td></tr>
+</table>
+<p><strong>The pre-1.29 workarounds</strong> — the app curling <code>/quitquitquit</code>, a sentinel file in
+   a shared <code>emptyDir</code>, or <code>shareProcessNamespace</code> plus killing the sidecar — all
+   couple containers that were meant to be independent. That coupling is the thing the feature removed.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Prove a bare pod is never rescheduled, and that pod specs are immutable.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl run standalone --image=nginx:alpine
+$ kubectl create deploy managed --image=nginx:alpine --replicas=1
+$ kubectl get pods -o wide --no-headers | awk '{print $1, $7}'
+managed-6799fc88d8-4wm2t worker-1
+standalone               worker-1
+
+$ kubectl get pod standalone -o jsonpath='owner={.metadata.ownerReferences}{"\n"}'
+owner=                                       ← nothing owns it
+$ kubectl get pod -l app=managed -o jsonpath='owner={.items[0].metadata.ownerReferences[0].kind}{"\n"}'
+owner=ReplicaSet
+</pre>
+<pre>
+$ kubectl drain worker-1 --ignore-daemonsets --delete-emptydir-data --force
+node/worker-1 cordoned
+Warning: deleting Pods not managed by ReplicationController, Job, DaemonSet or
+StatefulSet: default/standalone            ← --force was REQUIRED, and it warns you
+evicting pod default/managed-6799fc88d8-4wm2t
+evicting pod default/standalone
+node/worker-1 drained
+
+$ kubectl get pods -o wide --no-headers | awk '{print $1, $3, $7}'
+managed-6799fc88d8-9x2mv Running worker-2  ← rescheduled elsewhere automatically
+                                            ← standalone: GONE. Permanently.
+$ kubectl get pod standalone
+Error from server (NotFound): pods "standalone" not found
+</pre>
+<pre>
+IMMUTABILITY — why controllers exist at all:
+$ kubectl patch pod managed-6799fc88d8-9x2mv \
+    -p '{"spec":{"containers":[{"name":"nginx","resources":{"limits":{"memory":"1Gi"}}}]}}'
+The Pod "managed-6799fc88d8-9x2mv" is invalid: spec: Forbidden: pod updates may not
+change fields other than `spec.containers[*].image`,
+`spec.initContainers[*].image`, `spec.activeDeadlineSeconds`,
+`spec.tolerations` (only additions to existing tolerations)...
+
+$ kubectl set image pod/managed-6799fc88d8-9x2mv nginx=nginx:1.27-alpine
+pod/managed-6799fc88d8-9x2mv image updated   ← image IS on the allowlist
+$ sleep 3; kubectl get pod -l app=managed -o jsonpath='{.items[0].spec.containers[0].image}{"\n"}'
+nginx:alpine                                 ← and the ReplicaSet reverted it in ~1s
+</pre>
+<pre>
+The supported way to change anything — edit the controller's template:
+$ kubectl set image deploy/managed nginx=nginx:1.27-alpine
+$ kubectl rollout status deploy/managed
+deployment "managed" successfully rolled out
+$ kubectl get pods -l app=managed --no-headers | awk '{print $1}'
+managed-7d4b9c8f5d-t2h8n                     ← a NEW pod; the old one was replaced
+</pre>
+<table class="tbl">
+  <tr><th></th><th>Bare pod</th><th>Deployment-managed pod</th></tr>
+  <tr><td><code>ownerReferences</code></td><td>None</td><td>ReplicaSet</td></tr>
+  <tr><td>Node drain</td><td><strong>Deleted permanently</strong> (needs <code>--force</code>)</td><td>Rescheduled</td></tr>
+  <tr><td>Node failure</td><td>Gone</td><td>Rescheduled</td></tr>
+  <tr><td>Changing resources</td><td>Impossible — recreate by hand</td><td>Edit the template; new pod created</td></tr>
+  <tr><td>Legitimate use</td><td>A debug shell</td><td>Everything else</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>A pod is containers sharing <strong>network, IPC and UTS namespaces</strong> — one IP, <code>localhost</code> between containers, one hostname.</li>
+        <li><strong>Mount namespaces are not shared</strong>: sharing files needs a volume. PID namespaces are opt-in via <code>shareProcessNamespace</code>.</li>
+        <li>One network namespace means <strong>two containers cannot bind the same port</strong> — verified as <code>address already in use</code>.</li>
+        <li>The <strong>pause container</strong> holds the namespaces open, which is why a container restart keeps the pod IP and a pod recreation does not.</li>
+        <li>Every pod in a rolling update gets a new IP — measured, all three replicas changed. <strong>Never configure a pod IP</strong>; that is what Services are for.</li>
+        <li><strong>Phase ≠ readiness</strong>: <code>Running</code> with <code>0/1</code> is a pod serving no traffic. Alert on <code>Ready</code> and endpoint counts, never on phase.</li>
+        <li>The <code>STATUS</code> column is synthesised, not the phase — <code>ImagePullBackOff</code>, <code>CrashLoopBackOff</code> and <code>PodInitializing</code> each point at a different layer.</li>
+        <li><strong><code>CrashLoopBackOff</code> is a delay, not a failure mode</strong> — measured 10s → 20s → 40s → 80s → 160s → 300s, resetting after ~10 minutes of stability.</li>
+        <li><code>kubectl logs</code> shows nothing during backoff because the container has not started: <strong>use <code>--previous</code></strong>, plus <code>lastState.terminated.exitCode</code>.</li>
+        <li>Init containers run <strong>sequentially to completion</strong>; a failing one blocks the pod indefinitely, which is better than starting a degraded app.</li>
+        <li><strong>Effective request = <code>max(max init, sum app)</code></strong> — an 8Gi init container made a 256Mi app unschedulable on 4Gi nodes.</li>
+        <li>Init containers support no probes, and are the wrong place for migrations in a multi-replica Deployment — every replica would run them at once.</li>
+        <li>App containers start <strong>in parallel</strong>; list order guarantees nothing.</li>
+        <li>An ordinary sidecar blocks Job completion for ever — measured: <strong>30+ minutes versus 14 seconds</strong> once converted.</li>
+        <li><strong>Native sidecars</strong> are init containers with <code>restartPolicy: Always</code>: they start before the app, stop after it, restart on crash, and never block completion.</li>
+        <li>The pre-1.29 workarounds (<code>/quitquitquit</code>, sentinel files, <code>shareProcessNamespace</code>) all coupled containers that were meant to be independent.</li>
+        <li>Put containers in one pod only when they share a lifecycle and a network identity; joint scaling, joint releases and joint resource accounting are the price.</li>
+        <li><strong>A bare pod has no <code>ownerReferences</code> and is never recreated</strong> — a node drain deleted it permanently, and required <code>--force</code> to do so.</li>
+        <li>Pod specs are <strong>immutable</strong> apart from image, tolerations and <code>activeDeadlineSeconds</code> — which is precisely why controllers create new pods instead of editing them.</li>
+        <li>A pod stuck <code>Terminating</code> on a dead node is the control plane refusing to guess: force-deleting is acceptable for a Deployment and dangerous for a StatefulSet, where the safe move is deleting the Node object or using the <code>out-of-service</code> taint.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="objects-yaml.html">← Objects, the API &amp; How Apply Works</a>
+      <a href="deployments.html">Deployments, ReplicaSets &amp; Rollouts →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
