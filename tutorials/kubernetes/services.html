@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Services, Endpoints &amp; kube-proxy — Kubernetes — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Services, Endpoints &amp; kube-proxy <span class="level-badge level-int">Networking &amp; Traffic</span></h1>
+    <p><strong>What you'll master:</strong> the fact that reframes everything else — <strong>a ClusterIP has no
+       process behind it and nothing listens on it</strong>; it is a DNAT rule programmed onto every node, which
+       is why you cannot ping it and why it never appears in <code>ss</code>; the chain from selector to
+       EndpointSlice to kube-proxy rules, and why <strong>only Ready pods are endpoints</strong>; iptables versus
+       IPVS versus nftables, and the rule-count growth that makes large clusters slow; the load-balancing reality
+       that catches every team eventually — <strong>balancing is per <em>connection</em>, not per request</strong>,
+       so gRPC and HTTP/2 clients pin all their traffic to one pod; <code>externalTrafficPolicy: Local</code> and
+       the trade between source-IP preservation and traffic imbalance; headless Services, Services without
+       selectors, and <code>ExternalName</code>; and a triage order that finds a broken Service in three commands.
+       Prerequisites: <a href="pods.html">Pods</a>, <a href="objects-yaml.html">Objects &amp; selectors</a>, and
+       <a href="../docker/networking.html">Docker: Networking</a>.</p>
+
+    <h2>Part 1 — A ClusterIP Is Not a Thing</h2>
+
+    <p>The single most useful realisation about Kubernetes networking: the Service's IP address is fictional.
+       Nothing owns it, nothing binds it, no process is listening. It exists only as packet-rewriting rules
+       installed on every node.</p>
+
+<pre>
+$ kubectl get svc web
+NAME   TYPE        CLUSTER-IP      PORT(S)   AGE
+web    ClusterIP   10.96.140.22    80/TCP    4m
+
+$ ping -c1 -W1 10.96.140.22
+1 packets transmitted, 0 received, 100% packet loss     ← no ICMP responder exists
+
+$ sudo ss -ltnp | grep 10.96.140.22
+                                                        ← nothing is listening
+
+$ curl -s -o /dev/null -w '%{http_code}\n' http://10.96.140.22/
+200                                                     ← and yet it works
+
+$ sudo iptables -t nat -L KUBE-SERVICES -n | grep 10.96.140.22
+KUBE-SVC-XPGD46QRK7WJZT7O  tcp -- 0.0.0.0/0  10.96.140.22  tcp dpt:80
+        ↑ THERE it is: a DNAT rule, on every node, rewriting the destination
+</pre>
+
+    <div class="note">🔑 <strong>The packet is rewritten before it leaves the pod's network namespace.</strong>
+       Your process connects to 10.96.140.22:80; netfilter picks an endpoint and rewrites the destination to
+       10.244.1.7:8080; the reply is rewritten back on the way in. There is no proxy in the data path, no extra
+       hop, and — importantly — <strong>no health checking</strong>: kube-proxy programs whatever the EndpointSlice
+       says, and if that list is stale, packets go to a pod that is gone.</div>
+
+    <h2>Part 2 — Selector → EndpointSlice → Rules</h2>
+
+<pre>
+   Service web        selector: {app: web}
+        │
+        │  the endpoints controller watches Services and Pods
+        ▼
+   EndpointSlice web-x7k2m     [10.244.1.7:8080 ready, 10.244.2.4:8080 ready]
+        │                       ↑ ONLY pods whose Ready condition is True
+        │  kube-proxy on EVERY node watches EndpointSlices
+        ▼
+   iptables / IPVS / nftables rules, on every node
+</pre>
+
+    <table class="tbl">
+      <tr><th>Service type</th><th>Reachable from</th><th>Implementation</th></tr>
+      <tr><td><code>ClusterIP</code> (default)</td><td>Inside the cluster</td><td>DNAT rules on every node</td></tr>
+      <tr><td><code>NodePort</code></td><td>Any node's IP on a high port (30000–32767)</td><td>ClusterIP <strong>plus</strong> a node-port rule</td></tr>
+      <tr><td><code>LoadBalancer</code></td><td>An external LB address</td><td>NodePort <strong>plus</strong> a cloud LB pointing at it</td></tr>
+      <tr><td><code>ExternalName</code></td><td>n/a — a DNS CNAME</td><td><strong>No proxying at all</strong></td></tr>
+      <tr><td>Headless (<code>clusterIP: None</code>)</td><td>DNS returns pod IPs directly</td><td><strong>No rules, no VIP</strong></td></tr>
+    </table>
+
+<pre>
+$ kubectl get endpointslices -l kubernetes.io/service-name=web \
+    -o custom-columns='ADDR:.endpoints[*].addresses[0],READY:.endpoints[*].conditions.ready'
+ADDR                     READY
+10.244.1.7,10.244.2.4    true,true
+
+$ kubectl patch deploy web -p '{"spec":{"template":{"spec":{"containers":[{"name":"nginx",
+    "readinessProbe":{"httpGet":{"path":"/nope","port":80},"periodSeconds":2}}]}}}}'
+$ sleep 20
+$ kubectl get endpointslices -l kubernetes.io/service-name=web -o jsonpath='{.items[0].endpoints}' | jq -c '.[].conditions'
+{"ready":false,"serving":false,"terminating":false}
+$ kubectl get svc web -o wide
+NAME   CLUSTER-IP     PORT(S)   SELECTOR
+web    10.96.140.22   80/TCP    app=web        ← the Service looks perfectly healthy
+$ curl -m2 http://web/ ; echo "exit=$?"
+exit=28                                        ← nothing to route to
+</pre>
+
+    <div class="note">⚠️ <strong>A Service with zero endpoints is not an error state — it is an empty routing
+       table.</strong> Nothing turns red, no condition flips, no event fires. The two causes are a selector that
+       matches no pods (a typo, or selecting the Deployment's labels rather than the pod template's) and pods that
+       exist but are not Ready. <code>kubectl get endpointslices</code> distinguishes them instantly, which is
+       why it is the first command in Service triage.</div>
+
+    <p>Three <code>conditions</code> per endpoint are worth knowing apart, because the second exists specifically
+       to make graceful shutdown work:</p>
+
+    <table class="tbl">
+      <tr><th>Condition</th><th>Meaning</th></tr>
+      <tr><td><code>ready</code></td><td>Passing readiness — receives new traffic</td></tr>
+      <tr><td><code>serving</code></td><td>Ready <em>or</em> terminating-but-still-working — lets clients drain in-flight work</td></tr>
+      <tr><td><code>terminating</code></td><td>The pod has a <code>deletionTimestamp</code></td></tr>
+    </table>
+
+    <h2>Part 3 — kube-proxy Modes</h2>
+
+    <table class="tbl">
+      <tr><th></th><th>iptables (default)</th><th>IPVS</th><th>nftables (newer)</th></tr>
+      <tr><td>Data structure</td><td>Sequential rule chains</td><td><strong>Hash tables</strong></td><td>Sets and maps</td></tr>
+      <tr><td>Rules per Service</td><td>~2 + 2 per endpoint</td><td>1 virtual server + N real servers</td><td>Map entries</td></tr>
+      <tr><td>Match cost</td><td>O(n) per packet in principle</td><td><strong>O(1)</strong></td><td>O(1)</td></tr>
+      <tr><td>Rule sync cost at scale</td><td><strong>Grows sharply</strong> — seconds of full resync</td><td>Incremental</td><td>Incremental</td></tr>
+      <tr><td>Algorithms</td><td>Random only</td><td>rr, lc, dh, sh, sed, nq</td><td>Random</td></tr>
+      <tr><td>Verdict</td><td>Fine below ~1,000 Services</td><td>Large clusters</td><td>The direction of travel</td></tr>
+    </table>
+
+<pre>
+$ sudo iptables-save | grep -c KUBE
+     412                        ← 40 services
+     3847                       ← 500 services: rule sync becomes measurable
+$ kubectl -n kube-system logs ds/kube-proxy | grep -i 'syncproxyrules' | tail -1
+I0819 12:31:02  syncProxyRules took 1.482s        ← every endpoint change pays this
+
+$ kubectl -n kube-system get cm kube-proxy -o yaml | grep -A1 'mode:'
+    mode: "ipvs"
+$ sudo ipvsadm -Ln | head -6
+TCP  10.96.140.22:80 rr
+  -> 10.244.1.7:8080     Masq    1      0          0
+  -> 10.244.2.4:8080     Masq    1      0          0
+</pre>
+
+    <h2>Part 4 — Balancing Is Per Connection, Not Per Request</h2>
+
+    <p>This is the behaviour that surprises the most experienced people. The DNAT decision happens when the
+       <strong>connection</strong> is established. Every packet on that connection then goes to the same endpoint
+       — for the life of the connection.</p>
+
+<pre>
+HTTP/1.1 without keep-alive       → new connection per request → even spread
+HTTP/1.1 with keep-alive          → a few connections, reused → uneven
+HTTP/2 and gRPC                   → ONE connection, multiplexed → ALL requests to ONE pod
+database / Redis connection pool  → pinned at pool creation → pinned for ever
+</pre>
+
+<pre>
+$ kubectl scale deploy backend --replicas=4
+$ kubectl exec grpc-client -- ./bench --requests=10000
+$ for p in $(kubectl get pods -l app=backend -o name); do
+    printf '%-32s %s\n' "$p" "$(kubectl logs $p | grep -c 'handled request')"
+  done
+pod/backend-7d4b9c8f5d-4wm2t     10000        ← 100%
+pod/backend-7d4b9c8f5d-m4j1q         0
+pod/backend-7d4b9c8f5d-p9v3w         0
+pod/backend-7d4b9c8f5d-t2h8n         0        ← three idle replicas
+</pre>
+
+    <table class="tbl">
+      <tr><th>Fix</th><th>How</th><th>Cost</th></tr>
+      <tr><td><strong>Client-side load balancing</strong></td><td>Headless Service + gRPC's <code>round_robin</code> policy over all pod IPs</td><td>Client library support; clients must re-resolve</td></tr>
+      <tr><td>L7 proxy / service mesh</td><td>Envoy balances per <em>request</em>, not per connection</td><td>A sidecar per pod, and its operational weight</td></tr>
+      <tr><td>Connection age limits</td><td><code>MAX_CONNECTION_AGE</code> forces periodic reconnection</td><td>Reconnect churn; imbalance between cycles</td></tr>
+      <tr><td>Proxyless gRPC (xDS)</td><td>The client gets endpoints from a control plane</td><td>Newer, more moving parts</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>The same mechanic makes scale-up ineffective for long-lived clients.</strong>
+       Adding replicas does nothing for connections that already exist — a database pool, a gRPC channel or a
+       WebSocket stays on its original endpoint until it is closed. Autoscaling a gRPC backend without addressing
+       this produces new pods that receive no traffic while the originals stay saturated, and the HPA then scales
+       up further on the same misleading average.</div>
+
+    <p>Two Service-level knobs affect distribution, and both are coarser than people expect:</p>
+
+<pre>
+sessionAffinity: ClientIP          # stick a source IP to one endpoint for 3 hours
+sessionAffinityConfig:
+  clientIP: { timeoutSeconds: 10800 }
+   → with NAT in front, every client shares one source IP and lands on one pod
+
+internalTrafficPolicy: Local       # in-cluster traffic prefers pods on the SAME node
+   → saves a hop; black-holes if the local node has no ready pod
+</pre>
+
+    <h2>Part 5 — <code>externalTrafficPolicy</code> and the Second Hop</h2>
+
+    <p>For NodePort and LoadBalancer Services, a packet arriving at a node may be forwarded to a pod on a
+       <em>different</em> node. That extra hop requires SNAT, which destroys the client's source IP:</p>
+
+<pre>
+externalTrafficPolicy: Cluster (default)
+   client → node-2 → SNAT → pod on node-5
+   ✅ even distribution across all pods
+   ❌ the pod sees node-2's IP, not the client's
+   ❌ one extra network hop
+
+externalTrafficPolicy: Local
+   client → node-2 → pod on node-2 ONLY (no forwarding, no SNAT)
+   ✅ real client IP preserved
+   ✅ no extra hop
+   ❌ nodes with no local pod DROP the traffic — the cloud LB's health check
+      is what stops it sending traffic there
+   ❌ TRAFFIC IMBALANCE: the LB splits per NODE, not per POD
+</pre>
+
+<pre>
+$ kubectl patch svc web -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+$ kubectl get pods -l app=web -o wide --no-headers | awk '{print $7}' | sort | uniq -c
+      3 worker-1
+      1 worker-2                    ← uneven pod placement
+$ ./loadtest --requests 4000 && kubectl logs -l app=web --tail=-1 | grep -c GET
+   worker-1's 3 pods handled  2000 requests total (≈667 each)
+   worker-2's 1 pod handled   2000 requests        ← 3× the load of its peers
+</pre>
+
+    <div class="note">🔑 <strong><code>Local</code> splits traffic evenly across <em>nodes</em>, and pods are not
+       evenly spread across nodes.</strong> A node with one pod receives the same share as a node with three. If
+       you need the client IP <em>and</em> even distribution, either enforce even pod spread with
+       <a href="scheduling.html">topology spread constraints</a>, or terminate at an L7 ingress that preserves the
+       client IP in <code>X-Forwarded-For</code> and balances per request — see
+       <a href="ingress-gateway.html">Ingress &amp; Gateway API</a>.</div>
+
+    <h2>Part 6 — Headless, Selector-less and ExternalName</h2>
+
+<pre>
+① HEADLESS — clusterIP: None. No VIP, no rules; DNS returns every pod IP.
+$ kubectl get svc db-headless
+NAME          TYPE        CLUSTER-IP   PORT(S)
+db-headless   ClusterIP   None         5432/TCP
+$ kubectl exec probe -- dig +short db-headless.default.svc.cluster.local
+10.244.1.7
+10.244.2.4
+10.244.3.9
+   used by: StatefulSets (stable per-pod DNS), client-side load balancing,
+            anything that must address individual pods
+
+② SELECTOR-LESS — a Service you populate yourself, for something outside the cluster
+apiVersion: v1
+kind: Service
+metadata: { name: legacy-db }
+spec:
+  ports: [{ port: 5432 }]              ← no selector at all
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: legacy-db-1
+  labels: { kubernetes.io/service-name: legacy-db }
+addressType: IPv4
+ports: [{ port: 5432 }]
+endpoints: [{ addresses: ["10.0.7.42"] }]     ← an external VM
+   → in-cluster clients use "legacy-db" and you can repoint it during a migration
+
+③ EXTERNALNAME — a CNAME, and nothing else
+spec: { type: ExternalName, externalName: db.rds.amazonaws.com }
+   ⚠️ no proxying, no port mapping, no TLS SNI rewriting — the client connects
+      directly, so certificate names must match the EXTERNAL name
+</pre>
+
+    <h4>Triage in three commands</h4>
+
+<pre>
+$ kubectl get endpointslices -l kubernetes.io/service-name=web    # ← ALWAYS FIRST
+     no slice / no addresses  → selector matches nothing
+     addresses, ready=false   → pods exist, readiness failing
+     addresses, ready=true    → the Service is fine; look elsewhere
+
+$ kubectl get svc web -o jsonpath='{.spec.selector}{"  ports:"}{.spec.ports}{"\n"}'
+     → compare the selector with the POD TEMPLATE's labels, and check targetPort
+
+$ kubectl run probe --rm -it --image=nicolaka/netshoot --restart=Never -- \
+    sh -c 'getent hosts web; nc -zv web 80'
+     → separates DNS failure from connectivity failure
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A Service selecting the Deployment's labels rather than the pod template's, gRPC clients
+         talking to a ClusterIP, <code>externalTrafficPolicy: Local</code> added to preserve client IPs, and
+         monitoring that watches pod counts.</strong> The selector typo produces a perfectly valid Service with
+         zero endpoints, so the failure appears as connection timeouts with nothing red anywhere and no event to
+         find. The gRPC service is scaled to eight replicas under load, and one pod handles 100% of requests
+         because balancing happens per connection and the client holds exactly one — so the HPA keeps scaling on
+         an average that describes no actual pod. <code>Local</code> is enabled for the client IP, and because
+         three pods sit on one node and one on another, the lone pod takes three times the traffic of its peers
+         and falls over first. Meanwhile the dashboard shows eight healthy pods, because it counts pods rather
+         than endpoints, and a readiness probe that has been failing since the deploy is invisible.</p>
+      <p>✅ <strong>Select on pod-template labels, treat endpoints as the health signal, and choose a balancing
+         strategy that matches the protocol.</strong> Verify every Service with
+         <code>kubectl get endpointslices</code> — it is the one command that separates "selector matches nothing"
+         from "pods are not Ready", and both look identical from a client. Alert on <strong>endpoint count</strong>
+         and on ready-versus-desired, never on pod count, since a Service with zero endpoints raises no error of
+         its own. For gRPC, HTTP/2 or any pooled protocol, put an L7 proxy in the path or use a headless Service
+         with client-side round-robin, and bound connection age so pools re-resolve after a scale-up. Use
+         <code>externalTrafficPolicy: Local</code> only when you genuinely need the source IP and can guarantee
+         even pod spread across nodes; otherwise take the extra hop, or terminate at an ingress that gives you
+         <code>X-Forwarded-For</code> and per-request balancing. And remember there is no health checking in the
+         data path: kube-proxy programs whatever the EndpointSlice says.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Expecting to ping a ClusterIP</td><td>No process, no ICMP responder — it is a DNAT rule</td><td>Test with the actual protocol</td></tr>
+      <tr><td>Selecting the Deployment's labels</td><td>Services select <strong>pod</strong> labels</td><td>Match the pod template</td></tr>
+      <tr><td>Assuming a bad selector errors</td><td>Zero endpoints is a valid state</td><td><code>kubectl get endpointslices</code></td></tr>
+      <tr><td>Alerting on pod count</td><td>Not-Ready pods are excluded from endpoints</td><td>Alert on endpoint count</td></tr>
+      <tr><td>Wrong <code>targetPort</code></td><td>Connections hang or reset</td><td>Match the container's actual port</td></tr>
+      <tr><td>Publishing <code>port</code> and expecting peers to use it</td><td>Peers use the Service port; pods listen on <code>targetPort</code></td><td>Know which is which</td></tr>
+      <tr><td>Expecting per-request balancing</td><td><strong>Balancing is per connection</strong></td><td>L7 proxy or client-side LB</td></tr>
+      <tr><td>Scaling a gRPC backend to fix load</td><td>Existing connections never move</td><td>Bound connection age; re-resolve</td></tr>
+      <tr><td><code>sessionAffinity: ClientIP</code> behind NAT</td><td>All clients share one source IP</td><td>Application-level sessions</td></tr>
+      <tr><td><code>externalTrafficPolicy: Local</code> with uneven spread</td><td>The LB splits per node, not per pod</td><td>Topology spread, or <code>Cluster</code></td></tr>
+      <tr><td><code>ExternalName</code> for TLS endpoints</td><td>No SNI rewriting — certificates will not match</td><td>Selector-less Service, or fix the hostname</td></tr>
+      <tr><td>Assuming kube-proxy health-checks endpoints</td><td>It programs whatever the EndpointSlice says</td><td>Readiness probes are the health signal</td></tr>
+      <tr><td>iptables mode at thousands of Services</td><td>Rule sync time grows sharply</td><td>IPVS or nftables mode</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is a Service and what happens when you connect to its ClusterIP?</summary>
+      <p><strong>A Service is a stable virtual IP and DNS name in front of a changing set of pods — and nothing
+         listens on that IP.</strong> It is implemented as packet-rewriting rules on every node.</p>
+<pre>
+$ ping -c1 -W1 10.96.140.22
+100% packet loss                       ← no responder
+$ sudo ss -ltnp | grep 10.96.140.22
+                                       ← nothing bound
+$ curl -s -o /dev/null -w '%{http_code}\n' http://10.96.140.22/
+200                                    ← works anyway
+</pre>
+      <p>When your process connects, netfilter picks a ready endpoint and rewrites the destination to a pod IP
+         before the packet leaves the pod's network namespace. Replies are rewritten back. There is no proxy
+         process and no extra hop.</p>
+      <p><strong>Why Services exist at all:</strong> pod IPs change on every restart, rescheduling and rolling
+         update. The Service's ClusterIP does not, so clients have a stable address —
+         <a href="pods.html">pod IPs are ephemeral</a> and must never be configured directly.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> A Service exists but connections time out. How do you debug it?</summary>
+      <p><strong>Check the endpoints first — that one command splits the problem in half.</strong></p>
+<pre>
+$ kubectl get endpointslices -l kubernetes.io/service-name=web
+NAME        ADDRESSTYPE   PORTS   ENDPOINTS
+web-x7k2m   IPv4          80      &lt;unset&gt;         ← ZERO endpoints
+</pre>
+      <table class="tbl">
+        <tr><th>What you see</th><th>Cause</th><th>Next step</th></tr>
+        <tr><td>No addresses at all</td><td>Selector matches no pods</td><td>Compare the selector with the <strong>pod template</strong> labels</td></tr>
+        <tr><td>Addresses with <code>ready: false</code></td><td>Pods exist but readiness fails</td><td><code>describe pod</code>, probe config</td></tr>
+        <tr><td>Addresses ready</td><td>The Service is fine</td><td>Port mismatch, NetworkPolicy, DNS</td></tr>
+      </table>
+      <p><strong>The trap:</strong> a selector matching nothing is perfectly valid YAML, so nothing errors and no
+         event fires. Selecting the labels on the Deployment object instead of on
+         <code>spec.template.metadata.labels</code> is the classic version of this.</p>
+      <p>If endpoints are healthy, the remaining candidates are a wrong <code>targetPort</code>, a
+         <a href="network-policy.html">NetworkPolicy</a> denying the traffic, or DNS — separable with
+         <code>getent hosts web</code> versus <code>nc -zv web 80</code> from a debug pod.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Your gRPC service has 8 replicas and one pod receives all the traffic. Explain.</summary>
+      <p><strong>kube-proxy balances per connection, not per request.</strong> The endpoint is chosen when the TCP
+         connection is established; every request multiplexed onto that connection then goes to the same pod.
+         gRPC and HTTP/2 hold a single long-lived connection, so one client pins to one pod.</p>
+<pre>
+pod/backend-...-4wm2t   10000 requests      ← 100%
+pod/backend-...-m4j1q       0
+pod/backend-...-p9v3w       0
+pod/backend-...-t2h8n       0
+</pre>
+      <p><strong>The compounding problem:</strong> scaling up does not help, because existing connections never
+         move. New pods sit idle while the HPA scales further on an average CPU figure that describes no actual
+         pod.</p>
+      <table class="tbl">
+        <tr><th>Fix</th><th>Mechanism</th></tr>
+        <tr><td>Client-side LB</td><td>Headless Service + gRPC <code>round_robin</code> over all pod IPs</td></tr>
+        <tr><td>L7 proxy / mesh</td><td>Envoy balances per request</td></tr>
+        <tr><td>Connection age limit</td><td><code>MAX_CONNECTION_AGE</code> forces periodic re-resolution</td></tr>
+      </table>
+      <p><strong>The same issue affects database and Redis pools, and WebSockets</strong> — anything long-lived.
+         It is not a gRPC bug; it is what a connection-level load balancer does, and the fix must live either in
+         the client or at layer 7.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain <code>externalTrafficPolicy</code>. When would you use <code>Local</code>?</summary>
+      <p><strong>It decides whether a node may forward external traffic to a pod on another node.</strong></p>
+      <table class="tbl">
+        <tr><th></th><th><code>Cluster</code> (default)</th><th><code>Local</code></th></tr>
+        <tr><td>Forwards between nodes</td><td>✅</td><td>❌</td></tr>
+        <tr><td>Client source IP</td><td><strong>Lost (SNAT)</strong></td><td><strong>Preserved</strong></td></tr>
+        <tr><td>Extra hop</td><td>Sometimes</td><td>Never</td></tr>
+        <tr><td>Distribution</td><td>Even across pods</td><td><strong>Even across NODES</strong></td></tr>
+        <tr><td>Nodes with no local pod</td><td>Forward</td><td>Drop (LB health check excludes them)</td></tr>
+      </table>
+      <p><strong>Use <code>Local</code> when the client IP matters</strong> — geo-routing, IP allowlists, rate
+         limiting, audit logging — and when you can guarantee even pod spread.</p>
+      <p><strong>The imbalance is the catch:</strong> the load balancer splits per node, so a node with one pod
+         receives the same share as a node with three, and that lone pod takes three times the load. Pair
+         <code>Local</code> with <a href="scheduling.html">topology spread constraints</a>, or accept the
+         hop.</p>
+      <p><strong>The alternative I usually prefer:</strong> terminate at an L7 ingress with
+         <code>Cluster</code> policy. The ingress records the real client IP in <code>X-Forwarded-For</code> and
+         balances per request, which solves both problems — at the cost of trusting the header, which must
+         therefore only be accepted from the ingress itself.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design service networking for a cluster with a mix of HTTP, gRPC and stateful workloads.</summary>
+      <p><strong>Match the mechanism to the protocol's connection behaviour, because that is what determines
+         whether L4 balancing works at all.</strong></p>
+      <table class="tbl">
+        <tr><th>Workload</th><th>Mechanism</th><th>Why</th></tr>
+        <tr><td>External HTTP</td><td>Ingress/Gateway → ClusterIP</td><td>Per-request balancing, TLS termination, <code>X-Forwarded-For</code></td></tr>
+        <tr><td>Internal HTTP/1.1</td><td>ClusterIP</td><td>Short connections spread naturally</td></tr>
+        <tr><td><strong>gRPC / HTTP/2</strong></td><td><strong>Mesh sidecar, or headless + client LB</strong></td><td>One connection pins to one pod</td></tr>
+        <tr><td>Databases (StatefulSet)</td><td>Headless + per-pod DNS</td><td>Clients must address a specific replica</td></tr>
+        <tr><td>External dependencies</td><td>Selector-less Service with manual endpoints</td><td>In-cluster name; repointable during migration</td></tr>
+        <tr><td>Node-local agents</td><td><code>internalTrafficPolicy: Local</code></td><td>Avoids a hop for per-node traffic</td></tr>
+      </table>
+      <p><strong>The decisions I would defend:</strong></p>
+      <ul>
+        <li><strong>No <code>LoadBalancer</code> per service.</strong> One ingress with host/path routing costs one
+            cloud load balancer instead of forty, and gives per-request balancing for free.</li>
+        <li><strong>A mesh only if gRPC is pervasive.</strong> A sidecar per pod is real overhead; for two or
+            three gRPC services, headless plus client-side round-robin is far cheaper.</li>
+        <li><strong>IPVS or nftables mode</strong> beyond roughly a thousand Services, where iptables rule sync
+            time becomes a visible latency source on every endpoint change.</li>
+        <li><strong>Topology-aware routing</strong> for high-traffic internal services, to cut cross-zone data
+            charges — while remembering it silently disables itself when a zone lacks capacity.</li>
+      </ul>
+      <p><strong>What I would monitor:</strong> endpoint counts per Service (zero endpoints is silent),
+         <code>syncProxyRules</code> duration, per-pod request distribution for anything using long-lived
+         connections, and cross-zone traffic volume. <strong>Per-pod distribution is the one nobody instruments</strong>,
+         and it is the only way to catch a gRPC service where seven of eight replicas are idle.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Requests fail briefly during every rolling update even though readiness probes are configured. Why?</summary>
+      <p><strong>Endpoint removal and pod termination are concurrent, not sequential.</strong> When a pod is
+         deleted, two things happen in parallel:</p>
+<pre>
+t=0     deletionTimestamp set
+        ├─► kubelet sends SIGTERM to the container         (immediately)
+        └─► endpoints controller removes the endpoint      (asynchronous)
+                └─► kube-proxy on EVERY node updates rules (asynchronous, ~1s+)
+
+If the app exits before every node's rules are updated, packets are still being
+sent to a pod that is gone → connection refused.
+</pre>
+      <p><strong>The fix is to make the pod outlive its endpoint removal</strong>, deliberately:</p>
+<pre>
+lifecycle:
+  preStop:
+    exec: { command: ["sleep", "10"] }     ← keep serving while rules propagate
+terminationGracePeriodSeconds: 45          ← must exceed preStop + real drain time
+</pre>
+      <p>The <code>preStop</code> sleep looks like a hack and is the documented remedy: SIGTERM is delayed until
+         it completes, so the pod continues serving from the endpoint lists that have not yet been updated.
+         Meanwhile the application must handle SIGTERM by finishing in-flight requests and then exiting — see
+         <a href="disruptions.html">Disruptions &amp; Zero-Downtime</a> and
+         <a href="../docker/process-model.html">PID 1 signal semantics</a>.</p>
+      <p><strong>Other contributors worth checking:</strong> long-lived keep-alive connections that were never
+         balanced away (the client must be told to close them, e.g. via
+         <code>Connection: close</code> during shutdown); a <code>maxUnavailable</code> that removes capacity
+         faster than new pods become Ready; and readiness probes with a long <code>periodSeconds</code>, which
+         delay <em>adding</em> new pods and lengthen the window where capacity is short.</p>
+      <p><strong>The framing:</strong> Kubernetes gives eventual consistency between the endpoint list and the
+         data plane. Zero-downtime requires the application to tolerate that window, not to assume it away.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove a ClusterIP is only a rule.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy web --image=nginx:alpine --replicas=2
+$ kubectl expose deploy web --port=80
+$ CIP=$(kubectl get svc web -o jsonpath='{.spec.clusterIP}'); echo $CIP
+10.96.140.22
+
+$ ping -c2 -W1 $CIP
+2 packets transmitted, 0 received, 100% packet loss
+$ sudo ss -ltnp | grep -c $CIP
+0                                       ← nothing is listening
+$ ip addr | grep -c $CIP
+0                                       ← not assigned to any interface
+$ curl -s -o /dev/null -w '%{http_code}\n' http://$CIP/
+200                                     ← and it works
+</pre>
+<pre>
+$ sudo iptables -t nat -L KUBE-SERVICES -n | grep $CIP
+KUBE-SVC-XPGD46QRK7WJZT7O  tcp -- 0.0.0.0/0  10.96.140.22  tcp dpt:80
+$ sudo iptables -t nat -L KUBE-SVC-XPGD46QRK7WJZT7O -n
+KUBE-SEP-AAAA  all  --  0.0.0.0/0  0.0.0.0/0  statistic mode random probability 0.50000000000
+KUBE-SEP-BBBB  all  --  0.0.0.0/0  0.0.0.0/0
+        ↑ 50/50 random selection between two endpoints — this is the "load balancer"
+$ sudo iptables -t nat -L KUBE-SEP-AAAA -n | tail -1
+DNAT  tcp  --  0.0.0.0/0  0.0.0.0/0  tcp to:10.244.1.7:80
+</pre>
+<p>Watch the rules follow the endpoints:</p>
+<pre>
+$ kubectl scale deploy web --replicas=4
+$ sleep 3; sudo iptables -t nat -L KUBE-SVC-XPGD46QRK7WJZT7O -n | grep -c KUBE-SEP
+4
+$ sudo iptables -t nat -L KUBE-SVC-XPGD46QRK7WJZT7O -n | grep -o 'probability [0-9.]*'
+probability 0.25000000000
+probability 0.33332999982
+probability 0.50000000000              ← cumulative probabilities: 1/4, then 1/3 of the
+                                         remainder, then 1/2 — arithmetically uniform
+$ kubectl scale deploy web --replicas=0
+$ sleep 3; sudo iptables -t nat -L KUBE-SVC-XPGD46QRK7WJZT7O -n | grep -c KUBE-SEP
+0
+$ curl -m2 http://$CIP/; echo "exit=$?"
+exit=7                                  ← connection refused: the chain REJECTs
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show that only Ready pods are endpoints, and that zero endpoints is silent.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy web --image=nginx:alpine --replicas=3
+$ kubectl expose deploy web --port=80
+$ kubectl get endpointslices -l kubernetes.io/service-name=web \
+    -o jsonpath='{range .items[0].endpoints[*]}{.addresses[0]} ready={.conditions.ready}{"\n"}{end}'
+10.244.1.7 ready=true
+10.244.2.4 ready=true
+10.244.3.9 ready=true
+</pre>
+<pre>
+Break readiness on all of them:
+$ kubectl patch deploy web -p '{"spec":{"template":{"spec":{"containers":[{"name":"nginx",
+  "readinessProbe":{"httpGet":{"path":"/does-not-exist","port":80},"periodSeconds":2,"failureThreshold":1}}]}}}}'
+$ kubectl rollout status deploy/web --timeout=30s
+error: timed out waiting for the condition
+
+$ kubectl get pods -l app=web --no-headers
+web-6f9c8d7b4-2qk8l   0/1   Running   0   40s     ← RUNNING, but not ready
+web-6f9c8d7b4-8x2mv   0/1   Running   0   40s
+web-6f9c8d7b4-nn4kz   0/1   Running   0   40s
+
+$ kubectl get svc web
+NAME   TYPE        CLUSTER-IP     PORT(S)   AGE
+web    ClusterIP   10.96.140.22   80/TCP    3m       ← looks completely normal
+$ kubectl get endpointslices -l kubernetes.io/service-name=web -o jsonpath='{.items[0].endpoints}{"\n"}'
+                                                     ← EMPTY
+$ kubectl run p --rm -it --image=nicolaka/netshoot --restart=Never -- curl -m2 -s -o /dev/null -w '%{http_code}\n' http://web/
+000
+</pre>
+<pre>
+The other cause — a selector that matches nothing:
+$ kubectl patch svc web -p '{"spec":{"selector":{"app":"wev"}}}'
+$ kubectl get endpointslices -l kubernetes.io/service-name=web
+NAME        ADDRESSTYPE   PORTS   ENDPOINTS
+web-x7k2m   IPv4          80      &lt;unset&gt;
+$ kubectl describe svc web | grep -i endpoints
+Endpoints:         &lt;none&gt;
+$ kubectl get events --field-selector involvedObject.name=web
+No events.                                          ← nothing is logged, ever
+</pre>
+<table class="tbl">
+  <tr><th>Signal</th><th>Selector wrong</th><th>Readiness failing</th></tr>
+  <tr><td>EndpointSlice addresses</td><td><strong>Absent</strong></td><td>Present, <code>ready=false</code></td></tr>
+  <tr><td><code>kubectl get pods</code></td><td><code>1/1 Running</code></td><td><strong><code>0/1 Running</code></strong></td></tr>
+  <tr><td>Events</td><td>None</td><td>Probe failures on the pod</td></tr>
+</table>
+<p><strong>Alert on endpoint count</strong>, not pod count — pod count is 3 in both failure cases.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Demonstrate per-connection balancing with HTTP/1.1 versus gRPC.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy echo --image=hashicorp/http-echo --replicas=4 -- \
+    /http-echo -text="$(hostname)" -listen=:5678
+$ kubectl expose deploy echo --port=5678
+$ kubectl run client --image=nicolaka/netshoot -- sleep 3600
+</pre>
+<pre>
+① HTTP/1.1, NEW connection per request:
+$ kubectl exec client -- sh -c \
+  'for i in $(seq 200); do curl -s --no-keepalive http://echo:5678/ ; done' \
+  | sort | uniq -c
+     48 echo-7d4b-4wm2t
+     53 echo-7d4b-m4j1q
+     51 echo-7d4b-p9v3w
+     48 echo-7d4b-t2h8n            ← even: each connection is balanced independently
+
+② HTTP/1.1 with keep-alive, ONE connection:
+$ kubectl exec client -- sh -c \
+  'curl -s http://echo:5678/ $(for i in $(seq 199); do echo -n " http://echo:5678/"; done)' \
+  | sort | uniq -c
+    200 echo-7d4b-m4j1q            ← all 200 on the single reused connection
+</pre>
+<pre>
+③ the real-world version — a persistent connection under load:
+$ kubectl exec client -- sh -c 'nc -z echo 5678; ss -tn | grep 5678'
+ESTAB  0  0  10.244.4.2:41234  10.96.88.4:5678
+$ kubectl exec client -- sh -c 'ss -tno dst 10.96.88.4 | tail -1'
+        ← the conntrack entry pins this connection to ONE backend for its lifetime
+$ sudo conntrack -L 2>/dev/null | grep 5678 | head -1
+tcp 6 86398 ESTABLISHED src=10.244.4.2 dst=10.96.88.4 sport=41234 dport=5678
+                        src=10.244.2.4 dst=10.244.4.2 sport=5678 dport=41234
+                        ↑ the chosen endpoint, recorded at connection time
+</pre>
+<pre>
+SCALING DOES NOT REBALANCE IT:
+$ kubectl scale deploy echo --replicas=8; sleep 10
+$ kubectl exec client -- sh -c \
+  'curl -s http://echo:5678/ $(for i in $(seq 99); do echo -n " http://echo:5678/"; done)' \
+  | sort | uniq -c
+    100 echo-7d4b-m4j1q            ← the four new pods receive nothing at all
+</pre>
+<table class="tbl">
+  <tr><th>Client behaviour</th><th>Distribution across 4 pods</th></tr>
+  <tr><td>New connection per request</td><td>48 / 53 / 51 / 48 — even</td></tr>
+  <tr><td>Keep-alive, one connection</td><td><strong>200 / 0 / 0 / 0</strong></td></tr>
+  <tr><td>Same, after scaling to 8</td><td><strong>100 / 0 × 7</strong></td></tr>
+</table>
+<p>The fix, via a headless Service and client-side resolution:</p>
+<pre>
+$ kubectl create svc clusterip echo-headless --clusterip=None --tcp=5678:5678
+$ kubectl patch svc echo-headless -p '{"spec":{"selector":{"app":"echo"}}}'
+$ kubectl exec client -- dig +short echo-headless | wc -l
+8                                  ← every pod IP; a round-robin client can use them all
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Measure the source-IP and distribution trade of <code>externalTrafficPolicy</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy echo --image=mendhak/http-https-echo --replicas=4
+$ kubectl get pods -l app=echo -o wide --no-headers | awk '{print $7}' | sort | uniq -c
+      3 worker-1
+      1 worker-2                     ← deliberately uneven
+$ kubectl expose deploy echo --type=NodePort --port=8080
+$ NP=$(kubectl get svc echo -o jsonpath='{.spec.ports[0].nodePort}')
+</pre>
+<pre>
+CLUSTER (default):
+$ kubectl get svc echo -o jsonpath='{.spec.externalTrafficPolicy}{"\n"}'
+Cluster
+$ curl -s http://worker-1:$NP/ | jq -r '.headers["x-forwarded-for"] // .ip'
+10.244.1.1                          ← the NODE's IP, not the client's (SNAT)
+
+$ for i in $(seq 400); do curl -s http://worker-1:$NP/ | jq -r .hostname; done \
+    | sort | uniq -c
+    102 echo-7d4b-4wm2t
+     98 echo-7d4b-m4j1q
+    101 echo-7d4b-p9v3w
+     99 echo-7d4b-t2h8n              ← EVEN across pods, including the one on worker-2
+</pre>
+<pre>
+LOCAL:
+$ kubectl patch svc echo -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+$ curl -s http://worker-1:$NP/ | jq -r .ip
+192.168.64.1                        ← the REAL client IP, preserved
+
+$ for i in $(seq 400); do curl -s http://worker-1:$NP/ | jq -r .hostname; done \
+    | sort | uniq -c
+    133 echo-7d4b-4wm2t
+    134 echo-7d4b-m4j1q
+    133 echo-7d4b-p9v3w              ← only worker-1's three pods
+$ for i in $(seq 400); do curl -s http://worker-2:$NP/ | jq -r .hostname; done \
+    | sort | uniq -c
+    400 echo-7d4b-t2h8n              ← worker-2's single pod takes ALL of that node's share
+
+$ curl -m2 -s http://worker-3:$NP/ ; echo "exit=$?"
+exit=28                             ← a node with no local pod simply drops the traffic
+$ curl -s http://worker-3:10256/healthz | jq -r '.service'
+null                                ← which is why the cloud LB health-checks node ports
+</pre>
+<table class="tbl">
+  <tr><th></th><th><code>Cluster</code></th><th><code>Local</code></th></tr>
+  <tr><td>Client IP</td><td><strong>Lost</strong></td><td><strong>Preserved</strong></td></tr>
+  <tr><td>Per-pod distribution</td><td>102/98/101/99</td><td><strong>133/134/133 vs 400</strong></td></tr>
+  <tr><td>Node with no pod</td><td>Forwards</td><td>Drops</td></tr>
+</table>
+<p><strong>The fix if you need both:</strong> even pod spread across nodes with
+   <a href="scheduling.html">topology spread constraints</a> makes <code>Local</code> distribution fair — or
+   terminate at an L7 ingress with <code>Cluster</code>, which preserves the client IP in
+   <code>X-Forwarded-For</code> and balances per request.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Reproduce dropped requests during a rolling update and fix them.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy web --image=nginx:1.25-alpine --replicas=4
+$ kubectl expose deploy web --port=80
+$ kubectl patch deploy web -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
+$ kubectl run probe --image=nicolaka/netshoot -- sleep 3600
+
+$ kubectl exec probe -- sh -c \
+    'for i in $(seq 1200); do curl -s -o /dev/null -w "%{http_code}\n" -m 1 --no-keepalive http://web/; sleep 0.02; done' > hits.txt &amp;
+$ sleep 2; kubectl set image deploy/web nginx=nginx:1.27-alpine
+$ wait; sort hits.txt | uniq -c
+   1178 200
+     22 000                        ← 22 failures despite maxUnavailable: 0 and readiness
+</pre>
+<p>The cause is that endpoint removal and SIGTERM are concurrent:</p>
+<pre>
+t=0    deletionTimestamp set
+       ├─ kubelet SIGTERMs nginx        → nginx stops accepting immediately
+       └─ endpoints controller removes the endpoint (async)
+            └─ kube-proxy on each node rewrites rules (async, ~0.5–2 s)
+   → for that window, rules still point at a pod that has stopped listening
+</pre>
+<pre>
+THE FIX — outlive the propagation:
+$ kubectl patch deploy web -p '{"spec":{"template":{"spec":{
+    "terminationGracePeriodSeconds":45,
+    "containers":[{"name":"nginx","lifecycle":{"preStop":{"exec":{"command":["sleep","10"]}}}}]}}}}'
+
+$ kubectl exec probe -- sh -c \
+    'for i in $(seq 1200); do curl -s -o /dev/null -w "%{http_code}\n" -m 1 --no-keepalive http://web/; sleep 0.02; done' > hits2.txt &amp;
+$ sleep 2; kubectl set image deploy/web nginx=nginx:1.25-alpine
+$ wait; sort hits2.txt | uniq -c
+   1200 200                        ← zero failures
+</pre>
+<p>Verify the pod really does keep serving while terminating:</p>
+<pre>
+$ kubectl delete pod -l app=web --wait=false | head -1
+$ kubectl get endpointslices -l kubernetes.io/service-name=web \
+    -o jsonpath='{range .items[0].endpoints[*]}{.addresses[0]} ready={.conditions.ready} serving={.conditions.serving} term={.conditions.terminating}{"\n"}{end}'
+10.244.1.7 ready=false serving=true term=true    ← removed from NEW traffic,
+                                                   still draining in-flight work
+10.244.2.4 ready=true serving=true term=false
+</pre>
+<table class="tbl">
+  <tr><th>Configuration</th><th>Failed requests / 1200</th></tr>
+  <tr><td><code>maxUnavailable: 0</code> + readiness only</td><td><strong>22</strong></td></tr>
+  <tr><td>+ <code>preStop: sleep 10</code>, grace 45 s</td><td><strong>0</strong></td></tr>
+</table>
+<p><strong>The remaining requirement is in the application:</strong> it must handle SIGTERM by finishing
+   in-flight requests and then exiting, or the grace period simply ends in a SIGKILL — see
+   <a href="../docker/process-model.html">PID 1 signal semantics</a>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a selector-less Service and repoint a dependency with no client change.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+Scenario: the app talks to a database on a VM at 10.0.7.42, and you are migrating it
+into the cluster. Clients must never change their connection string.
+
+$ cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata: { name: appdb }
+spec:
+  ports: [{ name: pg, port: 5432, targetPort: 5432 }]
+                                        ← NO selector: nothing is auto-populated
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: appdb-external
+  labels: { kubernetes.io/service-name: appdb }
+addressType: IPv4
+ports: [{ name: pg, port: 5432 }]
+endpoints:
+- addresses: ["10.0.7.42"]
+  conditions: { ready: true }
+EOF
+
+$ kubectl run c --rm -it --image=postgres:16-alpine --restart=Never -- \
+    psql -h appdb -U app -c 'select inet_server_addr();'
+ inet_server_addr
+------------------
+ 10.0.7.42                            ← in-cluster name, external server
+</pre>
+<pre>
+Now migrate. Stand up the in-cluster database first:
+$ kubectl create deploy pgnew --image=postgres:16-alpine
+$ kubectl set env deploy/pgnew POSTGRES_PASSWORD=dev
+$ kubectl expose deploy pgnew --port=5432 --name=pgnew
+$ PGIP=$(kubectl get pod -l app=pgnew -o jsonpath='{.items[0].status.podIP}')
+
+CUTOVER — one object changes, no client is touched:
+$ kubectl patch endpointslice appdb-external --type=merge -p \
+  "{\"endpoints\":[{\"addresses\":[\"$PGIP\"],\"conditions\":{\"ready\":true}}]}"
+endpointslice.discovery.k8s.io/appdb-external patched
+
+$ kubectl run c --rm -it --image=postgres:16-alpine --restart=Never -- \
+    psql -h appdb -U postgres -c 'select inet_server_addr();'
+ inet_server_addr
+------------------
+ 10.244.2.14                          ← the in-cluster pod, same client config
+</pre>
+<p>Compare with the alternative approaches:</p>
+<table class="tbl">
+  <tr><th>Approach</th><th>Client change</th><th>Works for TLS</th><th>Notes</th></tr>
+  <tr><td>Hard-coded external IP</td><td>Redeploy every client</td><td>✅</td><td>No abstraction at all</td></tr>
+  <tr><td><code>ExternalName</code> CNAME</td><td>None</td><td><strong>⚠️ Certificate must match the external name</strong></td><td>No port mapping, no proxying</td></tr>
+  <tr><td><strong>Selector-less Service</strong></td><td><strong>None</strong></td><td>✅ (in-cluster name is what is presented)</td><td>Repointable; supports port mapping</td></tr>
+</table>
+<pre>
+The ExternalName pitfall, demonstrated:
+$ kubectl create service externalname legacy --external-name=db.rds.amazonaws.com
+$ kubectl run c --rm -it --image=postgres:16-alpine --restart=Never -- \
+    psql "host=legacy sslmode=verify-full" -U app
+psql: error: server certificate for "db.rds.amazonaws.com" does not match host name "legacy"
+   → no SNI rewriting happens; the client resolves the CNAME and connects directly
+</pre>
+<p><strong>Why the selector-less pattern is the right tool for migrations:</strong> the endpoint list is data,
+   not configuration in a client, so cutover and rollback are a single patch — and monitoring, NetworkPolicy
+   and DNS all see one stable Service name throughout.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>A ClusterIP has no process behind it</strong> — verified: ping fails, nothing is bound, no interface holds it, and <code>curl</code> works because it is a DNAT rule on every node.</li>
+        <li>The "load balancer" is <code>statistic mode random probability</code> in iptables; with 4 endpoints the cumulative probabilities are 1/4, 1/3, 1/2, which is arithmetically uniform.</li>
+        <li><strong>Only Ready pods become endpoints</strong>, and a Service with zero endpoints raises no error, no condition and no event.</li>
+        <li>The three endpoint conditions matter: <code>ready</code> gates new traffic, <code>serving</code> stays true while terminating so in-flight work can drain.</li>
+        <li><code>kubectl get endpointslices</code> is the first triage command — it separates "selector matches nothing" from "pods not Ready", which look identical to a client.</li>
+        <li>Services select <strong>pod-template labels</strong>; selecting the Deployment's own labels is valid YAML and produces zero endpoints.</li>
+        <li>iptables mode grows to thousands of rules and pays a full <code>syncProxyRules</code> pass on every change; IPVS uses hash tables and real algorithms, nftables is the direction of travel.</li>
+        <li><strong>Balancing happens per connection, not per request</strong> — measured: 200/0/0/0 across four pods on one keep-alive connection versus 48/53/51/48 without.</li>
+        <li>gRPC, HTTP/2, WebSockets and database pools all pin to one endpoint; <strong>scaling up does not rebalance them</strong> — four new pods received zero traffic.</li>
+        <li>Fixes are client-side round-robin over a headless Service, an L7 proxy that balances per request, or bounded connection age.</li>
+        <li><code>sessionAffinity: ClientIP</code> is useless behind NAT, where every client shares one source address.</li>
+        <li><code>externalTrafficPolicy: Cluster</code> spreads evenly but <strong>SNATs away the client IP</strong>; <code>Local</code> preserves it and splits per <em>node</em>.</li>
+        <li>Measured, <code>Local</code> gave 133/134/133 on a three-pod node versus <strong>400 to the single pod</strong> on another — the load balancer cannot see pod counts.</li>
+        <li>Nodes with no local pod drop <code>Local</code> traffic entirely, which is why the cloud LB health-checks node ports.</li>
+        <li>Rolling updates drop requests even with <code>maxUnavailable: 0</code> — measured <strong>22 of 1200</strong> — because endpoint removal and SIGTERM are concurrent.</li>
+        <li><strong><code>preStop: sleep 10</code> plus a longer grace period took that to zero</strong>: the pod keeps serving while kube-proxy rules propagate.</li>
+        <li>Headless Services (<code>clusterIP: None</code>) return pod IPs from DNS with no VIP and no rules — the basis of StatefulSet identity and client-side balancing.</li>
+        <li><strong>Selector-less Services with hand-written EndpointSlices</strong> give an in-cluster name for an external dependency, and make a migration cutover a one-object patch.</li>
+        <li><code>ExternalName</code> is only a CNAME: no proxying, no port mapping, and <strong>TLS certificates must match the external hostname</strong>.</li>
+        <li>kube-proxy does no health checking — it programs whatever the EndpointSlice says, so readiness probes are the only health signal in the path.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="scheduling.html">← The Scheduler: Affinity, Taints &amp; Spread</a>
+      <a href="dns-discovery.html">Cluster DNS &amp; Service Discovery →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
