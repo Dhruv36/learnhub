@@ -1,0 +1,977 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cluster DNS &amp; Service Discovery — Kubernetes — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Cluster DNS &amp; Service Discovery <span class="level-badge level-int">Networking &amp; Traffic</span></h1>
+    <p><strong>What you'll master:</strong> the exact name scheme CoreDNS serves, and which record type each kind
+       of Service produces; <strong>the <code>ndots:5</code> trap</strong> — measured — where resolving one
+       external hostname costs <strong>eight DNS queries</strong> and adds latency to every outbound call, plus
+       the two one-line fixes; how CoreDNS is deployed, scaled and cached, and why <strong>NodeLocal
+       DNSCache</strong> exists rather than simply adding replicas; the notorious <strong>five-second DNS
+       timeout</strong> caused by a conntrack race on parallel UDP lookups, and what actually fixes it;
+       <code>dnsPolicy</code>, including the <code>hostNetwork</code> trap where pods silently lose all cluster
+       resolution; StatefulSet per-pod DNS and <code>publishNotReadyAddresses</code>, without which clustered
+       databases cannot bootstrap; and a debugging order that tells NXDOMAIN, SERVFAIL and timeout apart in one
+       command. Prerequisites: <a href="services.html">Services &amp; Endpoints</a>,
+       <a href="pods.html">Pods</a>.</p>
+
+    <h2>Part 1 — The Name Scheme</h2>
+
+<pre>
+   &lt;service&gt;.&lt;namespace&gt;.svc.cluster.local          ← the canonical form
+   │          │           │    └── the cluster domain (configurable)
+   │          │           └────── always "svc" for Services
+   │          └────────────────── namespace
+   └───────────────────────────── Service name
+
+  from a pod in the SAME namespace:      web
+  from another namespace:                web.shop
+  fully qualified (fastest, see Part 2): web.shop.svc.cluster.local.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Object</th><th>Name</th><th>Record</th><th>Returns</th></tr>
+      <tr><td>ClusterIP Service</td><td><code>web.shop.svc.cluster.local</code></td><td>A / AAAA</td><td><strong>One VIP</strong></td></tr>
+      <tr><td>Headless Service</td><td>same</td><td>A / AAAA</td><td><strong>Every ready pod IP</strong></td></tr>
+      <tr><td>Named port</td><td><code>_http._tcp.web.shop.svc.cluster.local</code></td><td>SRV</td><td>Port + target</td></tr>
+      <tr><td>StatefulSet pod</td><td><code>db-0.db.shop.svc.cluster.local</code></td><td>A</td><td>That pod's IP</td></tr>
+      <tr><td><code>ExternalName</code></td><td><code>legacy.shop.svc.cluster.local</code></td><td>CNAME</td><td>The external name</td></tr>
+      <tr><td>Any pod (rarely used)</td><td><code>10-244-1-7.shop.pod.cluster.local</code></td><td>A</td><td>The pod IP</td></tr>
+    </table>
+
+<pre>
+$ kubectl run p --rm -it --image=nicolaka/netshoot --restart=Never -- sh
+# dig +short web.shop.svc.cluster.local
+10.96.140.22                          ← ClusterIP: one VIP
+
+# dig +short db-headless.shop.svc.cluster.local
+10.244.1.7
+10.244.2.4
+10.244.3.9                            ← headless: all ready pod IPs
+
+# dig +short SRV _pg._tcp.db-headless.shop.svc.cluster.local
+0 33 5432 db-0.db-headless.shop.svc.cluster.local.
+0 33 5432 db-1.db-headless.shop.svc.cluster.local.
+0 33 5432 db-2.db-headless.shop.svc.cluster.local.
+                                      ← SRV gives ports AND stable per-pod names
+</pre>
+
+    <div class="note">🔑 <strong>DNS is the only reason a headless Service is useful.</strong> It has no VIP and
+       programs no kube-proxy rules (<a href="services.html">Services</a>), so the record set <em>is</em> the
+       feature: clients get every pod IP and can balance themselves, and StatefulSet pods get stable individual
+       names. Everything a headless Service does happens in CoreDNS.</div>
+
+    <h2>Part 2 — <code>ndots:5</code>, and the Eight Queries</h2>
+
+    <p>Every pod gets a generated <code>/etc/resolv.conf</code>. The <code>ndots</code> option decides when a name
+       is treated as absolute, and Kubernetes sets it to <strong>5</strong> — far higher than any normal
+       system:</p>
+
+<pre>
+$ kubectl exec p -- cat /etc/resolv.conf
+search shop.svc.cluster.local svc.cluster.local cluster.local eu-west-1.compute.internal
+nameserver 10.96.0.10
+options ndots:5
+
+  rule: a name with FEWER than `ndots` dots is tried against every search domain
+        FIRST, and only then as written.
+</pre>
+
+<pre>
+Resolving "api.stripe.com" (2 dots &lt; 5) from a pod:
+
+  ① api.stripe.com.shop.svc.cluster.local        → NXDOMAIN
+  ② api.stripe.com.svc.cluster.local             → NXDOMAIN
+  ③ api.stripe.com.cluster.local                 → NXDOMAIN
+  ④ api.stripe.com.eu-west-1.compute.internal    → NXDOMAIN
+  ⑤ api.stripe.com                               → 3.18.7.42   ✅
+
+  and glibc queries A and AAAA in parallel for each  →  10 queries for one name
+</pre>
+
+<pre>
+$ kubectl exec p -- sh -c 'time getent hosts api.stripe.com' 2>&amp;1 | tail -3
+real    0m0.048s
+$ kubectl -n kube-system logs -l k8s-app=kube-dns --tail=200 | grep -c 'api.stripe.com'
+10                                    ← ten queries reached CoreDNS
+
+$ kubectl exec p -- sh -c 'time getent hosts api.stripe.com.'   # trailing dot
+real    0m0.007s                      ← 7 ms vs 48 ms: one query, no search path
+$ kubectl -n kube-system logs -l k8s-app=kube-dns --tail=50 | grep -c 'api.stripe.com'
+2                                     ← A + AAAA only
+</pre>
+
+    <table class="tbl">
+      <tr><th>Fix</th><th>How</th><th>Trade-off</th></tr>
+      <tr><td><strong>Trailing dot</strong> in the hostname</td><td><code>api.stripe.com.</code></td><td>Free; but every config and library must do it</td></tr>
+      <tr><td><strong>Per-pod <code>ndots</code></strong></td><td><code>dnsConfig: {options: [{name: ndots, value: "2"}]}</code></td><td>Cross-namespace short names (<code>web.shop</code>) still work; bare <code>web</code> does not</td></tr>
+      <tr><td>Use FQDNs internally</td><td><code>web.shop.svc.cluster.local.</code></td><td>Verbose, but unambiguous and fastest</td></tr>
+      <tr><td>NodeLocal DNSCache</td><td>Cache on every node</td><td>Does not reduce the query <em>count</em>, only its cost</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>This is the single biggest source of avoidable DNS load in most clusters.</strong>
+       A service making 1,000 external API calls a second with a fresh resolution each time generates 10,000
+       queries per second, of which 8,000 are guaranteed NXDOMAIN. CoreDNS then becomes a scaling problem that
+       looks like a mysterious latency floor on outbound calls — and the fix is two lines of pod spec.</div>
+
+    <h2>Part 3 — CoreDNS, Caching and NodeLocal</h2>
+
+<pre>
+$ kubectl -n kube-system get deploy coredns
+NAME      READY   UP-TO-DATE   AVAILABLE
+coredns   2/2     2            2                  ← usually just two pods, cluster-wide
+
+$ kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}'
+.:53 {
+    errors
+    health { lameduck 5s }
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+       pods insecure
+       fallthrough in-addr.arpa ip6.arpa
+       ttl 30                                     ← record TTL served to clients
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf { max_concurrent 1000 }   ← upstream for everything else
+    cache 30                                      ← CoreDNS's own cache
+    loop
+    reload
+    loadbalance
+}
+</pre>
+
+    <table class="tbl">
+      <tr><th>Scaling lever</th><th>Effect</th><th>Caveat</th></tr>
+      <tr><td>More CoreDNS replicas</td><td>More query capacity</td><td>Every query still crosses the network</td></tr>
+      <tr><td><code>cache</code> plugin TTL</td><td>Fewer upstream lookups</td><td>Slower propagation of changes</td></tr>
+      <tr><td>cluster-proportional autoscaler</td><td>Replicas track node/core count</td><td>Reactive, not predictive</td></tr>
+      <tr><td><strong>NodeLocal DNSCache</strong></td><td>A caching DNS agent on <em>every node</em>, reached over a link-local IP</td><td>One more DaemonSet; the real fix</td></tr>
+      <tr><td>Fix <code>ndots</code></td><td><strong>Removes 80% of the queries entirely</strong></td><td>Do this first</td></tr>
+    </table>
+
+<pre>
+NodeLocal DNSCache changes the path:
+
+  without:  pod → (network) → CoreDNS pod on some node → upstream
+  with:     pod → node-local agent (169.254.20.10) → CoreDNS only on a cache miss
+
+  · cache hits never leave the node
+  · the agent uses TCP upstream, which sidesteps the conntrack race in Part 4
+  · measured effect on a busy cluster: CoreDNS QPS 42,000 → 5,100
+</pre>
+
+    <h2>Part 4 — The Five-Second DNS Timeout</h2>
+
+    <p>A famous and thoroughly confusing symptom: occasional requests take exactly 5.00 seconds, then succeed.
+       The cause is a kernel race between two UDP packets sent from one socket at the same instant:</p>
+
+<pre>
+  glibc sends the A and AAAA queries in PARALLEL, from the same source port,
+  to the same destination (the DNS Service VIP).
+
+  Both packets hit netfilter at once and each tries to create a conntrack entry
+  for the same 5-tuple. One insertion wins; the other is dropped as a duplicate.
+
+  → one of the two queries vanishes
+  → glibc waits for its answer until the resolver timeout (default 5 s)
+  → retries, succeeds
+
+  $ kubectl exec p -- sh -c 'for i in $(seq 200); do
+       /usr/bin/time -f %e getent hosts web 2>&amp;1 | tail -1; done' | sort -n | tail -3
+  0.004
+  5.003
+  5.004                        ← two of 200 lookups took exactly five seconds
+</pre>
+
+    <table class="tbl">
+      <tr><th>Mitigation</th><th>Mechanism</th><th>Verdict</th></tr>
+      <tr><td><code>options single-request-reopen</code></td><td>Use a new source port for the second query</td><td>glibc only; works</td></tr>
+      <tr><td><code>options use-vc</code></td><td>Force TCP for DNS</td><td>Works; slightly more overhead</td></tr>
+      <tr><td><code>options timeout:1 attempts:3</code></td><td>Fail fast and retry</td><td>Hides it rather than fixing it</td></tr>
+      <tr><td><strong>NodeLocal DNSCache</strong></td><td>Node-local agent, TCP upstream, no DNAT for the hot path</td><td><strong>The proper fix</strong></td></tr>
+      <tr><td>Alpine/musl images</td><td>musl also queries in parallel</td><td>Affected too — not a glibc-only issue</td></tr>
+    </table>
+
+<pre>
+dnsConfig:
+  options:
+  - { name: ndots, value: "2" }
+  - { name: single-request-reopen }
+  - { name: timeout, value: "1" }
+  - { name: attempts, value: "3" }
+</pre>
+
+    <div class="note">🔑 <strong>Exactly 5.000 seconds is a fingerprint.</strong> Application latency percentiles
+       with a hard cluster at 5 s — never 4.2 s, never 6.1 s — are almost always this, not your database and not
+       the network. The giveaway is that the <em>total</em> request time is 5 s plus the normal service time,
+       because the delay is entirely in name resolution before the connection is even attempted.</div>
+
+    <h2>Part 5 — <code>dnsPolicy</code> and the <code>hostNetwork</code> Trap</h2>
+
+    <table class="tbl">
+      <tr><th><code>dnsPolicy</code></th><th>Resolver used</th><th>Use for</th></tr>
+      <tr><td><code>ClusterFirst</code> (default)</td><td>CoreDNS, falling back upstream</td><td>Normal pods</td></tr>
+      <tr><td><code>Default</code></td><td><strong>The node's <code>/etc/resolv.conf</code></strong> — no cluster DNS at all</td><td>Pods that must not see cluster names</td></tr>
+      <tr><td><code>None</code></td><td>Only what <code>dnsConfig</code> specifies</td><td>Fully custom resolution</td></tr>
+      <tr><td><code>ClusterFirstWithHostNet</code></td><td>CoreDNS, for <code>hostNetwork</code> pods</td><td><strong>Required with <code>hostNetwork: true</code></strong></td></tr>
+    </table>
+
+<pre>
+$ kubectl run hn --image=nicolaka/netshoot --overrides='{"spec":{"hostNetwork":true}}' \
+    -- sleep 3600
+$ kubectl exec hn -- cat /etc/resolv.conf
+nameserver 10.0.0.2                    ← the NODE's resolver, not CoreDNS
+search eu-west-1.compute.internal
+$ kubectl exec hn -- getent hosts web
+                                       ← nothing. Cluster names do not resolve.
+
+$ kubectl run hn2 --image=nicolaka/netshoot \
+    --overrides='{"spec":{"hostNetwork":true,"dnsPolicy":"ClusterFirstWithHostNet"}}' -- sleep 3600
+$ kubectl exec hn2 -- getent hosts web
+10.96.140.22     web.shop.svc.cluster.local     ← fixed
+</pre>
+
+    <p>The trap is that <code>hostNetwork: true</code> silently changes <code>dnsPolicy</code> to
+       <code>Default</code> unless you say otherwise. Anything running on the host network — monitoring agents,
+       ingress controllers, CNI components — loses cluster service discovery without a single error message.</p>
+
+    <h2>Part 6 — StatefulSet DNS and Debugging</h2>
+
+<pre>
+apiVersion: apps/v1
+kind: StatefulSet
+spec:
+  serviceName: db-headless              ← REQUIRED: this is what creates per-pod DNS
+...
+apiVersion: v1
+kind: Service
+metadata: { name: db-headless }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true        ← critical for bootstrap; see below
+  selector: { app: db }
+
+$ kubectl exec p -- dig +short db-0.db-headless.shop.svc.cluster.local
+10.244.1.7                              ← stable name; survives rescheduling
+</pre>
+
+    <div class="note">⚠️ <strong><code>publishNotReadyAddresses: true</code> is what lets a clustered database
+       form a cluster.</strong> During bootstrap no member is Ready — each is waiting to discover its peers — so
+       with the default behaviour DNS returns nothing and the cluster deadlocks: readiness depends on peer
+       discovery, and peer discovery depends on readiness. Publishing not-ready addresses breaks the cycle.
+       Covered further in <a href="statefulsets.html">StatefulSets</a>.</div>
+
+<pre>
+DEBUGGING ORDER — one command distinguishes every failure mode:
+
+$ kubectl run dbg --rm -it --image=nicolaka/netshoot --restart=Never -- sh
+# dig web.shop.svc.cluster.local
+;; status: NOERROR       → resolution works; the problem is elsewhere
+;; status: NXDOMAIN      → the name does not exist: wrong namespace, wrong Service name,
+                           or a headless Service with no ready endpoints
+;; status: SERVFAIL      → CoreDNS could not answer: upstream failure, or the
+                           forward loop / plugin error — check CoreDNS logs
+   (no response, timeout) → connectivity to the DNS Service: NetworkPolicy, kube-proxy,
+                            or CoreDNS pods not Ready
+
+# dig @10.96.0.10 web.shop.svc.cluster.local       ← bypass the search path entirely
+# nslookup -type=srv _http._tcp.web.shop.svc.cluster.local
+</pre>
+
+    <table class="tbl">
+      <tr><th>Check</th><th>Command</th></tr>
+      <tr><td>Are CoreDNS pods healthy?</td><td><code>kubectl -n kube-system get pods -l k8s-app=kube-dns</code></td></tr>
+      <tr><td>Does the DNS Service have endpoints?</td><td><code>kubectl -n kube-system get endpointslices -l kubernetes.io/service-name=kube-dns</code></td></tr>
+      <tr><td>Is CoreDNS erroring?</td><td><code>kubectl -n kube-system logs -l k8s-app=kube-dns | grep -i error</code></td></tr>
+      <tr><td>Query rate and failures</td><td><code>coredns_dns_requests_total</code>, <code>coredns_dns_responses_total{rcode="NXDOMAIN"}</code></td></tr>
+      <tr><td>Is a NetworkPolicy blocking DNS?</td><td>Egress to UDP/TCP 53 must be allowed — see <a href="network-policy.html">Network Policies</a></td></tr>
+    </table>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Default <code>ndots:5</code> everywhere, two CoreDNS replicas for a 200-node cluster, an
+         egress NetworkPolicy that forgot port 53, monitoring agents on <code>hostNetwork</code> with the default
+         <code>dnsPolicy</code>, and a StatefulSet whose headless Service does not publish not-ready
+         addresses.</strong> Every external API call costs ten DNS queries, eight of them guaranteed NXDOMAIN, so
+         CoreDNS runs at 40,000 QPS and outbound latency has an unexplained floor. Occasional requests take
+         exactly 5.000 seconds and are blamed on the database for a month, because nobody recognises the
+         conntrack race fingerprint. The new "deny all egress" policy is rolled out and every pod in the namespace
+         instantly loses name resolution, which presents as total application failure with no obvious connection
+         to the policy. The monitoring DaemonSet runs on the host network and silently cannot resolve a single
+         cluster service, so its scrape targets have been failing since it was deployed. And the new database
+         StatefulSet never forms a cluster, because each member waits for peers that DNS refuses to publish until
+         they are Ready.</p>
+      <p>✅ <strong>Cut the query count first, cache at the node, and treat DNS as a dependency with its own
+         failure modes.</strong> Set <code>ndots: 2</code> in <code>dnsConfig</code> for pods that talk to
+         external services, or use fully-qualified names with a trailing dot — measured, that took one lookup
+         from 48 ms and ten queries to 7 ms and two. Deploy <strong>NodeLocal DNSCache</strong>, which serves
+         cache hits without leaving the node and uses TCP upstream, removing the five-second conntrack race as a
+         side effect; add <code>single-request-reopen</code> where you cannot. Scale CoreDNS with the
+         cluster-proportional autoscaler rather than leaving it at two replicas, and alert on its NXDOMAIN ratio —
+         a sudden climb is almost always a misconfigured search path. Always allow egress to UDP <em>and</em> TCP
+         port 53 in every NetworkPolicy, since a "deny all" policy that forgets DNS looks like a total outage.
+         Set <code>dnsPolicy: ClusterFirstWithHostNet</code> on every <code>hostNetwork</code> pod, and
+         <code>publishNotReadyAddresses: true</code> on headless Services backing clustered software, or
+         bootstrap deadlocks.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Leaving <code>ndots:5</code> for external-heavy pods</td><td>10 queries per external name, 8 of them NXDOMAIN</td><td><code>dnsConfig</code> <code>ndots: 2</code>, or trailing dots</td></tr>
+      <tr><td>Blaming 5-second latencies on the database</td><td>Exactly 5.000 s is the conntrack race fingerprint</td><td>NodeLocal DNSCache, <code>single-request-reopen</code></td></tr>
+      <tr><td>Scaling CoreDNS by guesswork</td><td>Two replicas serve any cluster until they suddenly do not</td><td>Proportional autoscaler; fix ndots first</td></tr>
+      <tr><td>NetworkPolicy without a DNS egress rule</td><td>Everything fails, with no mention of DNS</td><td>Allow UDP and TCP 53</td></tr>
+      <tr><td><code>hostNetwork</code> with default <code>dnsPolicy</code></td><td>Silently uses the node's resolver — no cluster names</td><td><code>ClusterFirstWithHostNet</code></td></tr>
+      <tr><td>Headless Service without <code>publishNotReadyAddresses</code></td><td>Clustered software cannot bootstrap</td><td>Set it to <code>true</code></td></tr>
+      <tr><td>StatefulSet without <code>serviceName</code></td><td>No per-pod DNS records at all</td><td>Point it at a headless Service</td></tr>
+      <tr><td>Caching DNS in the application for ever</td><td>Pod IPs change constantly; JVMs historically cached indefinitely</td><td>Respect TTL (<code>networkaddress.cache.ttl</code>)</td></tr>
+      <tr><td>Assuming short names work cross-namespace</td><td><code>web</code> only resolves in your own namespace</td><td><code>web.shop</code> or the FQDN</td></tr>
+      <tr><td>Long CoreDNS cache TTLs</td><td>Endpoint changes propagate slowly</td><td>Keep ~30 s; cache at the node instead</td></tr>
+      <tr><td>Ignoring the NXDOMAIN ratio</td><td>The clearest signal of a search-path problem</td><td>Alert on it</td></tr>
+      <tr><td>Using <code>ExternalName</code> for TLS endpoints</td><td>A CNAME with no SNI rewriting</td><td>See <a href="services.html">Services</a></td></tr>
+      <tr><td>Treating DNS as infrastructure that cannot fail</td><td>It is a Deployment like any other</td><td>Probes, PDBs, spread, monitoring</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How does one pod find another service in Kubernetes?</summary>
+      <p><strong>By DNS name, served by CoreDNS.</strong> Every Service gets a record under
+         <code>&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>.</p>
+<pre>
+same namespace:      web
+another namespace:   web.shop
+fully qualified:     web.shop.svc.cluster.local.
+</pre>
+      <table class="tbl">
+        <tr><th>Service type</th><th>DNS returns</th></tr>
+        <tr><td>ClusterIP</td><td>One virtual IP</td></tr>
+        <tr><td>Headless</td><td><strong>Every ready pod IP</strong></td></tr>
+        <tr><td>StatefulSet pod</td><td><code>db-0.db-headless.ns.svc.cluster.local</code></td></tr>
+        <tr><td>Named port (SRV)</td><td>Port number plus target names</td></tr>
+      </table>
+      <p><strong>Why names rather than IPs:</strong> pod IPs change on every restart and rescheduling, and the
+         ClusterIP is stable for the life of the Service. The DNS name is the only durable handle —
+         <a href="pods.html">pod IPs are ephemeral</a>.</p>
+      <p><strong>Worth adding:</strong> resolution is the <em>only</em> function of a headless Service. It has no
+         VIP and installs no kube-proxy rules, so its entire behaviour lives in CoreDNS.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why can't a pod resolve <code>web</code> from a different namespace?</summary>
+      <p><strong>Because the search path is namespace-specific.</strong> A pod's
+         <code>/etc/resolv.conf</code> lists its own namespace first:</p>
+<pre>
+search shop.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+
+  from namespace "shop":   "web" → web.shop.svc.cluster.local ✅
+  from namespace "admin":  "web" → web.admin.svc.cluster.local → NXDOMAIN
+                                 → web.svc.cluster.local       → NXDOMAIN
+                                 → web.cluster.local           → NXDOMAIN
+</pre>
+      <p><strong>Use <code>web.shop</code></strong> — two dots, still under <code>ndots:5</code>, so the search
+         path appends <code>svc.cluster.local</code> and it resolves. Or the full
+         <code>web.shop.svc.cluster.local.</code> with a trailing dot, which skips the search path entirely and is
+         the fastest form.</p>
+      <p><strong>The related gotcha:</strong> a Service is namespaced, but its DNS record is visible cluster-wide.
+         Namespaces are not a network boundary — restricting who may reach a Service requires
+         <a href="network-policy.html">NetworkPolicies</a>, not the fact that a name is inconvenient to
+         type.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain <code>ndots:5</code> and why it matters for performance.</summary>
+      <p><strong>A name with fewer than five dots is tried against every search domain before being tried as
+         written.</strong> Kubernetes sets 5 so that short in-cluster names work; the cost falls on external
+         names.</p>
+<pre>
+resolving "api.stripe.com" (2 dots):
+  ① api.stripe.com.shop.svc.cluster.local   NXDOMAIN
+  ② api.stripe.com.svc.cluster.local        NXDOMAIN
+  ③ api.stripe.com.cluster.local            NXDOMAIN
+  ④ api.stripe.com.eu-west-1.compute.internal  NXDOMAIN
+  ⑤ api.stripe.com                          ✅
+  × 2 for parallel A and AAAA               = 10 queries
+</pre>
+      <p><strong>Measured:</strong> 48 ms and ten queries for the bare name, versus <strong>7 ms and two</strong>
+         with a trailing dot. A service making 1,000 external calls a second generates 10,000 DNS QPS, 8,000 of
+         them guaranteed NXDOMAIN.</p>
+      <table class="tbl">
+        <tr><th>Fix</th><th>Cost</th></tr>
+        <tr><td>Trailing dot on external hostnames</td><td>Every config and library must do it</td></tr>
+        <tr><td><code>dnsConfig</code> with <code>ndots: 2</code></td><td>Bare same-namespace names stop working; <code>web.shop</code> still resolves</td></tr>
+        <tr><td>NodeLocal DNSCache</td><td>Makes the queries cheap rather than removing them</td></tr>
+      </table>
+      <p><strong>The systemic symptom</strong> is a latency floor on all outbound calls plus a CoreDNS scaling
+         problem, and the NXDOMAIN ratio on CoreDNS metrics is the clearest evidence.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Some requests take exactly 5 seconds. What is happening?</summary>
+      <p><strong>A conntrack race on parallel UDP DNS queries.</strong> The resolver sends the A and AAAA queries
+         simultaneously from the same source port to the same destination; both packets try to create a conntrack
+         entry for the same tuple, one is dropped as a duplicate, and the resolver waits out its 5-second
+         timeout before retrying.</p>
+<pre>
+$ for i in $(seq 200); do /usr/bin/time -f %e getent hosts web; done 2>&amp;1 | sort -n | tail -2
+5.003
+5.004                            ← exactly five seconds, twice in 200 lookups
+</pre>
+      <p><strong>The fingerprint is the exactness.</strong> Latency histograms with a hard spike at 5.000 s — never
+         4.2, never 6.1 — are this, not a slow database. The total request time is 5 s <em>plus</em> normal
+         service time, because the delay happens before the connection is attempted.</p>
+      <table class="tbl">
+        <tr><th>Fix</th><th>Effect</th></tr>
+        <tr><td><strong>NodeLocal DNSCache</strong></td><td>Node-local agent, TCP upstream — removes the race properly</td></tr>
+        <tr><td><code>single-request-reopen</code></td><td>Second query uses a new source port</td></tr>
+        <tr><td><code>use-vc</code></td><td>DNS over TCP; no UDP race</td></tr>
+        <tr><td><code>timeout:1 attempts:3</code></td><td>Reduces the damage, does not fix the cause</td></tr>
+      </table>
+      <p><strong>Note it is not glibc-specific:</strong> musl (Alpine) also queries in parallel, so switching base
+         image does not help. Fixing <code>ndots</code> reduces exposure simply by making far fewer queries.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> DNS is failing intermittently on a large cluster. Walk through your investigation and remediation.</summary>
+      <p><strong>Establish whether it is capacity, correctness or connectivity — the three have different
+         signatures.</strong></p>
+<pre>
+① CAPACITY
+$ kubectl -n kube-system top pods -l k8s-app=kube-dns
+coredns-x8k2p   980m   72Mi           ← CPU-saturated at ~1 core
+   coredns_dns_requests_total rate → 42,000 qps on 2 replicas
+   coredns_dns_responses_total{rcode="NXDOMAIN"} → 78% of all responses
+
+② CORRECTNESS  — that 78% is the actual finding
+   ndots:5 × external calls = 8 guaranteed NXDOMAIN per real lookup
+
+③ CONNECTIVITY
+$ kubectl -n kube-system get endpointslices -l kubernetes.io/service-name=kube-dns
+   any NetworkPolicy without an egress rule for port 53 breaks DNS for a namespace
+</pre>
+      <p><strong>Remediation in order of impact:</strong></p>
+      <ul>
+        <li><strong>Fix <code>ndots</code> first</strong> — it removes roughly 80% of the load rather than serving
+            it faster. Two lines of pod spec, no new components.</li>
+        <li><strong>Deploy NodeLocal DNSCache.</strong> Cache hits never leave the node, and its TCP upstream
+            eliminates the 5-second race. Measured on a busy cluster: 42,000 → 5,100 QPS reaching CoreDNS.</li>
+        <li><strong>Autoscale CoreDNS proportionally</strong> to nodes/cores rather than pinning two replicas, and
+            spread them across zones with a PDB — it is a Deployment and deserves the same availability
+            engineering as anything else.</li>
+        <li><strong>Keep the cache TTL short (~30 s)</strong>: long TTLs trade endpoint-change propagation for a
+            saving that node-local caching already provides.</li>
+      </ul>
+      <p><strong>What I would monitor afterwards:</strong> NXDOMAIN ratio (the search-path canary), CoreDNS p99
+         latency, cache hit rate at the node agent, and a synthetic probe resolving both a cluster name and an
+         external name from a normal pod — because DNS failure presents as "everything is broken" and needs its
+         own unambiguous signal.</p>
+      <p><strong>The design point worth stating:</strong> DNS is a hard dependency of every request path, but it is
+         deployed as an ordinary two-replica Deployment by default. Treating it as infrastructure that cannot
+         fail is precisely why these incidents are so confusing when it does.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A clustered database StatefulSet never forms a quorum on first deploy. Diagnose.</summary>
+      <p><strong>A bootstrap deadlock caused by readiness and peer discovery depending on each other.</strong>
+         Each member is unready until it finds peers; DNS publishes only ready addresses; so no member ever
+         discovers anyone.</p>
+<pre>
+$ kubectl exec db-0 -- dig +short db-headless.shop.svc.cluster.local
+                                   ← empty: no member is Ready yet
+$ kubectl logs db-0 | tail -2
+waiting for peers... found 0 members
+waiting for peers... found 0 members
+</pre>
+<pre>
+apiVersion: v1
+kind: Service
+metadata: { name: db-headless }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true     ← breaks the cycle
+  selector: { app: db }
+$ kubectl exec db-0 -- dig +short db-headless.shop.svc.cluster.local
+10.244.1.7
+10.244.2.4
+10.244.3.9                          ← all three visible; quorum forms
+</pre>
+      <p><strong>The other requirements for per-pod DNS</strong> are easy to get wrong together: the StatefulSet
+         must set <code>serviceName</code> to the headless Service, or no
+         <code>db-0.db-headless...</code> records exist at all; and the pods must be configured with their
+         <em>stable</em> names rather than IPs, since IPs change on every reschedule while the ordinal names do
+         not.</p>
+      <p><strong>The design caution:</strong> <code>publishNotReadyAddresses</code> means clients using this
+         Service may receive addresses of pods that are not serving. That is correct for peer discovery and wrong
+         for client traffic — so clustered databases normally get <strong>two Services</strong>: a headless one
+         with not-ready addresses published for the members to find each other, and a regular ClusterIP Service
+         with normal readiness gating for applications to connect to.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Map every DNS record type a Service can produce.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create ns shop
+$ kubectl -n shop create deploy web --image=nginx:alpine --replicas=3
+$ kubectl -n shop expose deploy web --port=80 --name=web
+$ kubectl -n shop create svc clusterip web-headless --clusterip=None --tcp=80:80
+$ kubectl -n shop patch svc web-headless -p '{"spec":{"selector":{"app":"web"}}}'
+$ kubectl -n shop create svc externalname legacy --external-name=db.example.com
+$ kubectl run dbg --rm -it --image=nicolaka/netshoot --restart=Never -n shop -- sh
+</pre>
+<pre>
+# dig +short web
+10.96.140.22                          ← ClusterIP: ONE virtual IP
+# dig +short web-headless
+10.244.1.7
+10.244.2.4
+10.244.3.9                            ← headless: every ready pod
+# dig +short legacy
+db.example.com.                       ← ExternalName: a CNAME
+# dig +short SRV _80._tcp.web.shop.svc.cluster.local
+0 100 80 web.shop.svc.cluster.local.
+# dig +short SRV _80._tcp.web-headless.shop.svc.cluster.local
+0 33 80 10-244-1-7.web-headless.shop.svc.cluster.local.
+0 33 80 10-244-2-4.web-headless.shop.svc.cluster.local.
+0 33 80 10-244-3-9.web-headless.shop.svc.cluster.local.
+</pre>
+<pre>
+Watch a headless record follow readiness:
+# exit
+$ kubectl -n shop scale deploy web --replicas=1
+$ kubectl run dbg --rm -it --image=nicolaka/netshoot --restart=Never -n shop -- \
+    dig +short web-headless
+10.244.1.7                            ← only the surviving pod
+
+$ kubectl -n shop scale deploy web --replicas=0
+$ kubectl run dbg --rm -it --image=nicolaka/netshoot --restart=Never -n shop -- \
+    dig web-headless +noall +comments | grep status
+;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 41287
+                                      ← a headless Service with no endpoints does not
+                                        resolve at all: NXDOMAIN, not an empty answer
+$ kubectl run dbg --rm -it --image=nicolaka/netshoot --restart=Never -n shop -- \
+    dig +short web
+10.96.140.22                          ← the ClusterIP still resolves. It routes nowhere.
+</pre>
+<table class="tbl">
+  <tr><th>Service</th><th>0 endpoints</th></tr>
+  <tr><td>ClusterIP</td><td>Resolves; connections fail</td></tr>
+  <tr><td>Headless</td><td><strong>NXDOMAIN</strong></td></tr>
+</table>
+<p>That difference matters when debugging: an NXDOMAIN on a headless name means "no ready pods", not "wrong
+   name".</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Count the queries one external lookup costs, and fix it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl -n kube-system edit cm coredns    # temporarily add "log" to the Corefile
+$ kubectl -n kube-system rollout restart deploy/coredns
+
+$ kubectl run p --image=nicolaka/netshoot -n shop -- sleep 3600
+$ kubectl exec -n shop p -- cat /etc/resolv.conf
+search shop.svc.cluster.local svc.cluster.local cluster.local eu-west-1.compute.internal
+nameserver 10.96.0.10
+options ndots:5
+
+$ kubectl exec -n shop p -- getent hosts example.com >/dev/null
+$ kubectl -n kube-system logs -l k8s-app=kube-dns --since=20s | grep -c 'example.com'
+10
+$ kubectl -n kube-system logs -l k8s-app=kube-dns --since=20s | grep 'example.com' | awk '{print $7, $NF}'
+example.com.shop.svc.cluster.local. NXDOMAIN
+example.com.shop.svc.cluster.local. NXDOMAIN
+example.com.svc.cluster.local.      NXDOMAIN
+example.com.svc.cluster.local.      NXDOMAIN
+example.com.cluster.local.          NXDOMAIN
+example.com.cluster.local.          NXDOMAIN
+example.com.eu-west-1.compute.internal. NXDOMAIN
+example.com.eu-west-1.compute.internal. NXDOMAIN
+example.com.                        NOERROR
+example.com.                        NOERROR       ← 8 wasted, 2 useful
+</pre>
+<pre>
+FIX ① a trailing dot:
+$ kubectl exec -n shop p -- getent hosts example.com. >/dev/null
+$ kubectl -n kube-system logs -l k8s-app=kube-dns --since=10s | grep -c 'example.com'
+2
+
+FIX ② per-pod ndots:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: p2, namespace: shop }
+spec:
+  dnsConfig:
+    options: [{ name: ndots, value: "2" }]
+  containers: [{ name: c, image: nicolaka/netshoot, command: ["sleep","3600"] }]
+EOF
+$ kubectl exec -n shop p2 -- getent hosts example.com >/dev/null
+$ kubectl -n kube-system logs -l k8s-app=kube-dns --since=10s | grep -c 'example.com'
+2                                     ← 2 dots ≥ ndots:2 → tried as absolute first
+</pre>
+<pre>
+Timing, and what still works:
+$ kubectl exec -n shop p  -- sh -c 'time getent hosts example.com' 2>&amp;1 | grep real
+real    0m0.048s
+$ kubectl exec -n shop p2 -- sh -c 'time getent hosts example.com' 2>&amp;1 | grep real
+real    0m0.007s                      ← 6.9× faster
+
+$ kubectl exec -n shop p2 -- getent hosts web.shop
+10.96.140.22   web.shop.svc.cluster.local     ← cross-namespace short form still works
+$ kubectl exec -n shop p2 -- getent hosts web
+                                      ← bare same-namespace name no longer resolves
+</pre>
+<p><strong>The trade in one line:</strong> <code>ndots: 2</code> costs you bare single-label names and saves
+   80% of your DNS traffic. Use FQDNs or <code>svc.ns</code> form in-cluster and take the win.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Catch the five-second timeout and eliminate it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl run p --image=nicolaka/netshoot -n shop -- sleep 3600
+$ kubectl exec -n shop p -- sh -c '
+    for i in $(seq 400); do
+      s=$(date +%s%N); getent hosts web >/dev/null 2>&amp;1; e=$(date +%s%N)
+      echo $(( (e-s)/1000000 ))
+    done' | sort -n | uniq -c | tail -4
+    396 3
+      1 4
+      2 5001
+      1 5002                          ← 3 of 400 lookups took ~5000 ms
+</pre>
+<pre>
+Confirm the mechanism — a dropped conntrack insertion:
+$ sudo conntrack -S | awk '{for(i=1;i<=NF;i++) if($i ~ /insert_failed/) print $i}' | head -2
+insert_failed=1847
+   (re-run the loop and watch this counter climb by roughly the number of 5 s lookups)
+
+$ sudo dmesg | grep -c 'nf_conntrack: table full'
+0                                     ← not table exhaustion: it is the race
+</pre>
+<pre>
+MITIGATION ① single-request-reopen:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: p3, namespace: shop }
+spec:
+  dnsConfig:
+    options:
+    - { name: ndots, value: "2" }
+    - { name: single-request-reopen }
+    - { name: timeout, value: "1" }
+    - { name: attempts, value: "3" }
+  containers: [{ name: c, image: nicolaka/netshoot, command: ["sleep","3600"] }]
+EOF
+$ kubectl exec -n shop p3 -- sh -c '(same 400-lookup loop)' | sort -n | tail -2
+      3
+      4                               ← no 5-second outliers at all
+</pre>
+<pre>
+MITIGATION ② NodeLocal DNSCache (the proper fix):
+$ kubectl -n kube-system get ds node-local-dns
+NAME             DESIRED   CURRENT   READY
+node-local-dns   3         3         3
+$ kubectl exec -n shop p -- cat /etc/resolv.conf | grep nameserver
+nameserver 169.254.20.10              ← link-local, on this node: no DNAT, no race
+
+$ kubectl exec -n shop p -- sh -c '(same loop)' | sort -n | uniq -c | tail -2
+    398 0
+      2 1                             ← sub-millisecond, cache-hit resolution
+$ kubectl -n kube-system logs -l k8s-app=kube-dns --since=1m | wc -l
+4                                     ← almost nothing reaches CoreDNS any more
+</pre>
+<table class="tbl">
+  <tr><th>Setup</th><th>p50</th><th>Worst</th><th>Queries to CoreDNS</th></tr>
+  <tr><td>Default</td><td>3 ms</td><td><strong>5002 ms</strong></td><td>All of them</td></tr>
+  <tr><td><code>single-request-reopen</code></td><td>3 ms</td><td>4 ms</td><td>All of them</td></tr>
+  <tr><td><strong>NodeLocal DNSCache</strong></td><td><strong>0 ms</strong></td><td>1 ms</td><td>Cache misses only</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Break DNS with a NetworkPolicy and with <code>hostNetwork</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+① THE "DENY ALL EGRESS" POLICY THAT FORGETS DNS
+$ kubectl -n shop apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: deny-egress }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to: [{ podSelector: { matchLabels: { app: web } } }]      ← "only talk to web"
+EOF
+
+$ kubectl exec -n shop p -- getent hosts web; echo "exit=$?"
+exit=2                                ← cannot even RESOLVE it
+$ kubectl exec -n shop p -- dig web +time=2 +tries=1 | grep -E 'status|timed out'
+;; connection timed out; no servers could be reached
+$ kubectl exec -n shop p -- nc -zv 10.244.1.7 80
+10.244.1.7 (10.244.1.7:80) open       ← direct pod IP works: it IS a DNS failure
+</pre>
+<pre>
+THE FIX — every egress policy needs a DNS rule:
+$ kubectl -n shop patch networkpolicy deny-egress --type=json -p '[{"op":"add","path":"/spec/egress/-","value":
+  {"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}},
+          "podSelector":{"matchLabels":{"k8s-app":"kube-dns"}}}],
+   "ports":[{"protocol":"UDP","port":53},{"protocol":"TCP","port":53}]}}]'
+$ kubectl exec -n shop p -- getent hosts web
+10.96.140.22   web.shop.svc.cluster.local
+</pre>
+<pre>
+② HOSTNETWORK SILENTLY LOSING CLUSTER DNS
+$ kubectl run hn -n shop --image=nicolaka/netshoot \
+    --overrides='{"spec":{"hostNetwork":true}}' -- sleep 3600
+$ kubectl exec -n shop hn -- cat /etc/resolv.conf
+nameserver 10.0.0.2                   ← the NODE's resolver
+search eu-west-1.compute.internal
+$ kubectl exec -n shop hn -- getent hosts web; echo "exit=$?"
+exit=2
+$ kubectl exec -n shop hn -- getent hosts example.com | head -1
+93.184.216.34                         ← external names work fine: easy to miss
+
+$ kubectl get pod -n shop hn -o jsonpath='{.spec.dnsPolicy}{"\n"}'
+ClusterFirst                          ← it SAYS ClusterFirst and is ignored,
+                                        because hostNetwork overrides it
+</pre>
+<pre>
+$ kubectl run hn2 -n shop --image=nicolaka/netshoot \
+    --overrides='{"spec":{"hostNetwork":true,"dnsPolicy":"ClusterFirstWithHostNet"}}' -- sleep 3600
+$ kubectl exec -n shop hn2 -- cat /etc/resolv.conf | grep nameserver
+nameserver 10.96.0.10
+$ kubectl exec -n shop hn2 -- getent hosts web
+10.96.140.22   web.shop.svc.cluster.local
+</pre>
+<table class="tbl">
+  <tr><th>Failure</th><th>Symptom</th><th>Distinguishing test</th></tr>
+  <tr><td>NetworkPolicy blocks 53</td><td>Everything fails</td><td>Direct pod IP works</td></tr>
+  <tr><td><code>hostNetwork</code> default policy</td><td>Cluster names fail, external names work</td><td><code>cat /etc/resolv.conf</code></td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build StatefulSet peer discovery and prove the bootstrap deadlock.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl apply -n shop -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Service
+metadata: { name: db-peers }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false        ← the DEFAULT, and the bug
+  selector: { app: db }
+  ports: [{ name: peer, port: 7000 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: db }
+spec:
+  serviceName: db-peers
+  replicas: 3
+  selector: { matchLabels: { app: db } }
+  template:
+    metadata: { labels: { app: db } }
+    spec:
+      containers:
+      - name: db
+        image: nicolaka/netshoot
+        command: ['sh','-c','
+          while true; do
+            n=$(dig +short db-peers.shop.svc.cluster.local | wc -l)
+            echo "peers visible: $n"
+            [ "$n" -ge 2 ] && touch /tmp/ready && echo "QUORUM FORMED"
+            sleep 5
+          done']
+        readinessProbe: { exec: { command: ["test","-f","/tmp/ready"] }, periodSeconds: 3 }
+EOF
+</pre>
+<pre>
+$ sleep 60; kubectl get pods -n shop -l app=db
+NAME   READY   STATUS    RESTARTS   AGE
+db-0   0/1     Running   0          60s
+db-1   0/1     Running   0          55s
+db-2   0/1     Running   0          50s      ← none will EVER become ready
+$ kubectl logs -n shop db-0 --tail=2
+peers visible: 0
+peers visible: 0
+$ kubectl exec -n shop db-0 -- dig +short db-peers.shop.svc.cluster.local | wc -l
+0
+$ kubectl get endpointslices -n shop -l kubernetes.io/service-name=db-peers \
+    -o jsonpath='{.items[0].endpoints[*].conditions.ready}{"\n"}'
+false false false
+
+   THE DEADLOCK: ready requires peers → peers requires DNS → DNS requires ready
+</pre>
+<pre>
+THE FIX:
+$ kubectl patch svc db-peers -n shop -p '{"spec":{"publishNotReadyAddresses":true}}'
+$ sleep 20; kubectl get pods -n shop -l app=db
+db-0   1/1   Running   0   2m
+db-1   1/1   Running   0   2m
+db-2   1/1   Running   0   2m
+$ kubectl logs -n shop db-0 --tail=2
+peers visible: 3
+QUORUM FORMED
+</pre>
+<p>Now show the per-pod names that make a StatefulSet worth using:</p>
+<pre>
+$ for i in 0 1 2; do
+    printf 'db-%s → %s\n' $i "$(kubectl exec -n shop db-0 -- dig +short db-$i.db-peers.shop.svc.cluster.local)"
+  done
+db-0 → 10.244.1.7
+db-1 → 10.244.2.4
+db-2 → 10.244.3.9
+
+$ kubectl delete pod -n shop db-1 &amp;&amp; sleep 25
+$ kubectl exec -n shop db-0 -- dig +short db-1.db-peers.shop.svc.cluster.local
+10.244.2.19                           ← NEW IP, SAME NAME. That is the whole point.
+</pre>
+<pre>
+The two-Service pattern this implies:
+  db-peers   headless, publishNotReadyAddresses: true   ← members find each other
+  db         ClusterIP, normal readiness gating         ← applications connect here
+$ kubectl -n shop expose statefulset db --port=5432 --name=db
+$ kubectl get endpointslices -n shop -l kubernetes.io/service-name=db \
+    -o jsonpath='{.items[0].endpoints[*].conditions.ready}{"\n"}'
+true true true                        ← clients never see a not-ready member
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a DNS triage runbook that names the failure in one pass.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > tools/dns-triage.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+# Usage: tools/dns-triage.sh &lt;namespace&gt; &lt;service&gt;   — read-only.
+set -uo pipefail
+NS=${1:?namespace}; SVC=${2:?service}
+say() { printf '%-26s %s\n' "$1" "$2"; }
+
+echo "== the DNS service itself"
+say "coredns pods"   "$(kubectl -n kube-system get pods -l k8s-app=kube-dns \
+                        --no-headers | awk '{print $2, $3}' | sort | uniq -c | tr '\n' ' ')"
+say "coredns endpoints" "$(kubectl -n kube-system get endpointslices \
+     -l kubernetes.io/service-name=kube-dns -o jsonpath='{.items[*].endpoints[*].addresses[0]}')"
+say "coredns errors/5m" "$(kubectl -n kube-system logs -l k8s-app=kube-dns --since=5m 2>/dev/null \
+     | grep -ci error)"
+
+echo; echo "== the target service"
+say "type"       "$(kubectl -n "$NS" get svc "$SVC" -o jsonpath='{.spec.type} clusterIP={.spec.clusterIP}')"
+say "selector"   "$(kubectl -n "$NS" get svc "$SVC" -o jsonpath='{.spec.selector}')"
+say "endpoints"  "$(kubectl -n "$NS" get endpointslices -l kubernetes.io/service-name="$SVC" \
+     -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}={.conditions.ready} {end}')"
+
+echo; echo "== resolution from inside $NS"
+kubectl run dnstriage-$$ -n "$NS" --rm -i --restart=Never --image=nicolaka/netshoot -- sh -c "
+  echo '--- resolv.conf'; grep -E 'search|ndots|nameserver' /etc/resolv.conf
+  echo '--- short name'; dig +noall +comments $SVC | grep -o 'status: [A-Z]*'
+  echo '--- fqdn';       dig +noall +comments $SVC.$NS.svc.cluster.local. | grep -o 'status: [A-Z]*'
+  echo '--- direct @coredns'; dig +noall +comments @10.96.0.10 $SVC.$NS.svc.cluster.local. \
+       | grep -o 'status: [A-Z]*' || echo 'NO RESPONSE (connectivity/NetworkPolicy)'
+  echo '--- external';   dig +short +time=2 +tries=1 example.com. | head -1
+" 2>/dev/null
+
+echo; echo "== egress policies in $NS (must allow port 53)"
+kubectl -n "$NS" get networkpolicy -o json | jq -r '
+  .items[] | select(.spec.policyTypes[]? == "Egress") |
+  "\(.metadata.name): dns_allowed=\([.spec.egress[]?.ports[]?.port] | index(53) != null)"'
+SH
+$ chmod +x tools/dns-triage.sh
+</pre>
+<pre>
+$ tools/dns-triage.sh shop web
+== the DNS service itself
+coredns pods                 2 1/1 Running
+coredns endpoints            10.244.0.4 10.244.1.3
+coredns errors/5m            0
+
+== the target service
+type                         ClusterIP clusterIP=10.96.140.22
+selector                     {"app":"wev"}
+endpoints
+== resolution from inside shop
+--- resolv.conf
+search shop.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+nameserver 10.96.0.10
+--- short name
+status: NOERROR
+--- fqdn
+status: NOERROR
+--- direct @coredns
+status: NOERROR
+--- external
+93.184.216.34
+
+== egress policies in shop (must allow port 53)
+deny-egress: dns_allowed=false
+</pre>
+<p>Two findings in one pass: the selector says <code>wev</code> and endpoints are empty (so DNS resolves fine
+   and connections will fail), and an egress policy does not allow port 53.</p>
+<table class="tbl">
+  <tr><th>Output pattern</th><th>Diagnosis</th></tr>
+  <tr><td>NOERROR + empty endpoints</td><td>Selector matches nothing, or pods not Ready</td></tr>
+  <tr><td>NXDOMAIN on short, NOERROR on FQDN</td><td>Wrong namespace, or an <code>ndots</code> change</td></tr>
+  <tr><td>NXDOMAIN on a headless name</td><td><strong>No ready endpoints</strong> — not a naming error</td></tr>
+  <tr><td>SERVFAIL</td><td>CoreDNS upstream or plugin failure — read its logs</td></tr>
+  <tr><td>No response at all</td><td>NetworkPolicy on port 53, or CoreDNS unreachable</td></tr>
+  <tr><td>Cluster names fail, external work</td><td><code>hostNetwork</code> with the wrong <code>dnsPolicy</code></td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Names follow <code>&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>; ClusterIP Services return one VIP, headless Services return <strong>every ready pod IP</strong>.</li>
+        <li>A headless Service with no ready endpoints returns <strong>NXDOMAIN</strong>, while a ClusterIP Service still resolves and simply routes nowhere — a useful diagnostic difference.</li>
+        <li>DNS is the entire feature of a headless Service: no VIP, no kube-proxy rules.</li>
+        <li><strong><code>ndots:5</code> makes one external lookup cost ten queries</strong> — eight guaranteed NXDOMAIN — measured at 48 ms versus 7 ms with a trailing dot.</li>
+        <li>Fix it with <code>dnsConfig</code> <code>ndots: 2</code> or FQDNs; the trade is that bare same-namespace names stop resolving while <code>web.shop</code> still works.</li>
+        <li>A service making 1,000 external calls per second generates 10,000 DNS QPS with the default — the most common cause of a mysterious outbound latency floor.</li>
+        <li><strong>Exactly 5.000-second latencies are a conntrack race</strong> on parallel A/AAAA UDP queries, not a slow database — measured 3 occurrences in 400 lookups.</li>
+        <li>The race affects musl as well as glibc; <code>single-request-reopen</code> or <code>use-vc</code> mitigate it, and <strong>NodeLocal DNSCache fixes it properly</strong>.</li>
+        <li>NodeLocal DNSCache serves hits without leaving the node and uses TCP upstream — measured 42,000 → 5,100 QPS reaching CoreDNS, and sub-millisecond p50.</li>
+        <li>Fix <code>ndots</code> before scaling CoreDNS: it removes ~80% of the load rather than serving it faster.</li>
+        <li>CoreDNS is an ordinary two-replica Deployment by default — it needs autoscaling, spread, a PDB and monitoring like anything else.</li>
+        <li><strong>Alert on the NXDOMAIN ratio</strong>: it is the clearest signal of a search-path problem.</li>
+        <li>An egress NetworkPolicy that forgets UDP <em>and</em> TCP port 53 breaks everything, and presents as total application failure with no mention of DNS.</li>
+        <li>The distinguishing test is that connecting to a pod IP directly still works while name resolution does not.</li>
+        <li><strong><code>hostNetwork: true</code> silently switches to the node's resolver</strong> — cluster names fail while external names keep working, and the pod still reports <code>dnsPolicy: ClusterFirst</code>.</li>
+        <li>Always set <code>dnsPolicy: ClusterFirstWithHostNet</code> on host-network pods.</li>
+        <li>StatefulSets need <code>serviceName</code> pointing at a headless Service, which is what creates <code>db-0.db-peers...</code> records — <strong>stable names over changing IPs</strong>, verified across a pod deletion.</li>
+        <li><strong><code>publishNotReadyAddresses: true</code> breaks the bootstrap deadlock</strong> where readiness needs peers and peer discovery needs readiness — demonstrated as three pods stuck at 0/1 forever.</li>
+        <li>Clustered databases therefore want two Services: a headless one publishing not-ready addresses for members, and a normal ClusterIP with readiness gating for clients.</li>
+        <li>Triage by rcode: NOERROR means look elsewhere, NXDOMAIN means the name or namespace, SERVFAIL means CoreDNS upstream, and no response means connectivity or policy.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="services.html">← Services, Endpoints &amp; kube-proxy</a>
+      <a href="ingress-gateway.html">Ingress, Gateway API &amp; Load Balancers →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
