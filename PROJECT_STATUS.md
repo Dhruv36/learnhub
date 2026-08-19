@@ -8,84 +8,58 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ## ▶️ RESUME HERE (last updated 2026-08-19)
 
-**Last completed:** ✅ **Redis v4 (track 10) — COMPLETE.** All **21 lessons** rebuilt from 11 v3
-lessons (~9KB) to v4 depth (47–63KB, every one `det=12 ex=6`) + **quiz bank retuned to the v4
-curriculum** (49 swaps, `10 200 0`, 0 duplicate stems, de-skewed 71/58/71). Whole track passes
-`python validate.py tutorials/redis` with **0 errors and 0 warnings**; pushed & live.
+**Last completed:** ✅ **Docker v4 (track 15) — COMPLETE.** All **21 lessons** rebuilt from 12 v3
+lessons (~10KB) to v4 depth (45–62KB, every one `det=12 ex=6`) across 6 sections, + **quiz bank
+retuned to the v4 curriculum** (80 swaps, sets retitled to the six sections, `10 200 0`, de-skewed
+72/61/67). Whole track passes `python validate.py tutorials/docker` with **0 errors and 0 warnings**
+(24 files); pushed & live.
 
-*§1 Foundations ×5* — `index.html` (data-structure server vs blob cache, the durability spectrum) ·
-`strings-keys.html` (encodings, **the TTL-loss bug**, expiry mechanics) ·
-`data-structures.html` (**listpack thresholds and the memory cliff**, reliable queues) ·
-`sorted-sets.html` (skiplist+hash, **the 2⁵³ score precision budget**, sliding windows) ·
-`single-threaded.html` (**head-of-line blocking measured**, fork pauses, scaling order)
-*§2 Working With Redis ×4* — `pipelining.html` (round-trip arithmetic, batch sizing) ·
-`transactions.html` (**MULTI has NO rollback**, WATCH retry storms, unkillable scripts) ·
-`caching.html` (**break-even hit rate = L_redis/L_db**, write-order race, negative caching) ·
-`cache-invalidation.html` (stampede arithmetic, **XFetch**, version-prefix invalidation 450× faster)
-*§3 Messaging ×3* — `pubsub.html` (**at-most-once: 7 of 20 lost across restarts**, buffer-limit
-disconnects, pattern cost 3.25×) · `streams.html` (**PEL leaks invisible to XLEN**, XAUTOCLAIM
-min-idle-time, check-then-act dedup fails) · `rate-limiting.html` (**fixed-window 2× burst**, four
-algorithms measured, fail-open fallback)
-*§4 Durability ×4* — `persistence.html` (**fork stall ~12ms/GB**, CoW dispersion 14×, 16,652 acked
-writes lost) · `replication.html` (**1MB backlog → full resync 15× slower**, quorum vs majority,
-split-brain bounded) · `cluster.html` (slots vs consistent hashing, **MOVED vs ASK**, `{global}`
-hash-tag hotspot = 100% on one node) · `locks.html` (**DEL-release deletes another holder's lock**,
-fencing tokens, Redlock 4.5×)
-*§5 Production ×5* — `memory.html` (per-key overhead 2.9× payload, **listpack cliff is one-way**,
-volatile-lru OOM trap) · `performance.html` (**99.5% of latency is not Redis**, SLOWLOG blind spots,
-pool exhaustion) · `observability.html` (**cumulative-counter trap: 0% real hit rate showed 66.7%**,
-errorstats, MONITOR costs 54%) · `security-ops.html` (**CONFIG+SAVE RCE path demonstrated**, additive
-ACLs, CONFIG SET hazards) · `use-cases.html` (capstone: **3,116 of 50,000 orders lost at failover**,
-six complete designs)
+*§1 Foundations ×5* — `index.html` (**a container is a process, not a VM**; ~0.4s vs ~24s VM start;
+`exec format error` = architecture) · `images-containers.html` (whiteouts, secret extraction,
+copy-up) · `namespaces.html` (what they don't isolate, JVM heap trap) · `cgroups.html` (CFS
+throttling cliff, OOM vs SIGKILL, page-cache accounting) · `runtime-stack.html` (shim survives
+daemon restart; socket = host root)
+*§2 Building Images ×5* — `dockerfile.html` (**shell form → 10.3s stop + exit 137**; ARG leaks) ·
+`build-cache.html` (**RUN cached on the command STRING**; ordering 23.4s → 0.74s) ·
+`multi-stage.html` (**1.19GB → 14.2MB**; scratch needs CA certs + numeric USER) ·
+`buildkit.html` (graph not script; **cross-compile beat QEMU 15.4×**) ·
+`optimization.html` (**Alpine+Python = 38s → 24 MINUTES**; never squash)
+*§3 Running Containers ×4* — `process-model.html` (**PID 1 ignores unhandled signals**; 271 zombies)
+· `volumes.html` (**volumes pre-populate, binds hide**; copy-up 310×) ·
+`networking.html` (**published ports BYPASS UFW**) · `env-secrets.html` (four leak paths, `_FILE`)
+*§4 Composing Systems ×2* — `compose.html` (**client not runtime**; project name strands volumes;
+**YAML base-60: `22:22` → port 1342**; `.env` ≠ `env_file`; ports concatenate and can never be
+removed by an override; recreate = 37 failed requests) · `healthchecks.html` (**`depends_on` orders
+starts, not readiness** — 27–72% flake → 0; **`start_period` is a grace window, not a delay**;
+**nothing acts on `unhealthy`** — `RestartCount 0` under `unless-stopped`; liveness checking the DB
+turned an 8s blip into 160 failed requests; `ExitCode -1` = the probe could not run)
+*§5 Production ×4* — `security.html` (**UID 0 inside is UID 0 outside**, proven on a bind mount;
+`--cap-drop=ALL` works for nginx/Postgres/Redis/Node; **`--privileged` measured**: caps 14→40,
+seccomp 2→0, AppArmor unconfined, host block devices in `/dev`; distroless 0 vs ubuntu 17 CVEs) ·
+`resource-limits.html` (**exit 137 vs `.State.OOMKilled`**; **page cache reported 78.54% on a
+sleeping container**; **62% average CPU at every quota while p99 went 41→96→488ms**; `/proc` is not
+namespaced) · `logging.html` (**json-file has no size limit** — 1.4GB/minute; **`daemon.json` only
+affects NEW containers**; `rm` frees nothing, `truncate` does; **blocking driver took 3ms → 14,208ms**;
+`PYTHONUNBUFFERED`) · `debugging.html` (**125 = your flags, 126/127 = the image**; four causes of
+`exec format error`; **`attach` Ctrl-C kills the container**; refused vs timeout; **`127.0.0.1` bind
+is the #1 networking bug**; `compose run --entrypoint sh`)
+*§6 Supply Chain ×1* — `registry-supply-chain.html` (**tags are mutable pointers, digests are
+identity**; promote in 0.2s vs rebuild in 47s with a drifted dependency; **retention GC deletes
+pinned digests**; scanners miss malicious code; **SBOM query 6.8s vs 41min**; signing without
+verification is theatre; Hub's 100/6h is per source IP)
 
-**Quiz-bank retune (2026-08-18):** 49 question swaps covering **34/34 v4 concepts** — TTL-loss bug,
-listpack cliff, 2⁵³ budget, head-of-line blocking, no-rollback, unkillable scripts, break-even hit
-rate, XFetch, version prefix, at-most-once, output-buffer disconnects, PEL leaks, XAUTOCLAIM,
-idempotency, fixed-window burst, token bucket, fork/CoW, repl backlog, quorum vs majority, MOVED/ASK,
-hash-tag hotspots, fencing, Redlock, volatile-lru, HyperLogLog sizing, fan-out hybrid, errorstats,
-and the cumulative-counter dashboard trap.
-
-Also: the orphaned v3 `pubsub-streams.html` is now a **redirect stub** (nav splits it into
-`pubsub.html` + `streams.html`); nothing links to it.
+Also: the orphaned v3 `internals.html` and `volumes-networking.html` are now **redirect stubs**
+(nav splits them into namespaces/cgroups/runtime-stack and volumes/networking); nothing links to them.
 
 ⚠️ **Scaffolding reminder:** any newly-copied `quiz.html` must be checked for BOTH the stale
 `← CSS Track` link AND mojibake (`Â·`, `â†’` — double-encoded UTF-8) before committing.
 
-**🚧 IN PROGRESS: Docker v4 (track 15)** — `tutorials/docker/`, rebuilding 12 v3 lessons (~10KB)
-into **21 lessons at v4 depth** (45–49KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
-**14 of 21 done — §1, §2 and §3 COMPLETE:**
+**🚧 NEXT: Kubernetes v4 (track 16)** — `tutorials/kubernetes/`, 12 v3 lessons → ~20 at v4 depth.
+Write `nav.js` first, then lessons (commit every 1–2), then retune the quiz bank, then a whole-track
+validate.
 
-*§1 Foundations ×5* — `index.html` (**a container is a process, not a VM**; ~0.4s vs ~24s VM start;
-`exec format error` = architecture) · `images-containers.html` · `namespaces.html` ·
-`cgroups.html` · `runtime-stack.html` (shim survives daemon restart; socket = host root)
-*§2 Building Images ×5* — `dockerfile.html` (**shell form → 10.3s stop + exit 137**, exec form →
-0.4s + exit 0; ARG leaks via `docker history`) · `build-cache.html` (**RUN cached on the command
-STRING**; ordering 23.4s → 0.74s = 31×; `mode=min` silently skips build stages) ·
-`multi-stage.html` (**1.19GB → 14.2MB = 84×**; "cleanup" made it *larger*; scratch needs CA certs +
-numeric USER) · `buildkit.html` (graph not script; **cross-compile beat QEMU 15.4×**; default driver
-lacks multi-platform + registry cache) · `optimization.html` (**Alpine+Python = 38s → 24 MINUTES**
-and a bigger image; warm pulls move 11MB of a 412MB image; never squash)
-*§3 Running Containers ×4* — `process-model.html` (**PID 1 ignores unhandled signals**; 271 zombies
-in 30s; pre-drain delay took dropped requests 21 → 0) · `volumes.html` (**volumes pre-populate,
-binds hide**; one-byte write to a 300MB image file = 310× slower via copy-up) ·
-`networking.html` (**published ports BYPASS UFW** — DNAT precedes INPUT, demonstrated; user-defined
-bridge has DNS, default does not) · `env-secrets.html` (four env-var leak paths; `_FILE` keeps
-secrets out of `/proc`; live rotation without restart)
 
-**⏳ NEXT: §4 Composing Systems ×2** — `compose.html` (v3, rewrite), `healthchecks.html` (NEW).
-Then §5 Production ×4 — `security.html` (v3), `resource-limits.html` (NEW), `logging.html` (NEW),
-`debugging.html` (v3). Then §6 — `registry-supply-chain.html` (v3).
-
-**Two housekeeping items for the END of the Docker track:**
-1. `internals.html` and `volumes-networking.html` are **orphaned** by the nav split (internals →
-   namespaces/cgroups/runtime-stack; volumes-networking → volumes/networking). Convert both to
-   redirect stubs, as was done for Redis's `pubsub-streams.html`.
-2. Retune the Docker quiz bank to the v4 curriculum, then `node tools/quizshuffle.js`.
-
-Current whole-track validate: 1 error (`index.html` → `resource-limits.html`, an expected forward
-link) + 2 warnings (the two orphans above). Both clear as the remaining lessons land.
-
-**Then the remaining infra four:** Kubernetes → AWS → CI/CD → MongoDB, each 12 v3 → ~20 at v4.
+**Then the remaining infra three:** AWS → CI/CD → MongoDB, each 12 v3 → ~20 at v4.
 
 **Tooling is committed in `tools/` — see `tools/README.md`. Nothing lives in a scratchpad.**
 ```
@@ -94,11 +68,11 @@ python tools/quizcheck.py tutorials/<track>                   # bank: 10 200 0, 
 node tools/quizshuffle.js tutorials/<track>                   # de-skew (idempotent)
 ```
 
-**The remaining infra tracks, in the user's order:** Docker → Kubernetes → AWS → CI/CD → MongoDB.
+**The remaining infra tracks, in the user's order:** Kubernetes → AWS → CI/CD → MongoDB.
 
 | Track | Dir | Now | Target |
 |-------|-----|-----|--------|
-| Docker | `tutorials/docker/` | 12 lessons | ~20 at v4 |
+| Docker | `tutorials/docker/` | ✅ **21 at v4** | done |
 | Kubernetes | `tutorials/kubernetes/` | 12 | ~20 |
 | AWS | `tutorials/aws/` | 12 | ~20 |
 | CI/CD | `tutorials/cicd/` | 12 | ~20 |
