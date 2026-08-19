@@ -1,0 +1,1040 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Network Policies — Kubernetes — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Network Policies <span class="level-badge level-adv">Networking &amp; Traffic</span></h1>
+    <p><strong>What you'll master:</strong> the default nobody expects — <strong>every pod can reach every other
+       pod in every namespace</strong>, so namespaces are an RBAC boundary and not a network one; the switch-flip
+       semantics that make policies confusing at first (a pod is unrestricted until <em>any</em> policy selects
+       it, then that direction becomes default-deny); the <strong>one-character YAML trap</strong> where a
+       stray <code>-</code> turns "pods labelled X in namespace Y" into "anything in any namespace", measured;
+       why a deny-all egress policy breaks <em>everything</em> by cutting DNS, and why allowing a Service's
+       ClusterIP does nothing because policies match <strong>pod IPs</strong>; the four things NetworkPolicy
+       structurally cannot do — no L7, no deny rules, no effect on <code>hostNetwork</code> pods, and
+       <strong>silent no-ops on a CNI that does not implement them</strong>; and a rollout order for a
+       default-deny baseline that does not take production down on the first apply. Prerequisites:
+       <a href="services.html">Services &amp; Endpoints</a>, <a href="dns-discovery.html">Cluster DNS</a>,
+       <a href="objects-yaml.html">selectors</a>.</p>
+
+    <h2>Part 1 — The Default Is Allow-All, Everywhere</h2>
+
+    <p>A fresh cluster is a flat network. Any pod can open a connection to any other pod's IP, in any namespace,
+       on any port — including ones the pod never published.</p>
+
+<pre>
+$ kubectl create ns finance &amp;&amp; kubectl create ns public
+$ kubectl -n finance create deploy payments --image=nginx:alpine
+$ kubectl -n finance expose deploy payments --port=80
+$ PAYIP=$(kubectl -n finance get pod -l app=payments -o jsonpath='{.items[0].status.podIP}')
+
+$ kubectl -n public run attacker --rm -it --image=nicolaka/netshoot --restart=Never -- sh
+# curl -s -o /dev/null -w '%{http_code}\n' http://$PAYIP/
+200                                    ← different namespace, no credentials, no policy
+# curl -s -o /dev/null -w '%{http_code}\n' http://payments.finance/
+200                                    ← the Service name resolves cluster-wide too
+# nmap -p- --open $PAYIP | head -3
+PORT   STATE SERVICE
+80/tcp open  http                       ← every port is reachable, published or not
+</pre>
+
+    <table class="tbl">
+      <tr><th>Boundary</th><th>Namespaces provide it?</th></tr>
+      <tr><td>RBAC / API access</td><td>✅ Yes</td></tr>
+      <tr><td>Resource quotas</td><td>✅ Yes</td></tr>
+      <tr><td>Name scoping</td><td>✅ Yes</td></tr>
+      <tr><td><strong>Network isolation</strong></td><td><strong>❌ None whatsoever</strong></td></tr>
+      <tr><td>Node isolation</td><td>❌ (needs taints/affinity)</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>This is the fact that matters most in this lesson.</strong> A compromised pod
+       anywhere in the cluster — a scraper, a CI runner, a vulnerable image — can reach your database pods
+       directly on their pod IPs, bypassing every Service, ingress and application-level control. NetworkPolicy is
+       the only mechanism that changes that, and it is opt-in.</div>
+
+    <h2>Part 2 — Policies Are Additive Whitelists With a Switch</h2>
+
+    <p>The semantics are simple once stated precisely, and almost nobody states them precisely:</p>
+
+<pre>
+  1. A pod that NO policy selects is unrestricted (allow-all, both directions).
+  2. The moment ANY policy selects a pod for a direction, that direction becomes
+     DEFAULT-DENY for that pod.
+  3. All policies selecting the pod are then UNION'd — the allowed set is the sum
+     of every matching rule.
+  4. There is no "deny" rule. You cannot subtract. Only add.
+</pre>
+
+<pre>
+# the canonical baseline: deny everything, in one namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny, namespace: finance }
+spec:
+  podSelector: {}                ← EMPTY = every pod in this namespace
+  policyTypes: [Ingress, Egress] ← both directions become default-deny
+                                   (no ingress/egress rules ⇒ nothing is allowed)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Spec</th><th>Effect on selected pods</th></tr>
+      <tr><td><code>policyTypes: [Ingress]</code>, no <code>ingress:</code></td><td>Deny all inbound; outbound untouched</td></tr>
+      <tr><td><code>policyTypes: [Egress]</code>, no <code>egress:</code></td><td>Deny all outbound; inbound untouched</td></tr>
+      <tr><td><code>ingress: [{}]</code></td><td><strong>Allow all inbound</strong> — an empty rule matches everything</td></tr>
+      <tr><td>Omitting <code>policyTypes</code></td><td>Inferred from which rule blocks are present</td></tr>
+      <tr><td>Two policies selecting one pod</td><td>Union of their allowances</td></tr>
+    </table>
+
+<pre>
+$ kubectl apply -f default-deny.yaml
+$ kubectl -n public run t --rm -it --image=nicolaka/netshoot --restart=Never -- \
+    curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments.finance/
+000                                    ← blocked
+
+$ kubectl -n finance run t --rm -it --image=nicolaka/netshoot --restart=Never -- \
+    curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments/
+000                                    ← blocked from INSIDE the namespace too:
+                                         "default-deny" means exactly that
+</pre>
+
+    <h2>Part 3 — The One-Character Trap</h2>
+
+    <p>Selectors combine differently depending on whether they are in the same list item. This is the most
+       consequential whitespace in Kubernetes:</p>
+
+<pre>
+  ✅ AND — "pods labelled app=api, IN namespaces labelled team=web"
+  ingress:
+  - from:
+    - namespaceSelector: { matchLabels: { team: web } }
+      podSelector:       { matchLabels: { app: api } }      ← same list item
+
+  ❌ OR — "anything in namespaces labelled team=web, OR pods labelled app=api
+           in ANY namespace"
+  ingress:
+  - from:
+    - namespaceSelector: { matchLabels: { team: web } }
+    - podSelector:       { matchLabels: { app: api } }      ← SEPARATE item: one dash
+</pre>
+
+<pre>
+$ kubectl apply -f or-version.yaml        # the second form, by accident
+$ kubectl label ns public team=web-                       # public is NOT team=web
+$ kubectl -n public run bad --image=nginx:alpine --labels=app=api
+$ kubectl -n public exec bad -- curl -s -o /dev/null -w '%{http_code}\n' http://payments.finance/
+200
+   → any pod, in ANY namespace, that labels itself app=api is now allowed in.
+     A tenant can grant themselves access by choosing a label.
+</pre>
+
+    <div class="note">⚠️ <strong>Any workload can set its own labels, so an <code>OR</code> with a bare
+       <code>podSelector</code> is not a security control.</strong> The AND form ties the allowance to a
+       <em>namespace</em> label, which ordinary users cannot set on their own namespace if you scope RBAC
+       properly. Review every <code>from:</code> and <code>to:</code> block for that leading dash — and note that
+       <code>kubectl</code> will never warn you, because both forms are perfectly valid.</div>
+
+    <table class="tbl">
+      <tr><th>Peer type</th><th>Matches</th><th>Note</th></tr>
+      <tr><td><code>podSelector</code></td><td>Pods in <strong>the policy's own namespace</strong></td><td>Alone, it never crosses namespaces</td></tr>
+      <tr><td><code>namespaceSelector</code></td><td>All pods in matching namespaces</td><td>Use <code>kubernetes.io/metadata.name</code> for a specific one</td></tr>
+      <tr><td>Both, same item</td><td><strong>AND</strong></td><td>What you almost always want</td></tr>
+      <tr><td>Both, separate items</td><td><strong>OR</strong></td><td>Almost always a mistake</td></tr>
+      <tr><td><code>ipBlock</code></td><td>CIDR, with <code>except</code></td><td><strong>Cluster-external addresses only in practice</strong></td></tr>
+    </table>
+
+    <h2>Part 4 — Egress: DNS, and Why the ClusterIP Does Not Work</h2>
+
+    <p>Two failures account for nearly every broken egress policy, and both come from the same root: policies
+       operate on <strong>pod IPs</strong>, at layer 3/4, after Kubernetes' own abstractions have been
+       resolved.</p>
+
+<pre>
+① DNS. A deny-all egress policy blocks port 53, so NOTHING resolves.
+   The symptom is total application failure with no mention of DNS anywhere.
+
+  egress:
+  - to:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+      podSelector:       { matchLabels: { k8s-app: kube-dns } }
+    ports:
+    - { protocol: UDP, port: 53 }
+    - { protocol: TCP, port: 53 }      ← BOTH: large answers and NodeLocal use TCP
+</pre>
+
+<pre>
+② The ClusterIP is not a peer. Allowing the Service's VIP allows nothing.
+
+$ kubectl get svc payments -n finance -o jsonpath='{.spec.clusterIP}{"\n"}'
+10.96.140.22
+  egress:
+  - to: [{ ipBlock: { cidr: 10.96.140.22/32 } }]      ← looks right; does nothing
+    ports: [{ protocol: TCP, port: 80 }]
+
+$ kubectl -n public exec t -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments.finance/
+000
+   WHY: DNAT rewrites the destination to a POD IP before the policy is evaluated,
+        so the packet the policy sees is destined for 10.244.1.7, not the VIP.
+
+  ✅ select the BACKEND PODS instead:
+  egress:
+  - to:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: finance } }
+      podSelector:       { matchLabels: { app: payments } }
+    ports: [{ protocol: TCP, port: 80 }]
+</pre>
+
+    <table class="tbl">
+      <tr><th>Egress destination</th><th>How to express it</th></tr>
+      <tr><td>Another pod in-cluster</td><td><code>namespaceSelector</code> + <code>podSelector</code> (never the ClusterIP)</td></tr>
+      <tr><td>DNS</td><td>The kube-dns pods, UDP <strong>and</strong> TCP 53</td></tr>
+      <tr><td>An external API</td><td><code>ipBlock</code> — but only if you know its addresses</td></tr>
+      <tr><td>The API server</td><td><code>ipBlock</code> for the endpoint, or a CNI-specific entity selector</td></tr>
+      <tr><td>Anything by hostname</td><td><strong>Not possible</strong> — no L7 in the API</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Egress to the internet by name is the standard requirement NetworkPolicy cannot
+       meet.</strong> "Allow calls to <code>api.stripe.com</code>" is a hostname; the API takes CIDRs, and
+       Stripe's addresses change. The honest options are a wide <code>ipBlock</code> (weak), an egress proxy that
+       enforces an allowlist at L7 (the usual answer), or CNI extensions such as Cilium's
+       <code>CiliumNetworkPolicy</code> with FQDN rules — which are not portable.</div>
+
+    <h2>Part 5 — What NetworkPolicy Cannot Do</h2>
+
+    <table class="tbl">
+      <tr><th>Limitation</th><th>Consequence</th><th>Alternative</th></tr>
+      <tr><td><strong>Requires CNI support</strong></td><td>On Flannel, policies are accepted and <strong>silently do nothing</strong></td><td>Calico, Cilium, Antrea, Weave</td></tr>
+      <tr><td>No L7 awareness</td><td>Cannot allow <code>GET /health</code> but deny <code>POST /admin</code></td><td>Service mesh authorization policies</td></tr>
+      <tr><td>No deny rules</td><td>Cannot express "allow all except X"</td><td>Restructure as an allowlist</td></tr>
+      <tr><td>No hostname/FQDN egress</td><td>External allowlists are CIDR-only</td><td>Egress proxy, or CNI extensions</td></tr>
+      <tr><td>Does not apply to <code>hostNetwork</code> pods</td><td>They use the node's namespace and bypass policy</td><td>Host firewall</td></tr>
+      <tr><td>Node-to-pod traffic is CNI-dependent</td><td><strong>Kubelet probes may be blocked</strong> on some CNIs</td><td>Test probes after applying a policy</td></tr>
+      <tr><td>Namespaced object</td><td>No cluster-wide default</td><td>A policy per namespace, enforced by admission</td></tr>
+      <tr><td>Stateful, so replies are allowed</td><td>An ingress rule implies its return traffic</td><td>Do not write egress rules for replies</td></tr>
+    </table>
+
+<pre>
+The silent no-op, which is the most dangerous entry in that table:
+
+$ kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}{"\n"}'
+$ kubectl -n kube-system get ds | grep -Ei 'calico|cilium|antrea|weave|flannel'
+kube-flannel-ds   3   3   3            ← Flannel: no NetworkPolicy implementation
+
+$ kubectl apply -f default-deny.yaml
+networkpolicy.networking.k8s.io/default-deny created     ← accepted, as always
+$ kubectl -n public exec t -- curl -s -o /dev/null -w '%{http_code}\n' http://payments.finance/
+200                                    ← STILL ALLOWED. The policy is decoration.
+</pre>
+
+    <h2>Part 6 — Rolling Out Default-Deny Without an Outage</h2>
+
+<pre>
+  ① Verify the CNI enforces policy AT ALL (see above). Otherwise stop here.
+
+  ② Label every namespace so policies can select them:
+     kubectl label ns finance team=payments tier=prod
+     (kubernetes.io/metadata.name is set automatically and is the safest selector)
+
+  ③ Apply an ALLOW-DNS policy to every namespace FIRST. On its own it is harmless,
+     and it prevents the classic "deny-all broke everything" incident.
+
+  ④ Apply default-deny INGRESS only. Egress is where the surprises live; ingress
+     is easier to reason about and reversible.
+
+  ⑤ Add allow rules driven by observed traffic, not by architecture diagrams —
+     flow logs (Cilium Hubble, Calico flow logs) show what actually talks.
+
+  ⑥ Only then add default-deny EGRESS, namespace by namespace, watching error rates.
+
+  ⑦ Enforce in admission that every new namespace gets the baseline, or the estate
+     drifts back to allow-all one namespace at a time.
+</pre>
+
+<pre>
+# the minimal safe baseline, per namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: finance }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-dns, namespace: finance }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+      podSelector:       { matchLabels: { k8s-app: kube-dns } }
+    ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-from-ingress, namespace: finance }
+spec:
+  podSelector: { matchLabels: { app: payments } }
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress-nginx } }
+    ports: [{ protocol: TCP, port: 8080 }]
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>No policies at all "because namespaces isolate teams", then a big-bang deny-all rollout on a
+         Friday, with rules written from an architecture diagram and an <code>ipBlock</code> for each
+         Service's ClusterIP.</strong> For two years any compromised pod in the cluster can open a connection
+         straight to the payments database's pod IP, bypassing the Service, the ingress and every application
+         control — because a namespace is an RBAC boundary and not a network one. The deny-all policy then lands
+         in every namespace at once and cuts DNS, so the entire platform fails simultaneously with errors that
+         never mention name resolution and a change that looks unrelated. The egress rules allow each
+         dependency's ClusterIP, which does nothing at all, since DNAT has already rewritten the destination to a
+         pod IP before the policy is evaluated. One rule was written with an extra dash, so it reads "or any pod
+         labelled <code>app=api</code> in <em>any</em> namespace" — an allowance any tenant can grant themselves
+         by choosing a label. And on a Flannel cluster none of it would have mattered anyway: every policy is
+         accepted by the API server and enforced by nothing.</p>
+      <p>✅ <strong>Confirm the CNI enforces policy, allow DNS before denying anything, select pods rather than
+         VIPs, and roll out ingress-first namespace by namespace.</strong> Start by proving enforcement works with
+         a deliberate test policy — a policy that is silently ignored is worse than none, because it creates
+         confidence without protection. Apply an allow-DNS policy everywhere <em>first</em>, permitting UDP
+         <strong>and</strong> TCP 53 to the kube-dns pods, so the deny-all step cannot take out name resolution.
+         Express in-cluster destinations as <code>namespaceSelector</code> plus <code>podSelector</code> in the
+         <strong>same list item</strong> — the AND form, tied to a namespace label users cannot set themselves —
+         and audit every rule for the stray dash that silently widens it. Add default-deny for
+         <strong>ingress first</strong>, derive allow rules from observed flow logs rather than from diagrams,
+         and only then take on egress, where hostnames are not expressible and an egress proxy is usually the real
+         answer. Finally, enforce the baseline in admission so a new namespace cannot be created without it,
+         because otherwise the estate returns to allow-all one namespace at a time.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Assuming namespaces isolate the network</td><td>Any pod can reach any pod IP, cluster-wide</td><td>NetworkPolicy; it is opt-in</td></tr>
+      <tr><td>Not checking CNI support</td><td>On Flannel policies are <strong>silently ignored</strong></td><td>Verify with a deliberate test</td></tr>
+      <tr><td>Deny-all egress without allowing DNS</td><td>Everything fails, with no mention of DNS</td><td>Allow UDP <em>and</em> TCP 53 first</td></tr>
+      <tr><td>Allowing a Service's ClusterIP in <code>ipBlock</code></td><td>DNAT already rewrote the destination to a pod IP</td><td>Select the backend pods</td></tr>
+      <tr><td>The extra dash before <code>podSelector</code></td><td>Turns AND into OR — any namespace qualifies</td><td>Same list item; audit every rule</td></tr>
+      <tr><td>Trusting a bare <code>podSelector</code> across namespaces</td><td>Tenants label their own pods</td><td>Pair with a <code>namespaceSelector</code></td></tr>
+      <tr><td>Expecting deny rules</td><td>The API has none — only additive allows</td><td>Restructure as an allowlist</td></tr>
+      <tr><td>Writing egress rules for reply traffic</td><td>Policies are stateful; replies are implicit</td><td>Only describe connection initiation</td></tr>
+      <tr><td>Trying to allow by hostname</td><td>No L7 or FQDN support</td><td>Egress proxy, or CNI extensions</td></tr>
+      <tr><td>Forgetting <code>hostNetwork</code> pods</td><td>They bypass policy entirely</td><td>Host firewall; restrict who may use it</td></tr>
+      <tr><td>Not retesting probes after a policy</td><td>Node-to-pod handling is CNI-dependent</td><td>Check readiness after applying</td></tr>
+      <tr><td>Big-bang rollout</td><td>Every namespace fails at once</td><td>Ingress first, namespace by namespace</td></tr>
+      <tr><td>Rules from architecture diagrams</td><td>The diagram is not what the traffic does</td><td>Derive from flow logs</td></tr>
+      <tr><td>No admission enforcement</td><td>New namespaces silently return to allow-all</td><td>Policy-as-code on namespace creation</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the default network behaviour between pods?</summary>
+      <p><strong>Completely open.</strong> Every pod can reach every other pod's IP, in every namespace, on every
+         port — the Kubernetes network model requires a flat, NAT-free pod network.</p>
+<pre>
+$ kubectl -n public exec attacker -- curl -s -o /dev/null -w '%{http_code}\n' http://10.244.1.7/
+200                        ← a pod in another namespace, straight to a pod IP
+</pre>
+      <table class="tbl">
+        <tr><th>Namespaces isolate</th><th>Namespaces do NOT isolate</th></tr>
+        <tr><td>API access (RBAC)</td><td><strong>Network traffic</strong></td></tr>
+        <tr><td>Quotas, names</td><td>Node placement</td></tr>
+      </table>
+      <p><strong>Why it matters:</strong> a compromised pod anywhere — a scraper, a CI runner, a vulnerable
+         dependency — can connect directly to your database pods, bypassing the Service, the ingress and every
+         application-level control.</p>
+      <p><strong>NetworkPolicy is the only fix, and it is opt-in.</strong> Worth adding: it also requires a CNI
+         that implements it. On Flannel, policies are accepted by the API server and enforced by nothing.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How do you deny all traffic to pods in a namespace?</summary>
+      <p><strong>A policy with an empty <code>podSelector</code> and no rules.</strong></p>
+<pre>
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny, namespace: finance }
+spec:
+  podSelector: {}                  ← every pod in this namespace
+  policyTypes: [Ingress, Egress]   ← both directions
+                                     (no rule blocks ⇒ nothing allowed)
+</pre>
+      <p>The semantics are the part to get right: <strong>a pod that no policy selects is unrestricted</strong>.
+         As soon as any policy selects it for a direction, that direction becomes default-deny, and all policies
+         selecting the pod are then unioned together.</p>
+      <p><strong>The warning that belongs with this answer:</strong> deny-all <em>egress</em> also blocks DNS, so
+         every name lookup fails and the application appears completely broken with no error mentioning DNS.
+         Always pair it with a rule allowing UDP and TCP port 53 to the kube-dns pods.</p>
+      <p>Note also that <code>ingress: [{}]</code> — an empty rule — means <em>allow all</em>, which is the exact
+         opposite of omitting the block entirely.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain the difference between these two <code>from</code> blocks.</summary>
+<pre>
+A)  from:
+    - namespaceSelector: { matchLabels: { team: web } }
+      podSelector:       { matchLabels: { app: api } }
+
+B)  from:
+    - namespaceSelector: { matchLabels: { team: web } }
+    - podSelector:       { matchLabels: { app: api } }
+</pre>
+      <p><strong>A is AND; B is OR.</strong> In A, both selectors are in one list item, so the peer must satisfy
+         both: pods labelled <code>app=api</code> <em>inside</em> namespaces labelled <code>team=web</code>. In B
+         they are separate items, so the rule allows <em>everything</em> in <code>team=web</code> namespaces
+         <strong>or</strong> any pod labelled <code>app=api</code> in <strong>any namespace</strong>.</p>
+      <p><strong>Why B is a security bug, not just a wider rule:</strong> pod labels are set by whoever creates
+         the pod. Any tenant in any namespace can grant themselves access by labelling their pod
+         <code>app=api</code>. The AND form ties the allowance to a <em>namespace</em> label, which ordinary users
+         cannot set if namespace objects are RBAC-restricted.</p>
+      <p><strong>What makes it dangerous</strong> is that both are valid YAML and valid API objects — no warning,
+         no validation error, and the difference is one dash. Reviewing <code>from</code> and <code>to</code>
+         blocks for that dash is a genuine checklist item, and the safest namespace selector is
+         <code>kubernetes.io/metadata.name</code>, which the API server sets automatically and users cannot
+         forge.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> You allowed egress to a Service's ClusterIP and traffic is still blocked. Why?</summary>
+      <p><strong>Because NetworkPolicy is evaluated after DNAT.</strong> kube-proxy rewrites the destination from
+         the ClusterIP to a pod IP before the policy sees the packet, so a rule permitting the VIP matches
+         nothing.</p>
+<pre>
+egress:
+- to: [{ ipBlock: { cidr: 10.96.140.22/32 } }]     ← the ClusterIP. Never matches.
+  ports: [{ protocol: TCP, port: 80 }]
+
+egress:
+- to:
+  - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: finance } }
+    podSelector:       { matchLabels: { app: payments } }     ← the actual peers
+  ports: [{ protocol: TCP, port: 80 }]
+</pre>
+      <p><strong>The generalisation:</strong> NetworkPolicy works on real pod IPs at layers 3 and 4, after
+         Kubernetes' abstractions have been resolved. That also explains why the <code>port</code> in a rule is
+         the <strong>container's</strong> port (the Service's <code>targetPort</code>), not the Service port — a
+         second common reason a "correct-looking" rule blocks everything.</p>
+      <p><strong>And the same reasoning covers DNS:</strong> allowing egress to the kube-dns ClusterIP does not
+         work either; you must select the CoreDNS pods in <code>kube-system</code>.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How would you roll out default-deny across an existing production cluster?</summary>
+      <p><strong>Incrementally, DNS first, ingress before egress, and driven by observed traffic rather than
+         architecture diagrams.</strong> A big-bang apply fails every namespace simultaneously with symptoms that
+         never mention networking.</p>
+      <table class="tbl">
+        <tr><th>Step</th><th>Why this order</th></tr>
+        <tr><td>1. Prove the CNI enforces policy</td><td>A silently-ignored policy is worse than none — it creates false confidence</td></tr>
+        <tr><td>2. Label all namespaces</td><td>Policies cannot select what has no labels</td></tr>
+        <tr><td>3. Allow-DNS everywhere</td><td>Harmless alone; prevents the classic outage</td></tr>
+        <tr><td>4. Default-deny <strong>ingress</strong></td><td>Easier to reason about; failures are localised</td></tr>
+        <tr><td>5. Allow rules from flow logs</td><td>Real traffic ≠ the diagram</td></tr>
+        <tr><td>6. Default-deny <strong>egress</strong>, per namespace</td><td>Where the surprises live</td></tr>
+        <tr><td>7. Admission enforcement</td><td>Otherwise new namespaces drift back to allow-all</td></tr>
+      </table>
+      <p><strong>Observability is what makes this tractable.</strong> Cilium Hubble or Calico flow logs show every
+         connection that <em>would</em> be denied before you enforce, which turns a guessing exercise into a
+         derivation. Without that, the honest approach is to enforce in a staging namespace, watch error rates,
+         and expect to discover dependencies nobody documented — a metrics scraper, a sidecar phoning home, a
+         batch job that talks to a service nobody remembers.</p>
+      <p><strong>Where I would set expectations:</strong> egress to the internet is the part NetworkPolicy cannot
+         really solve. Hostnames are not expressible, external IP ranges change, and a broad
+         <code>ipBlock</code> to <code>0.0.0.0/0</code> is theatre. The realistic design is a default-deny egress
+         with an allow to an <strong>egress proxy</strong> that enforces a hostname allowlist at L7 — which is
+         also the only version that produces a useful audit log.</p>
+      <p><strong>What I would measure:</strong> percentage of namespaces with a baseline policy, denied-flow rates
+         per namespace (a spike after a deploy means a missing rule), and — the one people forget — that pods are
+         still passing their readiness probes, since node-to-pod handling varies by CNI.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> What are NetworkPolicy's structural limits, and when do you need something else?</summary>
+      <p><strong>It is an L3/L4 allowlist on pod identity. Every limit follows from that sentence.</strong></p>
+      <table class="tbl">
+        <tr><th>Limit</th><th>Consequence</th><th>Reach for</th></tr>
+        <tr><td>No L7</td><td>Cannot allow <code>GET /health</code> but deny <code>POST /admin</code></td><td>Mesh AuthorizationPolicy</td></tr>
+        <tr><td>No identity beyond labels</td><td>Cannot verify <em>who</em> is calling, only where from</td><td>mTLS with workload identity (SPIFFE)</td></tr>
+        <tr><td>No hostnames</td><td>External allowlists are CIDR-only</td><td>Egress proxy, Cilium FQDN policies</td></tr>
+        <tr><td>No deny rules</td><td>"Allow all except X" is inexpressible</td><td>Restructure as an allowlist</td></tr>
+        <tr><td>Bypassed by <code>hostNetwork</code></td><td>Those pods use the node's stack</td><td>Host firewall; restrict the privilege</td></tr>
+        <tr><td>CNI-dependent</td><td>Silently unenforced on some CNIs</td><td>Verify; choose Calico/Cilium</td></tr>
+      </table>
+      <p><strong>The identity point is the deepest one.</strong> A policy allowing "pods labelled
+         <code>app=api</code> in namespace <code>web</code>" trusts a label, and labels are assigned by whoever
+         creates the pod. Within a namespace that is fine; across a trust boundary it is not, which is why
+         zero-trust designs move to cryptographic workload identity and mTLS rather than network-position rules.</p>
+      <p><strong>Where I would still use NetworkPolicy even with a mesh:</strong> defence in depth. The mesh
+         enforces at L7 inside the sidecar; NetworkPolicy enforces in the kernel and still applies if the sidecar
+         is bypassed, misconfigured, or absent on a pod. They fail in different ways, which is precisely the
+         argument for both.</p>
+      <p><strong>And the honest cost:</strong> a mesh adds a proxy per pod, real latency, and a substantial
+         operational surface. For a cluster whose requirement is "the payments namespace should not be reachable
+         from everywhere", NetworkPolicy alone is the proportionate answer and a mesh is not.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove namespaces provide no network isolation, then close it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create ns finance; kubectl create ns public
+$ kubectl -n finance create deploy payments --image=nginx:alpine
+$ kubectl -n finance expose deploy payments --port=80
+$ PODIP=$(kubectl -n finance get pod -l app=payments -o jsonpath='{.items[0].status.podIP}')
+$ kubectl -n public run t --image=nicolaka/netshoot -- sleep 3600
+
+$ kubectl -n public exec t -- curl -s -o /dev/null -w 'by pod IP:  %{http_code}\n' http://$PODIP/
+by pod IP:  200
+$ kubectl -n public exec t -- curl -s -o /dev/null -w 'by service: %{http_code}\n' http://payments.finance/
+by service: 200
+$ kubectl -n public exec t -- getent hosts payments.finance
+10.96.140.22   payments.finance.svc.cluster.local     ← DNS is cluster-wide too
+</pre>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: finance }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+EOF
+
+$ kubectl -n public exec t -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://$PODIP/
+000                                       ← blocked
+$ kubectl -n finance run t2 --image=nicolaka/netshoot -- sleep 3600
+$ kubectl -n finance exec t2 -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments/
+000                                       ← blocked from INSIDE the namespace too
+</pre>
+<p>Now allow only what should be allowed:</p>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-same-ns, namespace: finance }
+spec:
+  podSelector: { matchLabels: { app: payments } }
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{ podSelector: {} }]           ← any pod in THIS namespace
+    ports: [{ protocol: TCP, port: 80 }]
+EOF
+$ kubectl -n finance exec t2 -- curl -m3 -s -o /dev/null -w 'same ns:  %{http_code}\n' http://payments/
+same ns:  200
+$ kubectl -n public exec t -- curl -m3 -s -o /dev/null -w 'other ns: %{http_code}\n' http://$PODIP/
+other ns: 000                             ← exactly the boundary we wanted
+</pre>
+<pre>
+Verify the union rule — a second policy ADDS access, never removes it:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-monitoring, namespace: finance }
+spec:
+  podSelector: { matchLabels: { app: payments } }
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+    ports: [{ protocol: TCP, port: 80 }]
+EOF
+$ kubectl -n monitoring run m --rm -it --image=nicolaka/netshoot --restart=Never -- \
+    curl -m3 -s -o /dev/null -w '%{http_code}\n' http://$PODIP/
+200                                       ← allowed, and same-ns access still works
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Break DNS with a deny-all egress, and fix it properly.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-egress, namespace: finance }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+EOF
+
+$ kubectl -n finance exec t2 -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments/
+000
+$ kubectl -n finance exec t2 -- getent hosts payments; echo "exit=$?"
+exit=2                                     ← cannot even resolve
+$ kubectl -n finance exec t2 -- dig payments +time=2 +tries=1 2>&amp;1 | grep -i 'timed out'
+;; connection timed out; no servers could be reached
+
+DISTINGUISHING TEST — is it DNS or connectivity?
+$ kubectl -n finance exec t2 -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://$PODIP/
+000                                        ← both blocked here; but in the classic
+                                             incident the pod IP works and names do not
+</pre>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-dns, namespace: finance }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+      podSelector:       { matchLabels: { k8s-app: kube-dns } }
+    ports:
+    - { protocol: UDP, port: 53 }
+    - { protocol: TCP, port: 53 }
+EOF
+$ kubectl -n finance exec t2 -- getent hosts payments
+10.96.140.22   payments.finance.svc.cluster.local     ← resolution restored
+$ kubectl -n finance exec t2 -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments/
+000                                        ← still no connectivity, correctly
+</pre>
+<pre>
+Show that UDP alone is not enough:
+$ kubectl patch networkpolicy allow-dns -n finance --type=json \
+    -p '[{"op":"remove","path":"/spec/egress/0/ports/1"}]'      # drop TCP 53
+$ kubectl -n finance exec t2 -- dig +tcp payments +time=2 +tries=1 2>&amp;1 | tail -1
+;; connection timed out; no servers could be reached
+   → large answers, DNSSEC and NodeLocal DNSCache all use TCP; always allow both
+</pre>
+<pre>
+Finally allow the real destination — by POD, not by ClusterIP:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-to-payments, namespace: finance }
+spec:
+  podSelector: { matchLabels: { run: t2 } }
+  policyTypes: [Egress]
+  egress:
+  - to: [{ podSelector: { matchLabels: { app: payments } } }]
+    ports: [{ protocol: TCP, port: 80 }]
+EOF
+$ kubectl -n finance exec t2 -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments/
+200
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Demonstrate the AND/OR dash trap and how much it widens access.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl label ns finance team=payments
+$ kubectl label ns trusted team=payments
+$ kubectl create ns hostile
+
+THE INTENDED (AND) VERSION:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-api, namespace: finance }
+spec:
+  podSelector: { matchLabels: { app: payments } }
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: { matchLabels: { team: payments } }
+      podSelector:       { matchLabels: { app: api } }         ← SAME item = AND
+    ports: [{ protocol: TCP, port: 80 }]
+EOF
+
+$ kubectl -n trusted run api --image=nicolaka/netshoot --labels=app=api -- sleep 3600
+$ kubectl -n hostile run api --image=nicolaka/netshoot --labels=app=api -- sleep 3600
+$ kubectl -n hostile run other --image=nicolaka/netshoot --labels=app=other -- sleep 3600
+
+$ for ns_pod in trusted/api hostile/api hostile/other; do
+    ns=${ns_pod%/*}; p=${ns_pod#*/}
+    printf '%-16s %s\n' "$ns_pod" \
+      "$(kubectl -n $ns exec $p -- curl -m3 -s -o /dev/null -w '%{http_code}' http://$PODIP/)"
+  done
+trusted/api      200      ← team=payments namespace AND app=api pod
+hostile/api      000      ← right pod label, wrong namespace → DENIED ✅
+hostile/other    000
+</pre>
+<pre>
+NOW THE TYPO — one extra dash:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-api, namespace: finance }
+spec:
+  podSelector: { matchLabels: { app: payments } }
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: { matchLabels: { team: payments } }
+    - podSelector:       { matchLabels: { app: api } }         ← SEPARATE item = OR
+    ports: [{ protocol: TCP, port: 80 }]
+EOF
+networkpolicy.networking.k8s.io/allow-api configured           ← no warning whatsoever
+
+$ for ns_pod in trusted/api hostile/api hostile/other; do ... done
+trusted/api      200
+hostile/api      200      ← ⚠️ ALLOWED: a hostile namespace granted itself access
+hostile/other    000        by choosing a pod label
+</pre>
+<p>Quantify the widening:</p>
+<pre>
+$ kubectl get pods -A -l app=api --no-headers | wc -l
+7                                    ← 7 pods cluster-wide now qualify, in any namespace
+$ kubectl get ns -l team=payments --no-headers | wc -l
+2                                    ← the intended rule covered 2 namespaces
+</pre>
+<table class="tbl">
+  <tr><th>Form</th><th>Reads as</th><th>Who can grant themselves access</th></tr>
+  <tr><td>Same list item (AND)</td><td>app=api pods <em>inside</em> team=payments namespaces</td><td>Only someone who can label a <strong>namespace</strong></td></tr>
+  <tr><td>Separate items (OR)</td><td>Anything in team=payments <strong>or</strong> any app=api pod anywhere</td><td><strong>Any tenant, by labelling a pod</strong></td></tr>
+</table>
+<p>A lint rule worth having in CI:</p>
+<pre>
+$ kubectl get netpol -A -o json | jq -r '
+  .items[] | .metadata.namespace as $ns | .metadata.name as $n |
+  (.spec.ingress[]?, .spec.egress[]?) | (.from?, .to?) |
+  select(. != null) | select(length > 1) |
+  select(any(.[]; has("podSelector")) and any(.[]; has("namespaceSelector"))) |
+  "\($ns)/\($n): separate items — podSelector applies to ALL namespaces"'
+finance/allow-api: separate items — podSelector applies to ALL namespaces
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show why allowing a ClusterIP does nothing.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ CIP=$(kubectl -n finance get svc payments -o jsonpath='{.spec.clusterIP}')
+$ echo "ClusterIP=$CIP  podIP=$PODIP"
+ClusterIP=10.96.140.22  podIP=10.244.1.7
+
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: egress-vip, namespace: public }
+spec:
+  podSelector: { matchLabels: { run: t } }
+  policyTypes: [Egress]
+  egress:
+  - to: [{ ipBlock: { cidr: 10.96.140.22/32 } }]      ← the ClusterIP
+    ports: [{ protocol: TCP, port: 80 }]
+  - to:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+      podSelector: { matchLabels: { k8s-app: kube-dns } }
+    ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+EOF
+
+$ kubectl -n public exec t -- getent hosts payments.finance
+10.96.140.22   payments.finance.svc.cluster.local     ← DNS works
+$ kubectl -n public exec t -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments.finance/
+000                                                   ← still blocked
+</pre>
+<pre>
+WHY — the packet is DNAT'd before the policy sees it:
+$ sudo conntrack -L 2>/dev/null | grep 10.96.140.22 | head -1
+tcp 6 SYN_SENT src=10.244.4.2 dst=10.96.140.22 sport=44212 dport=80
+                              [UNREPLIED] src=10.244.1.7 dst=10.244.4.2 ...
+                                            ↑ the real destination is the POD IP
+</pre>
+<pre>
+THE FIX:
+$ kubectl patch networkpolicy egress-vip -n public --type=json -p '[{"op":"replace",
+  "path":"/spec/egress/0/to","value":[{"namespaceSelector":{"matchLabels":
+  {"kubernetes.io/metadata.name":"finance"}},"podSelector":{"matchLabels":{"app":"payments"}}}]}]'
+$ kubectl -n public exec t -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments.finance/
+200
+</pre>
+<pre>
+The related port trap — the rule takes the CONTAINER port, not the Service port:
+$ kubectl -n finance patch svc payments -p '{"spec":{"ports":[{"port":8080,"targetPort":80}]}}'
+$ kubectl -n public exec t -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments.finance:8080/
+200                                   ← rule says port 80 (targetPort) and it works
+$ kubectl patch networkpolicy egress-vip -n public --type=json \
+    -p '[{"op":"replace","path":"/spec/egress/0/ports/0/port","value":8080}]'
+$ kubectl -n public exec t -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://payments.finance:8080/
+000                                   ← "matching" the Service port BREAKS it
+</pre>
+<table class="tbl">
+  <tr><th>Written in the policy</th><th>Works?</th><th>Because</th></tr>
+  <tr><td><code>ipBlock</code> with the ClusterIP</td><td><strong>❌</strong></td><td>DNAT already rewrote the destination</td></tr>
+  <tr><td>namespace + pod selector</td><td>✅</td><td>Matches the real peer</td></tr>
+  <tr><td><code>port</code> = Service port</td><td><strong>❌</strong></td><td>Policies see the container port</td></tr>
+  <tr><td><code>port</code> = targetPort</td><td>✅</td><td>The port on the wire</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Verify your CNI actually enforces policy, and find what else it does not cover.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — which CNI is installed?
+$ kubectl -n kube-system get ds -o custom-columns=NAME:.metadata.name --no-headers \
+    | grep -Ei 'calico|cilium|antrea|weave|flannel|kube-router'
+kube-flannel-ds
+
+STEP 2 — the enforcement test. Never assume.
+$ kubectl create ns nptest
+$ kubectl -n nptest run target --image=nginx:alpine
+$ kubectl -n nptest run probe  --image=nicolaka/netshoot -- sleep 3600
+$ TIP=$(kubectl -n nptest get pod target -o jsonpath='{.status.podIP}')
+$ kubectl -n nptest exec probe -- curl -m3 -s -o /dev/null -w 'before: %{http_code}\n' http://$TIP/
+before: 200
+
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: deny-all, namespace: nptest }
+spec: { podSelector: {}, policyTypes: [Ingress, Egress] }
+EOF
+networkpolicy.networking.k8s.io/deny-all created
+
+$ sleep 5
+$ kubectl -n nptest exec probe -- curl -m3 -s -o /dev/null -w 'after:  %{http_code}\n' http://$TIP/
+after:  200
+   ⛔ THE POLICY IS NOT ENFORCED. Flannel accepts the object and implements nothing.
+      Every policy in this cluster is decoration.
+</pre>
+<pre>
+On an enforcing CNI the same test gives:
+after:  000
+$ kubectl -n kube-system get ds | grep calico
+calico-node   3   3   3
+</pre>
+<pre>
+STEP 3 — things policy does not cover even on a good CNI:
+
+① hostNetwork pods bypass it entirely
+$ kubectl -n nptest run hn --image=nicolaka/netshoot \
+    --overrides='{"spec":{"hostNetwork":true}}' -- sleep 3600
+$ kubectl -n nptest exec hn -- curl -m3 -s -o /dev/null -w 'hostNetwork: %{http_code}\n' http://$TIP/
+hostNetwork: 200            ← deny-all is in force, and this pod is unaffected
+   → it uses the NODE's network namespace, which policy does not govern
+
+② kubelet probes are node-to-pod, and handling is CNI-dependent
+$ kubectl -n nptest patch deploy target -p '{"spec":{"template":{"spec":{"containers":
+    [{"name":"target","readinessProbe":{"httpGet":{"path":"/","port":80}}}]}}}}' 2>/dev/null
+$ kubectl -n nptest get pods -l run=target
+target   1/1   Running          ← probes still pass here; on some CNIs they DO NOT,
+                                  and a deny-all silently makes every pod unready
+
+③ replies are implicit — policies are stateful
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: ingress-only, namespace: nptest }
+spec:
+  podSelector: { matchLabels: { run: target } }
+  policyTypes: [Ingress]
+  ingress: [{ from: [{ podSelector: { matchLabels: { run: probe } } }] }]
+EOF
+$ kubectl -n nptest exec probe -- curl -m3 -s -o /dev/null -w '%{http_code}\n' http://$TIP/
+200                          ← no egress rule needed on target for the RESPONSE
+</pre>
+<table class="tbl">
+  <tr><th>Gap</th><th>Detection</th><th>Mitigation</th></tr>
+  <tr><td>CNI does not enforce</td><td><strong>The deny-all test above</strong></td><td>Calico, Cilium, Antrea</td></tr>
+  <tr><td><code>hostNetwork</code> pods</td><td>Test explicitly</td><td>Host firewall; restrict the privilege via <a href="pod-security.html">Pod Security</a></td></tr>
+  <tr><td>Probes blocked</td><td>Pods go 0/1 after applying</td><td>Allow the node CIDR on ingress</td></tr>
+  <tr><td>Assuming replies need rules</td><td>Over-broad egress rules</td><td>Only describe connection initiation</td></tr>
+</table>
+<p><strong>Run the deny-all test in CI against every cluster.</strong> A policy that is accepted and ignored
+   is worse than no policy at all, because it produces confidence without protection.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build and verify a complete namespace baseline.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > baseline.yaml &lt;&lt;'EOF'
+# 1. deny all ingress and egress for every pod in the namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: 00-default-deny, namespace: shop }
+spec: { podSelector: {}, policyTypes: [Ingress, Egress] }
+---
+# 2. DNS for everyone (UDP and TCP)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: 10-allow-dns, namespace: shop }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+      podSelector:       { matchLabels: { k8s-app: kube-dns } }
+    ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+---
+# 3. the ingress controller may reach the web tier
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: 20-allow-ingress-controller, namespace: shop }
+spec:
+  podSelector: { matchLabels: { tier: web } }
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress-nginx } }
+    ports: [{ protocol: TCP, port: 8080 }]
+---
+# 4. web → api, api → db  (each direction on BOTH sides)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: 30-web-to-api, namespace: shop }
+spec:
+  podSelector: { matchLabels: { tier: api } }
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{ podSelector: { matchLabels: { tier: web } } }]
+    ports: [{ protocol: TCP, port: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: 31-web-egress-api, namespace: shop }
+spec:
+  podSelector: { matchLabels: { tier: web } }
+  policyTypes: [Egress]
+  egress:
+  - to: [{ podSelector: { matchLabels: { tier: api } } }]
+    ports: [{ protocol: TCP, port: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: 40-api-to-db, namespace: shop }
+spec:
+  podSelector: { matchLabels: { tier: db } }
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{ podSelector: { matchLabels: { tier: api } } }]
+    ports: [{ protocol: TCP, port: 5432 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: 41-api-egress-db, namespace: shop }
+spec:
+  podSelector: { matchLabels: { tier: api } }
+  policyTypes: [Egress]
+  egress:
+  - to: [{ podSelector: { matchLabels: { tier: db } } }]
+    ports: [{ protocol: TCP, port: 5432 }]
+---
+# 5. metrics scraping
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: 50-allow-prometheus, namespace: shop }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+      podSelector:       { matchLabels: { app: prometheus } }
+    ports: [{ protocol: TCP, port: 9090 }]
+EOF
+$ kubectl apply -f baseline.yaml
+</pre>
+<pre>
+$ cat > tools/netpol-verify.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+# Assert the reachability matrix. Exit non-zero on any deviation.
+set -uo pipefail
+try() { # from_ns/from_pod  to_host:port  expected(OK|DENY)
+  local src=$1 dst=$2 want=$3 ns=${1%/*} pod=${1#*/} got
+  kubectl -n "$ns" exec "$pod" -- sh -c "nc -z -w3 ${dst/:/ }" >/dev/null 2>&1 \
+    && got=OK || got=DENY
+  [ "$got" = "$want" ] && printf '  ✅ %-24s → %-26s %s\n' "$src" "$dst" "$got" \
+                       || { printf '  ❌ %-24s → %-26s got=%s want=%s\n' "$src" "$dst" "$got" "$want"; FAIL=1; }
+}
+FAIL=0
+echo "ALLOWED paths:"
+try shop/web-probe   api.shop:8080          OK
+try shop/api-probe   db.shop:5432           OK
+try ingress-nginx/c  web.shop:8080          OK
+echo "DENIED paths:"
+try shop/web-probe   db.shop:5432           DENY     # web must not reach db
+try public/attacker  db.shop:5432           DENY
+try public/attacker  api.shop:8080          DENY
+try shop/db-probe    api.shop:8080          DENY     # no reverse path
+exit $FAIL
+SH
+$ chmod +x tools/netpol-verify.sh &amp;&amp; tools/netpol-verify.sh
+ALLOWED paths:
+  ✅ shop/web-probe          → api.shop:8080              OK
+  ✅ shop/api-probe          → db.shop:5432               OK
+  ✅ ingress-nginx/c         → web.shop:8080              OK
+DENIED paths:
+  ✅ shop/web-probe          → db.shop:5432               DENY
+  ✅ public/attacker         → db.shop:5432               DENY
+  ✅ public/attacker         → api.shop:8080              DENY
+  ✅ shop/db-probe           → api.shop:8080              DENY
+$ echo $?
+0
+</pre>
+<p>Catch a regression the way it happens in practice:</p>
+<pre>
+$ kubectl patch networkpolicy 40-api-to-db -n shop --type=json \
+    -p '[{"op":"add","path":"/spec/ingress/0/from/-","value":{"podSelector":{}}}]'
+$ tools/netpol-verify.sh
+  ❌ shop/web-probe          → db.shop:5432               got=OK want=DENY
+$ echo $?
+1                                     ← the tier boundary silently disappeared
+</pre>
+<table class="tbl">
+  <tr><th>Design choice</th><th>Reason</th></tr>
+  <tr><td>Numbered names (00, 10, 20…)</td><td>Reading order matches evaluation intent; deny first</td></tr>
+  <tr><td>Rules on <strong>both</strong> sides</td><td>Ingress on the target and egress on the source are separate policies</td></tr>
+  <tr><td><code>kubernetes.io/metadata.name</code></td><td>Set by the API server; tenants cannot forge it</td></tr>
+  <tr><td>Container ports, not Service ports</td><td>Policy sees the port on the wire</td></tr>
+  <tr><td>An executable matrix in CI</td><td>Reviewing YAML does not prove reachability</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>The default is allow-all across every namespace</strong> — verified reaching a pod in another namespace by pod IP, with no policy and no credentials.</li>
+        <li>Namespaces are an RBAC, quota and naming boundary — <strong>never a network boundary</strong>.</li>
+        <li>A pod no policy selects is unrestricted; <strong>the moment any policy selects it for a direction, that direction becomes default-deny</strong>, and all matching policies are unioned.</li>
+        <li>There are <strong>no deny rules</strong>: you can only add allowances, so "allow all except X" must be restructured as an allowlist.</li>
+        <li><code>podSelector: {}</code> means every pod in the namespace; <code>ingress: [{}]</code> means <strong>allow all</strong> — the opposite of omitting the block.</li>
+        <li><strong>One extra dash turns AND into OR</strong>: measured, a hostile namespace granted itself access by labelling a pod <code>app=api</code>, widening the rule from 2 namespaces to 7 pods anywhere.</li>
+        <li>Pod labels are set by whoever creates the pod, so a bare cross-namespace <code>podSelector</code> is not a security control; pair it with a <code>namespaceSelector</code>, ideally on <code>kubernetes.io/metadata.name</code>.</li>
+        <li><strong>Deny-all egress kills DNS</strong>, producing total application failure with no error mentioning name resolution.</li>
+        <li>Allow <strong>both UDP and TCP port 53</strong> — TCP alone is needed for large answers, DNSSEC and NodeLocal DNSCache.</li>
+        <li><strong>Allowing a Service's ClusterIP does nothing</strong>: DNAT rewrites the destination to a pod IP before the policy is evaluated. Select the backend pods.</li>
+        <li>For the same reason the rule's <code>port</code> is the <strong>container port</strong> (targetPort) — matching the Service port breaks it.</li>
+        <li>Policies are <strong>stateful</strong>: reply traffic is implicit, so never write egress rules for responses.</li>
+        <li><strong>On a CNI without a policy implementation, policies are accepted and silently do nothing</strong> — a deny-all test still returned 200 on Flannel.</li>
+        <li>A policy that is ignored is worse than none, because it creates confidence without protection: run the deny-all test against every cluster.</li>
+        <li><code>hostNetwork</code> pods use the node's namespace and <strong>bypass NetworkPolicy entirely</strong>.</li>
+        <li>Node-to-pod handling is CNI-dependent, so <strong>retest readiness probes</strong> after applying a deny-all.</li>
+        <li>NetworkPolicy has no L7 and no FQDN support — "allow calls to api.stripe.com" needs an egress proxy or non-portable CNI extensions.</li>
+        <li>Roll out in order: verify the CNI, label namespaces, <strong>allow DNS first</strong>, then default-deny ingress, then allow rules from <em>flow logs</em>, then egress.</li>
+        <li>Enforce the baseline in admission, or the estate drifts back to allow-all one new namespace at a time.</li>
+        <li><strong>Ship an executable reachability matrix</strong>: reviewing YAML does not prove isolation, and a one-line patch silently removed a tier boundary that the test caught immediately.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="ingress-gateway.html">← Ingress, Gateway API &amp; Load Balancers</a>
+      <a href="config-secrets.html">ConfigMaps &amp; Secrets →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
