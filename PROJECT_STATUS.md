@@ -6,7 +6,7 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-18)
+## ▶️ RESUME HERE (last updated 2026-08-19)
 
 **Last completed:** ✅ **Redis v4 (track 10) — COMPLETE.** All **21 lessons** rebuilt from 11 v3
 lessons (~9KB) to v4 depth (47–63KB, every one `det=12 ex=6`) + **quiz bank retuned to the v4
@@ -51,8 +51,41 @@ Also: the orphaned v3 `pubsub-streams.html` is now a **redirect stub** (nav spli
 ⚠️ **Scaffolding reminder:** any newly-copied `quiz.html` must be checked for BOTH the stale
 `← CSS Track` link AND mojibake (`Â·`, `â†’` — double-encoded UTF-8) before committing.
 
-**⏳ NEXT: the remaining infra five** — Docker → Kubernetes → AWS → CI/CD → MongoDB.
-Each is 12 v3 lessons to be expanded to ~20 at v4 depth.
+**🚧 IN PROGRESS: Docker v4 (track 15)** — `tutorials/docker/`, rebuilding 12 v3 lessons (~10KB)
+into **21 lessons at v4 depth** (45–49KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
+**14 of 21 done — §1, §2 and §3 COMPLETE:**
+
+*§1 Foundations ×5* — `index.html` (**a container is a process, not a VM**; ~0.4s vs ~24s VM start;
+`exec format error` = architecture) · `images-containers.html` · `namespaces.html` ·
+`cgroups.html` · `runtime-stack.html` (shim survives daemon restart; socket = host root)
+*§2 Building Images ×5* — `dockerfile.html` (**shell form → 10.3s stop + exit 137**, exec form →
+0.4s + exit 0; ARG leaks via `docker history`) · `build-cache.html` (**RUN cached on the command
+STRING**; ordering 23.4s → 0.74s = 31×; `mode=min` silently skips build stages) ·
+`multi-stage.html` (**1.19GB → 14.2MB = 84×**; "cleanup" made it *larger*; scratch needs CA certs +
+numeric USER) · `buildkit.html` (graph not script; **cross-compile beat QEMU 15.4×**; default driver
+lacks multi-platform + registry cache) · `optimization.html` (**Alpine+Python = 38s → 24 MINUTES**
+and a bigger image; warm pulls move 11MB of a 412MB image; never squash)
+*§3 Running Containers ×4* — `process-model.html` (**PID 1 ignores unhandled signals**; 271 zombies
+in 30s; pre-drain delay took dropped requests 21 → 0) · `volumes.html` (**volumes pre-populate,
+binds hide**; one-byte write to a 300MB image file = 310× slower via copy-up) ·
+`networking.html` (**published ports BYPASS UFW** — DNAT precedes INPUT, demonstrated; user-defined
+bridge has DNS, default does not) · `env-secrets.html` (four env-var leak paths; `_FILE` keeps
+secrets out of `/proc`; live rotation without restart)
+
+**⏳ NEXT: §4 Composing Systems ×2** — `compose.html` (v3, rewrite), `healthchecks.html` (NEW).
+Then §5 Production ×4 — `security.html` (v3), `resource-limits.html` (NEW), `logging.html` (NEW),
+`debugging.html` (v3). Then §6 — `registry-supply-chain.html` (v3).
+
+**Two housekeeping items for the END of the Docker track:**
+1. `internals.html` and `volumes-networking.html` are **orphaned** by the nav split (internals →
+   namespaces/cgroups/runtime-stack; volumes-networking → volumes/networking). Convert both to
+   redirect stubs, as was done for Redis's `pubsub-streams.html`.
+2. Retune the Docker quiz bank to the v4 curriculum, then `node tools/quizshuffle.js`.
+
+Current whole-track validate: 1 error (`index.html` → `resource-limits.html`, an expected forward
+link) + 2 warnings (the two orphans above). Both clear as the remaining lessons land.
+
+**Then the remaining infra four:** Kubernetes → AWS → CI/CD → MongoDB, each 12 v3 → ~20 at v4.
 
 **Tooling is committed in `tools/` — see `tools/README.md`. Nothing lives in a scratchpad.**
 ```
