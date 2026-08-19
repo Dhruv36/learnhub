@@ -6,75 +6,53 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-13)
+## ▶️ RESUME HERE (last updated 2026-08-18)
 
-**Last completed:** ✅ **LeetCode Patterns v4 (track 18)** — **all 21 lessons** rebuilt from v3
-(~12KB) to v4 (48–59KB, every one `det=12 ex=6`) + **quiz bank retuned** (`10 200 0`, 0 duplicate
-stems). Whole track passes `python validate.py tutorials/leetcode` with **0 errors and 0 warnings**;
-pushed & live.
+**Last completed:** ✅ **Redis v4 (track 10) — COMPLETE.** All **21 lessons** rebuilt from 11 v3
+lessons (~9KB) to v4 depth (47–63KB, every one `det=12 ex=6`) + **quiz bank retuned to the v4
+curriculum** (49 swaps, `10 200 0`, 0 duplicate stems, de-skewed 71/58/71). Whole track passes
+`python validate.py tutorials/redis` with **0 errors and 0 warnings**; pushed & live.
 
-*§Start Here + Foundations ×4* — `index.html` (recognition vs recall, constraint→complexity table,
-the 45-minute procedure) · `big-o.html` · `arrays-strings.html` · `hashing.html`
-*§Core Patterns ×8* — `two-pointers.html` · `sliding-window.html` · `prefix-sum.html` ·
-`fast-slow-pointers.html` (Floyd's `F = kC − a` derivation, implicit sequences, Brent's) ·
-`merge-intervals.html` (sweep line, sort-by-**end** greedy, difference-array benchmark) ·
-`binary-search.html` (predicate/boundary template, search on the *answer*, monotonicity fuzzer) ·
-`monotonic-stack.html` (four variants derived, histogram width, trapping water 3 ways) ·
-`linked-list-reversal.html` (pointer order from data dependencies, k-group, structural checker)
-*§Trees & Graphs ×4* — `bfs-dfs.html` (shortest-path invariant, mark-on-push, multi-source,
-three-colour cycles) · `binary-tree-patterns.html` (information-flow direction,
-return-one-track-another, BST in-order) · `topological-sort.html` (Kahn's, DFS finishing order,
-level counting, Alien Dictionary) · `union-find.html` (α(n), weighted/bipartite variants,
-offline deletion, Kruskal)
-*§Advanced ×6* — `heaps-top-k.html` (min-heap for k largest, two heaps, k-way merge, Quickselect) ·
-`backtracking.html` (choose/explore/unchoose, the `i > start` duplicate idiom, measured pruning) ·
-`dynamic-programming.html` (state definition, knapsack loop direction, LIS, reconstruction) ·
-`greedy.html` (exchange argument, where greedy fails, hypothesis fuzzing) ·
-`trie.html` (isEnd, wildcard search, Word Search II pruning, binary trie for XOR) ·
-`bit-manipulation.html` (XOR properties, `n&(n-1)`, submasks, bitmask DP, JS 32-bit hazards)
+*§1 Foundations ×5* — `index.html` (data-structure server vs blob cache, the durability spectrum) ·
+`strings-keys.html` (encodings, **the TTL-loss bug**, expiry mechanics) ·
+`data-structures.html` (**listpack thresholds and the memory cliff**, reliable queues) ·
+`sorted-sets.html` (skiplist+hash, **the 2⁵³ score precision budget**, sliding windows) ·
+`single-threaded.html` (**head-of-line blocking measured**, fork pauses, scaling order)
+*§2 Working With Redis ×4* — `pipelining.html` (round-trip arithmetic, batch sizing) ·
+`transactions.html` (**MULTI has NO rollback**, WATCH retry storms, unkillable scripts) ·
+`caching.html` (**break-even hit rate = L_redis/L_db**, write-order race, negative caching) ·
+`cache-invalidation.html` (stampede arithmetic, **XFetch**, version-prefix invalidation 450× faster)
+*§3 Messaging ×3* — `pubsub.html` (**at-most-once: 7 of 20 lost across restarts**, buffer-limit
+disconnects, pattern cost 3.25×) · `streams.html` (**PEL leaks invisible to XLEN**, XAUTOCLAIM
+min-idle-time, check-then-act dedup fails) · `rate-limiting.html` (**fixed-window 2× burst**, four
+algorithms measured, fail-open fallback)
+*§4 Durability ×4* — `persistence.html` (**fork stall ~12ms/GB**, CoW dispersion 14×, 16,652 acked
+writes lost) · `replication.html` (**1MB backlog → full resync 15× slower**, quorum vs majority,
+split-brain bounded) · `cluster.html` (slots vs consistent hashing, **MOVED vs ASK**, `{global}`
+hash-tag hotspot = 100% on one node) · `locks.html` (**DEL-release deletes another holder's lock**,
+fencing tokens, Redlock 4.5×)
+*§5 Production ×5* — `memory.html` (per-key overhead 2.9× payload, **listpack cliff is one-way**,
+volatile-lru OOM trap) · `performance.html` (**99.5% of latency is not Redis**, SLOWLOG blind spots,
+pool exhaustion) · `observability.html` (**cumulative-counter trap: 0% real hit rate showed 66.7%**,
+errorstats, MONITOR costs 54%) · `security-ops.html` (**CONFIG+SAVE RCE path demonstrated**, additive
+ACLs, CONFIG SET hazards) · `use-cases.html` (capstone: **3,116 of 50,000 orders lost at failover**,
+six complete designs)
 
-**Quiz-bank retune (2026-08-13):** 27 question swaps adding v4-only material (Floyd's derivation,
-Brent, exchange argument, difference arrays, predicate template, monotonicity, histogram width,
-mark-on-push, multi-source BFS, three-colour marking, α(n), offline deletion, min-heap top-k,
-Quickselect, `i > start`, knapsack direction, LIS state, canonical coin systems, isEnd, MSB-first
-tries, submasks). **Also fixed a pre-existing flaw:** 191 of 200 correct answers sat at index 1,
-making the quiz guessable — options are now deterministically shuffled (66/71/63).
+**Quiz-bank retune (2026-08-18):** 49 question swaps covering **34/34 v4 concepts** — TTL-loss bug,
+listpack cliff, 2⁵³ budget, head-of-line blocking, no-rollback, unkillable scripts, break-even hit
+rate, XFetch, version prefix, at-most-once, output-buffer disconnects, PEL leaks, XAUTOCLAIM,
+idempotency, fixed-window burst, token bucket, fork/CoW, repl backlog, quorum vs majority, MOVED/ASK,
+hash-tag hotspots, fencing, Redlock, volatile-lru, HyperLogLog sizing, fan-out hybrid, errorstats,
+and the cumulative-counter dashboard trap.
+
+Also: the orphaned v3 `pubsub-streams.html` is now a **redirect stub** (nav splits it into
+`pubsub.html` + `streams.html`); nothing links to it.
 
 ⚠️ **Scaffolding reminder:** any newly-copied `quiz.html` must be checked for BOTH the stale
 `← CSS Track` link AND mojibake (`Â·`, `â†’` — double-encoded UTF-8) before committing.
 
-**🚧 IN PROGRESS: Redis v4 (track 10)** — `tutorials/redis/`, rebuilding 11 v3 lessons (~9KB) into
-**21 lessons at v4 depth** (47–53KB, `det=12 ex=6`). New `nav.js` written: 5 sections.
-
-**7 of 21 done — §1 Foundations COMPLETE (5), §2 Working With Redis 2 of 4:**
-- ✅ `index.html` (47KB) — data-structure server vs blob cache, where speed comes from, the durability
-  spectrum, RESP + round trips, keyspace/naming, when Redis is the wrong tool
-- ✅ `strings-keys.html` (52KB) — int/embstr/raw encodings, modern `SET` options, atomic numerics,
-  **how expiry actually works** (lazy + active sampling), the **TTL-loss bug**, key-schema design
-- ✅ `data-structures.html` (54KB) — hashes/lists/sets, **listpack thresholds and the memory cliff**,
-  reliable queues with `BLMOVE`, server-side set algebra, the O(n) commands that block
-- ✅ `sorted-sets.html` (53KB) — skiplist+hashtable, **the 2⁵³ score precision budget**, ZRANGEBYLEX
-  and its mixed-score trap, sliding windows, delayed queues with atomic claiming
-- ✅ `single-threaded.html` (51KB) — the event loop, atomicity for free, **head-of-line blocking
-  measured**, what Redis actually threads, fork pauses and CoW, scaling order
-- ✅ `pipelining.html` (52KB) — round-trip arithmetic, batch sizing (100–1000 sweet spot), pipeline
-  vs MULTI proven non-atomic, variadic commands, connection pooling, per-command pipeline errors
-- ✅ `transactions.html` (53KB) — **MULTI has NO rollback**, queue-time vs runtime errors, WATCH
-  optimistic locking and its retry storms (8× slower than Lua at 50 threads), EVALSHA/NOSCRIPT,
-  safe Lua lock release, the **unkillable-script hazard** after a write
-
-**⏳ NEXT: finish §2** — `caching.html`, then `cache-invalidation.html`. Then §3 Messaging ×3
-(pubsub, streams, rate-limiting), §4 Durability ×4 (persistence, replication, cluster, locks),
-§5 Production ×5 (memory, performance, observability, security-ops, use-cases), then the
-quiz-bank retune.
-
-Forward links to unwritten lessons show as "broken link" in validate.py — currently 5, all expected;
-they clear as each file lands. Re-run the whole-track validate at the end.
-
-✅ **Redis quiz answer-skew already fixed** (was 200/200 at index 1, now 73/57/70). The bank still
-needs a **content retune** to the v4 curriculum when the lessons are done — the existing 200 questions
-are v3-era and miss the v4 material (TTL-loss bug, listpack cliff, 2⁵³ score budget, head-of-line
-blocking, MULTI-has-no-rollback, WATCH contention, unkillable scripts, round-trip arithmetic).
+**⏳ NEXT: the remaining infra five** — Docker → Kubernetes → AWS → CI/CD → MongoDB.
+Each is 12 v3 lessons to be expanded to ~20 at v4 depth.
 
 **Tooling is committed in `tools/` — see `tools/README.md`. Nothing lives in a scratchpad.**
 ```
@@ -83,7 +61,7 @@ python tools/quizcheck.py tutorials/<track>                   # bank: 10 200 0, 
 node tools/quizshuffle.js tutorials/<track>                   # de-skew (idempotent)
 ```
 
-**Then the remaining infra five, in the user's order:** Docker → Kubernetes → AWS → CI/CD → MongoDB.
+**The remaining infra tracks, in the user's order:** Docker → Kubernetes → AWS → CI/CD → MongoDB.
 
 | Track | Dir | Now | Target |
 |-------|-----|-----|--------|
@@ -139,7 +117,7 @@ Validate with the node one-liner at the bottom of this file → must print `10 2
 | 7 | Java | 12 | 200 | ✅ DONE |
 | 8 | SQL | 12 | 200 | ✅ **v4 DONE 12/12 + quiz retuned** (2026-08-05) |
 | 9 | MongoDB | 12 | 200 | ✅ DONE |
-| 10 | Redis | 11 → **21 (v4)** | 200 | 🚧 **v4 IN PROGRESS 7/21** — Foundations complete, §2 at 2/4 |
+| 10 | Redis | 11 → **21 (v4)** | 200 | ✅ **v4 COMPLETE** — 21/21 lessons, quiz retuned, 0 validate errors 
 | 11 | Docker | 12 | 200 | ✅ DONE |
 | 12 | Kubernetes | 12 | 200 | ✅ DONE |
 | 13 | AWS | 12 | 200 | ✅ DONE |
