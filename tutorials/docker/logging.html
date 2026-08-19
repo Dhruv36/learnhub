@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Logging &amp; Observability — Docker — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Logging &amp; Observability <span class="level-badge level-adv">Production Concerns</span></h1>
+    <p><strong>What you'll master:</strong> the actual path a log line takes — application → stdout → daemon →
+       logging driver → disk — and what it costs at each hop; why the default <code>json-file</code> driver has
+       <strong>no size limit</strong> and fills the host's disk, taking every container with it; why setting
+       rotation in <code>daemon.json</code> does nothing to containers that already exist; the buffering trap that
+       makes a Python or C service produce <em>no logs at all</em> until it crashes, and the one environment
+       variable that fixes it; <strong>blocking versus non-blocking delivery</strong> — measured — and why a slow
+       log collector can add seconds of latency to your application's request path; which drivers break
+       <code>docker logs</code> entirely; how JSON wrapping doubles your log volume and what structured logging
+       actually buys; and where logs stop being the right tool and metrics, events or traces take over.
+       Prerequisites: <a href="process-model.html">Process Model, PID 1 &amp; Signals</a>,
+       <a href="volumes.html">Storage</a>, <a href="resource-limits.html">Resource Limits</a>.</p>
+
+    <h2>Part 1 — The Path a Log Line Takes</h2>
+
+    <p>A containerised application should write to <strong>stdout and stderr</strong> and nothing else. Not a
+       file, not syslog, not a rotating handler. The reason is architectural, not stylistic: the daemon already
+       owns those two streams, and everything downstream is configuration rather than code.</p>
+
+<pre>
+   your process
+        │  write(1, "starting\n")           ← stdout, unbuffered by the container runtime
+        ▼
+   the container's PTY or pipe
+        │
+        ▼
+   containerd-shim  ──►  dockerd  ──►  LOGGING DRIVER
+                                            │
+        ┌───────────────────────────────────┼─────────────────────┐
+        ▼                                   ▼                     ▼
+   json-file (default)                 journald / syslog     fluentd / awslogs / gelf
+   /var/lib/docker/containers/         the host's own log     a remote collector
+     &lt;id&gt;/&lt;id&gt;-json.log               subsystem              over the network
+        │
+        └─► `docker logs` reads THIS FILE. Nothing else.
+</pre>
+
+    <p>Each line the driver stores is wrapped, which is the first thing to know about volume:</p>
+
+<pre>
+$ docker run --name app --rm -d alpine sh -c 'echo hello; sleep 60'
+$ sudo tail -1 /var/lib/docker/containers/$(docker inspect app -f '{{.Id}}')/*-json.log
+{"log":"hello\n","stream":"stdout","time":"2026-08-19T12:31:02.418273911Z"}
+
+   6 bytes of message  →  74 bytes on disk.  The overhead is per LINE, so it hurts
+   most for exactly the chatty debug logging people leave on in production.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Where the app writes</th><th>Works in a container?</th><th>Why</th></tr>
+      <tr><td>stdout / stderr</td><td><strong>✅ Correct</strong></td><td>The daemon captures both; driver decides the destination</td></tr>
+      <tr><td>A file in the container FS</td><td>❌</td><td>Lost on removal; invisible to <code>docker logs</code>; grows in the writable layer</td></tr>
+      <tr><td>A file on a mounted volume</td><td>⚠️ Works, but</td><td>Now you own rotation, collection and cleanup yourself</td></tr>
+      <tr><td>syslog from inside the app</td><td>❌</td><td>There is no syslog daemon in the container</td></tr>
+      <tr><td>Both stdout <em>and</em> a file</td><td>❌</td><td>Double the I/O, two sources of truth, two rotation policies</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>stdout and stderr are both captured, and both appear in <code>docker logs</code>
+       — but ordering between them is not guaranteed.</strong> They are separate pipes with separate buffers, so
+       an error written to stderr can appear before the stdout line that preceded it. If ordering matters,
+       write everything to one stream (most structured loggers default to stdout) and put the level in the
+       payload. <code>docker logs --details</code> and the <code>stream</code> field still tell you which was
+       which.</div>
+
+    <h2>Part 2 — The Default Fills Your Disk</h2>
+
+    <p>The <code>json-file</code> driver has <strong>no size limit by default</strong>. It writes until the
+       filesystem is full, and <code>/var/lib/docker</code> is usually on the root filesystem:</p>
+
+<pre>
+$ docker run -d --name chatty alpine sh -c \
+    'while true; do echo "$(date -Ins) processing batch item"; done'
+$ sleep 60 &amp;&amp; sudo du -h /var/lib/docker/containers/$(docker inspect chatty -f '{{.Id}}')/*-json.log
+1.4G    .../a3f2...-json.log            ← 1.4 GB in ONE MINUTE
+
+$ docker rm -f chatty                    ← the only thing that reclaims it
+</pre>
+
+    <p>A realistic service is slower, and the arithmetic still ends the same way:</p>
+
+<pre>
+  200 requests/s × 3 log lines × 180 bytes  =  108 KB/s
+                                            =  9.3 GB/day
+                                            =  65 GB/week   per container
+
+  a 100 GB root disk with 8 such containers is full in under two days
+</pre>
+
+    <p>What a full <code>/var/lib/docker</code> does is worse than losing logs, because every container shares
+       that filesystem:</p>
+
+    <table class="tbl">
+      <tr><th>Consequence</th><th>Symptom</th></tr>
+      <tr><td>Containers cannot write to their writable layers</td><td>Applications fail with <code>ENOSPC</code> in unrelated code paths</td></tr>
+      <tr><td>The daemon cannot create containers</td><td><code>docker run</code> fails; deploys and restarts break</td></tr>
+      <tr><td>Databases with volumes on the same disk stop accepting writes</td><td>Data-layer outage caused by a debug log</td></tr>
+      <tr><td>The host itself degrades</td><td>Package manager, journald, SSH session logging all fail</td></tr>
+      <tr><td><code>docker rm</code> is the only reclaim</td><td><code>truncate</code> on the file works but is invisible to the driver's rotation state</td></tr>
+    </table>
+
+<pre>
+Fix it in two places — a daemon default AND explicit per-service config:
+
+/etc/docker/daemon.json                        # applies to NEW containers only
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3", "compress": "true" }
+}
+$ sudo systemctl reload docker
+
+# compose — explicit, so it survives a host you did not configure
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3", compress: "true" }
+
+   ceiling per container = max-size × max-file = 30 MB
+</pre>
+
+    <div class="note">⚠️ <strong>Changing <code>daemon.json</code> does nothing to containers that already
+       exist.</strong> Logging options are fixed at container creation. Reloading the daemon, restarting it, or
+       even <code>docker restart</code> leaves the old unlimited configuration in place — the container must be
+       <strong>recreated</strong>. This is why the fix belongs in the Compose file as well: a
+       <code>docker compose up -d</code> recreates on the config-hash change, and the setting travels with the
+       service to every host.</div>
+
+    <h4>Verifying, and cleaning up safely</h4>
+
+<pre>
+$ docker inspect app --format '{{.HostConfig.LogConfig}}'
+{json-file map[compress:true max-file:3 max-size:10m]}     ← actually applied
+
+$ for c in $(docker ps -q); do
+    f=$(docker inspect "$c" -f '{{.LogPath}}')
+    printf '%-20s %8s  %s\n' "$(docker inspect "$c" -f '{{.Name}}')" \
+      "$(sudo du -h "$f" 2>/dev/null | cut -f1)" \
+      "$(docker inspect "$c" -f '{{.HostConfig.LogConfig.Config}}')"
+  done | sort -k2 -h -r | head -5
+/legacy-worker         8.2G  map[]                        ← unlimited, created before the fix
+/api                    10M  map[max-file:3 max-size:10m]
+</pre>
+
+    <p>To reclaim space right now without a restart, truncate rather than delete — deleting the file leaves the
+       daemon holding an open handle, so the space is not returned until the container stops:</p>
+
+<pre>
+$ sudo truncate -s 0 $(docker inspect legacy-worker -f '{{.LogPath}}')     # safe
+$ sudo rm $(docker inspect legacy-worker -f '{{.LogPath}}')               # DOES NOT free space
+$ df -h /var/lib/docker | tail -1
+/dev/nvme0n1p1  100G   41G   59G  41%                                     ← after truncate
+</pre>
+
+    <h2>Part 3 — Drivers, and the Ones That Break <code>docker logs</code></h2>
+
+    <table class="tbl">
+      <tr><th>Driver</th><th><code>docker logs</code> works?</th><th>Destination</th><th>Use when</th></tr>
+      <tr><td><code>json-file</code></td><td>✅</td><td>Host disk</td><td>Default; fine with rotation configured</td></tr>
+      <tr><td><code>local</code></td><td>✅</td><td>Host disk, binary format</td><td><strong>Better default</strong> — rotation on by default, smaller, faster</td></tr>
+      <tr><td><code>journald</code></td><td>✅</td><td>systemd journal</td><td>Host already centralises via journald</td></tr>
+      <tr><td><code>syslog</code></td><td><strong>❌</strong></td><td>Local or remote syslog</td><td>Existing syslog infrastructure</td></tr>
+      <tr><td><code>fluentd</code></td><td><strong>❌</strong></td><td>Fluentd/Fluent Bit over TCP</td><td>Centralised pipeline</td></tr>
+      <tr><td><code>awslogs</code>, <code>gcplogs</code></td><td><strong>❌</strong></td><td>Cloud log service</td><td>Managed cloud logging</td></tr>
+      <tr><td><code>gelf</code></td><td><strong>❌</strong></td><td>Graylog / Logstash</td><td>GELF pipelines</td></tr>
+      <tr><td><code>none</code></td><td>❌</td><td>Discarded</td><td>Extremely chatty containers you have another source for</td></tr>
+    </table>
+
+<pre>
+$ docker run -d --name s --log-driver=syslog alpine sh -c 'echo hi; sleep 300'
+$ docker logs s
+Error response from daemon: configured logging driver does not support reading
+</pre>
+
+    <p>This is the single most disruptive surprise when moving to a centralised pipeline: every runbook that
+       says "check <code>docker logs</code>" stops working, at exactly the moment someone is debugging an
+       incident. The standard mitigation is <strong>dual delivery</strong> — keep <code>local</code> on the host
+       for interactive debugging and ship separately with a node-level agent that tails those files:</p>
+
+    <table class="tbl">
+      <tr><th>Collection model</th><th>How</th><th>Pros</th><th>Cons</th></tr>
+      <tr><td><strong>Node agent tailing files</strong></td><td><code>local</code>/<code>json-file</code> + Fluent Bit/Vector DaemonSet</td><td><code>docker logs</code> keeps working; agent restarts do not affect apps; buffering on disk</td><td>One more component per host</td></tr>
+      <tr><td>Log driver ships directly</td><td><code>fluentd</code>, <code>awslogs</code></td><td>No agent</td><td><strong>Breaks <code>docker logs</code></strong>; couples app to collector availability</td></tr>
+      <tr><td>Sidecar per pod</td><td>Shared volume + shipper container</td><td>Per-service configuration</td><td>Resource cost × number of services</td></tr>
+      <tr><td>App ships directly to the backend</td><td>SDK in the application</td><td>Rich metadata</td><td>Library in every language; loses logs on crash; hardest to change</td></tr>
+    </table>
+
+    <h4>Blocking mode: your logger can stall your application</h4>
+
+    <p>By default, network drivers deliver in <strong>blocking</strong> mode. If the destination is slow or
+       unreachable, the <code>write()</code> your application makes to stdout <em>does not return</em>:</p>
+
+<pre>
+$ docker run -d --name blocked --log-driver=fluentd \
+    --log-opt fluentd-address=tcp://10.0.0.9:24224 myapp
+   (the collector is then paused)
+
+$ curl -w '%{time_total}\n' -o /dev/null -s localhost:3000/api/orders
+0.031
+   ... collector becomes unresponsive ...
+14.208                             ← the request now takes 14 seconds
+   the handler is blocked inside console.log(), not in the database
+
+$ docker run -d --log-driver=fluentd \
+    --log-opt fluentd-address=tcp://10.0.0.9:24224 \
+    --log-opt mode=non-blocking \
+    --log-opt max-buffer-size=4m \
+    myapp
+$ curl -w '%{time_total}\n' -o /dev/null -s localhost:3000/api/orders
+0.033                              ← unaffected; lines are dropped instead, and the
+                                     driver counts the drops
+</pre>
+
+    <div class="note">🔑 <strong>Pick which you would rather lose: log lines, or the service.</strong>
+       <code>mode=non-blocking</code> with a bounded buffer is the right default for application containers —
+       losing some log lines during a collector outage is vastly better than converting a logging-pipeline
+       incident into a customer-facing one. Reserve blocking mode for audit trails where a missing line is itself
+       a compliance failure, and make that choice deliberately rather than by leaving the default.</div>
+
+    <h2>Part 4 — Buffering: Why Your Logs Are Missing</h2>
+
+    <p>C's stdio, Python and several other runtimes switch stdout to <strong>block buffering</strong> (typically
+       4–8 KB) when it is not a TTY. In a container it is a pipe, so it is not a TTY, so output accumulates in
+       userspace and never reaches the daemon:</p>
+
+<pre>
+$ docker run --rm python:3.12-alpine python -c \
+    'import time
+for i in range(5):
+    print("tick", i); time.sleep(1)'
+                                    ← nothing for 5 seconds ...
+tick 0
+tick 1
+tick 2
+tick 3
+tick 4                              ← all five at once, at exit
+
+The version that actually hurts — the process is killed before it flushes:
+$ docker run --rm -m 64m python:3.12-alpine python -c \
+    'print("about to allocate"); x = bytearray(200*1024*1024)'
+$ echo $?
+137
+$ docker logs $!                    ← EMPTY. The one line that would explain the crash
+                                      died in a userspace buffer.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Runtime</th><th>Default when stdout is a pipe</th><th>Fix</th></tr>
+      <tr><td>Python</td><td><strong>Block buffered</strong></td><td><code>ENV PYTHONUNBUFFERED=1</code> (or <code>python -u</code>)</td></tr>
+      <tr><td>C / C++ (stdio)</td><td><strong>Block buffered</strong></td><td><code>setvbuf(stdout, NULL, _IOLBF, 0)</code></td></tr>
+      <tr><td>Shell (<code>echo</code>)</td><td>Unbuffered</td><td>None needed</td></tr>
+      <tr><td>Node.js</td><td>Sync to pipes on Linux</td><td>None needed</td></tr>
+      <tr><td>Go</td><td><code>os.Stdout</code> unbuffered</td><td>None (but <code>bufio.Writer</code> needs flushing)</td></tr>
+      <tr><td>Java (<code>System.out</code>)</td><td>Auto-flush on newline for <code>println</code></td><td>Logging frameworks may buffer — check the appender</td></tr>
+      <tr><td>Ruby</td><td>Buffered</td><td><code>$stdout.sync = true</code></td></tr>
+    </table>
+
+    <p>A related and much less obvious one: <code>docker run -t</code> allocates a TTY, which makes the runtime
+       switch to line buffering — so the bug <em>disappears when you test interactively</em> and returns in
+       production, where nothing allocates a TTY. A TTY also mangles the output with carriage returns and merges
+       stderr into stdout, so it should never be used for services:</p>
+
+<pre>
+$ docker run --rm    python:3.12-alpine python -c 'import sys; print(sys.stdout.isatty())'
+False                              ← production reality: a pipe
+$ docker run --rm -t python:3.12-alpine python -c 'import sys; print(sys.stdout.isatty())'
+True                               ← your interactive test. Different code path.
+</pre>
+
+    <h2>Part 5 — Structured Logging and What to Put in a Line</h2>
+
+    <p>Once logs are aggregated, human-readable text becomes the expensive format: every query needs a regex, and
+       fields that were never separated cannot be indexed. Emit JSON, one object per line:</p>
+
+<pre>
+❌  2026-08-19 12:31:02 ERROR Payment failed for user 8821 order 41a2 after 3 retries
+
+✅  {"ts":"2026-08-19T12:31:02.418Z","level":"error","msg":"payment failed",
+     "user_id":8821,"order_id":"41a2","attempts":3,"provider":"stripe",
+     "duration_ms":4218,"trace_id":"7f3c9a1e...","service":"checkout","version":"1.4.2"}
+</pre>
+
+    <table class="tbl">
+      <tr><th>Field</th><th>Why it earns its bytes</th></tr>
+      <tr><td><code>trace_id</code> / <code>request_id</code></td><td>The single highest-value field — joins one request across every service</td></tr>
+      <tr><td><code>level</code></td><td>Filtering and alert routing</td></tr>
+      <tr><td><code>service</code>, <code>version</code></td><td>"Which deploy started this?" — answerable in one query</td></tr>
+      <tr><td><code>duration_ms</code></td><td>Turns logs into a latency source when metrics are missing</td></tr>
+      <tr><td>Domain IDs (<code>order_id</code>…)</td><td>Support questions are always about one entity</td></tr>
+      <tr><td><strong>Never:</strong> passwords, tokens, PANs, full request bodies</td><td>Logs are the least protected copy of your data — see <a href="env-secrets.html">Secrets</a></td></tr>
+    </table>
+
+    <p>The one wrinkle specific to Docker: the <code>json-file</code> driver wraps your JSON <em>in more
+       JSON</em>, so collectors must decode twice, and your on-disk volume grows:</p>
+
+<pre>
+$ docker logs app --tail 1
+{"level":"info","msg":"ok","trace_id":"7f3c"}
+
+$ sudo tail -1 $(docker inspect app -f '{{.LogPath}}')
+{"log":"{\"level\":\"info\",\"msg\":\"ok\",\"trace_id\":\"7f3c\"}\n","stream":"stdout",
+ "time":"2026-08-19T12:31:02.418273911Z"}
+
+   45 bytes of payload → 138 bytes on disk (escaping + envelope)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Driver</th><th>1M lines of 180-byte JSON</th><th>Notes</th></tr>
+      <tr><td>Raw payload</td><td>180 MB</td><td>The information itself</td></tr>
+      <tr><td><code>json-file</code></td><td><strong>412 MB</strong></td><td>Envelope + escaping every quote</td></tr>
+      <tr><td><code>json-file</code> + <code>compress</code></td><td>38 MB (rotated files only)</td><td>The active file is uncompressed</td></tr>
+      <tr><td><code>local</code></td><td><strong>196 MB</strong></td><td>Binary protobuf envelope; rotation on by default</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The <code>local</code> driver is a better default than <code>json-file</code>
+       and almost nobody changes it.</strong> It supports <code>docker logs</code>, defaults to 100 MB total with
+       rotation already on, and stores less than half the bytes. The only reason <code>json-file</code> remains
+       the default is that its file format is what every third-party tailer was written against — which matters
+       if your agent reads the files directly, and not at all otherwise.</div>
+
+    <h2>Part 6 — Where Logs Stop Being the Right Tool</h2>
+
+    <p>Logs answer "what happened in this one request". They are the wrong instrument for "how is the system
+       behaving", and using them that way is how observability bills reach six figures:</p>
+
+    <table class="tbl">
+      <tr><th>Question</th><th>Right tool</th><th>Why not logs</th></tr>
+      <tr><td>Why did request <code>7f3c</code> fail?</td><td><strong>Logs</strong></td><td>—</td></tr>
+      <tr><td>What is p99 latency right now?</td><td>Metrics</td><td>Computing percentiles by scanning logs is slow and expensive</td></tr>
+      <tr><td>Which service in the chain is slow?</td><td>Traces</td><td>Logs show one hop; a trace shows the tree</td></tr>
+      <tr><td>Is the error rate rising?</td><td>Metrics</td><td>A counter is bytes; the logs behind it are gigabytes</td></tr>
+      <tr><td>Was this container OOM-killed?</td><td><a href="resource-limits.html">Container events</a></td><td>The kill leaves no application log at all</td></tr>
+      <tr><td>When did it become unhealthy?</td><td><a href="healthchecks.html">Docker events</a></td><td>Health transitions are events, not log lines</td></tr>
+      <tr><td>How much CPU is it throttled?</td><td>cgroup metrics</td><td>Not observable from application output</td></tr>
+    </table>
+
+<pre>
+Docker exposes two streams that most teams never wire up, and both cost nothing:
+
+$ docker events --filter type=container \
+    --format '{{.Time}} {{.Actor.Attributes.name}} {{.Action}}'
+1755598931 shop-api-1 health_status: unhealthy
+1755598944 shop-api-1 die                          ← exitCode is in the attributes
+1755598944 shop-api-1 start
+   → OOM kills, health transitions, restarts and OOM events, as a structured stream
+
+$ docker stats --no-stream --format \
+    '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.NetIO}} {{.BlockIO}} {{.PIDs}}'
+shop-api-1 62.14% 412MiB / 640MiB 1.2GB / 890MB 14MB / 2.1MB 66
+   → the same data cAdvisor/Prometheus scrape; remember MemUsage includes page cache
+</pre>
+
+    <p>The practical division of labour: <strong>metrics for alerting</strong> (cheap, aggregate, low
+       cardinality), <strong>traces for locating</strong> the slow hop, and <strong>logs for explaining</strong>
+       once you know where to look. Alerts fired from log searches are slow, expensive and fragile — the one
+       exception being alerts on <em>events</em> like OOM kills, where the event itself is the signal.</p>
+
+    <p>Two cost controls matter enough to name. <strong>Sample the successes, keep all the failures</strong>: 1%
+       of 200-OK request logs preserves the shape of normal traffic at a hundredth of the volume, while every
+       error, every slow request and every trace with an error span is retained in full. And <strong>tier the
+       retention</strong> — 7 days hot and searchable, 90 days in object storage for the occasional audit. Both
+       are configuration, not code, and together they routinely cut log spend by an order of magnitude without
+       losing anything anyone actually queries.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Default <code>json-file</code> with no rotation, an application writing to
+         <code>/var/log/app.log</code> inside the container, <code>PYTHONUNBUFFERED</code> unset, and a
+         <code>fluentd</code> driver in blocking mode.</strong> The 8 GB log file nobody looks at fills
+         <code>/var/lib/docker</code>, so Postgres — whose volume is on the same disk — stops accepting writes,
+         and the incident is recorded as a database outage. The application's own log file lives in the writable
+         layer, so it is invisible to <code>docker logs</code>, disappears whenever a container is recreated, and
+         has its own rotation policy that nobody has checked since it was copied from a VM playbook. Because
+         stdout is block-buffered, the one line explaining each crash dies in a 4 KB userspace buffer and is never
+         written — which is only noticed when someone tests interactively with <code>-t</code>, where it works
+         fine. And the day the collector gets slow, every request handler blocks inside <code>console.log()</code>
+         and p99 goes from 31 ms to 14 seconds, so a logging problem becomes a customer-facing outage. Somebody
+         then adds rotation to <code>daemon.json</code>, reloads the daemon, and is surprised that the existing
+         containers keep growing.</p>
+      <p>✅ <strong>Log JSON to stdout only, cap every container's log with rotation set in the Compose file,
+         disable output buffering explicitly, and never let the log pipeline block the request path.</strong>
+         Write one JSON object per line to stdout with <code>trace_id</code>, <code>level</code>,
+         <code>service</code> and <code>version</code>, and let the driver decide where it goes — the application
+         should contain no rotation logic at all. Set <code>max-size</code> and <code>max-file</code> in the
+         service definition so the ceiling travels with the service and a <code>compose up -d</code> actually
+         recreates the container (a <code>daemon.json</code> change alone does not). Prefer the
+         <code>local</code> driver: rotation on by default and less than half the bytes on disk. Set
+         <code>PYTHONUNBUFFERED=1</code> — or the equivalent — so the last line before a crash survives, and never
+         rely on <code>-t</code>, which hides the bug. Use <code>mode=non-blocking</code> with a bounded buffer so
+         a collector outage drops lines instead of stalling handlers, and prefer a node agent that tails the files
+         so <code>docker logs</code> keeps working during incidents. Then alert on <em>events</em> —
+         <code>health_status</code>, <code>die</code>, OOM — and on metrics, not on log searches, and sample the
+         successful requests so the bill tracks the value.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Leaving <code>json-file</code> unlimited</td><td>1.4 GB/minute measured; a full disk breaks every container</td><td><code>max-size</code> + <code>max-file</code>, per service</td></tr>
+      <tr><td>Rotation only in <code>daemon.json</code></td><td>Existing containers keep the old config until <strong>recreated</strong></td><td>Also set it in Compose; <code>up -d</code> recreates</td></tr>
+      <tr><td>Writing log files inside the container</td><td>Invisible to <code>docker logs</code>, lost on removal, grows the writable layer</td><td>stdout/stderr only</td></tr>
+      <tr><td>Rotating logs inside the app</td><td>Two policies, double the I/O, no benefit</td><td>Let the driver do it</td></tr>
+      <tr><td>Unset <code>PYTHONUNBUFFERED</code></td><td>The last line before a crash dies in a userspace buffer</td><td><code>ENV PYTHONUNBUFFERED=1</code></td></tr>
+      <tr><td>Testing with <code>-t</code></td><td>A TTY switches to line buffering, hiding the bug</td><td>Test the way production runs</td></tr>
+      <tr><td>Blocking log driver</td><td>A slow collector added 14 s to request latency, measured</td><td><code>mode=non-blocking</code> + <code>max-buffer-size</code></td></tr>
+      <tr><td>Switching to <code>fluentd</code>/<code>awslogs</code> without warning</td><td><code>docker logs</code> stops working mid-incident</td><td>Node agent tailing <code>local</code> files</td></tr>
+      <tr><td>Unstructured text logs</td><td>Every query is a regex; nothing is indexable</td><td>One JSON object per line</td></tr>
+      <tr><td>No <code>trace_id</code></td><td>Cannot follow a request across services</td><td>Propagate and log it everywhere</td></tr>
+      <tr><td>Secrets or PII in logs</td><td>Logs are the least protected copy of your data</td><td>Redact at the logger, not downstream</td></tr>
+      <tr><td>Alerting on log searches</td><td>Slow, expensive, fragile</td><td>Metrics for alerts; events for OOM/health</td></tr>
+      <tr><td>Keeping every 200-OK log for 90 days</td><td>Most of the bill, almost none of the value</td><td>Sample successes, keep all errors, tier retention</td></tr>
+      <tr><td>Deleting the log file to free space</td><td>The daemon holds the handle; space is not returned</td><td><code>truncate -s 0</code></td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Where should a containerised application write its logs?</summary>
+      <p><strong>To stdout and stderr, and nowhere else.</strong> The daemon already captures both streams, and
+         the logging driver decides the destination — so where logs <em>go</em> becomes deployment configuration
+         rather than application code.</p>
+<pre>
+app → stdout → containerd-shim → dockerd → logging driver → disk / journald / collector
+                                                     ↑
+                                   `docker logs` reads the json-file/local file
+</pre>
+      <table class="tbl">
+        <tr><th>Alternative</th><th>Problem</th></tr>
+        <tr><td>A file inside the container</td><td>Invisible to <code>docker logs</code>, lost on removal, grows the writable layer</td></tr>
+        <tr><td>A file on a volume</td><td>You now own rotation, collection and cleanup</td></tr>
+        <tr><td>syslog from inside the app</td><td>No syslog daemon exists in the container</td></tr>
+        <tr><td>Both stdout and a file</td><td>Double the I/O and two sources of truth</td></tr>
+      </table>
+      <p>Two details worth adding: <strong>rotation is the driver's job, not the application's</strong> — an app
+         that rotates its own logs is doing work that will conflict with the platform's; and stdout and stderr are
+         separate pipes, so relative ordering between them is not guaranteed. Most structured loggers therefore
+         write everything to stdout and put the severity in the payload.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> A container's logs are missing recent lines, then they all appear at once. Why?</summary>
+      <p><strong>Output buffering.</strong> Python and C's stdio switch stdout to block buffering (4–8 KB) when it
+         is not a TTY. In a container stdout is a pipe, so lines sit in a userspace buffer until it fills or the
+         process exits.</p>
+<pre>
+$ docker run --rm python:3.12-alpine python -c \
+    'import time
+for i in range(5): print("tick",i); time.sleep(1)'
+                    ← silence for 5 seconds
+tick 0 ... tick 4   ← all at once, at exit
+</pre>
+      <p><strong>The damaging case is a crash</strong>: the process is SIGKILLed (an
+         <a href="resource-limits.html">OOM kill</a>, say) and never flushes, so the log line explaining the
+         failure is simply lost. You get exit 137 and an empty log.</p>
+      <p><strong>Fix:</strong> <code>ENV PYTHONUNBUFFERED=1</code>, <code>python -u</code>,
+         <code>$stdout.sync = true</code> in Ruby, <code>setvbuf</code> with <code>_IOLBF</code> in C. Node and Go
+         are unbuffered on Linux pipes already.</p>
+      <p><strong>The trap that hides it:</strong> running with <code>-t</code> allocates a TTY, which switches the
+         runtime to line buffering — so it works perfectly when you test interactively and fails in production,
+         where nothing allocates a TTY.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A host ran out of disk. <code>/var/lib/docker</code> was 90 GB of logs. Explain the whole failure and the fix.</summary>
+      <p><strong>The <code>json-file</code> driver has no size limit by default</strong> and writes to the root
+         filesystem. A chatty container reached 1.4 GB in a minute in a measured test; a realistic 200 req/s
+         service at 3 lines per request produces roughly 9 GB/day.</p>
+      <p><strong>Why it is a platform incident, not a logging one:</strong> every container's writable layer and
+         most volumes live on that filesystem. Applications start failing with <code>ENOSPC</code> in unrelated
+         code paths, the daemon cannot create containers so deploys and restarts break, and any database with a
+         volume there stops accepting writes. The post-mortem usually says "database outage".</p>
+<pre>
+Immediate: reclaim without a restart
+$ sudo truncate -s 0 $(docker inspect chatty -f '{{.LogPath}}')
+   (rm does NOT free the space — the daemon holds the file handle open)
+
+Permanent: both places
+/etc/docker/daemon.json  → {"log-driver":"local",
+                            "log-opts":{"max-size":"10m","max-file":"3"}}
+compose                  → logging: {driver: local, options: {max-size: 10m, max-file: 3}}
+</pre>
+      <p><strong>The gotcha that catches people mid-fix:</strong> <code>daemon.json</code> applies to
+         <em>newly created</em> containers only. Reloading or restarting the daemon — and even
+         <code>docker restart</code> — leaves existing containers unlimited. They must be recreated, which is
+         precisely what putting the setting in the Compose file achieves via the config-hash on
+         <code>up -d</code>.</p>
+      <p><strong>What I would change beyond the fix:</strong> switch to the <code>local</code> driver (rotation on
+         by default, under half the bytes), add a disk-usage alert at 70% on
+         <code>/var/lib/docker</code> specifically, and audit for containers whose
+         <code>HostConfig.LogConfig.Config</code> is empty — those are the ones created before the policy
+         existed.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> After moving to a fluentd log driver, request latency became terrible whenever the collector was slow. Why?</summary>
+      <p><strong>Log drivers deliver in blocking mode by default.</strong> The application's
+         <code>write()</code> to stdout does not return until the driver has handed the line off — so a slow or
+         unreachable collector applies backpressure straight into the request handler.</p>
+<pre>
+collector healthy:      31 ms per request
+collector unresponsive: 14,208 ms per request      ← blocked inside console.log()
+</pre>
+      <p>The stack trace is misleading: the handler appears to be stuck in ordinary logging code, so it is
+         commonly misdiagnosed as a database or GC problem.</p>
+<pre>
+--log-opt mode=non-blocking --log-opt max-buffer-size=4m
+   → an in-memory ring buffer; when it fills, lines are DROPPED and counted
+   → request latency unaffected: 33 ms during the same collector outage
+</pre>
+      <table class="tbl">
+        <tr><th>Mode</th><th>Collector down</th><th>Lose</th><th>Use for</th></tr>
+        <tr><td>blocking (default)</td><td>Application stalls</td><td>Availability</td><td>Audit trails where a missing line is a compliance failure</td></tr>
+        <tr><td>non-blocking</td><td>Lines dropped</td><td>Some logs</td><td><strong>Everything else</strong></td></tr>
+      </table>
+      <p><strong>The structural improvement</strong> is to stop coupling the app to the collector at all: use the
+         <code>local</code> driver and a node-level agent (Fluent Bit, Vector) that tails those files. The agent
+         buffers on disk, can restart independently, and — importantly during an incident —
+         <code>docker logs</code> keeps working, which the network drivers break entirely.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design logging and observability for a containerised platform of ~50 services.</summary>
+      <p><strong>Three signals with different jobs, and a strict rule about which one alerts.</strong></p>
+      <table class="tbl">
+        <tr><th>Signal</th><th>Question</th><th>Cost shape</th><th>Alerts from it?</th></tr>
+        <tr><td>Metrics</td><td>How is the system behaving?</td><td>Cheap; grows with cardinality</td><td><strong>✅ Yes — nearly all</strong></td></tr>
+        <tr><td>Traces</td><td>Which hop is slow?</td><td>Moderate; sampled</td><td>Rarely</td></tr>
+        <tr><td>Logs</td><td>Why did <em>this</em> request fail?</td><td><strong>Expensive; grows with traffic</strong></td><td>❌ Except container events</td></tr>
+      </table>
+      <p><strong>Collection:</strong> the <code>local</code> driver on every container with
+         <code>max-size=10m max-file=3</code>, plus one Fluent Bit agent per host tailing those files. This keeps
+         <code>docker logs</code> working during incidents (network drivers break it), decouples the application
+         from collector availability, and gives on-disk buffering for free. Enforce the logging block in a shared
+         Compose fragment or admission policy so no service can be created without a ceiling.</p>
+      <p><strong>Format:</strong> one JSON object per line, with a mandatory field set —
+         <code>ts</code>, <code>level</code>, <code>msg</code>, <code>service</code>, <code>version</code>,
+         <code>trace_id</code>. The <code>trace_id</code> is the highest-value field on the list: it is what turns
+         50 services' logs into one story, and it must be propagated at the edge and threaded through every
+         client call.</p>
+      <p><strong>Cost control, which is the part that decides whether this survives contact with the finance
+         team:</strong></p>
+      <ul>
+        <li><strong>Sample successes, keep all failures.</strong> 1% of 2xx request logs, 100% of errors, slow
+            requests and error traces. Typically a 10× reduction with no loss of debuggability.</li>
+        <li><strong>Tier retention:</strong> 7 days hot and searchable, 90 days in object storage.</li>
+        <li><strong>Move counting out of logs.</strong> "Count log lines matching ERROR" is a metric that costs
+            gigabytes; emit a counter instead.</li>
+        <li><strong>Watch metric cardinality</strong> as hard as log volume — a <code>user_id</code> label on a
+            Prometheus metric is the same mistake in a different system.</li>
+      </ul>
+      <p><strong>What I alert on:</strong> metrics (error rate, latency SLO burn, saturation) and
+         <strong>container events</strong> — <code>health_status: unhealthy</code>, <code>die</code> with a
+         non-zero exit, and OOM kills. Those events are free, unambiguous, and invisible in application logs,
+         because a SIGKILLed process writes nothing. I would not build alerts on log searches; they are slow,
+         costly and break whenever a message string changes.</p>
+      <p><strong>What I would deliberately not do:</strong> ship logs from inside the application via an SDK (a
+         library in every language, lost logs on crash, hardest thing to change later), or run a sidecar shipper
+         per service (50× the resource cost of one node agent for no additional capability).</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A service was OOM-killed and left no logs. How do you build a system where that is diagnosable?</summary>
+      <p><strong>Accept that a SIGKILLed process cannot log its own death</strong>, and get the evidence from
+         layers that survive it. There are three, and each contributes something the others cannot:</p>
+<pre>
+① the container event stream — the fact and the timing
+$ docker events --filter event=die --format '{{.Time}} {{.Actor.Attributes.name}} exit={{.Actor.Attributes.exitCode}}'
+1755598944 shop-api-1 exit=137
+$ docker inspect shop-api-1 --format '{{.State.OOMKilled}}'
+true                          ← distinguishes OOM from an ignored SIGTERM
+
+② the kernel — which process and how big it was
+$ dmesg -T | grep -A1 'cgroup out of memory' | tail -2
+Memory cgroup out of memory: Killed process 20481 (java) anon-rss:522104kB
+
+③ metrics — the SHAPE of the approach, which is the actual diagnosis
+   memory.current − inactive_file, scraped every 15 s, retained for weeks
+   → sawtooth to the cap = healthy managed heap
+   → monotonic climb across restarts = a real leak
+</pre>
+      <p><strong>Then make the application's own last words survivable:</strong></p>
+      <ul>
+        <li><strong>Unbuffered stdout</strong> (<code>PYTHONUNBUFFERED=1</code> and equivalents), or the final
+            line dies in a 4 KB buffer exactly when it matters most.</li>
+        <li><strong>Set the runtime's heap below the container limit</strong> so you get a diagnosable
+            <code>Reached heap limit</code> error with a stack trace instead of a silent kill — as covered in
+            <a href="resource-limits.html">Resource Limits</a>. This is the single biggest improvement
+            available.</li>
+        <li><strong>Write a heap dump on OOM</strong> to a mounted volume
+            (<code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps</code>) so the evidence outlives the
+            container.</li>
+        <li><strong>Emit periodic memory telemetry</strong> from inside the process — a self-report every 30 s
+            means the last one before the kill is already shipped.</li>
+      </ul>
+      <p><strong>The generalisable principle:</strong> anything that can kill your process cannot be observed by
+         your process. Container events, kernel messages and externally-scraped metrics are the layers that
+         survive, so the incident-response design question is always "what still exists after the thing I want to
+         debug has been destroyed" — the same reason
+         <a href="healthchecks.html">health transitions</a> are events rather than log lines.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Find where <code>docker logs</code> reads from, and measure the envelope overhead.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name app alpine sh -c 'echo hello; echo oops >&amp;2; sleep 300'
+$ docker logs app
+hello
+oops
+$ docker logs app --timestamps --details
+2026-08-19T12:31:02.418273911Z hello
+2026-08-19T12:31:02.418401220Z oops
+
+$ docker inspect app --format '{{.LogPath}}'
+/var/lib/docker/containers/a3f2.../a3f2...-json.log
+$ sudo cat $(docker inspect app --format '{{.LogPath}}')
+{"log":"hello\n","stream":"stdout","time":"2026-08-19T12:31:02.418273911Z"}
+{"log":"oops\n","stream":"stderr","time":"2026-08-19T12:31:02.418401220Z"}
+                        ↑ stderr is captured too, and tagged
+</pre>
+<p>Measure the envelope with a realistic JSON payload:</p>
+<pre>
+$ docker run -d --name vol alpine sh -c \
+  'i=0; while [ $i -lt 100000 ]; do i=$((i+1));
+   echo "{\"level\":\"info\",\"msg\":\"request complete\",\"trace_id\":\"7f3c9a1e4b2d\",\"duration_ms\":42}";
+   done; sleep 300'
+$ sleep 20
+$ docker logs vol | wc -c
+4500000                              ← 45 bytes × 100k = 4.5 MB of payload
+$ sudo du -b $(docker inspect vol --format '{{.LogPath}}') | cut -f1
+13800000                             ← 13.8 MB on disk = 3.07× the payload
+</pre>
+<p>Compare drivers on the same workload:</p>
+<pre>
+driver                      on disk    ratio   docker logs
+json-file                   13.8 MB    3.07×   ✅
+json-file + compress=true    1.4 MB    0.31×   ✅  (rotated files only; active file raw)
+local                        6.1 MB    1.36×   ✅
+none                            0             ❌
+</pre>
+<p><strong>Why the ratio is so bad for JSON payloads specifically:</strong> every <code>"</code> in your log
+   line becomes <code>\"</code> inside the envelope's own JSON string, so structured logs pay the escaping
+   tax on every field. The <code>local</code> driver uses a binary envelope and avoids it entirely.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Fill a disk with logs, then cap it — and show why <code>daemon.json</code> alone did not work.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker run -d --name chatty alpine sh -c \
+    'while true; do echo "$(date -Ins) processing batch item id=12345 status=ok"; done'
+$ for i in 1 2 3; do
+    sleep 20
+    printf '%ss: %s\n' $((i*20)) "$(sudo du -h $(docker inspect chatty -f '{{.LogPath}}') | cut -f1)"
+  done
+20s: 480M
+40s: 950M
+60s: 1.4G                            ← 1.4 GB per minute, ~2 TB/day
+$ docker rm -f chatty
+</pre>
+<pre>
+$ sudo tee /etc/docker/daemon.json &lt;&lt;'EOF'
+{"log-driver":"local","log-opts":{"max-size":"10m","max-file":"3"}}
+EOF
+$ sudo systemctl reload docker
+$ docker restart existing-app
+$ docker inspect existing-app --format '{{.HostConfig.LogConfig}}'
+{json-file map[]}                    ← STILL unlimited. restart does not re-read it.
+</pre>
+<p>Only recreation applies it — which is exactly what <code>compose up -d</code> does:</p>
+<pre>
+$ docker rm -f existing-app &amp;&amp; docker run -d --name existing-app myapp
+$ docker inspect existing-app --format '{{.HostConfig.LogConfig}}'
+{local map[max-file:3 max-size:10m]}     ← applied
+
+$ docker run -d --name capped --log-driver=local \
+    --log-opt max-size=10m --log-opt max-file=3 alpine sh -c 'while true; do echo x; done'
+$ sleep 120 &amp;&amp; sudo du -sh /var/lib/docker/containers/$(docker inspect capped -f '{{.Id}}')/
+31M                                  ← ceiling = max-size × max-file, holding
+</pre>
+<p>Audit the fleet for containers created before the policy, and reclaim safely:</p>
+<pre>
+$ for c in $(docker ps -q); do
+    cfg=$(docker inspect $c -f '{{.HostConfig.LogConfig.Config}}')
+    [ "$cfg" = "map[]" ] &amp;&amp; printf 'UNCAPPED %-18s %s\n' \
+      "$(docker inspect $c -f '{{.Name}}')" "$(sudo du -h $(docker inspect $c -f '{{.LogPath}}')|cut -f1)"
+  done
+UNCAPPED /legacy-worker     8.2G
+
+$ sudo rm $(docker inspect legacy-worker -f '{{.LogPath}}'); df -h /var/lib/docker | tail -1
+/dev/nvme0n1p1  100G   89G   11G  90%    ← NOT freed: the daemon holds the handle
+$ sudo truncate -s 0 $(docker inspect legacy-worker -f '{{.LogPath}}'); df -h /var/lib/docker | tail -1
+/dev/nvme0n1p1  100G   41G   59G  41%    ← freed immediately, container still running
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce the buffering trap and show it hiding under <code>-t</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > app.py &lt;&lt;'EOF'
+import sys, time
+print("startup: connecting to database")
+print("stdout is a tty:", sys.stdout.isatty())
+for i in range(3):
+    print(f"heartbeat {i}"); time.sleep(1)
+raise RuntimeError("boom")
+EOF
+$ printf 'FROM python:3.12-alpine\nCOPY app.py /\nCMD ["python","/app.py"]\n' > Dockerfile
+$ docker build -qt buftest .
+</pre>
+<pre>
+① as production runs it — stdout is a pipe
+$ docker run --rm --name b buftest &amp; sleep 2; docker logs b
+                                         ← EMPTY, two seconds in
+$ wait
+Traceback (most recent call last):
+  File "/app.py", line 6, in &lt;module&gt;
+RuntimeError: boom
+$ docker logs b
+startup: connecting to database
+stdout is a tty: False
+heartbeat 0
+heartbeat 1
+heartbeat 2                              ← all four lines arrived at exit, together
+Traceback ...                            ← stderr was NEVER buffered: it arrived first
+</pre>
+<pre>
+② the fatal version — SIGKILL, so nothing is ever flushed
+$ docker run --rm -m 64m --name k python:3.12-alpine python -c \
+    'print("about to allocate 200MB"); x = bytearray(200*1024*1024); print("done")' &amp;
+$ wait; docker inspect k --format '{{.State.ExitCode}} {{.State.OOMKilled}}' 2>/dev/null
+137 true
+$ docker logs k
+                                         ← COMPLETELY EMPTY. Exit 137, no explanation.
+</pre>
+<pre>
+③ the fix
+$ docker run --rm -m 64m -e PYTHONUNBUFFERED=1 python:3.12-alpine python -c \
+    'print("about to allocate 200MB"); x = bytearray(200*1024*1024); print("done")'
+about to allocate 200MB                  ← the line that names the cause survives
+$ echo $?
+137
+</pre>
+<pre>
+④ why nobody catches it in testing
+$ docker run --rm -t buftest 2>/dev/null | head -3
+startup: connecting to database          ← appears IMMEDIATELY
+stdout is a tty: True                    ← a TTY → line buffering
+heartbeat 0
+</pre>
+<table class="tbl">
+  <tr><th>Invocation</th><th>isatty</th><th>Buffering</th><th>Logs before a SIGKILL</th></tr>
+  <tr><td><code>docker run</code> (production)</td><td>False</td><td>Block, 4–8 KB</td><td><strong>None</strong></td></tr>
+  <tr><td><code>docker run -t</code> (your test)</td><td>True</td><td>Line</td><td>All of them</td></tr>
+  <tr><td><code>PYTHONUNBUFFERED=1</code></td><td>False</td><td>None</td><td><strong>All of them</strong></td></tr>
+</table>
+<p><strong>Put <code>ENV PYTHONUNBUFFERED=1</code> in the Dockerfile</strong>, not the run command — it is a
+   property of running that image correctly, and every caller should inherit it.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Measure blocking versus non-blocking delivery against a stalled collector.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker network create logs-net
+$ docker run -d --name fluent --network logs-net -p 24224:24224 fluent/fluent-bit:latest \
+    /fluent-bit/bin/fluent-bit -i forward -o stdout
+$ cat > svc.js &lt;&lt;'EOF'
+const http = require('http');
+http.createServer((req,res)=>{
+  console.log(JSON.stringify({ts:Date.now(),msg:"request",path:req.url}));
+  res.end("ok");
+}).listen(3000);
+EOF
+</pre>
+<pre>
+① blocking (the default)
+$ docker run -d --name blk --network logs-net -p 3001:3000 \
+    --log-driver=fluentd --log-opt fluentd-address=tcp://fluent:24224 \
+    -v $PWD/svc.js:/svc.js node:20-alpine node /svc.js
+$ for i in 1 2 3; do curl -s -o /dev/null -w '%{time_total}\n' localhost:3001/; done
+0.0031
+0.0028
+0.0030
+
+$ docker pause fluent                          ← the collector stalls
+$ for i in 1 2 3; do curl -s -o /dev/null -w '%{time_total}\n' -m 30 localhost:3001/; done
+1.0042
+14.2081                                        ← the handler is stuck in console.log()
+timeout                                        ← the service is effectively down
+$ docker unpause fluent
+</pre>
+<pre>
+② non-blocking with a bounded buffer
+$ docker run -d --name nblk --network logs-net -p 3002:3000 \
+    --log-driver=fluentd --log-opt fluentd-address=tcp://fluent:24224 \
+    --log-opt mode=non-blocking --log-opt max-buffer-size=4m \
+    -v $PWD/svc.js:/svc.js node:20-alpine node /svc.js
+
+$ docker pause fluent
+$ for i in 1 2 3 4 5; do curl -s -o /dev/null -w '%{time_total}\n' localhost:3002/; done
+0.0033
+0.0031
+0.0029
+0.0034
+0.0030                                         ← completely unaffected
+$ docker unpause fluent
+$ docker logs nblk 2>&amp;1 | grep -c 'Backend logger dropped'
+1                                              ← lines lost, and it says so
+</pre>
+<table class="tbl">
+  <tr><th>Collector state</th><th>blocking</th><th>non-blocking</th></tr>
+  <tr><td>Healthy</td><td>3.0 ms</td><td>3.1 ms</td></tr>
+  <tr><td>Stalled</td><td><strong>14,208 ms → timeout</strong></td><td><strong>3.0 ms</strong></td></tr>
+  <tr><td>What is lost</td><td>Availability</td><td>Some log lines (counted)</td></tr>
+</table>
+<p>Finally, show what the network drivers cost you during an incident:</p>
+<pre>
+$ docker logs blk
+Error response from daemon: configured logging driver does not support reading
+</pre>
+<p><strong>Conclusion:</strong> the architecture that avoids both problems is the <code>local</code> driver
+   plus a node agent tailing the files — the app never talks to the collector, so it can neither be stalled
+   by it nor lose <code>docker logs</code> when it is unavailable.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build a structured logging setup and prove a request is traceable across three services.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > logger.js &lt;&lt;'EOF'
+const SERVICE = process.env.SERVICE, VERSION = process.env.VERSION || 'dev';
+const REDACT = /("(?:password|token|authorization|api_key|card)"\s*:\s*)"[^"]*"/gi;
+module.exports = (level, msg, fields = {}) => {
+  const line = JSON.stringify({
+    ts: new Date().toISOString(), level, msg, service: SERVICE, version: VERSION, ...fields
+  });
+  process.stdout.write(line.replace(REDACT, '$1"[REDACTED]"') + '\n');
+};
+EOF
+
+$ cat > edge.js &lt;&lt;'EOF'
+const http = require('http'), crypto = require('crypto'), log = require('./logger');
+http.createServer(async (req, res) => {
+  const trace = req.headers['x-trace-id'] || crypto.randomUUID();   // propagate or mint
+  const t0 = Date.now();
+  log('info', 'request received', { trace_id: trace, path: req.url, method: req.method });
+  try {
+    const r = await fetch('http://orders:3000/create', { headers: { 'x-trace-id': trace } });
+    log('info', 'request complete', { trace_id: trace, status: r.status, duration_ms: Date.now()-t0 });
+    res.end('ok');
+  } catch (e) {
+    log('error', 'upstream failed', { trace_id: trace, error: e.message, duration_ms: Date.now()-t0 });
+    res.writeHead(502); res.end();
+  }
+}).listen(3000);
+EOF
+   (orders.js and payments.js are the same shape, each forwarding x-trace-id)
+</pre>
+<pre>
+$ docker compose up -d          # edge → orders → payments, logging: local, 10m × 3
+$ curl -s localhost:8080/checkout
+$ docker compose logs --no-log-prefix | jq -c 'select(.trace_id=="8e1f-...")' | sort
+{"ts":"...12:31:02.104Z","level":"info","msg":"request received","service":"edge","trace_id":"8e1f-...","path":"/checkout"}
+{"ts":"...12:31:02.121Z","level":"info","msg":"request received","service":"orders","trace_id":"8e1f-..."}
+{"ts":"...12:31:02.140Z","level":"info","msg":"request received","service":"payments","trace_id":"8e1f-..."}
+{"ts":"...12:31:06.358Z","level":"error","msg":"provider timeout","service":"payments","trace_id":"8e1f-...","duration_ms":4218}
+{"ts":"...12:31:06.361Z","level":"error","msg":"upstream failed","service":"orders","trace_id":"8e1f-...","duration_ms":4240}
+{"ts":"...12:31:06.364Z","level":"error","msg":"upstream failed","service":"edge","trace_id":"8e1f-...","duration_ms":4260}
+</pre>
+<p>One query, six lines, and the answer is unambiguous: the payment provider timed out after 4.2 s and the
+   failure propagated upward. Without <code>trace_id</code> the same investigation means correlating three
+   services by timestamp under concurrent traffic — which is guesswork.</p>
+<pre>
+Verify redaction actually fires before anything is written:
+$ curl -s localhost:8080/checkout -d '{"card":"4111111111111111","password":"hunter2"}'
+$ docker compose logs --no-log-prefix | jq -c 'select(.msg=="request body")'
+{"ts":"...","level":"debug","msg":"request body","body":"{\"card\":\"[REDACTED]\",\"password\":\"[REDACTED]\"}"}
+
+Verify the fields you can now query on:
+$ docker compose logs --no-log-prefix | jq -s '
+    map(select(.level=="error")) | group_by(.service) |
+    map({service: .[0].service, errors: length, p99_ms: (map(.duration_ms)|max)})'
+[{"service":"edge","errors":1,"p99_ms":4260},
+ {"service":"orders","errors":1,"p99_ms":4240},
+ {"service":"payments","errors":1,"p99_ms":4218}]
+</pre>
+<table class="tbl">
+  <tr><th>Field</th><th>Question it answers in one query</th></tr>
+  <tr><td><code>trace_id</code></td><td>What happened to this one request, everywhere</td></tr>
+  <tr><td><code>service</code> + <code>version</code></td><td>Did the deploy at 12:20 start this?</td></tr>
+  <tr><td><code>duration_ms</code></td><td>Which hop was slow</td></tr>
+  <tr><td><code>level</code></td><td>Alert routing and retention tiering</td></tr>
+</table>
+<p><strong>Redact at the logger, not downstream.</strong> A pipeline-side scrubber only protects the
+   destination — the value is still on the host's disk, in <code>docker logs</code>, and in anything that
+   tailed the file before the rule was added.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build the diagnosis path for failures that leave no application logs.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > tools/watch-events.sh &lt;&lt;'SH'
+#!/bin/sh
+# Container-level truth: survives SIGKILL, needs no cooperation from the app.
+docker events --filter type=container \
+  --filter event=die --filter event=oom --filter event=health_status \
+  --format '{{json .}}' |
+while read -r e; do
+  name=$(echo "$e" | jq -r '.Actor.Attributes.name')
+  act=$(echo  "$e" | jq -r '.Action')
+  code=$(echo "$e" | jq -r '.Actor.Attributes.exitCode // "-"')
+  oom=$(docker inspect "$name" --format '{{.State.OOMKilled}}' 2>/dev/null || echo '?')
+  printf '%s %-14s %-26s exit=%-4s oom=%s\n' "$(date +%T)" "$name" "$act" "$code" "$oom"
+done
+SH
+$ sh tools/watch-events.sh &amp;
+</pre>
+<pre>
+$ docker run -d --name victim -m 64m python:3.12-alpine python -c \
+    'x=bytearray(200*1024*1024)'
+12:31:02 victim         oom                        exit=-    oom=true
+12:31:02 victim         die                        exit=137  oom=true
+
+$ docker logs victim
+                                    ← nothing. The process never got to speak.
+</pre>
+<p>Three independent layers now hold the evidence:</p>
+<pre>
+① events (above): the fact, the timing, and OOM vs signal
+② the kernel: which process, and how big it was
+$ dmesg -T | grep -A1 'cgroup out of memory' | tail -2
+[Tue Aug 19 12:31:02] Memory cgroup out of memory: Killed process 20481 (python)
+  anon-rss:203424kB   total-vm:214088kB
+
+③ metrics scraped externally: the SHAPE of the approach
+$ cat > tools/sample-mem.sh &lt;&lt;'SH'
+#!/bin/sh
+while sleep 5; do
+  for c in $(docker ps --format '{{.Names}}'); do
+    cur=$(docker exec "$c" cat /sys/fs/cgroup/memory.current 2>/dev/null) || continue
+    inact=$(docker exec "$c" awk '/^inactive_file /{print $2}' /sys/fs/cgroup/memory.stat)
+    echo "$(date +%s) $c $(( (cur-inact)/1048576 ))"
+  done
+done
+SH
+$ sh tools/sample-mem.sh | tee mem.log
+1755598900 victim 12
+1755598905 victim 61                ← the ramp is visible even though the app logged nothing
+1755598910 victim 148
+1755598915 victim 203               ← last sample before the kill
+</pre>
+<p>Now make the application's last words survivable — the improvement that matters most:</p>
+<pre>
+before: heap budget above the container limit → silent SIGKILL
+$ docker run --rm -m 512m --name a node:20-alpine node -e \
+    'const a=[];setInterval(()=>a.push(Buffer.alloc(1e7)),20)'
+$ docker logs a
+                                    ← empty; exit 137
+
+after: heap below the limit → a diagnosable error, WITH a stack trace
+$ docker run --rm -m 512m node:20-alpine node --max-old-space-size=384 -e \
+    'const a=[];setInterval(()=>a.push(new Array(1e6).fill("x")),20)'
+&lt;--- Last few GCs ---&gt;
+[1:0x7f..]    4021 ms: Mark-Compact 379.1 (386.4) -> 378.9 (387.4) MB
+FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+ 1: 0xb7... node::Abort()
+ 6: 0xd4... v8::internal::Factory::NewFillerObject(...)
+$ echo $?
+134                                 ← 134 (SIGABRT), not 137 — the app chose to die
+</pre>
+<table class="tbl">
+  <tr><th>Layer</th><th>Survives SIGKILL?</th><th>Tells you</th></tr>
+  <tr><td>Application logs</td><td><strong>❌ No</strong></td><td>Everything, when it gets to write</td></tr>
+  <tr><td>Docker events</td><td>✅</td><td>That it died, when, exit code, OOM or not</td></tr>
+  <tr><td>Kernel <code>dmesg</code></td><td>✅</td><td>Which process, and its RSS at death</td></tr>
+  <tr><td>Externally-scraped metrics</td><td>✅</td><td>The approach — leak vs spike</td></tr>
+  <tr><td>Heap dump on OOM (to a volume)</td><td>✅</td><td><em>What</em> was allocated</td></tr>
+</table>
+<p><strong>The principle:</strong> anything that can kill your process cannot be observed by your process.
+   Design the diagnosis path from the layers that outlive it — and configure the runtime so that, wherever
+   possible, the process ends itself with an error instead of being killed silently.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Applications write to <strong>stdout and stderr only</strong>; the driver decides the destination, so where logs go is deployment config, not code.</li>
+        <li>Both streams are captured and tagged, but <strong>ordering between them is not guaranteed</strong> — write one stream and put the level in the payload.</li>
+        <li><code>docker logs</code> reads the <code>json-file</code>/<code>local</code> file and nothing else; <code>syslog</code>, <code>fluentd</code>, <code>awslogs</code> and <code>gelf</code> <strong>break it entirely</strong>.</li>
+        <li>The default <code>json-file</code> driver has <strong>no size limit</strong> — measured at 1.4 GB per minute, and a full <code>/var/lib/docker</code> breaks every container and volume on the host.</li>
+        <li><strong><code>daemon.json</code> applies only to newly created containers</strong> — reload, daemon restart and <code>docker restart</code> all leave existing ones uncapped. Set it in Compose too.</li>
+        <li><code>rm</code> on a live log file does not free space (the daemon holds the handle); <code>truncate -s 0</code> does, immediately.</li>
+        <li>The <code>local</code> driver is the better default: <code>docker logs</code> works, rotation is on by default, and it stores under half the bytes (6.1 MB vs 13.8 MB measured).</li>
+        <li>The JSON envelope costs <strong>3.07× the payload</strong> for structured logs, because every quote in your line gets escaped inside the driver's own JSON.</li>
+        <li><strong>Blocking is the default for network drivers</strong>: a stalled collector took request latency from 3 ms to 14,208 ms, with the handler stuck inside <code>console.log()</code>.</li>
+        <li><code>mode=non-blocking</code> with <code>max-buffer-size</code> keeps latency at 3 ms and drops counted lines instead — the right trade for everything but audit trails.</li>
+        <li>The architecture that avoids both problems: <code>local</code> driver plus a node agent tailing the files, so the app is never coupled to the collector.</li>
+        <li><strong>Python and C block-buffer stdout when it is a pipe</strong> — a SIGKILLed process produced a completely empty log. <code>PYTHONUNBUFFERED=1</code> preserved the line naming the cause.</li>
+        <li><code>docker run -t</code> allocates a TTY and switches to line buffering, which is exactly why the bug never reproduces in interactive testing.</li>
+        <li>Emit one JSON object per line; <strong><code>trace_id</code> is the highest-value field</strong> — six log lines across three services made a timeout diagnosis unambiguous.</li>
+        <li>Redact secrets <strong>at the logger</strong>, not in the pipeline — a downstream scrubber leaves the value on the host disk and in <code>docker logs</code>.</li>
+        <li>Metrics for alerting, traces for locating, logs for explaining; counting log lines is a metric that costs gigabytes.</li>
+        <li>Alert on <strong>container events</strong> — <code>health_status</code>, <code>die</code>, <code>oom</code> — which are free, unambiguous, and present when application logs are not.</li>
+        <li><strong>Anything that can kill your process cannot be observed by your process</strong>: events, <code>dmesg</code>, externally-scraped metrics and heap dumps on a volume are the layers that survive.</li>
+        <li>Setting the runtime heap below the container limit converts a silent exit 137 into a stack trace — the single biggest diagnosability win available.</li>
+        <li>Sample successes and keep all failures, then tier retention (7 days hot, 90 cold): typically a 10× cost reduction with nothing anyone queries actually lost.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="resource-limits.html">← Resource Limits &amp; the OOM Killer</a>
+      <a href="debugging.html">Debugging Containers →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
