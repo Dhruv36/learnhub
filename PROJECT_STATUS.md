@@ -61,7 +61,7 @@ Also: the five v3 files orphaned by the nav split (`pods-deployments`, `services
 
 **🚧 IN PROGRESS: AWS v4 (track 17)** — `tutorials/aws/`, rebuilding 12 v3 lessons (~12KB) into
 **20 lessons at v4 depth** (56–75KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
-**10 of 20 done — §1 Foundations, §2 Networking and §3 Compute COMPLETE:**
+**14 of 20 done — §1 Foundations, §2 Networking, §3 Compute and §4 Data COMPLETE:**
 
 *§1 Foundations ×4* — ✅ `index.html` (**the shared-responsibility line moves per service**; AZ *names*
 are randomised per account so cross-account placement must use **Zone IDs**; the `us-east-1` control-plane
@@ -146,11 +146,37 @@ growing LINEARLY** — `BisectBatchOnFunctionError` isolated it in 15 splits; **
 mismatch** — 387 connections vs 90, and raising `max_connections` traded refusals for **8.4-second queries**;
 **API Gateway's 29 s wall returns 504 while the function completes and bills** — 47 customers charged twice,
 fixed **idempotency-first**; SnapStart's shared-snapshot uniqueness trap)
-**⏳ NEXT: §4 Data — `s3.html` (NEW)**, then `rds-aurora.html` (NEW), `dynamodb.html` (NEW),
-`messaging.html` (v3 rewrite).
+*§4 Data ×4* — ✅ `s3.html` (**no folders** — `CommonPrefixes` proven synthetic, `mv` = COPY+DELETE, LIST a
+billion objects = **1 M requests / $5 / 5.5 h**; **strong consistency since Dec 2020** and **random prefixes
+obsolete since 2018**, both still circulating; per-prefix limits driven into `503 SlowDown` — **3,204 → 25,500
+req/s across 8 prefixes**, adaptive retries absorbing a 31% throttle rate; **`BlockPublicPolicy` REFUSES TO
+STORE** the policy being debugged; **DELETE writes a marker so deleting makes the bucket bigger** — console and
+`s3 ls` hid **10.2 TB** that CloudWatch and the invoice both counted; the 4-clause lifecycle rule **14.0 → 2.6
+TB (81%)**; **Bucket Keys $577 → $3.71/mo**; **compliance-mode Object Lock irreversible by root**) ·
+✅ `rds-aurora.html` (**Multi-AZ is availability, not scale** — no standby endpoint, not even listed, and it
+costs the same as single-AZ+replica while buying the opposite thing; failover **38 s AWS / 49 s Node / NEVER on
+a default JVM / 9 s behind RDS Proxy**; replica lag **0/200 failures idle, 187/200 under write load**;
+**Aurora ships redo log records not pages** → **1,841 s vs 21 ms** lag and **47 min vs 4.6 min** to add a
+replica with zero writer impact; **retention 0 silently disables PITR**; **a restore returns a NEW hostname,
+default parameter group, default SG, no Multi-AZ** — real RTO **32 min vs a runbook claiming 11**; Performance
+Insights wait events picking a **$0 index worth 32×** over a **$8,064/yr resize worth 1.3×**) ·
+✅ `dynamodb.html` (model from access patterns not entities; **hot partition = 69% throttled at 2.5%
+consumed**, capacity doubled to no effect, sharded to **21,840/s**; **`FilterExpression` applies AFTER the
+read** — 482,104 items / 60,263 RCU to return 12, vs **1.5 RCU** on a GSI, with **`ScannedCount` vs `Count`**
+as the diagnostic; **a throttled GSI rejected 92% of BASE-TABLE writes** while the table sat at 1%;
+single-table design with every pattern proven one Query + a hot-partition review of *index* keys;
+**read-modify-write lost 947 of 1,000 units silently** and the atomic conditional fix is *cheaper*) ·
+✅ `messaging.html` (queue/topic/bus/stream chosen by **backpressure, retention, replay**; visibility timeout
+**14 of 20 jobs run twice with perfect metrics**; **long polling = 401× fewer requests AND 10× lower latency**,
+no trade-off; filter policies **−40% deliveries, −99.2%** for one subscriber; poison message received **43×
+in 90 s**, capped by `maxReceiveCount` + rate-limited redrive; **the FIFO message group ID is ordering AND
+parallelism** — **304 msg/s on one group with 20 idle workers, 18,420 on sixty**; **EventBridge archive is NOT
+retroactive** — a `FilterArns`-scoped replay recovered **3,632 events** without touching 3 healthy consumers;
+**everything is at-least-once → key idempotency on BUSINESS ids, not message ids**)
+**⏳ NEXT: §5 Operations — `observability.html` (v3 rewrite)**, then `iac.html` (v3 rewrite) and
+`security-ops.html` (NEW).
 
-*Remaining sections:* §4 Data ×4
-(`s3` NEW, `rds-aurora` NEW, `dynamodb` NEW, `messaging` v3 rewrite) · §5 Operations ×3
+*Remaining sections:* §5 Operations ×3
 (`observability`, `iac` v3 rewrites, `security-ops` NEW) · §6 Architecture ×3 (`well-architected` v3
 rewrite, `resilience-dr` NEW, `scaling-patterns` NEW).
 
