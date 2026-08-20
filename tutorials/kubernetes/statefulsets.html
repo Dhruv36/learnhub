@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StatefulSets &amp; Stable Identity — Kubernetes — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>StatefulSets &amp; Stable Identity <span class="level-badge level-adv">Configuration &amp; State</span></h1>
+    <p><strong>What you'll master:</strong> the three guarantees a Deployment cannot give — <strong>stable
+       ordinal names, stable per-pod storage, and ordered operations</strong> — and the mechanics that produce
+       them; why a StatefulSet <em>requires</em> a headless Service and what breaks without it; the cost of
+       <code>OrderedReady</code>, measured, where <strong>one stuck pod blocks every higher ordinal
+       indefinitely</strong>, and when <code>podManagementPolicy: Parallel</code> is the right escape;
+       <code>partition</code>-based rolling updates, which give you a canary by ordinal that Deployments have no
+       equivalent for; the PVC lifecycle surprise — <strong>scaling down does not delete PVCs, and neither does
+       deleting the StatefulSet</strong> — plus the retention policy that changes it; the force-delete hazard
+       that turns a stuck pod into a split-brain database; and the honest question of when a StatefulSet is the
+       wrong tool, which is more often than its reputation suggests. Prerequisites:
+       <a href="storage.html">Storage</a>, <a href="dns-discovery.html">Cluster DNS</a>,
+       <a href="deployments.html">Deployments</a>.</p>
+
+    <h2>Part 1 — Three Guarantees</h2>
+
+    <table class="tbl">
+      <tr><th></th><th>Deployment</th><th>StatefulSet</th></tr>
+      <tr><td>Pod names</td><td>Random suffix (<code>web-7d4b9c-x8k2p</code>)</td><td><strong>Ordinal (<code>db-0</code>, <code>db-1</code>)</strong></td></tr>
+      <tr><td>Name after rescheduling</td><td>New name</td><td><strong>Same name</strong></td></tr>
+      <tr><td>DNS</td><td>Service only</td><td><strong>Per-pod: <code>db-0.db-headless.ns.svc</code></strong></td></tr>
+      <tr><td>Storage</td><td>Shared PVC, or none</td><td><strong>One PVC per pod, reattached by ordinal</strong></td></tr>
+      <tr><td>Create/scale order</td><td>All at once</td><td>0, 1, 2… waiting for Ready</td></tr>
+      <tr><td>Delete/scale-down order</td><td>Arbitrary</td><td><strong>Reverse: N-1, then N-2…</strong></td></tr>
+      <tr><td>Update order</td><td>By <code>maxSurge</code>/<code>maxUnavailable</code></td><td>Highest ordinal first, one at a time</td></tr>
+    </table>
+
+<pre>
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: db }
+spec:
+  serviceName: db-headless          ← REQUIRED: this is what creates per-pod DNS
+  replicas: 3
+  selector: { matchLabels: { app: db } }
+  template:
+    metadata: { labels: { app: db } }
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: pg
+        image: postgres:16-alpine
+        volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+  volumeClaimTemplates:             ← ONE PVC PER POD, created automatically
+  - metadata: { name: data }
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: retain      ← see Storage: never the Delete default
+      resources: { requests: { storage: 100Gi } }
+</pre>
+
+<pre>
+$ kubectl get pods,pvc -l app=db
+NAME       READY   STATUS
+pod/db-0   1/1     Running
+pod/db-1   1/1     Running
+pod/db-2   1/1     Running
+NAME                              STATUS   VOLUME        CAPACITY
+persistentvolumeclaim/data-db-0   Bound    pvc-9f21c0e   100Gi     ← <template>-<sts>-<ordinal>
+persistentvolumeclaim/data-db-1   Bound    pvc-4c88ba7   100Gi
+persistentvolumeclaim/data-db-2   Bound    pvc-7a3d2f1   100Gi
+</pre>
+
+    <div class="note">🔑 <strong>Identity survives everything except deletion of the PVC.</strong> Delete
+       <code>db-1</code> and it comes back as <code>db-1</code>, on possibly a different node, with a new IP —
+       and reattached to <code>data-db-1</code>, the same disk with the same data. That triple (name, DNS record,
+       volume) is the entire point of the object, and it is what lets clustered software recognise a restarted
+       member as the same member rather than as a new empty one.</div>
+
+    <h2>Part 2 — The Headless Service Requirement</h2>
+
+    <p><code>serviceName</code> is not optional decoration: it is the name CoreDNS uses to build per-pod records.
+       Point it at a Service that does not exist and the pods run with no individual DNS at all.</p>
+
+<pre>
+apiVersion: v1
+kind: Service
+metadata: { name: db-headless }
+spec:
+  clusterIP: None                    ← headless: no VIP, no kube-proxy rules
+  publishNotReadyAddresses: true     ← lets members find each other during bootstrap
+  selector: { app: db }
+  ports: [{ name: pg, port: 5432 }]
+
+$ kubectl exec db-0 -- dig +short db-1.db-headless.default.svc.cluster.local
+10.244.2.4
+$ kubectl delete pod db-1 &amp;&amp; sleep 25
+$ kubectl exec db-0 -- dig +short db-1.db-headless.default.svc.cluster.local
+10.244.3.17                          ← NEW IP, SAME NAME — the stable handle
+</pre>
+
+    <p>The <code>publishNotReadyAddresses</code> detail is what makes clustered software able to bootstrap at all:
+       during first start no member is Ready because each is waiting to discover peers, so without it DNS returns
+       nothing and the cluster deadlocks. It is covered in full in
+       <a href="dns-discovery.html">Cluster DNS</a>.</p>
+
+    <p>Which leads to the standard two-Service pattern, because those semantics are right for peers and wrong for
+       clients:</p>
+
+    <table class="tbl">
+      <tr><th>Service</th><th>Type</th><th><code>publishNotReadyAddresses</code></th><th>Used by</th></tr>
+      <tr><td><code>db-headless</code></td><td>Headless</td><td><strong>true</strong></td><td>Members finding each other</td></tr>
+      <tr><td><code>db</code></td><td>ClusterIP</td><td>false</td><td>Applications — normal readiness gating</td></tr>
+      <tr><td><code>db-primary</code></td><td>ClusterIP with a <code>role=primary</code> selector</td><td>false</td><td>Writes, if the operator labels the leader</td></tr>
+    </table>
+
+    <h2>Part 3 — Ordering, and What It Costs</h2>
+
+<pre>
+podManagementPolicy: OrderedReady    (the default)
+  create:  db-0 → wait for Ready → db-1 → wait for Ready → db-2
+  delete:  db-2 → db-1 → db-0                       (reverse)
+  update:  db-2 → db-1 → db-0, one at a time, waiting for Ready between each
+</pre>
+
+<pre>
+$ kubectl set image sts/db pg=postgres:16-alpine-broken
+$ sleep 120; kubectl get pods -l app=db
+NAME   READY   STATUS             RESTARTS   AGE
+db-0   1/1     Running            0          2h
+db-1   1/1     Running            0          2h
+db-2   0/1     CrashLoopBackOff   4          2m       ← highest ordinal first
+
+$ sleep 3600; kubectl get pods -l app=db --no-headers | awk '{print $1, $3}'
+db-0 Running
+db-1 Running
+db-2 CrashLoopBackOff                ← an hour later: db-1 and db-0 were never touched
+</pre>
+
+    <div class="note">⚠️ <strong>A stuck pod halts the rollout — which is the feature, not the bug.</strong> With
+       a Deployment and <code>minReadySeconds: 0</code>, a broken image can replace every replica before anyone
+       notices. A StatefulSet stops at the first failure, leaving the rest of the cluster serving. The mirror
+       image is that a pod which can never become Ready blocks scaling and updates <em>indefinitely</em>, so
+       <code>db-0</code> failing means nothing above it will ever start.</div>
+
+    <table class="tbl">
+      <tr><th><code>podManagementPolicy</code></th><th>Behaviour</th><th>Use when</th></tr>
+      <tr><td><code>OrderedReady</code> (default)</td><td>Strictly sequential; one failure blocks everything</td><td>Members must join in order (many databases)</td></tr>
+      <tr><td><code>Parallel</code></td><td>All pods created/deleted at once; identity and storage still stable</td><td><strong>Peers that self-organise</strong> — Cassandra, Elasticsearch, Kafka</td></tr>
+    </table>
+
+<pre>
+$ kubectl patch sts db -p '{"spec":{"podManagementPolicy":"Parallel"}}'
+The StatefulSet "db" is invalid: spec: Forbidden: updates to statefulset spec for
+fields other than 'replicas', 'ordinals', 'template', 'updateStrategy',
+'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden
+   → it is IMMUTABLE. Delete the StatefulSet with --cascade=orphan and recreate it;
+     the pods and PVCs survive and are re-adopted.
+</pre>
+
+    <h2>Part 4 — Updates by Ordinal: a Canary Deployments Cannot Do</h2>
+
+<pre>
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    partition: 2            ← ONLY pods with ordinal >= 2 are updated
+</pre>
+
+<pre>
+$ kubectl patch sts db -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":2}}}}'
+$ kubectl set image sts/db pg=postgres:17-alpine
+$ sleep 60; kubectl get pods -l app=db \
+    -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image
+NAME   IMAGE
+db-0   postgres:16-alpine
+db-1   postgres:16-alpine
+db-2   postgres:17-alpine        ← one canary; soak it for as long as you like
+
+$ kubectl patch sts db -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":0}}}}'
+$ kubectl rollout status sts/db
+statefulset rolling update complete 3 pods at revision db-7d4b9c8f5d...
+</pre>
+
+    <table class="tbl">
+      <tr><th>Strategy</th><th>Effect</th></tr>
+      <tr><td><code>RollingUpdate</code>, <code>partition: 0</code></td><td>Update everything, highest ordinal first</td></tr>
+      <tr><td><code>RollingUpdate</code>, <code>partition: N</code></td><td><strong>Canary</strong>: only ordinals ≥ N</td></tr>
+      <tr><td><code>OnDelete</code></td><td>Nothing happens until <em>you</em> delete a pod — full manual control</td></tr>
+      <tr><td><code>maxUnavailable</code> (newer)</td><td>Update more than one at a time, still by ordinal</td></tr>
+    </table>
+
+    <p><code>OnDelete</code> is what most database operators use, because upgrading a replica is rarely just
+       "replace the pod" — it may need a controlled failover, a schema step, or a verification pause between
+       members. The StatefulSet supplies identity and storage; the operator supplies the procedure.</p>
+
+    <h2>Part 5 — PVCs Outlive Almost Everything</h2>
+
+<pre>
+$ kubectl scale sts db --replicas=1
+$ sleep 30; kubectl get pods,pvc -l app=db --no-headers | awk '{print $1, $2}'
+pod/db-0 1/1
+persistentvolumeclaim/data-db-0 Bound
+persistentvolumeclaim/data-db-1 Bound      ← kept
+persistentvolumeclaim/data-db-2 Bound      ← kept, and still being billed
+
+$ kubectl delete sts db
+$ kubectl get pvc -l app=db --no-headers | wc -l
+3                                          ← deleting the StatefulSet keeps them ALL
+</pre>
+
+    <table class="tbl">
+      <tr><th>Action</th><th>Default PVC behaviour</th><th>Why</th></tr>
+      <tr><td>Delete a pod</td><td>Kept</td><td>The replacement must reattach</td></tr>
+      <tr><td>Scale down</td><td><strong>Kept</strong></td><td>Scaling back up must find its data</td></tr>
+      <tr><td>Delete the StatefulSet</td><td><strong>Kept</strong></td><td>Deliberate: the data may be the point</td></tr>
+      <tr><td>Delete the PVC</td><td>PV follows <code>reclaimPolicy</code></td><td><a href="storage.html"><code>Delete</code> destroys the disk</a></td></tr>
+    </table>
+
+<pre>
+persistentVolumeClaimRetentionPolicy:
+  whenScaled:  Delete        ← delete PVCs for ordinals removed by scaling down
+  whenDeleted: Retain        ← keep them when the StatefulSet itself is deleted
+</pre>
+
+    <div class="note">🔑 <strong>Retained PVCs are simultaneously a safety feature and a silent cost.</strong>
+       Scaling a 10-replica cluster to 3 leaves seven 100 GB volumes attached to nothing, billed indefinitely, and
+       nothing in Kubernetes will ever mention them. But setting <code>whenScaled: Delete</code> means an
+       autoscaling event or a hasty <code>kubectl scale</code> destroys real data. For databases, keep the
+       default and audit orphaned PVCs on a schedule; use <code>Delete</code> only for genuinely disposable
+       workloads.</div>
+
+    <h2>Part 6 — Force Deletion, and When Not to Use a StatefulSet</h2>
+
+<pre>
+$ kubectl get pod db-0
+NAME   READY   STATUS        AGE
+db-0   1/1     Terminating   14m           ← its node died
+
+$ kubectl delete pod db-0 --force --grace-period=0
+warning: Immediate deletion does not wait for confirmation that the running resource
+has been terminated. The resource may continue to run on the cluster indefinitely.
+</pre>
+
+    <p>Read that warning literally. For a Deployment it is usually fine. For a StatefulSet it removes the one
+       guarantee the object exists to provide — <strong>that <code>db-0</code> exists exactly once</strong>. If
+       the node is partitioned rather than dead, the old <code>db-0</code> is still running and still writing,
+       and Kubernetes will now start a second <code>db-0</code> on another node. With
+       <a href="storage.html">RWO storage</a> the volume attach usually blocks that; with RWX or a replicated
+       database, it does not.</p>
+
+    <table class="tbl">
+      <tr><th>Situation</th><th>Correct action</th></tr>
+      <tr><td>Node genuinely dead</td><td>Delete the <strong>Node object</strong>, or apply the <code>out-of-service</code> taint</td></tr>
+      <tr><td>Node partitioned</td><td><strong>Wait.</strong> Force-deleting risks two writers</td></tr>
+      <tr><td>Pod stuck on a live node</td><td>Fix the finalizer, preStop hook or unmount failure</td></tr>
+      <tr><td>You must force it</td><td>Prove the process is gone first — power off the instance</td></tr>
+    </table>
+
+    <h4>When a StatefulSet is the wrong tool</h4>
+
+    <table class="tbl">
+      <tr><th>Workload</th><th>Better choice</th><th>Why</th></tr>
+      <tr><td>App writing to a shared RWX volume</td><td><strong>Deployment</strong></td><td>No identity needed; ordering only slows deploys</td></tr>
+      <tr><td>App whose state is in an external database</td><td>Deployment</td><td>The pods are stateless</td></tr>
+      <tr><td>Production PostgreSQL/MySQL</td><td><strong>An operator</strong>, or a managed service</td><td>Failover, backups, PITR are not StatefulSet features</td></tr>
+      <tr><td>Kafka, Cassandra, Elasticsearch</td><td>StatefulSet (via their operator)</td><td>Genuine per-member identity and storage</td></tr>
+      <tr><td>Sharded cache needing stable names</td><td>StatefulSet</td><td>Identity, without ordering: use <code>Parallel</code></td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>A StatefulSet is not a database.</strong> It gives identity, storage and
+       ordering — it does not know what a leader is, cannot fail over, will not take a backup, and has no idea
+       whether replication is caught up. Everything that makes a database production-ready lives in an operator or
+       in the engine itself. "We run Postgres on Kubernetes" means "we run an operator"; a bare StatefulSet is a
+       single point of failure with good name management.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A bare StatefulSet running a single-replica production database on the default StorageClass,
+         with <code>OrderedReady</code>, no headless Service configured for peer discovery, and a runbook that
+         says "if a pod is stuck, force delete it".</strong> The default class has
+         <code>reclaimPolicy: Delete</code>, so the day someone tidies up a PVC the disk is destroyed at the cloud
+         provider. Scaling the cluster from 10 to 3 during a cost review leaves seven 100 GB volumes attached to
+         nothing and billed for a year, because nothing in Kubernetes mentions them. The peer Service was created
+         without <code>publishNotReadyAddresses</code>, so the cluster deadlocks on first boot — every member
+         waiting for peers that DNS refuses to publish until they are Ready. A bad image update leaves
+         <code>db-0</code> in <code>CrashLoopBackOff</code>, and because ordering is strict, nothing above it will
+         ever start again. And when a node is partitioned, the runbook's force-delete starts a second
+         <code>db-0</code> while the first is still writing — turning a temporary outage into corrupted data and
+         destroying the one guarantee the object existed to provide.</p>
+      <p>✅ <strong>Use an operator for databases, a <code>Retain</code> class for the volumes, the right
+         management policy for the software, and never force-delete a pod whose process you have not proven is
+         gone.</strong> Let an operator own failover, backups and version upgrades — the StatefulSet underneath it
+         supplies identity and storage, and nothing more. Point <code>volumeClaimTemplates</code> at a
+         <code>Retain</code> StorageClass so a deleted PVC detaches rather than destroys, and audit orphaned PVCs
+         on a schedule since scaling down deliberately keeps them. Give the peer discovery Service
+         <code>publishNotReadyAddresses: true</code> and keep a separate ClusterIP Service with normal readiness
+         gating for application traffic. Choose <code>OrderedReady</code> when members must join in sequence and
+         <code>Parallel</code> for software that self-organises — and remember the field is immutable, so it needs
+         <code>--cascade=orphan</code> to change. Use <code>partition</code> to canary one ordinal before
+         committing the rest, which no Deployment can do. And when a pod is stuck, delete the <em>Node</em> object
+         or apply the <code>out-of-service</code> taint once you are certain the machine is dead, rather than
+         force-deleting the pod and hoping.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Using a StatefulSet as a database solution</td><td>It has no failover, backup or leader concept</td><td>An operator, or a managed service</td></tr>
+      <tr><td><code>volumeClaimTemplates</code> on the default class</td><td><code>reclaimPolicy: Delete</code> destroys the disk</td><td>A <code>Retain</code> StorageClass</td></tr>
+      <tr><td>Expecting scale-down to free storage</td><td>PVCs are kept deliberately — and billed</td><td>Audit orphans; retention policy if disposable</td></tr>
+      <tr><td>Expecting <code>delete sts</code> to clean up</td><td>PVCs survive that too</td><td>Delete them explicitly, knowingly</td></tr>
+      <tr><td>Missing or wrong <code>serviceName</code></td><td>No per-pod DNS records exist at all</td><td>A headless Service, referenced correctly</td></tr>
+      <tr><td>No <code>publishNotReadyAddresses</code></td><td>Bootstrap deadlock: readiness needs peers, peers need readiness</td><td>Set it on the peer Service</td></tr>
+      <tr><td>One Service for peers and clients</td><td>Clients get not-ready members</td><td>Two Services</td></tr>
+      <tr><td><code>OrderedReady</code> for self-organising peers</td><td>Slow rollouts; one stuck pod blocks all</td><td><code>Parallel</code></td></tr>
+      <tr><td>Trying to patch <code>podManagementPolicy</code></td><td>Immutable</td><td><code>--cascade=orphan</code> and recreate</td></tr>
+      <tr><td><code>kubectl delete pod --force</code> on a stuck member</td><td><strong>Two pods with one identity — split brain</strong></td><td>Delete the Node, or the <code>out-of-service</code> taint</td></tr>
+      <tr><td>Addressing members by IP</td><td>IPs change on every reschedule</td><td>The ordinal DNS name</td></tr>
+      <tr><td>Assuming ordinal 0 is the leader</td><td>Kubernetes has no leader concept</td><td>Ask the application; label the leader</td></tr>
+      <tr><td>Expecting a rollback to restore data</td><td>Only the pod template is versioned</td><td>Database-level backups</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> When would you use a StatefulSet instead of a Deployment?</summary>
+      <p><strong>When pods are not interchangeable</strong> — when each one needs a stable name, its own storage,
+         or a defined order.</p>
+      <table class="tbl">
+        <tr><th></th><th>Deployment</th><th>StatefulSet</th></tr>
+        <tr><td>Pod names</td><td>Random</td><td><code>db-0</code>, <code>db-1</code> — stable across rescheduling</td></tr>
+        <tr><td>Storage</td><td>Shared or none</td><td>One PVC per pod, reattached by ordinal</td></tr>
+        <tr><td>DNS</td><td>Service only</td><td>Per-pod record</td></tr>
+        <tr><td>Ordering</td><td>None</td><td>0,1,2 up; N-1…0 down</td></tr>
+      </table>
+      <p><strong>The clarifying test:</strong> if you can kill any pod and a replacement is equally good, use a
+         Deployment. If <code>db-1</code> must come back as <code>db-1</code> with <code>db-1</code>'s data,
+         use a StatefulSet.</p>
+      <p><strong>The common false positive:</strong> an application with a shared RWX volume or whose state lives
+         in an external database is <em>stateless</em> from Kubernetes' point of view. A StatefulSet there buys
+         nothing and makes deploys slower.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why does a StatefulSet need a headless Service?</summary>
+      <p><strong>Because that Service's name is what CoreDNS uses to build the per-pod DNS records.</strong>
+         <code>spec.serviceName</code> supplies the middle of
+         <code>db-0.<em>db-headless</em>.namespace.svc.cluster.local</code>.</p>
+<pre>
+spec:
+  serviceName: db-headless
+---
+kind: Service
+metadata: { name: db-headless }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: db }
+</pre>
+      <p>Headless means no ClusterIP and no kube-proxy rules — DNS <em>is</em> the whole feature. Without it there
+         is no stable way to address one member, which is what clustered software needs to name its peers.</p>
+      <p><strong>The detail that catches people:</strong> <code>publishNotReadyAddresses: true</code>. During
+         bootstrap no member is Ready — each is waiting to find peers — so with the default, DNS returns nothing
+         and the cluster deadlocks permanently. That is also why production setups use <strong>two</strong>
+         Services: a headless one publishing not-ready addresses for peers, and a normal ClusterIP with readiness
+         gating for applications.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> You scaled a StatefulSet from 5 to 2. What happened to the storage?</summary>
+      <p><strong>Nothing — all five PVCs still exist, and three of them are attached to nothing while continuing
+         to bill.</strong></p>
+<pre>
+$ kubectl get pvc -l app=db --no-headers | wc -l
+5
+$ kubectl get pods -l app=db --no-headers | wc -l
+2
+</pre>
+      <p><strong>That is deliberate:</strong> scaling back to 5 must find each member's data where it left it. The
+         same applies to deleting the StatefulSet itself — the PVCs survive, because the data is usually the point
+         and an accidental <code>kubectl delete sts</code> should not be destructive.</p>
+<pre>
+persistentVolumeClaimRetentionPolicy:
+  whenScaled:  Delete
+  whenDeleted: Retain
+</pre>
+      <p><strong>The trade-off to state:</strong> <code>whenScaled: Delete</code> removes the silent cost but
+         means a hasty <code>kubectl scale</code> destroys real data. For databases I keep the default and audit
+         orphaned PVCs on a schedule, because nothing in Kubernetes will ever mention them.</p>
+      <p><strong>And the compounding hazard:</strong> if the StorageClass has <code>reclaimPolicy: Delete</code>,
+         deleting those orphaned PVCs destroys the disks at the cloud provider — so the cleanup step is exactly
+         where the data loss happens. Use a <code>Retain</code> class for anything you care about.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A StatefulSet update is stuck. <code>db-2</code> is crash-looping and <code>db-1</code>/<code>db-0</code> are untouched. Is that broken?</summary>
+      <p><strong>No — it is the ordering guarantee doing its job.</strong> Updates proceed from the highest
+         ordinal down, one pod at a time, and will not continue until the current pod is Ready.</p>
+<pre>
+db-0   1/1   Running            (old image)
+db-1   1/1   Running            (old image)
+db-2   0/1   CrashLoopBackOff   (new image)     ← the rollout stops here, indefinitely
+</pre>
+      <p><strong>Compare with a Deployment:</strong> with <code>minReadySeconds: 0</code> a broken image can
+         replace every replica before anyone reacts. The StatefulSet stopped at one, leaving two members
+         serving.</p>
+      <p><strong>The mirror image is the real risk:</strong> a pod that can never become Ready blocks everything
+         above it forever. If <code>db-0</code> is the broken one, nothing else will ever start.
+         <code>podManagementPolicy: Parallel</code> avoids that for software that self-organises — but note it is
+         <strong>immutable</strong>, so changing it requires deleting the StatefulSet with
+         <code>--cascade=orphan</code> and recreating it, which preserves the pods and PVCs.</p>
+      <p><strong>Recovery here</strong> is to roll the image back (<code>kubectl rollout undo sts/db</code>); the
+         controller replaces <code>db-2</code> with the old spec and the set converges. If the pod is wedged for
+         another reason, <code>updateStrategy: OnDelete</code> gives you fully manual control while you
+         work.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a production database deployment on Kubernetes.</summary>
+      <p><strong>First, argue against it.</strong> A managed service gives backups, point-in-time recovery,
+         failover, patching and a support contract. Running it yourself is justified by a specific requirement —
+         cost at scale, an unavailable engine, data residency, or an operator that genuinely automates the hard
+         parts — and not by preference.</p>
+      <p><strong>If it is in-cluster, the design:</strong></p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Choice</th><th>Reason</th></tr>
+        <tr><td>Controller</td><td><strong>An operator</strong> (CloudNativePG, Zalando, Percona)</td><td>Failover, backups, PITR, version upgrades</td></tr>
+        <tr><td>Workload</td><td>StatefulSet, managed by the operator</td><td>Identity and per-pod storage only</td></tr>
+        <tr><td>Storage</td><td><code>Retain</code> class, <code>WaitForFirstConsumer</code>, expandable</td><td>No accidental destruction; zone-correct</td></tr>
+        <tr><td>Availability</td><td><strong>Replication</strong>, spread across zones</td><td>Disk failover is minutes; replica promotion is seconds</td></tr>
+        <tr><td>Services</td><td>Headless for peers, ClusterIP for clients, one for the primary</td><td>Different readiness semantics</td></tr>
+        <tr><td>Backups</td><td>Engine-native, to another account and region</td><td>Snapshots are same-account and crash-consistent</td></tr>
+        <tr><td>Updates</td><td><code>OnDelete</code> or operator-driven</td><td>Upgrades need failover, not pod replacement</td></tr>
+      </table>
+      <p><strong>The point I would press:</strong> a StatefulSet gives identity, storage and ordering. It has no
+         concept of a leader, cannot fail over, and does not know whether replication is caught up. Every property
+         that makes a database production-ready lives above it. A bare StatefulSet running one replica is a single
+         point of failure with excellent name management.</p>
+      <p><strong>What I would insist on operationally:</strong> restore drills on a schedule, because an untested
+         backup is a hypothesis; PodDisruptionBudgets so a node drain cannot take quorum; anti-affinity or
+         topology spread so replicas are not co-located; and an explicit, rehearsed runbook for the partitioned-node
+         case — because that is precisely when someone reaches for <code>--force</code> and creates two writers.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A StatefulSet pod is stuck <code>Terminating</code> because its node is unreachable. Walk through it.</summary>
+      <p><strong>The control plane cannot tell a dead node from a partitioned one, so it refuses to conclude the
+         pod is gone. That refusal is protecting you.</strong></p>
+<pre>
+$ kubectl get pod db-0
+db-0   1/1   Terminating   14m
+$ kubectl get node worker-2
+worker-2   NotReady   14m
+</pre>
+      <p><strong>Why force-deleting is uniquely dangerous here:</strong> a StatefulSet's core guarantee is that
+         <code>db-0</code> exists exactly once. <code>--force --grace-period=0</code> removes the object without
+         any confirmation that the process stopped, and the controller immediately creates a new
+         <code>db-0</code> elsewhere. If the node was partitioned, the original is still running and still
+         writing — two members with one identity, which for a database means divergent data and, at cluster level,
+         split brain.</p>
+      <table class="tbl">
+        <tr><th>Situation</th><th>Action</th></tr>
+        <tr><td>Node genuinely dead (verified powered off)</td><td>Delete the Node object, or taint <code>node.kubernetes.io/out-of-service</code></td></tr>
+        <tr><td>Node unreachable, status unknown</td><td><strong>Wait.</strong> Investigate the network first</td></tr>
+        <tr><td>Node alive, pod wedged</td><td>Finalizers, preStop hook, volume unmount</td></tr>
+      </table>
+      <p>The <code>out-of-service</code> taint is the supported path: it deletes the pods <em>and</em> force-detaches
+         their volumes, so the replacement starts in seconds rather than after the ~6-minute detach timeout
+         described in <a href="storage.html">Storage</a>. It carries the same requirement — the node must really
+         be gone.</p>
+      <p><strong>The design conclusion:</strong> if this scenario is an outage you cannot tolerate, the answer is
+         not faster force-deletion. It is replication, so that losing one member is a failover rather than a
+         recovery, and the stuck pod stops being on the critical path at all.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove identity and storage survive rescheduling.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Service
+metadata: { name: db-headless }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: db }
+  ports: [{ name: p, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: db }
+spec:
+  serviceName: db-headless
+  replicas: 3
+  selector: { matchLabels: { app: db } }
+  template:
+    metadata: { labels: { app: db } }
+    spec:
+      containers:
+      - name: c
+        image: busybox
+        command: ['sh','-c','echo "$(hostname) created $(date -Iseconds)" >> /data/log; sleep 3600']
+        volumeMounts: [{ name: data, mountPath: /data }]
+  volumeClaimTemplates:
+  - metadata: { name: data }
+    spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }
+EOF
+
+$ kubectl get pods,pvc -l app=db --no-headers | awk '{print $1, $2}'
+pod/db-0 1/1
+pod/db-1 1/1
+pod/db-2 1/1
+persistentvolumeclaim/data-db-0 Bound
+persistentvolumeclaim/data-db-1 Bound
+persistentvolumeclaim/data-db-2 Bound        ← <template>-<sts>-<ordinal>
+</pre>
+<pre>
+$ kubectl exec db-1 -- sh -c 'echo "UNIQUE-DATA-FOR-DB1" >> /data/log'
+$ kubectl get pod db-1 -o custom-columns=NODE:.spec.nodeName,IP:.status.podIP --no-headers
+worker-2   10.244.2.4
+
+$ kubectl delete pod db-1
+$ sleep 25; kubectl get pod db-1 -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IP:.status.podIP --no-headers
+db-1   worker-3   10.244.3.17        ← SAME NAME, different node, different IP
+$ kubectl exec db-1 -- cat /data/log
+db-1 created 2026-08-19T12:31:02+00:00
+UNIQUE-DATA-FOR-DB1                  ← the same volume, reattached
+db-1 created 2026-08-19T12:39:44+00:00
+</pre>
+<pre>
+DNS follows the name, not the IP:
+$ kubectl exec db-0 -- nslookup db-1.db-headless 2>/dev/null | tail -2
+Name:   db-1.db-headless.default.svc.cluster.local
+Address: 10.244.3.17                 ← updated automatically
+
+Contrast with a Deployment:
+$ kubectl create deploy app --image=busybox --replicas=3 -- sleep 3600
+$ kubectl get pods -l app=app --no-headers | awk '{print $1}'
+app-6799fc88d8-4wm2t
+app-6799fc88d8-m4j1q
+app-6799fc88d8-p9v3w
+$ kubectl delete pod app-6799fc88d8-m4j1q; sleep 10
+$ kubectl get pods -l app=app --no-headers | awk '{print $1}'
+app-6799fc88d8-4wm2t
+app-6799fc88d8-p9v3w
+app-6799fc88d8-t2h8n                 ← a DIFFERENT name; nothing is stable
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Observe ordered creation, deletion and the blocking failure.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl delete sts db; kubectl delete pvc -l app=db
+$ kubectl apply -f sts.yaml   # 3 replicas, with a 10s startup delay per pod
+$ while sleep 3; do kubectl get pods -l app=db --no-headers | awk '{printf "%s=%s ", $1, $3}'; echo; done
+db-0=ContainerCreating
+db-0=Running
+db-0=Running db-1=Pending
+db-0=Running db-1=ContainerCreating
+db-0=Running db-1=Running db-2=Pending
+db-0=Running db-1=Running db-2=Running
+                                     ← strictly one at a time, each waiting for Ready
+
+$ kubectl scale sts db --replicas=0
+$ while sleep 2; do kubectl get pods -l app=db --no-headers | awk '{printf "%s ", $1}'; echo; done
+db-0 db-1 db-2
+db-0 db-1                            ← db-2 first
+db-0
+                                     ← REVERSE order
+</pre>
+<pre>
+THE BLOCKING FAILURE:
+$ kubectl scale sts db --replicas=3; sleep 60
+$ kubectl set image sts/db c=busybox:does-not-exist
+$ sleep 120; kubectl get pods -l app=db \
+    -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,IMAGE:.spec.containers[0].image --no-headers
+db-0   Running   busybox                    ← untouched
+db-1   Running   busybox                    ← untouched
+db-2   Pending   busybox:does-not-exist     ← stuck, highest ordinal first
+
+$ sleep 900; kubectl get pods -l app=db --no-headers | awk '{print $1, $3}'
+db-0 Running
+db-1 Running
+db-2 ImagePullBackOff                ← 15 minutes later: the rollout never proceeded
+$ kubectl rollout status sts/db --timeout=10s
+error: timed out waiting for the condition
+</pre>
+<pre>
+$ kubectl rollout undo sts/db
+$ sleep 30; kubectl get pods -l app=db --no-headers | awk '{print $1, $2, $3}'
+db-0 1/1 Running
+db-1 1/1 Running
+db-2 1/1 Running                     ← converges once the spec is valid
+</pre>
+<table class="tbl">
+  <tr><th></th><th>Deployment (<code>minReadySeconds: 0</code>)</th><th>StatefulSet</th></tr>
+  <tr><td>Bad image</td><td>Can replace every replica</td><td><strong>Stops at the first pod</strong></td></tr>
+  <tr><td>Pods still serving</td><td>Possibly none</td><td>2 of 3</td></tr>
+  <tr><td>If ordinal 0 is broken</td><td>n/a</td><td><strong>Nothing above it ever starts</strong></td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Canary one ordinal with <code>partition</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl patch sts db -p '{"spec":{"replicas":5}}'; sleep 90
+$ kubectl get pods -l app=db -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image --no-headers
+db-0   busybox:1.36
+db-1   busybox:1.36
+db-2   busybox:1.36
+db-3   busybox:1.36
+db-4   busybox:1.36
+
+$ kubectl patch sts db -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":4}}}}'
+$ kubectl set image sts/db c=busybox:1.37
+$ sleep 45; kubectl get pods -l app=db -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image --no-headers
+db-0   busybox:1.36
+db-1   busybox:1.36
+db-2   busybox:1.36
+db-3   busybox:1.36
+db-4   busybox:1.37        ← ONE canary. Soak it for hours if you like.
+</pre>
+<pre>
+$ kubectl get sts db -o jsonpath='current={.status.currentRevision}{"\n"}update={.status.updateRevision}{"\n"}updated={.status.updatedReplicas}{"\n"}'
+current=db-6799fc88d8
+update=db-7d4b9c8f5d
+updated=1                          ← 1 of 5 on the new revision
+
+$ kubectl patch sts db -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":2}}}}'
+$ sleep 90; kubectl get pods -l app=db -o custom-columns=N:.metadata.name,I:.spec.containers[0].image --no-headers
+db-0   busybox:1.36
+db-1   busybox:1.36
+db-2   busybox:1.37
+db-3   busybox:1.37
+db-4   busybox:1.37        ← 60% rolled out, still holding
+
+$ kubectl patch sts db -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":0}}}}'
+$ kubectl rollout status sts/db
+statefulset rolling update complete 5 pods at revision db-7d4b9c8f5d
+</pre>
+<pre>
+ABORTING A CANARY — raise the partition back and delete the canary pod:
+$ kubectl patch sts db -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":5}}}}'
+$ kubectl set image sts/db c=busybox:1.36
+$ kubectl delete pod db-4
+$ sleep 30; kubectl get pod db-4 -o jsonpath='{.spec.containers[0].image}{"\n"}'
+busybox:1.36                       ← reverted, without touching db-0..db-3
+
+FULL MANUAL CONTROL:
+$ kubectl patch sts db -p '{"spec":{"updateStrategy":{"type":"OnDelete"}}}'
+$ kubectl set image sts/db c=busybox:1.37
+$ sleep 60; kubectl get pods -l app=db -o custom-columns=I:.spec.containers[0].image --no-headers | sort -u
+busybox:1.36                       ← NOTHING updated until you delete a pod
+$ kubectl delete pod db-4; sleep 20
+$ kubectl get pod db-4 -o jsonpath='{.spec.containers[0].image}{"\n"}'
+busybox:1.37                       ← exactly one member, when you chose
+</pre>
+<table class="tbl">
+  <tr><th>Strategy</th><th>Control</th><th>Deployment equivalent</th></tr>
+  <tr><td><code>partition: N</code></td><td>Canary by ordinal, held indefinitely</td><td><strong>None</strong></td></tr>
+  <tr><td><code>OnDelete</code></td><td>Fully manual, per pod</td><td>None</td></tr>
+  <tr><td><code>partition: 0</code></td><td>Normal rolling update</td><td>RollingUpdate</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Track PVC lifecycle across scaling and deletion.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl get pvc -l app=db --no-headers | wc -l
+5
+$ kubectl get pvc -l app=db -o custom-columns=NAME:.metadata.name,SIZE:.status.capacity.storage --no-headers
+data-db-0   1Gi
+data-db-1   1Gi
+data-db-2   1Gi
+data-db-3   1Gi
+data-db-4   1Gi
+
+$ kubectl scale sts db --replicas=2; sleep 30
+$ kubectl get pods -l app=db --no-headers | wc -l
+2
+$ kubectl get pvc -l app=db --no-headers | wc -l
+5                                  ← all five kept: 3 attached to nothing
+$ kubectl get pvc data-db-4 -o jsonpath='{.status.phase}{"\n"}'
+Bound                              ← bound to a PV, used by no pod, still billed
+</pre>
+<pre>
+Scaling back up reattaches the original data:
+$ kubectl exec db-1 -- cat /data/log | head -1
+db-1 created 2026-08-19T12:31:02+00:00
+$ kubectl scale sts db --replicas=5; sleep 90
+$ kubectl exec db-4 -- cat /data/log
+db-4 created 2026-08-19T12:33:41+00:00        ← the ORIGINAL db-4 line
+db-4 created 2026-08-19T13:02:18+00:00        ← plus the new one
+                                   ← proof the old volume was reused
+</pre>
+<pre>
+DELETING THE STATEFULSET KEEPS THEM TOO:
+$ kubectl delete sts db
+statefulset.apps "db" deleted
+$ kubectl get pvc -l app=db --no-headers | wc -l
+5                                  ← survived
+$ kubectl apply -f sts.yaml; sleep 120
+$ kubectl exec db-2 -- cat /data/log | wc -l
+3                                  ← the recreated StatefulSet re-adopted the volumes
+</pre>
+<pre>
+THE RETENTION POLICY:
+$ kubectl patch sts db -p '{"spec":{"persistentVolumeClaimRetentionPolicy":
+    {"whenScaled":"Delete","whenDeleted":"Retain"}}}'
+$ kubectl scale sts db --replicas=2; sleep 40
+$ kubectl get pvc -l app=db --no-headers | awk '{print $1}'
+data-db-0
+data-db-1                          ← 2,3,4 DELETED with the scale-down
+$ kubectl get pv | grep -c Released
+0                                  ← and with reclaimPolicy: Delete, the disks are gone
+
+$ kubectl scale sts db --replicas=3; sleep 60
+$ kubectl exec db-2 -- cat /data/log
+db-2 created 2026-08-19T13:14:52+00:00     ← ONE line: brand-new empty volume
+</pre>
+<table class="tbl">
+  <tr><th>Action</th><th>Default</th><th><code>whenScaled: Delete</code></th></tr>
+  <tr><td>Scale down</td><td>PVCs kept (and billed)</td><td><strong>PVCs deleted — data gone</strong></td></tr>
+  <tr><td>Scale back up</td><td>Original data returns</td><td>Empty volumes</td></tr>
+  <tr><td>Delete the StatefulSet</td><td>PVCs kept</td><td>Kept (<code>whenDeleted: Retain</code>)</td></tr>
+</table>
+<p>Find the orphans, since nothing else will tell you:</p>
+<pre>
+$ kubectl get pvc -A -o json | jq -r '.items[] | select(.status.phase=="Bound") |
+    "\(.metadata.namespace) \(.metadata.name) \(.status.capacity.storage)"' \
+  | while read ns pvc size; do
+      used=$(kubectl -n $ns get pods -o json | jq -r --arg p "$pvc" \
+        '[.items[] | select((.spec.volumes//[])[]?.persistentVolumeClaim.claimName == $p)] | length')
+      [ "$used" = "0" ] &amp;&amp; echo "ORPHAN $ns/$pvc $size"
+    done
+ORPHAN default/data-db-3 1Gi
+ORPHAN default/data-db-4 1Gi
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build a peer-discovering cluster and prove the two-Service pattern.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Service
+metadata: { name: peers }              # for MEMBERS
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: cluster }
+  ports: [{ name: gossip, port: 7000 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: cluster }            # for CLIENTS
+spec:
+  selector: { app: cluster }
+  ports: [{ name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: cluster }
+spec:
+  serviceName: peers
+  replicas: 3
+  podManagementPolicy: Parallel        # self-organising peers
+  selector: { matchLabels: { app: cluster } }
+  template:
+    metadata: { labels: { app: cluster } }
+    spec:
+      containers:
+      - name: node
+        image: nicolaka/netshoot
+        command:
+        - sh
+        - -c
+        - |
+          while true; do
+            n=$(dig +short peers.default.svc.cluster.local | wc -l)
+            echo "$(date +%T) $(hostname): peers=$n"
+            if [ "$n" -ge 3 ]; then touch /tmp/ready; fi
+            sleep 5
+          done
+        readinessProbe: { exec: { command: ["test","-f","/tmp/ready"] }, periodSeconds: 3 }
+EOF
+
+$ sleep 40; kubectl get pods -l app=cluster --no-headers | awk '{print $1, $2}'
+cluster-0 1/1
+cluster-1 1/1
+cluster-2 1/1                        ← all three formed a cluster
+$ kubectl logs cluster-0 --tail=2
+12:31:05 cluster-0: peers=1
+12:31:10 cluster-0: peers=3          ← not-ready addresses made discovery possible
+</pre>
+<pre>
+REMOVE publishNotReadyAddresses AND WATCH THE DEADLOCK:
+$ kubectl patch svc peers -p '{"spec":{"publishNotReadyAddresses":false}}'
+$ kubectl delete pod -l app=cluster
+$ sleep 120; kubectl get pods -l app=cluster --no-headers | awk '{print $1, $2}'
+cluster-0 0/1
+cluster-1 0/1
+cluster-2 0/1                        ← permanently stuck
+$ kubectl logs cluster-0 --tail=2
+12:36:41 cluster-0: peers=0
+12:36:46 cluster-0: peers=0          ← ready needs peers; peers needs ready
+$ kubectl patch svc peers -p '{"spec":{"publishNotReadyAddresses":true}}'
+$ sleep 20; kubectl get pods -l app=cluster --no-headers | awk '{print $2}' | sort -u
+1/1                                  ← recovers immediately
+</pre>
+<pre>
+WHY TWO SERVICES — clients must not see not-ready members:
+$ kubectl exec cluster-0 -- sh -c 'rm /tmp/ready'      # make cluster-0 unready
+$ sleep 10
+$ kubectl get endpointslices -l kubernetes.io/service-name=peers \
+    -o jsonpath='{range .items[0].endpoints[*]}{.addresses[0]}={.conditions.ready} {end}{"\n"}'
+10.244.1.7=false 10.244.2.4=true 10.244.3.9=true      ← peers: unready member INCLUDED
+$ kubectl get endpointslices -l kubernetes.io/service-name=cluster \
+    -o jsonpath='{range .items[0].endpoints[*]}{.addresses[0]}={.conditions.ready} {end}{"\n"}'
+10.244.2.4=true 10.244.3.9=true                        ← clients: excluded, correctly
+</pre>
+<pre>
+And Parallel management, which OrderedReady would have made impossible here:
+$ kubectl get sts cluster -o jsonpath='{.spec.podManagementPolicy}{"\n"}'
+Parallel
+   → with OrderedReady, cluster-0 would wait for peers that cannot start until
+     cluster-0 is Ready: a deadlock even WITH publishNotReadyAddresses
+$ kubectl patch sts cluster -p '{"spec":{"podManagementPolicy":"OrderedReady"}}'
+The StatefulSet "cluster" is invalid: spec: Forbidden: updates to statefulset spec
+for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy',
+'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden
+$ kubectl delete sts cluster --cascade=orphan          ← the way to change it
+$ # edit and re-apply; the existing pods and PVCs are re-adopted
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Demonstrate the force-delete split brain, and the safe alternative.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl apply -f sts.yaml     # 3 replicas, each appends to its own PVC
+$ kubectl exec db-0 -- sh -c 'echo "writer=$(hostname) t=$(date +%s)" >> /data/writes'
+$ kubectl get pod db-0 -o jsonpath='{.spec.nodeName}{"\n"}'
+worker-2
+
+SIMULATE A PARTITION (the node is ALIVE but unreachable from the control plane):
+$ multipass exec worker-2 -- sudo iptables -A OUTPUT -d 10.0.0.10 -j DROP   # block the API
+$ sleep 60; kubectl get node worker-2
+worker-2   NotReady   62s
+$ sleep 300; kubectl get pod db-0
+db-0   1/1   Terminating   6m        ← evicted after the 300s toleration, but STUCK
+
+$ multipass exec worker-2 -- sudo crictl ps --name db -q | wc -l
+1                                    ← ⚠️ THE PROCESS IS STILL RUNNING AND WRITING
+$ multipass exec worker-2 -- sudo crictl exec $(... ) sh -c 'echo "writer=db-0 t=$(date +%s)" >> /data/writes'
+</pre>
+<pre>
+THE DANGEROUS MOVE:
+$ kubectl delete pod db-0 --force --grace-period=0
+warning: Immediate deletion does not wait for confirmation that the running resource
+has been terminated. The resource may continue to run on the cluster indefinitely.
+pod "db-0" force deleted
+
+$ sleep 30; kubectl get pod db-0 -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName --no-headers
+db-0   worker-3                      ← a SECOND db-0 now exists
+$ multipass exec worker-2 -- sudo crictl ps --name db -q | wc -l
+1                                    ← and the FIRST one is still running
+   → two pods with one identity. With RWX or replicated storage, both write.
+     (With RWO the attach usually blocks it — which is the only thing saving you.)
+</pre>
+<pre>
+THE SAFE PATH — establish the truth first:
+$ multipass exec worker-2 -- sudo iptables -D OUTPUT -d 10.0.0.10 -j DROP   # heal
+$ sleep 30; kubectl get node worker-2
+worker-2   Ready
+$ kubectl get pods -l app=db --no-headers | wc -l
+3                                    ← the kubelet reconciles and removes the duplicate
+
+For a node that really is dead:
+$ multipass stop worker-2            # verified powered off
+$ kubectl taint node worker-2 node.kubernetes.io/out-of-service=nodeshutdown:NoExecute
+$ sleep 20; kubectl get pod db-0 -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName --no-headers
+db-0   worker-3                      ← rescheduled in ~20s, volumes force-detached
+$ kubectl exec db-0 -- cat /data/writes | wc -l
+2                                    ← the original data, intact, one writer
+
+Or simply delete the Node object:
+$ kubectl delete node worker-2
+   → the controller concludes its pods are gone and cleans them up safely
+</pre>
+<table class="tbl">
+  <tr><th>Action</th><th>Recovery time</th><th>Risk</th></tr>
+  <tr><td>Wait for the default timeouts</td><td>~12 min</td><td>None</td></tr>
+  <tr><td><code>out-of-service</code> taint (node verified dead)</td><td><strong>~20 s</strong></td><td>None, if truly dead</td></tr>
+  <tr><td>Delete the Node object</td><td>~30 s</td><td>None, if truly dead</td></tr>
+  <tr><td><strong><code>--force --grace-period=0</code></strong></td><td>~30 s</td><td><strong>Two pods, one identity</strong></td></tr>
+</table>
+<p><strong>The runbook rule:</strong> never force-delete a StatefulSet pod until the machine is verifiably
+   powered off. If that latency is unacceptable, the fix is replication so a lost member is a failover — not a
+   faster way to create a second writer.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>A StatefulSet gives <strong>stable ordinal names, per-pod storage, and ordered operations</strong> — verified: a deleted pod returned as <code>db-1</code> on a new node with a new IP and the same data.</li>
+        <li>PVCs are named <code>&lt;template&gt;-&lt;sts&gt;-&lt;ordinal&gt;</code> and are reattached by ordinal, never shared.</li>
+        <li><code>serviceName</code> must point at a <strong>headless Service</strong>, which is what creates per-pod DNS; without it there is no stable way to address a member.</li>
+        <li><strong><code>publishNotReadyAddresses: true</code> is required for bootstrap</strong> — measured, three pods stuck at 0/1 permanently without it, recovering within 20 s once set.</li>
+        <li>Use <strong>two Services</strong>: headless with not-ready addresses for peers, ClusterIP with normal readiness for clients — confirmed by comparing their EndpointSlices.</li>
+        <li><code>OrderedReady</code> creates 0→N waiting for Ready, deletes in reverse, and updates highest-ordinal-first.</li>
+        <li><strong>A stuck pod halts the rollout indefinitely</strong> — 15 minutes later <code>db-1</code> and <code>db-0</code> were still untouched, which protects the cluster but blocks everything above a broken ordinal 0.</li>
+        <li><code>podManagementPolicy: Parallel</code> suits self-organising peers, and is <strong>immutable</strong> — changing it needs <code>--cascade=orphan</code> and recreation.</li>
+        <li><strong><code>partition: N</code> is a canary by ordinal that Deployments have no equivalent for</strong>: one pod updated, held indefinitely, aborted by raising the partition and deleting the canary.</li>
+        <li><code>OnDelete</code> gives fully manual per-pod control, which is what most database operators use because upgrades need failover rather than pod replacement.</li>
+        <li><strong>Scaling down keeps every PVC</strong> — five volumes for two pods, bound, unused and billed, with nothing in Kubernetes mentioning them.</li>
+        <li><strong>Deleting the StatefulSet also keeps them</strong>, and recreating it re-adopts the volumes with their original data.</li>
+        <li><code>persistentVolumeClaimRetentionPolicy</code> changes that — and <code>whenScaled: Delete</code> made a scale-down destroy data permanently, returning empty volumes on scale-up.</li>
+        <li>Combine that with a <code>Delete</code> reclaim policy and the cleanup step is where the disks are destroyed at the cloud provider.</li>
+        <li><strong><code>--force --grace-period=0</code> on a StatefulSet pod destroys its core guarantee</strong>: demonstrated two <code>db-0</code> pods existing simultaneously while the original process was still writing.</li>
+        <li>The safe paths are deleting the Node object or the <code>node.kubernetes.io/out-of-service</code> taint — ~20 s recovery — but <strong>only once the machine is verifiably powered off</strong>.</li>
+        <li>A StatefulSet is <strong>not a database</strong>: no leader concept, no failover, no backups, no awareness of replication lag.</li>
+        <li>Production databases mean an operator or a managed service; the StatefulSet underneath supplies identity and storage only.</li>
+        <li>Point <code>volumeClaimTemplates</code> at a <code>Retain</code> StorageClass, or a deleted PVC destroys the disk.</li>
+        <li>Availability comes from <strong>replication, not from a faster way to move a disk</strong> — which is also what removes the force-delete dilemma entirely.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="storage.html">← Volumes, PVs, PVCs &amp; StorageClasses</a>
+      <a href="jobs-cronjobs.html">Jobs, CronJobs &amp; One-shot Work →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
