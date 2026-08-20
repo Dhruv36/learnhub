@@ -59,8 +59,33 @@ Also: the five v3 files orphaned by the nav split (`pods-deployments`, `services
 ⚠️ **Scaffolding reminder:** any newly-copied `quiz.html` must be checked for BOTH the stale
 `← CSS Track` link AND mojibake (`Â·`, `â†’` — double-encoded UTF-8) before committing.
 
-**🚧 NEXT: AWS v4 (track 17)** — `tutorials/aws/`, 12 v3 lessons → ~20 at v4 depth. Write `nav.js`
-first, then lessons (commit every 1–2), then retune the quiz bank, then a whole-track validate.
+**🚧 IN PROGRESS: AWS v4 (track 17)** — `tutorials/aws/`, rebuilding 12 v3 lessons (~12KB) into
+**20 lessons at v4 depth** (56–60KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
+**2 of 20 done:**
+
+*§1 Foundations ×4* — ✅ `index.html` (**the shared-responsibility line moves per service**; AZ *names*
+are randomised per account so cross-account placement must use **Zone IDs**; the `us-east-1` control-plane
+dependency for IAM/Route 53/CloudFront/ACM; **the account is the blast radius**; **SCPs only subtract** —
+an "Allow s3:*" SCP grants nobody anything; quotas are per-account *per-Region* and a new account gets
+**5 vCPUs**; throttling, jittered retries and eventual consistency; the day-one baseline) ·
+✅ `iam-basics.html` (**explicit Deny always wins** — AdministratorAccess did not override a one-line
+inline Deny; **cross-account needs BOTH sides**, and SSE-KMS needs a third grant on the key policy;
+`NotAction`+`Allow` grants every future service; **`iam:PassRole` on `*` + `lambda:CreateFunction` = admin**,
+demonstrated creating a backdoor user from a role explicitly denied `iam:CreateUser`; confused deputy via
+`aws:SourceArn`/`sts:ExternalId`; ABAC + **permission boundaries**, with an SCP enforcing the tag at
+creation; Access Analyzer found **243 services granted and never used**)
+**⏳ NEXT: `iam-deep-dive.html` (v3 rewrite — STS, trust policies, IMDSv2, OIDC federation)**, then
+`billing-cost.html` (NEW) to finish §1.
+
+*Remaining sections:* §2 Networking ×3 (`vpc-networking` v3 rewrite, `connectivity` NEW, `edge-dns` NEW) ·
+§3 Compute ×3 (`ec2-compute`, `containers`, `lambda-serverless` — all v3 rewrites) · §4 Data ×4
+(`s3` NEW, `rds-aurora` NEW, `dynamodb` NEW, `messaging` v3 rewrite) · §5 Operations ×3
+(`observability`, `iac` v3 rewrites, `security-ops` NEW) · §6 Architecture ×3 (`well-architected` v3
+rewrite, `resilience-dr` NEW, `scaling-patterns` NEW).
+
+**TWO END-OF-TRACK CHORES:** (1) `s3-cloudfront.html` and `rds-dynamodb.html` are **orphaned** by the
+nav split (s3-cloudfront → `s3` + `edge-dns`; rds-dynamodb → `rds-aurora` + `dynamodb`) — convert both
+to redirect stubs. (2) Retune the AWS quiz bank to the v4 curriculum, then `node tools/quizshuffle.js`.
 
 **Then the remaining infra two:** CI/CD → MongoDB, each 12 v3 → ~20 at v4.
 
@@ -77,7 +102,7 @@ node tools/quizshuffle.js tutorials/<track>                   # de-skew (idempot
 |-------|-----|-----|--------|
 | Docker | `tutorials/docker/` | ✅ **21 at v4** | done |
 | Kubernetes | `tutorials/kubernetes/` | ✅ **22 at v4** | done |
-| AWS | `tutorials/aws/` | 12 | ~20 |
+| AWS | `tutorials/aws/` | 🚧 2 of 20 at v4 | ~20 |
 | CI/CD | `tutorials/cicd/` | 12 | ~20 |
 | MongoDB | `tutorials/mongodb/` | 12 | ~20 |
 
