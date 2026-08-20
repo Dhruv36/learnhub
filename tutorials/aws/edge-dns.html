@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Route 53, Load Balancers &amp; CloudFront — AWS — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../kubernetes/index.html">Kubernetes</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Route 53, Load Balancers &amp; CloudFront <span class="level-badge level-adv">Networking</span></h1>
+
+    <p><strong>What you'll master:</strong> the four hops every external request takes — <strong>DNS → CDN →
+       load balancer → target</strong> — and how to tell which one broke, because all four can return a
+       five-hundred; <strong>alias records</strong>, which solve the apex-CNAME problem that no other DNS
+       provider can; routing policies, and why <strong>DNS failover is bounded by TTL plus a client cache you do
+       not control</strong> — measured at <strong>11 minutes</strong> on a 60-second TTL, and <em>forever</em>
+       on a default JVM; health checks that report healthy while the application is down, because they check the
+       load balancer that is checking the targets; ALB versus NLB, including <strong>client-IP preservation
+       rules that differ by target type</strong>, and <strong>cross-zone load balancing that is free and always
+       on for ALB but off and billable for NLB</strong>; the keepalive mismatch that produces
+       <strong>sporadic 502s no deploy can explain</strong>; CloudFront's cache key, where one header turned a
+       <strong>94% hit ratio into 0.3%</strong> and omitting another served one customer's page to another; and
+       a decoder table that turns 502/503/504 into a diagnosis instead of a guess. Prerequisites:
+       <a href="vpc-networking.html">VPCs, Subnets &amp; Security Groups</a> and
+       <a href="connectivity.html">Connecting VPCs, PrivateLink &amp; On-Prem</a>.</p>
+
+    <h2>Part 1 — Route 53, and the Record Type Only AWS Has</h2>
+
+    <p>Route 53 is three products sharing a name: a domain registrar, an authoritative DNS service, and a health
+       checking service. The DNS service is the interesting one, and it has one record type that does not exist
+       anywhere else.</p>
+
+<pre>
+THE APEX PROBLEM, which every DNS provider has and only AWS solves cleanly:
+
+  RFC 1034 forbids a CNAME coexisting with any other record at the same name.
+  A zone apex (acme.com) MUST have SOA and NS records.
+  → therefore acme.com can NEVER be a CNAME.
+
+  But an ALB's address is a hostname, not an IP:
+$ dig +short shop-alb-1234.us-east-1.elb.amazonaws.com
+54.211.14.9
+44.202.8.117                                       ← and these CHANGE without notice
+</pre>
+
+<pre>
+✅ THE ALIAS RECORD — resolved inside Route 53, so no CNAME is ever sent to the client:
+
+$ aws route53 change-resource-record-sets --hosted-zone-id Z1234567890ABC \
+    --change-batch '{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{
+      "Name":"acme.com","Type":"A",
+      "AliasTarget":{"HostedZoneId":"Z35SXDOTRQ7X7K",
+                     "DNSName":"shop-alb-1234.us-east-1.elb.amazonaws.com",
+                     "EvaluateTargetHealth":true}}}]}'
+
+$ dig +short acme.com
+54.211.14.9                                        ← an A record. At the apex. Tracking the ALB.
+44.202.8.117
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>CNAME</th><th><strong>Alias</strong></th></tr>
+      <tr><td>Allowed at the zone apex</td><td><strong>❌ Never</strong></td><td><strong>✅</strong></td></tr>
+      <tr><td>Query cost</td><td>Charged</td><td><strong>Free to AWS targets</strong></td></tr>
+      <tr><td>Extra lookup for the client</td><td>Yes — an extra round trip</td><td>No — resolved server-side</td></tr>
+      <tr><td>Tracks the target's changing IPs</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Can target</td><td>Any hostname</td><td>ALB/NLB, CloudFront, S3 website, API Gateway, another record in the zone</td></tr>
+      <tr><td>Can health-check the target</td><td>❌</td><td><strong>✅ <code>EvaluateTargetHealth</code></strong></td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Use an alias record for every AWS target, apex or not.</strong> It is free,
+       saves the client a round trip, and — the part people miss — <code>EvaluateTargetHealth: true</code> makes
+       the record disappear from responses when the target is unhealthy, without configuring a separate health
+       check. That is the cheapest failover mechanism in AWS and it costs nothing.</div>
+
+<pre>
+TTL is the only lever you have over how fast a change propagates, and it is a
+BEFORE-THE-FACT decision — lowering it during an incident does nothing for
+resolvers that already cached the old value:
+
+$ dig acme.com | grep -A1 'ANSWER SECTION'
+;; ANSWER SECTION:
+acme.com.       300     IN      A       54.211.14.9      ← 300s: minimum 5 min to move traffic
+
+  Lower the TTL to 60 the DAY BEFORE a migration, not during it.
+  Alias records to AWS targets inherit the target's TTL (60s for ELB) — you cannot set it.
+</pre>
+
+    <h2>Part 2 — Routing Policies</h2>
+
+    <table class="tbl">
+      <tr><th>Policy</th><th>Chooses by</th><th>Classic use</th><th>Watch out for</th></tr>
+      <tr><td>Simple</td><td>Nothing — returns all values</td><td>One target</td><td>No health awareness</td></tr>
+      <tr><td><strong>Weighted</strong></td><td>Configured ratio</td><td>Canary, blue/green, migration</td><td>Ratio applies to <em>resolvers</em>, not requests</td></tr>
+      <tr><td>Latency</td><td>Lowest measured latency to the AWS Region</td><td>Multi-Region apps</td><td>Latency to the <em>resolver</em>, not the user</td></tr>
+      <tr><td><strong>Failover</strong></td><td>Primary health check</td><td>DR</td><td><strong>Bounded by TTL + client caching</strong></td></tr>
+      <tr><td>Geolocation</td><td>User's country/continent</td><td>Compliance, localisation</td><td>Needs a default record, or unmatched users get nothing</td></tr>
+      <tr><td>Geoproximity</td><td>Distance, with a bias knob</td><td>Gradual regional shift</td><td>Requires traffic flow policies</td></tr>
+      <tr><td>Multivalue</td><td>Up to 8 healthy records, randomised</td><td>Poor man's load balancing</td><td>Not a load balancer — no connection awareness</td></tr>
+    </table>
+
+<pre>
+WEIGHTED — a canary, and the arithmetic that is not what people expect:
+
+$ aws route53 change-resource-record-sets --hosted-zone-id Z123 --change-batch '{"Changes":[
+  {"Action":"UPSERT","ResourceRecordSet":{"Name":"api.acme.com","Type":"A",
+    "SetIdentifier":"stable","Weight":95,
+    "AliasTarget":{"HostedZoneId":"Z35SXDOTRQ7X7K","DNSName":"stable-alb...","EvaluateTargetHealth":true}}},
+  {"Action":"UPSERT","ResourceRecordSet":{"Name":"api.acme.com","Type":"A",
+    "SetIdentifier":"canary","Weight":5,
+    "AliasTarget":{"HostedZoneId":"Z35SXDOTRQ7X7K","DNSName":"canary-alb...","EvaluateTargetHealth":true}}}
+]}'
+
+  ⚠️ 5% of DNS ANSWERS, not 5% of requests. A resolver serving 200,000 corporate
+     users caches one answer, so those 200,000 users are 100% canary or 100% stable.
+     With few, large resolvers the actual split can be wildly off target.
+</pre>
+
+    <div class="note">⚠️ <strong>DNS is a coarse traffic-splitting tool.</strong> The unit of granularity is a
+       resolver's cache entry, not a request, so weighted routing gives you approximately the ratio only across
+       many independent resolvers. For a real canary — 5% of <em>requests</em>, shifted instantly, with per-request
+       metrics — split at the load balancer with weighted target groups, not at DNS. Use weighted DNS for
+       coarse, slow moves such as a Region migration, where "roughly 10%, over an hour" is the actual
+       requirement.</div>
+
+    <h2>Part 3 — Health Checks, and Failover That Does Not Fail Over</h2>
+
+<pre>
+$ aws route53 create-health-check --caller-reference hc-$(date +%s) \
+    --health-check-config '{"Type":"HTTPS","FullyQualifiedDomainName":"api.acme.com",
+      "ResourcePath":"/health","Port":443,"RequestInterval":10,"FailureThreshold":2}' \
+    --query 'HealthCheck.Id' --output text
+a1b2c3d4-5e6f
+
+  checked from 15+ locations worldwide; unhealthy when >18% of checkers fail
+  RequestInterval 10s + FailureThreshold 2  →  ~20-30s to DETECT
+</pre>
+
+<pre>
+NOW THE ACTUAL FAILOVER TIME, measured end to end:
+
+  detection            (10s interval × 2 failures)          ~ 20-30 s
+  Route 53 propagation                                      ~  5-10 s
+  TTL expiry at recursive resolvers (TTL=60)                    0-60 s
+  client-side caching  (browser ~60s, JVM DEFAULT: FOREVER)     ???
+                                                            ─────────
+  realistic                                                 90 s - 11 min
+  worst case (a JVM with networkaddress.cache.ttl=-1)        NEVER
+</pre>
+
+    <div class="note">🔑 <strong>DNS failover is a minutes-scale mechanism, and for some clients it is an
+       infinite-scale mechanism.</strong> A JVM with the default security policy caches successful DNS lookups
+       <em>for the lifetime of the process</em> — set <code>networkaddress.cache.ttl=30</code> or those hosts
+       never move. Anything needing seconds-scale failover must fail over <em>below</em> DNS: multiple targets
+       behind one load balancer, or a global accelerator with anycast addresses that never change.</div>
+
+<pre>
+THE HEALTH CHECK THAT LIES — checking the thing that is already checking:
+
+  Route 53 → health-checks → ALB /health → ALB returns 200 (the ALB itself is fine)
+                                          → but every TARGET is failing
+  the ALB is up, so the health check passes, so Route 53 never fails over,
+  and users get 503s from a "healthy" endpoint.
+
+$ curl -s -o /dev/null -w '%{http_code}\n' https://api.acme.com/health
+200                                                ← the ALB answering for itself
+$ curl -s -o /dev/null -w '%{http_code}\n' https://api.acme.com/orders/42
+503                                                ← what users actually see
+</pre>
+
+<pre>
+✅ make the health check exercise the DEPENDENCY CHAIN, not the front door:
+
+  GET /health/deep  →  200 only if: the app is up
+                                    AND the database answers a real query
+                                    AND the critical downstream is reachable
+
+$ curl -s https://api.acme.com/health/deep | jq
+{ "status": "degraded", "db": "ok", "inventory": "timeout", "cache": "ok" }
+$ curl -s -o /dev/null -w '%{http_code}\n' https://api.acme.com/health/deep
+503                                                ← NOW Route 53 fails over
+</pre>
+
+    <p>The counter-argument matters too, and senior interviews probe it: a deep health check makes a shared
+       dependency a <strong>correlated failure</strong>. If every Region's health check queries the same global
+       database, one database blip marks <em>all</em> Regions unhealthy and Route 53 fails over to nothing.
+       Check dependencies that are <em>local</em> to the failover unit, and treat shared global dependencies as
+       something to alarm on rather than to route on.</p>
+
+    <h2>Part 4 — ALB vs NLB, and the Details That Bite</h2>
+
+    <table class="tbl">
+      <tr><th></th><th>ALB</th><th>NLB</th><th>Gateway LB</th></tr>
+      <tr><td>Layer</td><td>7 (HTTP/HTTPS/gRPC)</td><td>4 (TCP/UDP/TLS)</td><td>3 (appliances)</td></tr>
+      <tr><td>Routes on</td><td>Host, path, header, method, query, source IP</td><td>Port only</td><td>—</td></tr>
+      <tr><td>Static IP</td><td><strong>❌</strong> (hostname only)</td><td><strong>✅ one per AZ, or an EIP</strong></td><td>—</td></tr>
+      <tr><td>Latency added</td><td>~milliseconds</td><td><strong>~microseconds</strong></td><td>—</td></tr>
+      <tr><td>TLS</td><td>Terminates</td><td>Terminates <em>or</em> passes through</td><td>—</td></tr>
+      <tr><td>Client IP</td><td>In <code>X-Forwarded-For</code></td><td><strong>Preserved (see below)</strong></td><td>Preserved</td></tr>
+      <tr><td>Cross-zone LB</td><td><strong>Always on, free</strong></td><td><strong>Off by default, and billable when on</strong></td><td>Off by default</td></tr>
+      <tr><td>Cost shape</td><td>$0.0225/hr + LCU</td><td>$0.0225/hr + NLCU</td><td>$0.0125/hr + GLCU</td></tr>
+      <tr><td>Use for</td><td>HTTP apps, path routing, WAF</td><td>TCP, static IPs, PrivateLink, extreme throughput</td><td>Firewalls, IDS</td></tr>
+    </table>
+
+<pre>
+CLIENT IP PRESERVATION on NLB is NOT one rule — it depends on the target type:
+
+  instance targets                     → preserved (default ON, cannot disable)
+  IP targets, UDP / TCP_UDP            → preserved (default ON)
+  IP targets, TCP / TLS                → NOT preserved by default    ← the surprise
+  ALB, always                          → never preserved; read X-Forwarded-For
+
+$ aws elbv2 describe-target-group-attributes --target-group-arn arn:...:targetgroup/api/ab12 \
+    --query 'Attributes[?Key==`preserve_client_ip.enabled`].Value' --output text
+false                                              ← your rate limiter is seeing the NLB
+</pre>
+
+    <div class="note">⚠️ This is how IP allow-lists and rate limiters silently stop working. With preservation
+       off, every connection appears to come from the NLB's own address, so a per-IP rate limit throttles
+       <em>everyone</em> at once and an allow-list either admits everyone or nobody. Enable
+       <code>preserve_client_ip.enabled</code> — but know the cost: with preservation on, targets cannot be
+       addressed by the load balancer's own IP, and traffic from a target back through the same NLB (hairpin)
+       breaks. That is why it is off by default for TCP IP-targets.</div>
+
+<pre>
+CROSS-ZONE LOAD BALANCING — different defaults, and one of them costs money:
+
+  ALB: always enabled, and the cross-AZ transfer is FREE.
+  NLB: DISABLED by default. Each AZ's node sends only to targets IN THAT AZ.
+
+$ aws elbv2 describe-target-health --target-group-arn arn:...:targetgroup/api/ab12 \
+    --query 'TargetHealthDescriptions[].[Target.Id,Target.AvailabilityZone,TargetHealth.State]' --output text
+i-0aaa   us-east-1a   healthy
+i-0bbb   us-east-1b   healthy
+i-0ccc   us-east-1b   healthy
+i-0ddd   us-east-1b   healthy
+   → with cross-zone OFF, us-east-1a's single instance receives 50% of all traffic
+     while each 1b instance receives 16.7%. Uneven by design.
+
+$ aws elbv2 modify-target-group-attributes --target-group-arn arn:...:targetgroup/api/ab12 \
+    --attributes Key=load_balancing.cross_zone.enabled,Value=true
+   ⚠️ now billable: NLB cross-zone traffic is charged at standard cross-AZ rates.
+</pre>
+
+<pre>
+THE SPORADIC 502 — a keepalive race that no deploy explains:
+
+  ALB idle timeout        60 s  (default)
+  backend keepalive       5 s   (nginx default), or 5 s (Node.js default)
+
+  t=0     ALB opens a connection, uses it
+  t=5s    the BACKEND closes it (its keepalive expired)
+  t=7s    the ALB reuses the connection it still believes is open
+          → the FIN arrives, the ALB gets nothing usable
+          → HTTP 502, with no error in the application log at all
+
+$ aws elbv2 describe-load-balancer-attributes --load-balancer-arn arn:...:loadbalancer/app/shop/ab \
+    --query 'Attributes[?Key==`idle_timeout.timeout_seconds`].Value' --output text
+60
+</pre>
+
+<pre>
+✅ THE RULE: the backend's keepalive must be LONGER than the ALB's idle timeout.
+
+    # nginx
+    keepalive_timeout 75s;                         ← 75 > 60 ✅
+
+    // Node.js — the default of 5s is the single most common cause of this
+    server.keepAliveTimeout = 65000;               // 65s
+    server.headersTimeout   = 66000;               // must exceed keepAliveTimeout
+
+$ aws logs start-query --log-group-name /aws/alb/shop --query-string \
+  'fields elb_status_code, target_status_code | filter elb_status_code = 502
+   | stats count() by target_status_code'
+  target_status_code  count
+  "-"                 4,182                        ← NO target status: the target never replied.
+                                                     Not an application bug. A connection race.
+</pre>
+
+    <h2>Part 5 — CloudFront and the Cache Key</h2>
+
+    <p>CloudFront is worth understanding as three things at once: a cache, a TLS terminator at 600+ edge
+       locations, and — often the biggest line item saved — a <strong>cheaper egress path</strong>, since
+       fetching from an AWS origin is free and edge egress is below the raw internet rate. But everything
+       depends on one concept.</p>
+
+<pre>
+THE CACHE KEY is what CloudFront hashes to decide "is this the same object?"
+
+  BY DEFAULT it contains ONLY:  the distribution + the path
+  NOT:  query strings, headers, cookies
+
+  → two consequences, and they are opposite disasters:
+
+  (a) key TOO NARROW:  /profile ignores the Authorization header
+                       → user A's profile page is served to user B.
+  (b) key TOO WIDE:    include a per-user cookie or User-Agent
+                       → every request is unique, hit ratio ≈ 0, and the
+                         origin now serves MORE traffic than before CloudFront.
+</pre>
+
+<pre>
+$ aws cloudfront create-cache-policy --cache-policy-config '{
+    "Name":"static-assets","DefaultTTL":86400,"MaxTTL":31536000,"MinTTL":1,
+    "ParametersInCacheKeyAndForwardedToOrigin":{
+      "EnableAcceptEncodingGzip":true,"EnableAcceptEncodingBrotli":true,
+      "HeadersConfig":{"HeaderBehavior":"none"},
+      "CookiesConfig":{"CookieBehavior":"none"},
+      "QueryStringsConfig":{"QueryStringBehavior":"whitelist",
+        "QueryStrings":{"Quantity":1,"Items":["v"]}}}}'
+   → the key is path + "v". Nothing else varies it.
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>Cache policy</th><th>Origin request policy</th></tr>
+      <tr><td>Controls</td><td>What is <strong>in the cache key</strong></td><td>What is <strong>forwarded to the origin</strong></td></tr>
+      <tr><td>Adding a field</td><td>Fragments the cache</td><td>Costs nothing in hit ratio</td></tr>
+      <tr><td>Use for</td><td>Things that genuinely change the response</td><td>Things the origin needs but that do not change the response — logging, geo headers</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>These two policies are the single most misunderstood pair in CloudFront.</strong>
+       If the origin needs to <em>see</em> a header — for analytics, for geo, for a request ID — put it in the
+       <em>origin request</em> policy, where it is forwarded but does not fragment the cache. Only put it in the
+       <em>cache</em> policy if two requests differing in that header must receive genuinely different bytes.
+       Almost every catastrophic hit ratio is a header that belonged in the second policy and was put in the
+       first.</div>
+
+<pre>
+TTL PRECEDENCE — the origin usually wins, which surprises people:
+
+  origin sends Cache-Control: max-age=3600   and  MinTTL=0, MaxTTL=31536000
+    → CloudFront caches for 3600 s. The ORIGIN decided.
+
+  origin sends NOTHING                       and  DefaultTTL=86400
+    → CloudFront caches for 86400 s.
+
+  origin sends Cache-Control: max-age=60     and  MinTTL=3600
+    → CloudFront caches for 3600 s. MinTTL OVERRIDES a shorter origin value.
+
+  origin sends Cache-Control: no-store       → never cached, regardless of TTLs.
+</pre>
+
+<pre>
+INVALIDATION IS NOT A DEPLOYMENT STRATEGY:
+
+$ aws cloudfront create-invalidation --distribution-id E1A2B3C4D5 --paths '/*'
+   first 1,000 paths per month free, then $0.005 per path.
+   AND it takes minutes to complete, AND '/*' throws away the entire cache,
+   so the origin takes the full load while it refills.
+
+✅ versioned filenames instead — new name, new cache entry, zero invalidations:
+   /static/app.a3f91c2.js         (immutable, Cache-Control: max-age=31536000, immutable)
+   /static/app.b7e40d9.js         ← the deploy just changes the reference in the HTML
+   and the HTML itself: Cache-Control: no-cache (revalidate every time, cheap)
+</pre>
+
+<pre>
+LOCK THE ORIGIN so nobody bypasses the CDN — Origin Access Control for S3:
+
+$ OAC=$(aws cloudfront create-origin-access-control --origin-access-control-config \
+    '{"Name":"s3-oac","OriginAccessControlOriginType":"s3",
+      "SigningBehavior":"always","SigningProtocol":"sigv4"}' \
+    --query 'OriginAccessControl.Id' --output text)
+
+  then the bucket policy allows ONLY that distribution:
+  { "Effect":"Allow","Principal":{"Service":"cloudfront.amazonaws.com"},
+    "Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-assets/*",
+    "Condition":{"StringEquals":{"AWS:SourceArn":
+      "arn:aws:cloudfront::111122223333:distribution/E1A2B3C4D5"}}}
+
+  ← note this is the aws:SourceArn confused-deputy pattern from the IAM lesson,
+    applied to a service principal. Without it, any distribution could read the bucket.
+</pre>
+
+    <h2>Part 6 — Which Layer Broke?</h2>
+
+    <p>Four hops, and each can return a five-hundred. The response headers tell you which one answered, and that
+       is almost always faster than reading logs.</p>
+
+<pre>
+$ curl -sS -D- -o /dev/null https://shop.acme.com/orders/42
+HTTP/2 502
+server: CloudFront                                 ← ANSWERED BY CLOUDFRONT
+x-cache: Error from cloudfront
+x-amz-cf-pop: IAD79-P4
+x-amz-cf-id: kR3f...                               ← quote this to AWS support
+
+  vs:
+server: awselb/2.0                                 ← ANSWERED BY THE ALB
+  vs:
+server: nginx                                      ← the application answered; it is an app bug
+</pre>
+
+    <table class="tbl">
+      <tr><th>Code</th><th>From ALB, it means</th><th>Check</th></tr>
+      <tr><td><strong>502</strong></td><td>The target closed the connection or sent something malformed</td><td><strong>Keepalive mismatch</strong>, target crash, response headers too large</td></tr>
+      <tr><td><strong>503</strong></td><td><strong>No healthy targets</strong> in the target group</td><td><code>describe-target-health</code> — this one is unambiguous</td></tr>
+      <tr><td><strong>504</strong></td><td>The target did not answer within the idle timeout</td><td>Slow query, thread pool exhausted, downstream hang</td></tr>
+      <tr><td>460</td><td>The <em>client</em> closed before the ALB replied</td><td>Client timeout shorter than your latency — not your bug</td></tr>
+      <tr><td>463</td><td><code>X-Forwarded-For</code> with more than 30 addresses</td><td>A proxy loop</td></tr>
+      <tr><td><code>target_status_code = "-"</code></td><td>The target never produced a status at all</td><td>Connection-level failure, not application logic</td></tr>
+    </table>
+
+<pre>
+ALB access logs answer "how often, since when, and to which target":
+
+fields @timestamp, elb_status_code, target_status_code, target_processing_time, target
+| filter elb_status_code >= 500
+| stats count() as n, avg(target_processing_time) as avg_ms by elb_status_code, target
+| sort n desc
+
+  503   -            2,048   0.000                 ← no target at all
+  504   i-0ccc         311   60.001                ← ONE target, timing out at exactly 60s
+  502   i-0aaa         184   0.002                 ← instant: connection race, not slowness
+</pre>
+
+    <div class="note">💡 <strong><code>target_processing_time</code> is the fastest triage field in the whole
+       log.</strong> Exactly at the idle timeout means the target hung — look at the application. Near zero on a
+       502 means the connection failed before any work happened — look at keepalive and target health.
+       <code>-1</code> means the ALB never successfully sent the request. Three different causes, one status
+       code, distinguished by one number.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A CNAME attempted at the apex, a 300-second TTL lowered during the incident, health checks
+         pointed at the load balancer, NLB cross-zone left at its default, a Node backend with a five-second
+         keepalive behind a sixty-second ALB, and a CloudFront cache policy that forwards every header.</strong>
+         The apex CNAME is rejected outright, so someone hardcodes the ALB's current IP addresses in an A record
+         and it breaks silently the next time the ALB scales. The TTL was 300 seconds and was only lowered once
+         traffic needed moving, which changes nothing for resolvers that already cached the old answer, and a
+         fleet of JVMs never picks up the change at all. The Route 53 health check asks the ALB for
+         <code>/health</code>, the ALB answers 200 for itself while every target is failing, so failover never
+         triggers and users receive 503s from an endpoint monitoring calls healthy. The NLB has cross-zone
+         disabled by default, so the single instance in one AZ takes half the traffic while three instances in
+         another share the rest. Sporadic 502s appear with no application error and no correlated deploy,
+         because the backend closes idle connections before the load balancer stops reusing them. And the cache
+         policy includes <code>User-Agent</code>, so every browser version is a distinct cache entry, the hit
+         ratio collapses, and the origin serves more traffic than it did before the CDN existed.</p>
+      <p>✅ <strong>Alias records everywhere, TTLs lowered in advance, deep health checks scoped to the failover
+         unit, cross-zone understood as a per-load-balancer decision, keepalive ordered correctly, and a cache
+         key containing only what changes the bytes.</strong> Use alias records for every AWS target — free,
+         one less round trip, valid at the apex, and <code>EvaluateTargetHealth</code> gives failover with no
+         separate health check. Lower TTLs the day before a migration, and remember that DNS failover is a
+         minutes-scale mechanism that is infinite-scale for a default JVM; if you need seconds, fail over below
+         DNS. Point health checks at an endpoint that exercises the dependencies <em>local</em> to that failover
+         unit, so a real outage trips it and a shared global dependency does not mark every Region unhealthy at
+         once. Know that ALB cross-zone is always on and free while NLB's is off and billable, and choose
+         deliberately. Set the backend keepalive above the ALB idle timeout — 75s against 60s — because the
+         reverse produces 502s that appear in no application log. Put fields the origin merely needs to
+         <em>see</em> in the origin request policy and only genuinely response-varying fields in the cache
+         policy. And ship versioned filenames instead of invalidating, so a deploy never throws away a warm
+         cache.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>CNAME at the zone apex</td><td>Forbidden by RFC — the apex must hold SOA and NS records</td><td><strong>Alias record</strong>, which only AWS has</td></tr>
+      <tr><td>Hardcoding an ALB's IPs in an A record</td><td>ALB addresses change without notice; it breaks silently later</td><td>Alias to the ALB's hostname</td></tr>
+      <tr><td>Using a CNAME where an alias would work</td><td>Charged queries and an extra client round trip, with no health awareness</td><td>Alias with <code>EvaluateTargetHealth: true</code></td></tr>
+      <tr><td>Lowering TTL during the incident</td><td>Resolvers that already cached the old value keep it for the <em>old</em> TTL</td><td>Lower it the day before, as part of the plan</td></tr>
+      <tr><td>Expecting weighted DNS to split requests</td><td>It splits <strong>resolver answers</strong> — one corporate resolver sends 200,000 users one way</td><td>Weighted target groups at the ALB for real canaries</td></tr>
+      <tr><td>Assuming DNS failover is fast</td><td>Detection + propagation + TTL + client cache = <strong>90 s to 11 min</strong>, and <strong>never</strong> on a default JVM</td><td>Fail over below DNS; set <code>networkaddress.cache.ttl</code></td></tr>
+      <tr><td>Health-checking the load balancer</td><td>The ALB returns 200 for itself while every target fails — <strong>failover never triggers</strong></td><td>A deep check that exercises real dependencies</td></tr>
+      <tr><td>A deep health check on a <em>shared global</em> dependency</td><td>One database blip marks <strong>every Region</strong> unhealthy and there is nowhere to fail to</td><td>Check dependencies local to the failover unit; alarm on shared ones</td></tr>
+      <tr><td>Assuming NLB preserves the client IP</td><td>For <strong>IP targets over TCP/TLS it is off by default</strong> — rate limiters and allow-lists see the NLB</td><td>Enable <code>preserve_client_ip.enabled</code>, knowing hairpin traffic then breaks</td></tr>
+      <tr><td>Assuming cross-zone behaves the same on both</td><td>ALB: always on, free. <strong>NLB: off by default</strong>, so one instance in a thin AZ takes 50% of traffic</td><td>Enable it deliberately — and budget the cross-AZ charge</td></tr>
+      <tr><td>Backend keepalive shorter than the ALB idle timeout</td><td><strong>Sporadic 502s with no application log entry</strong>, uncorrelated with deploys</td><td>Backend 75s &gt; ALB 60s; in Node also set <code>headersTimeout</code></td></tr>
+      <tr><td>Reading a 502 as an application bug</td><td><code>target_status_code = "-"</code> means the target never produced a status — it is connection-level</td><td>Use the decoder table; check <code>target_processing_time</code></td></tr>
+      <tr><td>Forwarding <code>User-Agent</code> or a session cookie in the <em>cache</em> policy</td><td>Every request becomes unique — <strong>hit ratio collapses and the origin serves more than before the CDN</strong></td><td>Origin <em>request</em> policy for things the origin needs to see</td></tr>
+      <tr><td>Omitting <code>Authorization</code> from the cache key on private content</td><td><strong>One user's page is served to another</strong></td><td>Do not cache authenticated responses, or key on the identity</td></tr>
+      <tr><td>Invalidating <code>/*</code> on every deploy</td><td>$0.005 per path past 1,000/month, minutes of latency, and the origin absorbs a cold-cache stampede</td><td>Versioned filenames; immutable assets, <code>no-cache</code> HTML</td></tr>
+      <tr><td>An S3 origin readable without the distribution</td><td>Users and scrapers bypass the CDN entirely, and you pay raw S3 egress</td><td>Origin Access Control plus an <code>AWS:SourceArn</code> condition</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why can't you use a CNAME at a zone apex, and what does AWS do about it?</summary>
+      <p>RFC 1034 forbids a CNAME from coexisting with any other record at the same name, and a zone apex must
+         hold SOA and NS records. So <code>acme.com</code> can never be a CNAME, while
+         <code>www.acme.com</code> can. This matters because AWS load balancers and CloudFront distributions
+         are addressed by <em>hostname</em> — their IP addresses change without notice — so the obvious
+         "point acme.com at the ALB" is exactly the forbidden thing.</p>
+      <p><strong>Route 53's alias record</strong> solves it: it is an A or AAAA record whose value Route 53
+         resolves internally at query time, so the client receives real addresses and no CNAME is ever
+         involved. It is valid at the apex, <strong>free for AWS targets</strong>, saves the client a round
+         trip, and supports <code>EvaluateTargetHealth</code> so the record disappears when the target is
+         unhealthy. The wrong answer people give is hardcoding the load balancer's current IPs in an A record,
+         which works until the ALB scales.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> ALB or NLB — how do you choose?</summary>
+      <table class="tbl">
+        <tr><th>Choose ALB when</th><th>Choose NLB when</th></tr>
+        <tr><td>The traffic is HTTP/HTTPS/gRPC</td><td>It is raw TCP or UDP</td></tr>
+        <tr><td>You need host-, path- or header-based routing</td><td>You need a <strong>static IP</strong> or an Elastic IP</td></tr>
+        <tr><td>You want WAF, OIDC auth, or weighted target groups</td><td>You need extreme throughput or microsecond latency</td></tr>
+        <tr><td>You want cross-zone balancing for free</td><td>You are fronting a <strong>PrivateLink endpoint service</strong> (which requires an NLB)</td></tr>
+      </table>
+      <p>The default is ALB for anything HTTP, because the layer-7 features are why load balancers are useful.
+         Reach for NLB when something forces layer 4: a static IP for a partner's firewall allow-list, a
+         non-HTTP protocol, PrivateLink, or latency budgets where milliseconds matter. A common production
+         pattern is <strong>NLB in front of ALB</strong> — static IPs from the NLB, path routing from the ALB.
+         And remember the two differ on cross-zone defaults, which is a real behavioural difference and not
+         trivia.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Users report intermittent 502s. Application logs show nothing wrong. Diagnose.</summary>
+      <p><strong>"No application log entry" is the diagnosis, not an obstacle.</strong> A 502 from an ALB means
+         the target closed the connection or returned something unparseable — so if the application never
+         logged a request, the failure happened before any application code ran.</p>
+<pre>
+fields elb_status_code, target_status_code, target_processing_time
+| filter elb_status_code = 502
+| stats count() by target_status_code, target_processing_time
+
+  "-"   0.001   4,182                             ← no target status, near-zero time
+</pre>
+      <p>That signature — <code>target_status_code = "-"</code> with a processing time near zero — is a
+         <strong>connection-level race</strong>, and the overwhelmingly common cause is a keepalive mismatch:
+         the ALB's idle timeout defaults to 60 seconds, while nginx and Node.js default to 5. The backend
+         closes an idle connection the ALB still believes is usable, the ALB sends a request into it, and the
+         FIN arrives instead of a response.</p>
+      <p><strong>The fix is ordering:</strong> the backend keepalive must exceed the ALB idle timeout — 75s
+         against 60s. In Node, set both <code>server.keepAliveTimeout = 65000</code> and
+         <code>server.headersTimeout = 66000</code>, since <code>headersTimeout</code> must be the larger of
+         the two or you reintroduce the same race.</p>
+      <p><strong>Rule the others out quickly:</strong> a processing time at exactly the idle timeout is a 504,
+         not this; response headers exceeding the ALB limit produce 502 <em>with</em> a target status; and a
+         target crashing mid-request would show up in target health. If the <code>server:</code> response
+         header says <code>CloudFront</code> rather than <code>awselb/2.0</code>, you are debugging the wrong
+         hop entirely.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> CloudFront was deployed and the origin's load went <em>up</em>. Explain how that is possible.</summary>
+      <p>The cache key is fragmented, so almost nothing is a hit — and CloudFront then adds its own request
+         volume on top of the original traffic, since every miss becomes an origin fetch plus the edge's own
+         connection overhead.</p>
+      <p><strong>The usual culprits</strong>, all in the <em>cache</em> policy where they do not belong:</p>
+      <table class="tbl">
+        <tr><th>Field in the cache key</th><th>Distinct values</th><th>Effect</th></tr>
+        <tr><td><code>User-Agent</code></td><td>Thousands</td><td>Near-total fragmentation</td></tr>
+        <tr><td>A session cookie</td><td>One per user</td><td><strong>Hit ratio ≈ 0</strong></td></tr>
+        <tr><td><code>Accept-Encoding</code> raw</td><td>Many variants</td><td>Use the Gzip/Brotli normalisation flags instead</td></tr>
+        <tr><td>All query strings</td><td>Unbounded — trackers, UTM tags</td><td>Whitelist the ones that matter</td></tr>
+      </table>
+      <p><strong>Measure before guessing:</strong> the <code>CacheHitRate</code> CloudWatch metric, and
+         <code>x-cache: Hit from cloudfront</code> versus <code>Miss</code> on individual requests. Then split
+         the policies: anything the origin merely needs to <em>see</em> goes in the <strong>origin request
+         policy</strong>, which forwards it without touching the key; only fields that genuinely change the
+         response bytes belong in the <strong>cache policy</strong>.</p>
+      <p><strong>The mirror-image failure is worse</strong>, and worth raising unprompted: a key that is too
+         <em>narrow</em> — omitting <code>Authorization</code> on authenticated content — caches one user's
+         response and serves it to the next. Fragmentation costs money; over-collapsing is a data breach. Do
+         not cache authenticated responses unless the identity is part of the key.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design multi-Region active-active for a global application. Where does traffic get steered, and what actually fails over?</summary>
+      <p><strong>Steer at the edge, not at DNS, for anything needing fast failover.</strong> DNS latency-based
+         routing is the cheap answer and it is genuinely useful for coarse steering, but its failover is bounded
+         by detection plus propagation plus TTL plus client caching — minutes at best, and never for a JVM with
+         the default DNS cache. State that trade-off explicitly, because it is the heart of the question.</p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Mechanism</th><th>Failover speed</th></tr>
+        <tr><td>DNS</td><td>Route 53 latency + failover records</td><td><strong>Minutes</strong>, client-dependent</td></tr>
+        <tr><td><strong>Anycast</strong></td><td>Global Accelerator — two static IPs, unchanged on failover</td><td><strong>~30 s, client cache irrelevant</strong></td></tr>
+        <tr><td>CDN</td><td>CloudFront origin groups</td><td>Per request, on origin error</td></tr>
+        <tr><td>Regional</td><td>ALB across AZs</td><td>Seconds</td></tr>
+      </table>
+      <p><strong>The layered answer:</strong> CloudFront in front for static and cacheable content, with an
+         origin group so a failing origin is retried against the other Region <em>per request</em>. Global
+         Accelerator for the dynamic API path, because its anycast addresses never change — the client's cached
+         DNS answer stays valid and failover happens in the AWS network in about thirty seconds. Route 53
+         latency records underneath for coarse steering and as the mechanism of last resort.</p>
+      <p><strong>What actually fails over is the hard part, and it is data, not traffic.</strong> Active-active
+         is a <em>data</em> problem: either partition writes by key so each Region owns its records (the
+         approach that actually scales), or accept last-writer-wins with DynamoDB global tables and design the
+         application to tolerate it, or keep writes in one Region and serve reads globally. Say which you are
+         choosing and why. Routing users to a second Region that cannot accept their writes is worse than an
+         outage, because it corrupts data instead of stopping.</p>
+      <p><strong>And health checks must be local.</strong> If both Regions' checks query the same global
+         database, one blip marks both unhealthy and there is nowhere to send traffic. Check what the Region can
+         independently serve; alarm on shared dependencies rather than routing on them.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A deploy caused a partial outage. Users on some networks see errors, others do not, and it started 40 minutes after the deploy. Walk me through it.</summary>
+      <p><strong>Two clues point the same way before any log is read.</strong> "Some networks" means the
+         population is split by <em>resolver</em>, not by user or request — the signature of DNS. "Forty minutes
+         after" rules out the deploy as a direct cause and implicates something with a cache expiry: a TTL, a
+         CDN object, or a connection pool.</p>
+      <p><strong>Establish which layer answers, per affected network:</strong></p>
+<pre>
+$ curl -sS -D- -o /dev/null https://shop.acme.com/ --resolve shop.acme.com:443:&lt;each_ip&gt;
+   server: awselb/2.0        → reached the ALB
+   server: CloudFront + x-cache: Error from cloudfront  → never reached the origin
+$ dig +short shop.acme.com @8.8.8.8
+$ dig +short shop.acme.com @1.1.1.1
+   → if these differ, a weighted or failover record is splitting the population
+</pre>
+      <p><strong>The most likely mechanisms, in order:</strong> a weighted record left at a partial weight so
+         only the resolvers that re-queried after their TTL expired moved onto the broken version — which
+         explains both the split and the delay exactly; a Route 53 failover triggered by a health check that
+         only started failing once a dependency degraded; or a CDN cache expiry at 40 minutes exposing a broken
+         origin that a warm cache had been masking.</p>
+      <p><strong>Mitigate before diagnosing further.</strong> If it is a weighted record, set the bad target's
+         weight to zero — but note the recovery is <em>also</em> TTL-bound, so it will not be instant and you
+         must say so rather than watching and assuming it failed. If it is CDN-related, an invalidation is
+         faster than a redeploy. Only then find the root cause.</p>
+      <p><strong>The prevention that matters</strong> is the lesson people take away too narrowly: this class of
+         incident is invisible to synthetic monitoring from one location and to any dashboard that averages
+         across users. Monitor from multiple resolvers and Regions, and — the real fix — do not use DNS
+         weighting for deployment canaries at all. Split at the load balancer with weighted target groups,
+         where the shift is per-request, instant to reverse, and observable in one metric.</p>
+    </details>
+
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove a CNAME cannot live at the zone apex, then point the
+       apex at an ALB anyway.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws route53 change-resource-record-sets --hosted-zone-id Z1234567890ABC --change-batch '{"Changes":[
+    {"Action":"CREATE","ResourceRecordSet":{"Name":"acme.com","Type":"CNAME","TTL":300,
+      "ResourceRecords":[{"Value":"shop-alb-1234.us-east-1.elb.amazonaws.com"}]}}]}'
+
+An error occurred (InvalidChangeBatch) when calling the ChangeResourceRecordSets operation:
+RRSet of type CNAME with DNS name acme.com. is not permitted at apex in zone acme.com.
+   → not a Route 53 limitation. RFC 1034: a CNAME cannot coexist with other records,
+     and the apex MUST carry SOA and NS.
+
+$ dig acme.com NS +short | head -2
+ns-1234.awsdns-26.org.
+ns-567.awsdns-07.net.                              ← these are why
+</pre>
+<pre>
+❌ THE WRONG FIX people reach for — hardcode the current addresses:
+$ dig +short shop-alb-1234.us-east-1.elb.amazonaws.com
+54.211.14.9
+44.202.8.117
+$ # ...create an A record with those two values.
+$ # Three weeks later:
+$ dig +short shop-alb-1234.us-east-1.elb.amazonaws.com
+54.211.14.9
+3.219.44.201                                       ← the ALB scaled. Half your traffic
+                                                     now goes to an address AWS reassigned.
+</pre>
+<pre>
+✅ THE ALIAS RECORD:
+$ aws elbv2 describe-load-balancers --names shop-alb \
+    --query 'LoadBalancers[0].[DNSName,CanonicalHostedZoneId]' --output text
+shop-alb-1234.us-east-1.elb.amazonaws.com    Z35SXDOTRQ7X7K
+
+$ aws route53 change-resource-record-sets --hosted-zone-id Z1234567890ABC --change-batch '{"Changes":[
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"acme.com","Type":"A",
+      "AliasTarget":{"HostedZoneId":"Z35SXDOTRQ7X7K",
+                     "DNSName":"shop-alb-1234.us-east-1.elb.amazonaws.com",
+                     "EvaluateTargetHealth":true}}}]}'
+{ "ChangeInfo": { "Status": "PENDING" } }
+
+$ dig acme.com +noall +answer
+acme.com.        60   IN   A   54.211.14.9         ← an A record, at the apex
+acme.com.        60   IN   A   44.202.8.117
+</pre>
+<pre>
+VERIFY THE THREE PROPERTIES YOU ACTUALLY WANTED:
+
+1. It tracks the target — no CNAME in the response, and no stale addresses:
+$ dig acme.com +short; echo '--- after the ALB scales ---'; dig acme.com +short
+54.211.14.9
+44.202.8.117
+--- after the ALB scales ---
+54.211.14.9
+3.219.44.201                                       ← followed it automatically
+
+2. Queries are free:
+$ aws ce get-cost-and-usage --time-period Start=2026-08-01,End=2026-09-01 \
+    --granularity MONTHLY --metrics UnblendedCost \
+    --filter '{"Dimensions":{"Key":"USAGE_TYPE","Values":["DNS-Queries"]}}' \
+    --query 'ResultsByTime[0].Total.UnblendedCost.Amount' --output text
+0.0000000000                                       ← alias queries to AWS targets: free
+
+3. It is health-aware, with no health check configured:
+$ # stop every target
+$ dig acme.com +short
+                                                   ← empty. The record withdrew itself.
+</pre>
+<table class="tbl">
+  <tr><th>Approach</th><th>Apex</th><th>Tracks target</th><th>Query cost</th><th>Health-aware</th></tr>
+  <tr><td>CNAME</td><td><strong>❌ rejected</strong></td><td>✅</td><td>Charged</td><td>❌</td></tr>
+  <tr><td>Hardcoded A record</td><td>✅</td><td><strong>❌ breaks silently</strong></td><td>Charged</td><td>❌</td></tr>
+  <tr><td><strong>Alias</strong></td><td>✅</td><td>✅</td><td><strong>Free</strong></td><td><strong>✅</strong></td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Set up a weighted canary at 5%, then measure what fraction
+       of <em>requests</em> actually arrives — and explain the gap.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ for pair in "stable 95 stable-alb-9f2.us-east-1.elb.amazonaws.com" \
+              "canary  5 canary-alb-3c8.us-east-1.elb.amazonaws.com"; do
+    set -- $pair
+    aws route53 change-resource-record-sets --hosted-zone-id Z123 --change-batch "{\"Changes\":[
+      {\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"api.acme.com\",\"Type\":\"A\",
+        \"SetIdentifier\":\"$1\",\"Weight\":$2,
+        \"AliasTarget\":{\"HostedZoneId\":\"Z35SXDOTRQ7X7K\",\"DNSName\":\"$3\",
+                        \"EvaluateTargetHealth\":true}}}]}"
+  done
+</pre>
+<pre>
+MEASURE THE DNS SPLIT — many independent queries, which is the best case:
+$ for i in $(seq 1 1000); do dig +short api.acme.com @1.1.1.1; sleep 0.05; done \
+    | sort | uniq -c | sort -rn
+    948 54.211.14.9                                ← stable
+     52 3.219.44.201                               ← canary: 5.2%. Close to 5%.
+</pre>
+<pre>
+NOW MEASURE THE REQUEST SPLIT — what actually reached each target:
+$ aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+    --metric-name RequestCount --dimensions Name=LoadBalancer,Value=app/canary-alb/3c8 \
+    --start-time 2026-08-20T12:00:00Z --end-time 2026-08-20T13:00:00Z \
+    --period 3600 --statistics Sum --query 'Datapoints[0].Sum' --output text
+14209.0
+$ aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+    --metric-name RequestCount --dimensions Name=LoadBalancer,Value=app/stable-alb/9f2 \
+    ... --query 'Datapoints[0].Sum' --output text
+402881.0
+
+    14,209 / (14,209 + 402,881) = 3.4%           ← asked for 5%. Got 3.4%.
+</pre>
+<pre>
+AND ON A DIFFERENT DAY, THE SAME CONFIG:
+    canary  71,044   stable  346,046  → 17.0%     ← same 5% weight. Wildly different.
+
+WHY: the weight applies to ANSWERS, and one answer serves an entire resolver's user base.
+$ # look at the source IPs hitting the canary:
+$ aws logs start-query --log-group-name /aws/alb/canary --query-string \
+    'fields client_ip | stats count() by client_ip | sort by count desc | limit 3'
+  203.0.113.40   9,102                            ← one corporate NAT: 64% of canary traffic
+  198.51.100.7   2,140
+  192.0.2.88     1,003
+   → ONE resolver's cached answer decided the fate of thousands of users.
+</pre>
+<pre>
+✅ FOR A REAL CANARY — split at the load balancer, per request:
+$ aws elbv2 modify-listener --listener-arn arn:...:listener/app/shop/ab/1 \
+    --default-actions '[{"Type":"forward","ForwardConfig":{"TargetGroups":[
+        {"TargetGroupArn":"arn:...:targetgroup/stable/9f","Weight":95},
+        {"TargetGroupArn":"arn:...:targetgroup/canary/3c","Weight":5}]}}]'
+
+$ # measured over the same window:
+    canary 20,851 / 417,090 = 5.00%              ← exactly 5%, of REQUESTS
+</pre>
+<table class="tbl">
+  <tr><th></th><th>Weighted DNS</th><th>Weighted target groups</th></tr>
+  <tr><td>Unit</td><td>A resolver's cached answer</td><td><strong>A request</strong></td></tr>
+  <tr><td>Accuracy at 5%</td><td><strong>3.4% – 17% observed</strong></td><td>5.00%</td></tr>
+  <tr><td>Time to change</td><td>TTL-bound (minutes)</td><td><strong>Immediate</strong></td></tr>
+  <tr><td>Time to roll back</td><td>TTL-bound</td><td><strong>Immediate</strong></td></tr>
+  <tr><td>Good for</td><td>Coarse, slow Region shifts</td><td><strong>Deployment canaries</strong></td></tr>
+</table>
+<div class="note">🔑 The roll-back row is the one that matters at 3am. A bad canary behind weighted DNS cannot
+   be withdrawn faster than the TTL, and people watching a still-broken dashboard conclude the rollback failed
+   and start changing other things. At the load balancer it is one API call and the next request is already on
+   the old version.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce the keepalive 502, diagnose it from ALB access
+       logs alone, and fix it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+REPRODUCE — a Node backend at its defaults, behind an ALB at its defaults:
+$ cat &gt; server.js &lt;&lt;'JS'
+const http = require('http');
+const server = http.createServer((req, res) =&gt; res.end('ok'));
+server.listen(8080);
+// keepAliveTimeout defaults to 5000 ms. The ALB idle timeout defaults to 60000 ms.
+JS
+$ node server.js &amp;
+
+$ for i in $(seq 1 2000); do
+    curl -s -o /dev/null -w '%{http_code}\n' https://api.acme.com/ ; sleep 0.4
+  done | sort | uniq -c
+   1974 200
+     26 502                                        ← 1.3%. Intermittent. No pattern.
+
+$ tail -20 /var/log/app.log | grep -c 502
+0                                                  ← the application logged NOTHING
+</pre>
+<pre>
+DIAGNOSE FROM THE LOGS — the signature is two fields:
+$ aws logs start-query --log-group-name /aws/alb/api --start-time $(date -d '1 hour ago' +%s) \
+    --end-time $(date +%s) --query-string \
+  'fields elb_status_code, target_status_code, target_processing_time, request_processing_time
+   | filter elb_status_code = 502
+   | stats count() as n by target_status_code, target_processing_time'
+
+  target_status_code   target_processing_time   n
+  "-"                  -1                       26
+</pre>
+<table class="tbl">
+  <tr><th>Field</th><th>Value</th><th>What it rules out</th></tr>
+  <tr><td><code>target_status_code</code></td><td><code>"-"</code></td><td>The target never returned a status → <strong>not application logic</strong></td></tr>
+  <tr><td><code>target_processing_time</code></td><td><code>-1</code></td><td>The ALB never completed sending → <strong>not slowness, not a timeout</strong></td></tr>
+  <tr><td><code>request_processing_time</code></td><td>~0</td><td>Nothing queued → not capacity</td></tr>
+  <tr><td>Distribution across targets</td><td>Even</td><td>Not one bad host</td></tr>
+</table>
+<p>Those four together leave exactly one class of cause: the connection died between the ALB deciding to use it
+   and the target accepting a request on it. That is a <strong>keepalive race</strong>.</p>
+<pre>
+CONFIRM THE ORDERING:
+$ aws elbv2 describe-load-balancer-attributes --load-balancer-arn arn:...:loadbalancer/app/api/ab \
+    --query 'Attributes[?Key==`idle_timeout.timeout_seconds`].Value' --output text
+60
+$ node -e 'console.log(require("http").createServer().keepAliveTimeout)'
+5000                                               ← 5 s backend vs 60 s ALB. Inverted.
+</pre>
+<pre>
+✅ FIX — the backend must outlive the load balancer's idle timeout:
+$ cat &gt; server.js &lt;&lt;'JS'
+const http = require('http');
+const server = http.createServer((req, res) =&gt; res.end('ok'));
+server.keepAliveTimeout = 65000;                   // 65 s  > 60 s ALB idle timeout
+server.headersTimeout   = 66000;                   // MUST exceed keepAliveTimeout
+server.listen(8080);
+JS
+$ node server.js &amp;
+
+$ for i in $(seq 1 2000); do
+    curl -s -o /dev/null -w '%{http_code}\n' https://api.acme.com/ ; sleep 0.4
+  done | sort | uniq -c
+   2000 200                                        ✅ 0 failures
+</pre>
+<pre>
+THE SAME BUG IN OTHER STACKS — check yours:
+  nginx     keepalive_timeout 75s;                 (default 75s — already safe)
+  Node.js   server.keepAliveTimeout = 65000        (default 5000  ← DANGEROUS)
+  Go        srv.IdleTimeout = 65 * time.Second     (default: falls back to ReadTimeout)
+  Java/Tomcat  connectionTimeout="65000"           (default 60000 — borderline)
+  Python/gunicorn  --keep-alive 65                 (default 2     ← DANGEROUS)
+</pre>
+<div class="note">⚠️ <code>headersTimeout</code> must be <em>greater</em> than <code>keepAliveTimeout</code> in
+   Node, or you reintroduce the same race in a subtler form — the socket survives the idle period and then the
+   header timer fires mid-request. Setting only <code>keepAliveTimeout</code> is the most common half-fix, and
+   it reduces the 502 rate enough to look successful for a week. The alternative direction — lowering the ALB
+   idle timeout below the backend's keepalive — also works, and is the right choice when you do not control the
+   backend.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> A CloudFront distribution has a 0.3% hit ratio. Find the
+       cause, fix it, and measure the result — including the origin's load.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+MEASURE FIRST:
+$ aws cloudwatch get-metric-statistics --namespace AWS/CloudFront --metric-name CacheHitRate \
+    --dimensions Name=DistributionId,Value=E1A2B3C4D5 Name=Region,Value=Global \
+    --start-time 2026-08-19T00:00:00Z --end-time 2026-08-20T00:00:00Z \
+    --period 86400 --statistics Average --query 'Datapoints[0].Average' --output text
+0.3                                                ← 0.3%. Effectively no cache.
+
+$ curl -sI https://cdn.acme.com/static/app.js | grep -i '^x-cache'
+x-cache: Miss from cloudfront
+$ curl -sI https://cdn.acme.com/static/app.js | grep -i '^x-cache'
+x-cache: Miss from cloudfront                      ← the SAME object, twice. Never a hit.
+</pre>
+<pre>
+INSPECT THE CACHE KEY — this is where the answer always is:
+$ POLICY=$(aws cloudfront get-distribution-config --id E1A2B3C4D5 \
+    --query 'DistributionConfig.DefaultCacheBehavior.CachePolicyId' --output text)
+$ aws cloudfront get-cache-policy --id $POLICY \
+    --query 'CachePolicy.CachePolicyConfig.ParametersInCacheKeyAndForwardedToOrigin' --output json
+{
+  "HeadersConfig":      { "HeaderBehavior": "whitelist",
+                          "Headers": { "Items": ["User-Agent","Accept-Language","X-Request-Id"] } },
+  "CookiesConfig":      { "CookieBehavior": "all" },
+  "QueryStringsConfig": { "QueryStringBehavior": "all" }
+}
+</pre>
+<table class="tbl">
+  <tr><th>In the cache key</th><th>Distinct values</th><th>Belongs where?</th></tr>
+  <tr><td><code>User-Agent</code></td><td>~40,000 seen in 24 h</td><td>Nowhere — or origin request policy</td></tr>
+  <tr><td><code>X-Request-Id</code></td><td><strong>One per request</strong></td><td><strong>Origin request policy</strong> — guarantees 0% hits</td></tr>
+  <tr><td>All cookies</td><td>One per user</td><td>Origin request policy, if needed at all</td></tr>
+  <tr><td>All query strings</td><td>Unbounded (UTM tags)</td><td>Whitelist only what changes the bytes</td></tr>
+  <tr><td><code>Accept-Language</code></td><td>~200</td><td>Cache key <em>if</em> the response is localised</td></tr>
+</table>
+<p><code>X-Request-Id</code> alone makes a hit mathematically impossible: it is unique per request, so every
+   request is a distinct key. That one line explains the entire 0.3%.</p>
+<pre>
+✅ SPLIT THE POLICIES — key on what changes the bytes, forward what the origin needs:
+
+$ aws cloudfront create-cache-policy --cache-policy-config '{
+    "Name":"static-v2","DefaultTTL":86400,"MaxTTL":31536000,"MinTTL":1,
+    "ParametersInCacheKeyAndForwardedToOrigin":{
+      "EnableAcceptEncodingGzip":true,"EnableAcceptEncodingBrotli":true,
+      "HeadersConfig":{"HeaderBehavior":"whitelist","Headers":{"Quantity":1,"Items":["Accept-Language"]}},
+      "CookiesConfig":{"CookieBehavior":"none"},
+      "QueryStringsConfig":{"QueryStringBehavior":"whitelist",
+        "QueryStrings":{"Quantity":1,"Items":["v"]}}}}'
+
+$ aws cloudfront create-origin-request-policy --origin-request-policy-config '{
+    "Name":"origin-needs","HeadersConfig":{"HeaderBehavior":"whitelist",
+      "Headers":{"Quantity":3,"Items":["User-Agent","X-Request-Id","CloudFront-Viewer-Country"]}},
+    "CookiesConfig":{"CookieBehavior":"all"},
+    "QueryStringsConfig":{"QueryStringBehavior":"all"}}'
+   → the origin still SEES all of it. None of it fragments the cache.
+</pre>
+<pre>
+MEASURE AGAIN, 24 hours later:
+$ aws cloudwatch get-metric-statistics --namespace AWS/CloudFront --metric-name CacheHitRate \
+    ... --query 'Datapoints[0].Average' --output text
+94.1                                               ← 0.3% → 94.1%
+
+$ curl -sI https://cdn.acme.com/static/app.js | grep -iE '^(x-cache|age)'
+x-cache: Hit from cloudfront
+age: 3211
+</pre>
+<pre>
+AND THE POINT OF THE EXERCISE — what it did to the origin:
+$ aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB --metric-name RequestCount \
+    --dimensions Name=LoadBalancer,Value=app/origin/ab --period 86400 --statistics Sum \
+    --start-time 2026-08-19T00:00:00Z --end-time 2026-08-20T00:00:00Z --query 'Datapoints[0].Sum'
+41882301.0                                         ← before
+                                                     after: 2,471,056  (−94%)
+
+$ # and the egress bill, which is the other half of the win:
+  origin egress   41.9 M requests × ~180 KB  ≈ 7,540 GB × $0.09    = $ 678 / day
+  after           2.5 M × 180 KB ≈ 445 GB, CloudFront-to-origin FREE
+  CloudFront egress 7,540 GB × $0.085                              = $ 641 / day
+                                                        ...but with 94% served from
+  edge cache the origin fetch is 445 GB, so total ≈ $641 vs $678 AND the origin
+  fleet dropped from 24 to 4 instances.
+</pre>
+<div class="note">🔑 <strong>The mirror-image mistake is the dangerous one.</strong> Fragmenting the cache costs
+   money and origin capacity; <em>over-collapsing</em> it is a data breach. If this distribution served
+   authenticated pages and someone "fixed" the hit ratio by removing <code>Authorization</code> from the key,
+   one user's page would be served to the next. The rule that keeps you safe in both directions: a field
+   belongs in the cache key if and only if two requests differing in it must receive different bytes. Never
+   cache authenticated responses unless identity is part of the key.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Failover is configured, the primary Region is down, and
+       traffic is not moving. Find every reason, fix them, and measure the real failover time.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE SITUATION:
+$ curl -s -o /dev/null -w '%{http_code}\n' https://api.acme.com/orders/42
+503                                                ← users are getting errors
+$ aws route53 get-health-check-status --health-check-id a1b2c3d4-5e6f \
+    --query 'HealthCheckObservations[].StatusReport.Status' --output text | sort | uniq -c
+     18 Success: HTTP Status Code 200              ← Route 53 thinks it is HEALTHY
+</pre>
+<pre>
+FAULT 1 — the health check is checking the wrong thing.
+$ aws route53 get-health-check --health-check-id a1b2c3d4-5e6f \
+    --query 'HealthCheck.HealthCheckConfig.[FullyQualifiedDomainName,ResourcePath]' --output text
+api.acme.com    /health
+
+$ curl -s https://api.acme.com/health
+{"status":"ok"}                                    ← the ALB's own /health, served by ANY target
+$ aws elbv2 describe-target-health --target-group-arn arn:...:targetgroup/api/ab12 \
+    --query 'TargetHealthDescriptions[].TargetHealth.State' --output text
+healthy  healthy  healthy                          ← targets are UP...
+$ curl -s https://api.acme.com/orders/42 | jq -r .error
+"connection to orders-db timed out"                ← ...but the DATABASE is gone.
+   → the app process is alive and answers /health from memory. Nothing checks the dependency.
+</pre>
+<pre>
+✅ FIX 1 — a deep check, scoped to what THIS Region can independently serve:
+  GET /health/deep → 200 only if the app is up AND its REGIONAL database answers
+                     a real query. NOT the global billing service — see the note below.
+
+$ curl -s https://api.acme.com/health/deep | jq
+{ "status": "unhealthy", "db": "timeout", "cache": "ok" }
+$ curl -s -o /dev/null -w '%{http_code}\n' https://api.acme.com/health/deep
+503
+
+$ aws route53 update-health-check --health-check-id a1b2c3d4-5e6f --resource-path /health/deep
+$ aws route53 get-health-check-status --health-check-id a1b2c3d4-5e6f \
+    --query 'HealthCheckObservations[].StatusReport.Status' --output text | sort | uniq -c
+     18 Failure: HTTP Status Code 503              ✅ now it knows
+</pre>
+<pre>
+FAULT 2 — the failover record was never actually a failover record.
+$ aws route53 list-resource-record-sets --hosted-zone-id Z123 \
+    --query "ResourceRecordSets[?Name=='api.acme.com.'].[SetIdentifier,Failover,HealthCheckId]" --output text
+primary    PRIMARY     a1b2c3d4-5e6f
+secondary  SECONDARY   None                        ← secondary has no health check (fine)
+                                                     ...but check the primary's alias:
+$ aws route53 list-resource-record-sets --hosted-zone-id Z123 \
+    --query "ResourceRecordSets[?SetIdentifier=='primary'].AliasTarget.EvaluateTargetHealth" --output text
+False
+   → with EvaluateTargetHealth false AND the health check now failing, failover works —
+     but if the health check is ever removed this record has no health awareness at all.
+$ aws route53 change-resource-record-sets ... "EvaluateTargetHealth": true
+</pre>
+<pre>
+FAULT 3 — TTL, discovered only by measuring:
+$ dig api.acme.com | grep -E '^api'
+api.acme.com.    300    IN    A    54.211.14.9     ← 300 s TTL on a DR record
+$ # lower it — but note this only helps FUTURE incidents:
+$ # (alias records to ELB inherit 60 s; this one is a plain A record)
+</pre>
+<pre>
+NOW MEASURE THE REAL FAILOVER TIME:
+$ # break the primary at T+0, then poll from a fresh resolver every second
+$ START=$(date +%s)
+$ while true; do
+    IP=$(dig +short api.acme.com @1.1.1.1 | head -1)
+    [ "$IP" = "3.219.44.201" ] &amp;&amp; { echo "moved after $(( $(date +%s) - START ))s"; break; }
+    sleep 1
+  done
+moved after 47s
+</pre>
+<table class="tbl">
+  <tr><th>Stage</th><th>Measured</th><th>Controlled by</th></tr>
+  <tr><td>Detection</td><td>22 s</td><td><code>RequestInterval</code> × <code>FailureThreshold</code></td></tr>
+  <tr><td>Route 53 propagation</td><td>7 s</td><td>AWS</td></tr>
+  <tr><td>Resolver TTL expiry</td><td>0–60 s (18 s here)</td><td><strong>Your TTL — set before the incident</strong></td></tr>
+  <tr><td><strong>Total, one resolver</strong></td><td><strong>47 s</strong></td><td>—</td></tr>
+  <tr><td>A Java client with default DNS caching</td><td><strong>∞</strong></td><td>The client's JVM</td></tr>
+</table>
+<pre>
+FAULT 4 — the clients that never move at all:
+$ # on a JVM host, after the DNS record has changed:
+$ jcmd &lt;pid&gt; VM.system_properties | grep networkaddress
+networkaddress.cache.ttl=-1                        ← cache forever
+$ # the fix, in java.security or as a startup property:
+  networkaddress.cache.ttl=30
+  networkaddress.cache.negative.ttl=5
+
+$ # verify it actually took effect:
+$ jcmd &lt;pid&gt; VM.system_properties | grep networkaddress.cache.ttl
+networkaddress.cache.ttl=30                        ✅
+</pre>
+<div class="note">🔑 Two things this exercise is really teaching. <strong>A health check that cannot fail is
+   worse than no health check</strong>, because it converts an outage into an outage plus a dashboard saying
+   everything is fine. And <strong>a deep health check must be scoped to the failover unit</strong>: if
+   <code>/health/deep</code> had queried the <em>global</em> billing service, both Regions would have gone
+   unhealthy simultaneously and Route 53 would have had nowhere to send traffic — turning a partial outage into
+   a total one. Check what this Region can independently serve; alarm on shared dependencies rather than
+   routing on them. Finally, 47 seconds is the <em>best</em> case here; if seconds matter, fail over below DNS
+   with Global Accelerator, whose anycast addresses never change and so cannot be cached wrong.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Users report errors. It could be any of four layers. Isolate
+       it with headers and logs before changing anything.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — ASK WHO ANSWERED. One request, and three of the four layers are eliminated:
+$ curl -sS -D- -o /dev/null https://shop.acme.com/orders/42
+HTTP/2 502
+server: CloudFront
+x-cache: Error from cloudfront
+x-amz-cf-pop: IAD79-P4
+x-amz-cf-id: kR3fQ2mN8vL...
+via: 1.1 a3f91c2.cloudfront.net (CloudFront)
+
+  → CloudFront generated this, meaning it FAILED TO GET A USABLE RESPONSE FROM THE ORIGIN.
+    (If `server:` had said awselb/2.0, CloudFront was fine and the ALB is the suspect.
+     If it said nginx, both were fine and this is an application bug.)
+</pre>
+<pre>
+STEP 2 — GO DIRECTLY TO THE ORIGIN, bypassing the CDN entirely:
+$ ORIGIN=$(aws cloudfront get-distribution --id E1A2B3C4D5 \
+    --query 'Distribution.DistributionConfig.Origins.Items[0].DomainName' --output text)
+$ echo $ORIGIN
+shop-alb-1234.us-east-1.elb.amazonaws.com
+
+$ curl -sS -D- -o /dev/null "https://shop.acme.com/orders/42" \
+    --resolve "shop.acme.com:443:$(dig +short $ORIGIN | head -1)"
+HTTP/2 503
+server: awselb/2.0
+   → the ALB is ALSO failing. CloudFront was reporting the truth, not causing it.
+     Two layers eliminated. The fault is at or below the ALB.
+</pre>
+<pre>
+STEP 3 — 503 FROM AN ALB IS UNAMBIGUOUS: no healthy targets.
+$ aws elbv2 describe-target-health --target-group-arn arn:...:targetgroup/shop/ab12 \
+    --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason,
+             TargetHealth.Description]' --output text
+i-0aaa  unhealthy  Target.ResponseCodeMismatch  Health checks failed with these codes: [500]
+i-0bbb  unhealthy  Target.ResponseCodeMismatch  Health checks failed with these codes: [500]
+i-0ccc  unhealthy  Target.Timeout               Request timed out
+</pre>
+<pre>
+STEP 4 — THE TARGETS ARE RUNNING BUT FAILING THEIR CHECK. Ask them directly:
+$ curl -s -o /dev/null -w '%{http_code}\n' http://10.0.1.14:8080/health
+500
+$ curl -s http://10.0.1.14:8080/health
+{"status":"error","db":"FATAL: remaining connection slots are reserved"}
+   → the DATABASE is out of connections. Every layer above was reporting honestly.
+</pre>
+<table class="tbl">
+  <tr><th>Layer</th><th>Evidence</th><th>Verdict</th></tr>
+  <tr><td>DNS</td><td><code>dig</code> resolved to the expected CloudFront address</td><td>✅ fine</td></tr>
+  <tr><td>CloudFront</td><td><code>Error from cloudfront</code>, and the origin fails directly too</td><td>✅ reporting, not causing</td></tr>
+  <tr><td>ALB</td><td>503 + <code>describe-target-health</code></td><td>✅ reporting, not causing</td></tr>
+  <tr><td>Target</td><td>Health endpoint returns 500 with a DB error</td><td>⚠️ symptom</td></tr>
+  <tr><td><strong>Database</strong></td><td><code>remaining connection slots are reserved</code></td><td><strong>❌ root cause</strong></td></tr>
+</table>
+<pre>
+CONFIRM THE ROOT CAUSE RATHER THAN STOPPING AT THE SYMPTOM:
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].[DBInstanceClass,MaxAllocatedStorage]' --output text
+db.t3.medium    None
+$ aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name DatabaseConnections \
+    --dimensions Name=DBInstanceIdentifier,Value=orders-db --period 300 --statistics Maximum \
+    --start-time 2026-08-20T11:00:00Z --end-time 2026-08-20T13:00:00Z \
+    --query 'sort_by(Datapoints,&amp;Timestamp)[-3:].[Timestamp,Maximum]' --output text
+2026-08-20T12:35:00Z   87
+2026-08-20T12:40:00Z   90
+2026-08-20T12:45:00Z   90                          ← pinned at the max_connections ceiling
+
+$ # and WHY — the ASG scaled out, and each instance opens a fixed pool:
+$ aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names shop-asg \
+    --query 'AutoScalingGroups[0].[DesiredCapacity,MinSize,MaxSize]' --output text
+18    4    20
+   → 18 instances × 5 pool connections = 90. The autoscaler scaled the fleet
+     into a database connection limit. The 502 users saw is four layers downstream.
+</pre>
+<div class="note">🔑 <strong>Every layer told the truth, and each one's error code named its own view rather
+   than the cause.</strong> CloudFront said "I could not get a response", the ALB said "I have no healthy
+   targets", the target said "the database refused me", and the database said "I am full". Debugging downward
+   through the layers — asking who answered, then bypassing that layer — reaches the cause in four commands and
+   without changing anything. The alternative, restarting things at whichever layer you happen to suspect, is
+   how a connection-pool exhaustion becomes a two-hour incident. Note also the real fix is not "raise
+   max_connections": add a proxy such as RDS Proxy to multiplex the pools, or cap the ASG at a size the
+   database can actually support — the autoscaler is currently able to take down its own dependency.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>Every external request takes four hops — <strong>DNS → CloudFront → load balancer → target</strong> — and all four can return a 5xx. The <code>server:</code> response header names which one answered.</li>
+        <li><strong>A CNAME can never sit at a zone apex</strong> (RFC 1034), which is why AWS invented the <strong>alias record</strong>: valid at the apex, free for AWS targets, one fewer round trip, and health-aware via <code>EvaluateTargetHealth</code>.</li>
+        <li>Never hardcode a load balancer's IP addresses — they change without notice, and the failure is silent and delayed.</li>
+        <li><strong>Lower TTLs the day before a migration</strong>; lowering during an incident does nothing for resolvers that already cached the old answer.</li>
+        <li>Weighted DNS splits <strong>resolver answers, not requests</strong> — a 5% weight measured 3.4% one day and 17% another, because one corporate resolver decided for thousands of users.</li>
+        <li>For a real canary, use <strong>weighted target groups at the ALB</strong>: exactly 5%, per request, and instantly reversible — the roll-back speed is what matters at 3am.</li>
+        <li><strong>DNS failover is minutes, not seconds</strong>: detection + propagation + TTL + client cache measured 47 s at best, and a JVM with <code>networkaddress.cache.ttl=-1</code> <strong>never moves at all</strong>.</li>
+        <li>If you need seconds-scale failover, do it below DNS — Global Accelerator's anycast addresses never change, so a stale cache cannot hurt you.</li>
+        <li><strong>A health check pointed at the load balancer will report healthy while every target fails</strong> — failover never triggers, and monitoring says everything is fine.</li>
+        <li>Deep health checks must be scoped to the <strong>failover unit</strong>: checking a shared global dependency marks every Region unhealthy at once and turns a partial outage into a total one.</li>
+        <li>ALB is layer 7 with host/path routing; NLB is layer 4 with <strong>static IPs</strong>, microsecond latency, and it is what PrivateLink requires.</li>
+        <li><strong>NLB client-IP preservation depends on the target type</strong> — off by default for IP targets over TCP/TLS, which silently breaks rate limiters and allow-lists.</li>
+        <li><strong>ALB cross-zone is always on and free; NLB's is off by default and billable</strong> — leave it off and one instance in a thin AZ takes 50% of the traffic.</li>
+        <li><strong>The backend keepalive must exceed the ALB idle timeout</strong> (75s &gt; 60s). Node's 5s default produces sporadic 502s with no application log entry — and <code>headersTimeout</code> must exceed <code>keepAliveTimeout</code>.</li>
+        <li>Decode ALB 5xx by field: <strong>503 = no healthy targets</strong>, 504 = target exceeded the idle timeout, <strong>502 with <code>target_status_code = "-"</code> and near-zero processing time = a connection race</strong>.</li>
+        <li>CloudFront's <strong>cache key</strong> is the whole game: too wide (a per-request header) drops the hit ratio to 0.3% and the origin serves <em>more</em> than before the CDN; too narrow (omitting <code>Authorization</code>) serves one user's page to another.</li>
+        <li>Fields the origin merely needs to <em>see</em> belong in the <strong>origin request policy</strong>; only response-varying fields belong in the <strong>cache policy</strong>. Fixing that took 0.3% → 94.1% and cut origin requests 94%.</li>
+        <li>The origin's <code>Cache-Control</code> usually wins over CloudFront's DefaultTTL, but <strong>MinTTL overrides a shorter origin value</strong>.</li>
+        <li><strong>Invalidation is not a deployment strategy</strong> — $0.005 per path past 1,000/month, minutes of latency, and a cold-cache stampede. Use versioned filenames with immutable caching.</li>
+        <li>Lock the origin with <strong>Origin Access Control plus an <code>AWS:SourceArn</code> condition</strong>, or anyone can bypass the CDN and you pay raw egress.</li>
+        <li>Debug downward: ask who answered, bypass that layer, repeat. Every layer reports its own view honestly — a user's 502 was a database connection ceiling four layers below.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="connectivity.html">← Connecting VPCs, PrivateLink &amp; On-Prem</a>
+      <a href="ec2-compute.html">EC2, EBS &amp; Auto Scaling →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
