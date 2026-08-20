@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Requests, Limits &amp; QoS — Kubernetes — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Requests, Limits &amp; QoS <span class="level-badge level-adv">Scaling &amp; Reliability</span></h1>
+    <p><strong>What you'll master:</strong> what each number actually does — <strong>requests buy you a
+       scheduling reservation and a share of contended CPU; limits are enforcement, and the two are enforced by
+       completely different kernel mechanisms</strong>; the three QoS classes, how they are derived, and the
+       eviction order they dictate when a node runs short; why <strong>CPU limits are genuinely
+       controversial</strong> — throttling destroys tail latency at low average utilisation — and when to set them
+       anyway; why memory has no equivalent of throttling, so exceeding a limit is always a kill; the
+       <code>LimitRange</code> and <code>ResourceQuota</code> pair that make a namespace's defaults enforceable;
+       and a sizing method that produces numbers you can defend. Prerequisites:
+       <a href="scheduling.html">Scheduling</a>, <a href="pods.html">Pods</a>, and
+       <a href="../docker/resource-limits.html">Docker: Resource Limits</a>.</p>
+
+    <h2>Part 1 — Two Numbers, Two Mechanisms</h2>
+
+    <table class="tbl">
+      <tr><th></th><th><code>requests</code></th><th><code>limits</code></th></tr>
+      <tr><td>Used by the scheduler</td><td><strong>✅ Yes — this is the reservation</strong></td><td>❌ Never</td></tr>
+      <tr><td>CPU: kernel mechanism</td><td><code>cpu.weight</code> — a share under contention</td><td><code>cpu.max</code> — a hard quota that <strong>throttles</strong></td></tr>
+      <tr><td>Memory: kernel mechanism</td><td>Nothing directly; drives eviction ranking</td><td><code>memory.max</code> — exceed it and you are <strong>OOM-killed</strong></td></tr>
+      <tr><td>Effect on an idle node</td><td>None</td><td><strong>Still enforced</strong></td></tr>
+      <tr><td>Determines QoS class</td><td>✅</td><td>✅</td></tr>
+    </table>
+
+<pre>
+resources:
+  requests: { cpu: "500m", memory: "512Mi", ephemeral-storage: "1Gi" }
+  limits:   { cpu: "2",    memory: "512Mi" }
+
+$ kubectl exec api -- cat /sys/fs/cgroup/cpu.max
+200000 100000                    ← limit 2 CPU = 200 ms per 100 ms period
+$ kubectl exec api -- cat /sys/fs/cgroup/cpu.weight
+20                               ← derived from the 500m REQUEST
+$ kubectl exec api -- cat /sys/fs/cgroup/memory.max
+536870912                        ← 512Mi, a hard ceiling
+</pre>
+
+    <div class="note">🔑 <strong>The request is the only number the scheduler sees, and it is a reservation, not
+       a prediction.</strong> A node whose pods request 100% of its CPU accepts no more pods even if every one is
+       idle — and pods with <em>no</em> request are scheduled as though free, which is how a node ends up
+       overcommitted and evicting. Both directions are failures of the same rule: the request must reflect
+       reality.</div>
+
+<pre>
+CPU is compressible; memory is not.
+
+  over CPU limit    → THROTTLED: the process is paused until the next period
+  over memory limit → KILLED: there is no way to give a process "less memory"
+</pre>
+
+    <h2>Part 2 — QoS Classes and Eviction Order</h2>
+
+    <table class="tbl">
+      <tr><th>Class</th><th>Condition</th><th>Evicted</th><th><code>oom_score_adj</code></th></tr>
+      <tr><td><strong>Guaranteed</strong></td><td>Every container has requests == limits, for CPU <em>and</em> memory</td><td><strong>Last</strong></td><td>-997</td></tr>
+      <tr><td><strong>Burstable</strong></td><td>At least one request set, but not Guaranteed</td><td>Second</td><td>2–999, scaled by request</td></tr>
+      <tr><td><strong>BestEffort</strong></td><td>No requests or limits at all</td><td><strong>First</strong></td><td>1000</td></tr>
+    </table>
+
+<pre>
+$ kubectl get pods -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass
+NAME          QOS
+api           Guaranteed
+worker        Burstable
+scratch       BestEffort
+
+$ kubectl exec api -- cat /proc/1/oom_score_adj
+-997                             ← the kernel's global OOM killer avoids it
+$ kubectl exec scratch -- cat /proc/1/oom_score_adj
+1000                             ← the first thing the kernel picks
+</pre>
+
+    <p>Under node memory pressure the kubelet evicts in a specific order, and the rule that surprises people is
+       that <strong>usage relative to the request</strong> matters more than absolute usage:</p>
+
+<pre>
+  1. BestEffort pods                              (no requests at all)
+  2. Burstable pods USING MORE THAN THEIR REQUEST (most over first)
+  3. Burstable pods within their request
+  4. Guaranteed pods                              (only if the node is desperate)
+
+  → a Burstable pod requesting 100Mi and using 900Mi is evicted before one
+    requesting 2Gi and using 1.5Gi, despite using far less memory
+</pre>
+
+    <div class="note">⚠️ <strong>Guaranteed is not a performance tier, it is a survival tier.</strong> Setting
+       requests equal to limits gives no extra CPU and no faster memory — it buys eviction protection and
+       predictability, at the cost of reserving capacity you may not use. It is right for latency-critical and
+       stateful workloads; for everything else Burstable gives better cluster utilisation.</div>
+
+    <h2>Part 3 — CPU Limits Are Controversial</h2>
+
+    <p>Quota is enforced per 100 ms period. A container that exhausts its quota is <strong>stopped until the next
+       period begins</strong> — invisible in average CPU graphs, devastating in p99:</p>
+
+<pre>
+  a request needing 200 ms of CPU across 4 threads, with limits.cpu = 1:
+    period 1 (0–100ms):   4 threads consume 100 ms of quota in 25 ms wall time
+    period 1 (25–100ms):  THROTTLED — all four threads frozen for 75 ms
+    period 2:             same again
+    → 200 ms of work takes 225 ms, with two 75 ms freezes
+
+$ kubectl exec api -- cat /sys/fs/cgroup/cpu.stat
+nr_periods 84021
+nr_throttled 31447               ← 37% of periods hit the cap
+throttled_usec 402910000         ← 403 seconds frozen
+</pre>
+
+    <table class="tbl">
+      <tr><th>Config</th><th>Average CPU</th><th>p50</th><th>p99</th><th>Throttled periods</th></tr>
+      <tr><td>No CPU limit</td><td>62%</td><td>18 ms</td><td>41 ms</td><td>0%</td></tr>
+      <tr><td><code>limits.cpu: 4</code></td><td>62%</td><td>18 ms</td><td>44 ms</td><td>0.2%</td></tr>
+      <tr><td><code>limits.cpu: 2</code></td><td>62%</td><td>21 ms</td><td>96 ms</td><td>11%</td></tr>
+      <tr><td><code>limits.cpu: 1</code></td><td>62%</td><td>34 ms</td><td><strong>488 ms</strong></td><td>37%</td></tr>
+    </table>
+
+    <table class="tbl">
+      <tr><th>Set CPU limits</th><th>Omit CPU limits</th></tr>
+      <tr><td>Predictable, reproducible performance</td><td><strong>Better p99</strong> — no throttling</td></tr>
+      <tr><td>Protects neighbours from a runaway loop</td><td>Bursts absorb spikes for free</td></tr>
+      <tr><td>Required for the <code>Guaranteed</code> class</td><td>Requests already give a fair share under contention</td></tr>
+      <tr><td>Needed for exclusive CPUs (static CPU manager)</td><td>Better utilisation of idle capacity</td></tr>
+      <tr><td>Makes capacity planning honest</td><td>Noisy neighbours possible on an oversubscribed node</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The defensible position: always set memory limits, and set CPU limits only where
+       predictability matters more than tail latency.</strong> <code>cpu.weight</code> from the request already
+       provides proportional fairness under contention, so a CPU limit adds nothing on a healthy node and costs
+       p99 on a busy one. Batch and untrusted workloads should be capped; latency-critical services usually should
+       not — and either way <code>nr_throttled</code> belongs on the dashboard next to utilisation.</div>
+
+    <h2>Part 4 — Memory Has No Throttle</h2>
+
+<pre>
+$ kubectl get pod api -o jsonpath='{.status.containerStatuses[0].lastState.terminated}' | jq
+{ "exitCode": 137, "reason": "OOMKilled",
+  "startedAt": "...", "finishedAt": "..." }
+$ kubectl get events --field-selector reason=OOMKilling | tail -1
+Warning  OOMKilling  Memory cgroup out of memory: Killed process 20481 (java)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Signal</th><th>Meaning</th></tr>
+      <tr><td>Exit 137 + <code>reason: OOMKilled</code></td><td>The container exceeded <code>limits.memory</code></td></tr>
+      <tr><td>Exit 137, no OOMKilled</td><td>SIGKILL from elsewhere — usually an ignored SIGTERM</td></tr>
+      <tr><td>Pod status <code>Evicted</code></td><td><strong>The node ran short</strong>; the kubelet chose this pod</td></tr>
+      <tr><td>Memory climbs to the cap then flattens</td><td>Normal for a managed heap — not a leak</td></tr>
+      <tr><td>Climbs across restarts, never flattens</td><td>A real leak; raising the limit only delays it</td></tr>
+    </table>
+
+    <p>Two accounting details decide whether your numbers mean anything. <strong>Page cache counts toward the
+       cgroup's memory</strong>, so <code>kubectl top</code> can show 90% on an idle pod that has merely written
+       files — the honest figure is <code>memory.current − inactive_file</code>. And <strong>the runtime cannot see
+       the limit</strong> unless it is container-aware: <code>/proc/meminfo</code> is not namespaced, so Node,
+       Python and older JVMs size their heaps from the node's total RAM. Both are measured in detail in
+       <a href="../docker/resource-limits.html">Docker: Resource Limits</a>.</p>
+
+<pre>
+  budget roughly 25–30% of the container limit for everything outside the managed heap:
+    -XX:MaxRAMPercentage=75                    (JVM, container-aware since 10)
+    NODE_OPTIONS=--max-old-space-size=384      (for a 512Mi limit)
+    GOMEMLIMIT=450MiB                          (Go 1.19+, a soft limit)
+
+  and set it BELOW the container limit so you get a diagnosable heap error with a
+  stack trace instead of a silent SIGKILL.
+</pre>
+
+    <h2>Part 5 — LimitRange and ResourceQuota</h2>
+
+<pre>
+apiVersion: v1
+kind: LimitRange                       ← DEFAULTS and bounds, per namespace
+metadata: { name: defaults, namespace: shop }
+spec:
+  limits:
+  - type: Container
+    default:        { cpu: "500m", memory: "512Mi" }     ← applied if limits omitted
+    defaultRequest: { cpu: "100m", memory: "128Mi" }     ← applied if requests omitted
+    max:            { cpu: "4",    memory: "8Gi" }
+    min:            { cpu: "10m",  memory: "16Mi" }
+    maxLimitRequestRatio: { cpu: "10" }                  ← caps overcommit per container
+---
+apiVersion: v1
+kind: ResourceQuota                    ← a CEILING for the whole namespace
+metadata: { name: quota, namespace: shop }
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+    pods: "100"
+    persistentvolumeclaims: "20"
+    count/deployments.apps: "30"
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>LimitRange</th><th>ResourceQuota</th></tr>
+      <tr><td>Scope</td><td>Per container/pod</td><td>The whole namespace</td></tr>
+      <tr><td>Acts by</td><td><strong>Defaulting and rejecting</strong></td><td>Rejecting once the total is exceeded</td></tr>
+      <tr><td>Key effect</td><td>Pods without requests get sensible ones</td><td><strong>Forces every pod to declare requests</strong></td></tr>
+      <tr><td>Applies to existing pods</td><td>❌ Only new ones</td><td>❌ Only new ones</td></tr>
+    </table>
+
+<pre>
+$ kubectl run bare --image=nginx:alpine -n shop
+$ kubectl get pod bare -n shop -o jsonpath='{.spec.containers[0].resources}{"\n"}'
+{"limits":{"cpu":"500m","memory":"512Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}
+                                 ← the LimitRange filled them in
+
+# with a ResourceQuota on requests.cpu and NO LimitRange:
+$ kubectl run bare2 --image=nginx:alpine -n locked
+Error from server (Forbidden): pods "bare2" is forbidden: failed quota: quota:
+must specify limits.cpu for: bare2; requests.cpu for: bare2
+</pre>
+
+    <div class="note">⚠️ <strong>A ResourceQuota on CPU or memory makes requests mandatory for every pod in the
+       namespace.</strong> That is usually what you want — but adding one to a live namespace instantly breaks
+       every deployment whose manifests omit resources. Always land the <code>LimitRange</code> first so
+       defaults exist, then the quota.</div>
+
+    <h2>Part 6 — Sizing From Measurement</h2>
+
+<pre>
+  ① run under realistic load with generous limits
+  ② record the honest numbers:
+       memory = max over the window of (memory.current − inactive_file)
+       cpu    = p99 utilisation, plus nr_throttled if a limit is already set
+  ③ memory request = p99 usage;  memory limit = 1.5 × peak
+  ④ cpu request    = p99 usage;  cpu limit = omit, or ≥ 2× the request
+  ⑤ deploy, then WATCH: OOMKills, nr_throttled, and headroom
+  ⑥ re-derive quarterly — a limit is a measurement with an expiry date
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Diagnosis</th><th>Action</th></tr>
+      <tr><td>Exit 137, <code>OOMKilled: true</code></td><td>Limit genuinely exceeded</td><td>Raise the limit, or fix the leak — check the trend first</td></tr>
+      <tr><td>Pods <code>Evicted</code>, node <code>MemoryPressure</code></td><td>Node overcommitted</td><td>Raise <strong>requests</strong>, not limits</td></tr>
+      <tr><td>p99 spikes, average CPU low</td><td>CFS throttling</td><td><code>nr_throttled</code>; raise or remove the CPU limit</td></tr>
+      <tr><td>Pods Pending, nodes idle</td><td>Over-requested neighbours</td><td>Right-size requests — see <a href="scheduling.html">Scheduling</a></td></tr>
+      <tr><td>"90% memory" on an idle pod</td><td>Page cache in the accounting</td><td>Alert on OOMKills, not percentages</td></tr>
+    </table>
+
+<pre>
+$ kubectl apply -f vpa-recommender.yaml   # VPA in "Off" mode: recommendations only
+$ kubectl describe vpa api | grep -A5 'Recommendation'
+  Target:      cpu: 240m    memory: 412Mi      ← what it would set
+  Lower Bound: cpu: 180m    memory: 350Mi
+  Upper Bound: cpu: 890m    memory: 1200Mi
+$ kubectl get deploy api -o jsonpath='{.spec.template.spec.containers[0].resources.requests}{"\n"}'
+{"cpu":"2","memory":"4Gi"}                ← 8× the measured need, reserved and idle
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>No requests on half the workloads, four-times-oversized requests on the rest, CPU limits set
+         to exactly the request, and monitoring that watches node utilisation.</strong> The pods without requests
+         are BestEffort, so they schedule as though free, pack forty onto a node, and are the first thing evicted
+         when it runs short — taking down the batch jobs that were nearly finished. The over-requested services
+         reserve four times what they use, so nodes sit at 6% utilisation and completely unschedulable while the
+         dashboard shows enormous headroom and someone orders more instances. CPU limits equal to requests make
+         every service <code>Guaranteed</code>, which sounds good and means a four-thread API is throttled 37% of
+         periods with a p99 of 488 ms at 62% average CPU — invisible on every graph anyone looks at. A JVM sizes
+         its heap from the node's 64 GB because <code>/proc/meminfo</code> is not namespaced, so it is OOM-killed
+         at 512Mi on every deploy and written off as a bad image. And a ResourceQuota added later to control costs
+         instantly breaks every deployment whose manifests omit resources.</p>
+      <p>✅ <strong>Give every pod a measured request, set memory limits always, set CPU limits deliberately, and
+         monitor reservation rather than utilisation.</strong> Land a <code>LimitRange</code> first so no pod can
+         be created without sensible defaults, then a <code>ResourceQuota</code> to bound the namespace — in that
+         order, or the quota rejects everything. Derive requests from p99 observed usage using
+         <code>memory.current − inactive_file</code>, not <code>kubectl top</code>, which counts page cache; VPA
+         in recommendation mode turns this into a backlog rather than a guessing game. <strong>Always set a memory
+         limit</strong>, because memory is incompressible and an unbounded leak becomes a node-wide eviction event
+         with a victim chosen by heuristic. Treat CPU limits as a real trade: they buy predictability and cost
+         tail latency, so cap batch and untrusted work and usually leave latency-critical services uncapped, with
+         <code>nr_throttled</code> on the dashboard either way. Tell the runtime what it actually has —
+         <code>MaxRAMPercentage</code>, <code>--max-old-space-size</code>, <code>GOMEMLIMIT</code> — set below the
+         container limit so you get a stack trace instead of a silent kill. And alert on <strong>OOMKills,
+         evictions, throttling and requests-versus-allocatable</strong>, none of which appear on a utilisation
+         graph.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>No requests at all</td><td>BestEffort: scheduled as free, evicted first</td><td>Always set requests</td></tr>
+      <tr><td>Requests from guesswork</td><td>Over-requesting buys idle hardware; under-requesting causes evictions</td><td>p99 measured usage</td></tr>
+      <tr><td>Judging capacity by utilisation</td><td>Scheduling books <strong>requests</strong></td><td>Monitor requests vs allocatable</td></tr>
+      <tr><td>No memory limit</td><td>A leak becomes a node-wide eviction with an arbitrary victim</td><td>Always set one</td></tr>
+      <tr><td>CPU limit == request everywhere</td><td>Throttling at 62% average CPU; p99 12× worse</td><td>Cap batch; leave latency-critical uncapped</td></tr>
+      <tr><td>Ignoring <code>nr_throttled</code></td><td>Throttling is invisible in averages</td><td>Put it on the dashboard</td></tr>
+      <tr><td>Reading <code>kubectl top</code> as real memory</td><td>Includes reclaimable page cache</td><td><code>memory.current − inactive_file</code></td></tr>
+      <tr><td>Heap sized from the node</td><td><code>/proc</code> is not namespaced</td><td><code>MaxRAMPercentage</code>, <code>--max-old-space-size</code>, <code>GOMEMLIMIT</code></td></tr>
+      <tr><td>Heap == container limit</td><td>Stacks, metaspace and buffers live outside it</td><td>Heap ≈ 70–75% of the limit</td></tr>
+      <tr><td>Assuming Guaranteed is faster</td><td>It is an eviction tier, not a performance tier</td><td>Use it for latency-critical and stateful work</td></tr>
+      <tr><td>Quota before LimitRange</td><td>Every pod without resources is rejected</td><td>LimitRange first</td></tr>
+      <tr><td>Expecting a LimitRange to fix running pods</td><td>Admission applies to new pods only</td><td>Recreate them</td></tr>
+      <tr><td>Forgetting <code>ephemeral-storage</code></td><td>Logs and scratch fill the node — see <a href="storage.html">Storage</a></td><td>Request and limit it</td></tr>
+      <tr><td>Setting limits once and never again</td><td>Workloads drift</td><td>Re-derive quarterly</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between a request and a limit?</summary>
+      <p><strong>A request is a reservation used for scheduling; a limit is runtime enforcement. They are
+         implemented by different kernel mechanisms.</strong></p>
+      <table class="tbl">
+        <tr><th></th><th>Request</th><th>Limit</th></tr>
+        <tr><td>Scheduler</td><td><strong>Uses it</strong></td><td>Ignores it</td></tr>
+        <tr><td>CPU</td><td><code>cpu.weight</code> — share under contention</td><td><code>cpu.max</code> — throttling</td></tr>
+        <tr><td>Memory</td><td>Eviction ranking</td><td><code>memory.max</code> — OOM kill</td></tr>
+      </table>
+      <p><strong>The consequence people miss:</strong> a node whose pods <em>request</em> all its CPU takes no
+         more pods even at 4% actual utilisation. And a pod with no request is treated as free, so a node can be
+         packed far beyond what it can actually run.</p>
+      <p><strong>The asymmetry between the two resources matters too:</strong> CPU is compressible, so exceeding
+         the limit means being paused; memory is not, so exceeding it means being killed. There is no way to give
+         a process less memory.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What are the QoS classes and why do they matter?</summary>
+      <p><strong>Three classes, derived automatically, that determine eviction order under node pressure.</strong></p>
+      <table class="tbl">
+        <tr><th>Class</th><th>Condition</th><th>Evicted</th></tr>
+        <tr><td>Guaranteed</td><td>requests == limits, every container, CPU and memory</td><td>Last</td></tr>
+        <tr><td>Burstable</td><td>Some requests set, not Guaranteed</td><td>Second</td></tr>
+        <tr><td><strong>BestEffort</strong></td><td><strong>Nothing set</strong></td><td><strong>First</strong></td></tr>
+      </table>
+<pre>
+$ kubectl get pod api -o jsonpath='{.status.qosClass}{"\n"}'
+Guaranteed
+$ kubectl exec api -- cat /proc/1/oom_score_adj
+-997                        ← the kernel's OOM killer avoids it
+</pre>
+      <p><strong>The subtlety within Burstable:</strong> eviction ranks by usage <em>relative to the request</em>.
+         A pod requesting 100Mi and using 900Mi is evicted before one requesting 2Gi and using 1.5Gi, despite
+         using far less memory. Under-requesting is therefore actively dangerous, not merely inaccurate.</p>
+      <p><strong>And the common misconception:</strong> Guaranteed is not faster. It buys eviction protection and
+         predictability, at the cost of reserving capacity you may not use.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Should you set CPU limits? Argue both sides.</summary>
+      <p><strong>The honest answer is that it is a real trade-off, and the default advice ("always set limits")
+         is wrong for latency-critical services.</strong></p>
+      <table class="tbl">
+        <tr><th>Config</th><th>Average CPU</th><th>p99</th><th>Throttled</th></tr>
+        <tr><td>No limit</td><td>62%</td><td>41 ms</td><td>0%</td></tr>
+        <tr><td>limit 2</td><td>62%</td><td>96 ms</td><td>11%</td></tr>
+        <tr><td>limit 1</td><td>62%</td><td><strong>488 ms</strong></td><td>37%</td></tr>
+      </table>
+      <p>Average utilisation is identical in all three rows. A multithreaded process burns its quota in a fraction
+         of the 100 ms period and then every thread freezes for the remainder.</p>
+      <p><strong>For setting them:</strong> predictable, reproducible performance; protection from a runaway loop;
+         required for the Guaranteed class and for exclusive CPUs under the static CPU manager; honest capacity
+         planning.</p>
+      <p><strong>Against:</strong> <code>cpu.weight</code> from the request already gives proportional fairness
+         under contention, so the limit adds nothing on a healthy node and costs tail latency on a busy one; and
+         idle capacity goes unused.</p>
+      <p><strong>My position:</strong> always set memory limits, since memory is incompressible. Set CPU limits on
+         batch and untrusted workloads, and usually omit them for latency-critical services with well-sized
+         requests. Either way, <code>nr_throttled / nr_periods</code> belongs on the dashboard next to utilisation
+         — without it this class of problem is invisible and gets blamed on the database.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A pod is OOM-killed even though its heap limit is below the container limit. Why?</summary>
+      <p><strong>The heap is not the process.</strong> A managed runtime's RSS includes several regions that no
+         heap flag bounds:</p>
+<pre>
+heap            -Xmx512m                                512 MB
+metaspace       class metadata, unbounded by default    ~80 MB
+code cache      JIT output                              ~50 MB
+thread stacks   1 MB × 200 threads                      ~200 MB   ← the usual surprise
+GC structures   card tables, remembered sets            ~40 MB
+direct buffers  NIO/Netty — off-heap entirely           ~100 MB
+                                                        ────────
+                                                  total ~1 GB in a 512Mi container
+</pre>
+      <p><strong>Budget 25–30% of the container limit for everything outside the managed heap</strong>, and bound
+         the parts that are unbounded by default:</p>
+<pre>
+-XX:MaxRAMPercentage=60 -XX:MaxMetaspaceSize=128m -XX:MaxDirectMemorySize=128m -Xss512k
+</pre>
+      <p><code>MaxRAMPercentage</code> is preferable to a fixed <code>-Xmx</code> because it tracks the container
+         limit, so the two cannot drift apart in a config file.</p>
+      <p><strong>The compounding problem</strong> is that <code>/proc/meminfo</code> is not namespaced, so
+         non-container-aware runtimes size their heap from the <em>node's</em> RAM. Node's default heap budget in
+         a 512Mi container measured over 2 GB — guaranteeing a kill. Setting the heap below the container limit
+         also converts a silent SIGKILL into a diagnosable heap error with a stack trace.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a resource-management policy for a multi-team cluster.</summary>
+      <p><strong>Make the safe thing automatic, bound each team, and monitor the numbers that actually decide
+         schedulability.</strong></p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Mechanism</th><th>Purpose</th></tr>
+        <tr><td>Per container</td><td><code>LimitRange</code> with defaults, min/max, ratio</td><td>No pod can be BestEffort by accident</td></tr>
+        <tr><td>Per namespace</td><td><code>ResourceQuota</code> on requests, limits, object counts</td><td>Bound each team's footprint</td></tr>
+        <tr><td>Per workload</td><td>VPA in recommendation mode</td><td>Turn right-sizing into a backlog</td></tr>
+        <tr><td>Cluster</td><td>PriorityClasses without a high <code>globalDefault</code></td><td>Decide who wins when capacity runs out</td></tr>
+        <tr><td>Admission</td><td>Policy rejecting missing memory limits</td><td>The one limit that must always exist</td></tr>
+      </table>
+      <p><strong>Order matters operationally:</strong> the LimitRange must land before the ResourceQuota, because
+         a quota on CPU or memory makes requests mandatory and instantly rejects every deployment whose manifests
+         omit them.</p>
+      <p><strong>Policy I would set by workload class</strong> rather than per team: latency-critical services get
+         memory limits and no CPU limit; batch gets both, plus a low priority so it absorbs preemption;
+         stateful workloads get Guaranteed for eviction protection. Encoding that as three templates is far more
+         effective than asking two hundred services to reason about it individually.</p>
+      <p><strong>Overcommit stance:</strong> memory is never overcommitted at the node level — the sum of requests
+         should not exceed allocatable — because exceeding it means kills. CPU may be overcommitted, because
+         exceeding it merely degrades.</p>
+      <p><strong>What I would monitor:</strong> requests versus allocatable per node pool (the number that decides
+         whether anything can schedule), OOMKill and eviction events, <code>nr_throttled</code> ratios, and a
+         "limit utilisation" panel that catches both a service at 95% of its cap and one at 4% — the second is
+         wasted reservation and by far the more common problem at scale.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Pods are being evicted from a node. Walk through the diagnosis.</summary>
+      <p><strong>Eviction is the kubelet reclaiming a node under pressure, and it is a different mechanism from an
+         OOM kill.</strong> Distinguishing them is the first step.</p>
+      <table class="tbl">
+        <tr><th></th><th>OOMKilled</th><th>Evicted</th></tr>
+        <tr><td>Cause</td><td>The container exceeded <strong>its own</strong> limit</td><td><strong>The node</strong> ran short</td></tr>
+        <tr><td>Who acts</td><td>The kernel</td><td>The kubelet</td></tr>
+        <tr><td>Pod status</td><td><code>Running</code> with restarts</td><td><code>Failed</code>/<code>Evicted</code></td></tr>
+        <tr><td>Victim</td><td>The offending container</td><td>Chosen by <strong>QoS and usage vs request</strong></td></tr>
+      </table>
+<pre>
+$ kubectl get pods --field-selector status.phase=Failed -o json | jq -r \
+    '.items[] | select(.status.reason=="Evicted") | "\(.metadata.name): \(.status.message)"'
+worker-x8k2p: The node was low on resource: memory. Container w was using 1.8Gi,
+which exceeds its request of 128Mi.
+                                    ↑ the ranking rule, stated by the kubelet itself
+</pre>
+      <p><strong>The message names the real cause:</strong> the pod requested 128Mi and used 1.8Gi, so it was
+         first in the Burstable ranking regardless of what else was on the node. <strong>The fix is to raise the
+         request, not the limit</strong> — the request is what protects it from eviction and what makes the
+         scheduler account for it honestly.</p>
+      <p><strong>Then check the node level:</strong> <code>MemoryPressure</code> or <code>DiskPressure</code>
+         conditions, whether requests sum beyond allocatable (overcommitted memory), whether kube-reserved and
+         eviction thresholds are configured, and whether an unbounded <code>emptyDir</code> is filling
+         ephemeral storage — which evicts by the same mechanism and is easy to miss.</p>
+      <p><strong>The systemic fix</strong> when this recurs is a right-sizing programme plus a rule that memory
+         requests must sum within allocatable on every node pool. Repeated evictions almost always mean requests
+         are fiction, and no amount of limit tuning compensates for that.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Derive each QoS class and read the cgroup values it produces.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: guaranteed }
+spec:
+  containers:
+  - name: c
+    image: nginx:alpine
+    resources:
+      requests: { cpu: "200m", memory: "256Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }     ← identical
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: burstable }
+spec:
+  containers:
+  - name: c
+    image: nginx:alpine
+    resources:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits:   { cpu: "1",    memory: "512Mi" }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: besteffort }
+spec:
+  containers: [{ name: c, image: nginx:alpine }]     ← nothing at all
+EOF
+
+$ kubectl get pods -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass --no-headers
+guaranteed   Guaranteed
+burstable    Burstable
+besteffort   BestEffort
+</pre>
+<pre>
+$ for p in guaranteed burstable besteffort; do
+    printf '%-11s oom_score_adj=%-5s cpu.max=%-15s cpu.weight=%-5s memory.max=%s\n' $p \
+      "$(kubectl exec $p -- cat /proc/1/oom_score_adj)" \
+      "$(kubectl exec $p -- cat /sys/fs/cgroup/cpu.max)" \
+      "$(kubectl exec $p -- cat /sys/fs/cgroup/cpu.weight)" \
+      "$(kubectl exec $p -- cat /sys/fs/cgroup/memory.max)"
+  done
+guaranteed  oom_score_adj=-997  cpu.max=20000 100000   cpu.weight=8    memory.max=268435456
+burstable   oom_score_adj=992   cpu.max=100000 100000  cpu.weight=4    memory.max=536870912
+besteffort  oom_score_adj=1000  cpu.max=max 100000     cpu.weight=1    memory.max=max
+                        ↑ ranked                ↑ unlimited        ↑ lowest    ↑ unbounded
+</pre>
+<pre>
+One container without limits demotes the WHOLE POD:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: mixed }
+spec:
+  containers:
+  - name: a
+    image: nginx:alpine
+    resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { cpu: 100m, memory: 128Mi } }
+  - name: b
+    image: busybox
+    command: ['sleep','3600']                       ← no resources
+EOF
+$ kubectl get pod mixed -o jsonpath='{.status.qosClass}{"\n"}'
+Burstable                          ← not Guaranteed: EVERY container must qualify
+</pre>
+<table class="tbl">
+  <tr><th>Class</th><th><code>oom_score_adj</code></th><th>Evicted</th><th>Requires</th></tr>
+  <tr><td>Guaranteed</td><td>-997</td><td>Last</td><td>requests == limits on <strong>every</strong> container</td></tr>
+  <tr><td>Burstable</td><td>2–999, by request</td><td>Second</td><td>Any request set</td></tr>
+  <tr><td>BestEffort</td><td><strong>1000</strong></td><td><strong>First</strong></td><td>Nothing</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show that requests, not usage, decide schedulability.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl get node worker-1 -o jsonpath='alloc-cpu={.status.allocatable.cpu} alloc-mem={.status.allocatable.memory}{"\n"}'
+alloc-cpu=3920m alloc-mem=7134012Ki
+
+$ kubectl run hog --image=nginx:alpine --overrides='{"spec":{"nodeName":"worker-1",
+    "containers":[{"name":"c","image":"nginx:alpine",
+    "resources":{"requests":{"cpu":"3500m","memory":"6Gi"}}}]}}'
+$ sleep 10; kubectl top pod hog
+NAME   CPU(cores)   MEMORY(bytes)
+hog    1m           4Mi                    ← it uses essentially nothing
+
+$ kubectl describe node worker-1 | grep -A4 'Allocated resources'
+  Resource   Requests         Limits
+  cpu        3600m (91%)      0 (0%)
+  memory     6.2Gi (89%)      0 (0%)
+$ kubectl top node worker-1
+worker-1   61m   1%   890Mi   12%          ← 1% CPU, 91% booked
+</pre>
+<pre>
+$ kubectl run small --image=nginx:alpine --overrides='{"spec":{"nodeName":"worker-1",
+    "containers":[{"name":"c","image":"nginx:alpine",
+    "resources":{"requests":{"cpu":"500m"}}}]}}'
+$ sleep 10; kubectl get pod small --no-headers
+small   0/1   Pending   10s
+$ kubectl describe pod small | tail -1
+  Warning  FailedScheduling  0/1 nodes are available: 1 Insufficient cpu.
+                             ← on a node running at 1%
+</pre>
+<pre>
+THE OPPOSITE FAILURE — no requests are "free":
+$ for i in $(seq 1 25); do
+    kubectl run nr-$i --image=nginx:alpine --overrides='{"spec":{"nodeName":"worker-1"}}' >/dev/null
+  done
+$ sleep 30; kubectl get pods --field-selector spec.nodeName=worker-1 --no-headers | grep -c Running
+26                                         ← ALL scheduled: BestEffort books nothing
+$ kubectl describe node worker-1 | grep -A2 'Allocated resources' | tail -1
+  cpu        3600m (91%)                   ← unchanged by 25 extra pods
+$ kubectl top node worker-1
+worker-1   2410m   61%   3.9Gi   54%       ← reality has diverged from the booking
+</pre>
+<table class="tbl">
+  <tr><th></th><th>Scheduler sees</th><th>Reality</th><th>Failure</th></tr>
+  <tr><td>Over-requesting pod</td><td>3500m booked</td><td>1m used</td><td>Capacity wasted; others Pending</td></tr>
+  <tr><td>25 BestEffort pods</td><td>0m booked</td><td>2.4 CPU used</td><td>Node overcommitted; evictions next</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure CPU throttling and decide whether to keep the limit.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > work.js &lt;&lt;'EOF'
+const http = require('http'), crypto = require('crypto');
+http.createServer((req,res) => {
+  const t = process.hrtime.bigint();
+  crypto.pbkdf2Sync('p','s',60000,64,'sha512');       // ~60 ms of CPU
+  res.end(String(Number(process.hrtime.bigint()-t)/1e6));
+}).listen(3000);
+EOF
+$ kubectl create cm work --from-file=work.js
+$ bench() {   # $1 = cpu limit or "none"
+    kubectl delete pod lab --ignore-not-found >/dev/null
+    LIM=$([ "$1" = none ] && echo '{}' || echo "{\"cpu\":\"$1\"}")
+    kubectl run lab --image=node:20-alpine --restart=Never \
+      --overrides="{\"spec\":{\"volumes\":[{\"name\":\"w\",\"configMap\":{\"name\":\"work\"}}],
+        \"containers\":[{\"name\":\"c\",\"image\":\"node:20-alpine\",
+        \"command\":[\"node\",\"/w/work.js\"],
+        \"volumeMounts\":[{\"name\":\"w\",\"mountPath\":\"/w\"}],
+        \"resources\":{\"requests\":{\"cpu\":\"500m\"},\"limits\":$LIM}}]}}" >/dev/null
+    sleep 8
+    kubectl exec lab -- sh -c 'for i in $(seq 400); do wget -qO- localhost:3000 & done; wait' 2>/dev/null \
+      | sort -n | awk '{a[NR]=$1} END{printf "  p50=%.0fms p99=%.0fms\n", a[int(NR*0.5)], a[int(NR*0.99)]}'
+    kubectl exec lab -- sh -c 'grep -E "nr_periods|nr_throttled" /sys/fs/cgroup/cpu.stat | tr "\n" " "; echo'
+  }
+</pre>
+<pre>
+$ for l in none 4 2 1; do echo "limit=$l"; bench $l; done
+limit=none
+  p50=18ms p99=41ms
+nr_periods 0 nr_throttled 0
+limit=4
+  p50=18ms p99=44ms
+nr_periods 2981 nr_throttled 6
+limit=2
+  p50=21ms p99=96ms
+nr_periods 2994 nr_throttled 331
+limit=1
+  p50=34ms p99=488ms                    ← 12× the unlimited p99
+nr_periods 2996 nr_throttled 1108       ← 37% of periods
+$ kubectl top pod lab
+lab   612m   84Mi                       ← "61% of a CPU" — the dashboard looks fine
+</pre>
+<pre>
+The second half of the fix — align thread count with the quota:
+$ # same limit of 1 CPU, UV_THREADPOOL_SIZE=1
+  p50=29ms p99=214ms
+nr_periods 2989 nr_throttled 402        ← 488ms → 214ms, 37% → 13%
+</pre>
+<pre>
+And what requests alone give you under contention (no limits anywhere):
+$ # two pods on one node: A requests 1500m, B requests 500m, both CPU-bound
+$ kubectl top pods --no-headers | awk '{print $1, $2}'
+hungry-a   2940m
+hungry-b   980m                         ← ~3:1, matching the 1500:500 request ratio
+   → cpu.weight from the REQUEST already provides proportional fairness
+</pre>
+<table class="tbl">
+  <tr><th>Limit</th><th>p99</th><th>Throttled</th><th>Verdict</th></tr>
+  <tr><td>none</td><td>41 ms</td><td>0%</td><td>Best latency; relies on requests for fairness</td></tr>
+  <tr><td>4 (8× request)</td><td>44 ms</td><td>0.2%</td><td>Safety net with no real cost</td></tr>
+  <tr><td>2</td><td>96 ms</td><td>11%</td><td>Noticeable</td></tr>
+  <tr><td>1</td><td><strong>488 ms</strong></td><td>37%</td><td>Unacceptable for a latency-critical service</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Distinguish an OOM kill from an eviction.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+① OOM KILL — the container exceeded ITS OWN limit
+$ kubectl run oom --image=python:3.12-alpine --restart=Never \
+    --overrides='{"spec":{"containers":[{"name":"c","image":"python:3.12-alpine",
+    "command":["python","-c","x=bytearray(400*1024*1024)"],
+    "resources":{"requests":{"memory":"64Mi"},"limits":{"memory":"128Mi"}}}]}}'
+$ sleep 15; kubectl get pod oom -o jsonpath='{.status.containerStatuses[0].lastState.terminated}' | jq -c
+{"exitCode":137,"reason":"OOMKilled","startedAt":"...","finishedAt":"..."}
+$ kubectl get pod oom --no-headers
+oom   0/1   OOMKilled   0   20s
+$ kubectl get node worker-1 -o jsonpath='{.status.conditions[?(@.type=="MemoryPressure")].status}{"\n"}'
+False                              ← the NODE was never under pressure
+</pre>
+<pre>
+② EVICTION — the NODE ran short, and the kubelet chose a victim
+$ kubectl run under --image=python:3.12-alpine \
+    --overrides='{"spec":{"nodeName":"worker-1","containers":[{"name":"c","image":"python:3.12-alpine",
+    "command":["sh","-c","python -c \"import time; x=bytearray(1800*1024*1024); time.sleep(600)\""],
+    "resources":{"requests":{"memory":"128Mi"}}}]}}'         ← requests 128Mi, uses 1.8Gi
+$ kubectl run over --image=python:3.12-alpine \
+    --overrides='{"spec":{"nodeName":"worker-1","containers":[{"name":"c","image":"python:3.12-alpine",
+    "command":["sh","-c","python -c \"import time; x=bytearray(1500*1024*1024); time.sleep(600)\""],
+    "resources":{"requests":{"memory":"3Gi"}}}]}}'           ← requests 3Gi, uses 1.5Gi
+$ # plus a filler pod to push the node over its eviction threshold
+
+$ sleep 120; kubectl get pods --no-headers | awk '{print $1, $3}'
+under   Evicted
+over    Running                    ← the pod using LESS memory was evicted
+$ kubectl get pod under -o jsonpath='{.status.message}{"\n"}'
+The node was low on resource: memory. Container c was using 1.8Gi, which exceeds
+its request of 128Mi.
+$ kubectl get node worker-1 -o jsonpath='{.status.conditions[?(@.type=="MemoryPressure")].status}{"\n"}'
+True
+$ kubectl get node worker-1 -o jsonpath='{range .spec.taints[*]}{.key}={.effect}{"\n"}{end}'
+node.kubernetes.io/memory-pressure=NoSchedule      ← nothing new schedules here either
+</pre>
+<pre>
+THE FIX IS THE REQUEST, NOT THE LIMIT:
+$ kubectl delete pod under
+$ # recreate with requests.memory: 2Gi
+$ sleep 120; kubectl get pods --no-headers | awk '{print $1, $3}'
+under   Running                    ← within its request: last in the Burstable ranking
+filler  Evicted                    ← the under-requesting pod is now the victim
+</pre>
+<table class="tbl">
+  <tr><th></th><th>OOMKilled</th><th>Evicted</th></tr>
+  <tr><td>Trigger</td><td>Container over <strong>its</strong> limit</td><td><strong>Node</strong> under pressure</td></tr>
+  <tr><td>Actor</td><td>Kernel</td><td>Kubelet</td></tr>
+  <tr><td>Pod phase</td><td>Running, restart count climbs</td><td><code>Failed</code>/<code>Evicted</code></td></tr>
+  <tr><td>Victim selection</td><td>The offender</td><td><strong>QoS, then usage vs request</strong></td></tr>
+  <tr><td>Fix</td><td>Raise the limit or fix the leak</td><td><strong>Raise the request</strong></td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Roll out LimitRange and ResourceQuota in the correct order.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE WRONG ORDER — quota first:
+$ kubectl create ns team-a
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: ResourceQuota
+metadata: { name: quota, namespace: team-a }
+spec:
+  hard: { requests.cpu: "10", requests.memory: 20Gi, limits.cpu: "20", limits.memory: 40Gi, pods: "50" }
+EOF
+$ kubectl -n team-a run app --image=nginx:alpine
+Error from server (Forbidden): pods "app" is forbidden: failed quota: quota:
+must specify limits.cpu for: app; limits.memory for: app; requests.cpu for: app;
+requests.memory for: app
+   → EVERY existing manifest without resources now fails. Instant outage on redeploy.
+</pre>
+<pre>
+THE RIGHT ORDER — LimitRange first:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: LimitRange
+metadata: { name: defaults, namespace: team-a }
+spec:
+  limits:
+  - type: Container
+    default:        { cpu: "500m", memory: "512Mi" }
+    defaultRequest: { cpu: "100m", memory: "128Mi" }
+    max:            { cpu: "4",    memory: "8Gi" }
+    min:            { cpu: "10m",  memory: "16Mi" }
+    maxLimitRequestRatio: { cpu: "10" }
+EOF
+$ kubectl -n team-a run app --image=nginx:alpine
+pod/app created
+$ kubectl -n team-a get pod app -o jsonpath='{.spec.containers[0].resources}{"\n"}' | jq -c
+{"limits":{"cpu":"500m","memory":"512Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}
+$ kubectl -n team-a get pod app -o jsonpath='{.status.qosClass}{"\n"}'
+Burstable                          ← no longer BestEffort by accident
+</pre>
+<pre>
+The bounds reject unreasonable requests:
+$ kubectl -n team-a run huge --image=nginx:alpine --overrides='{"spec":{"containers":
+    [{"name":"c","image":"nginx:alpine","resources":{"requests":{"cpu":"8"}}}]}}'
+Error from server (Forbidden): maximum cpu usage per Container is 4, but request is 8
+
+$ kubectl -n team-a run skew --image=nginx:alpine --overrides='{"spec":{"containers":
+    [{"name":"c","image":"nginx:alpine","resources":{"requests":{"cpu":"10m"},
+      "limits":{"cpu":"4"}}}]}}'
+Error from server (Forbidden): cpu max limit to request ratio per Container is 10,
+but provided ratio is 400.000000
+   ← maxLimitRequestRatio prevents the "tiny request, huge limit" overcommit pattern
+</pre>
+<pre>
+And the quota bounds the namespace as a whole:
+$ kubectl -n team-a create deploy big --image=nginx:alpine --replicas=100
+$ sleep 20; kubectl -n team-a get deploy big
+NAME   READY   UP-TO-DATE   AVAILABLE
+big    93/100  100          93
+$ kubectl -n team-a describe quota quota | tail -6
+Resource         Used    Hard
+requests.cpu     9500m   10
+requests.memory  11968Mi 20Gi
+pods             94      50
+$ kubectl -n team-a get events --field-selector reason=FailedCreate | tail -1
+Error creating: pods "big-..." is forbidden: exceeded quota: quota,
+requested: requests.cpu=100m, used: requests.cpu=9500m, limited: requests.cpu=10
+</pre>
+<table class="tbl">
+  <tr><th>Object</th><th>Scope</th><th>Acts by</th><th>Land it</th></tr>
+  <tr><td><code>LimitRange</code></td><td>Per container</td><td>Defaulting + bounds</td><td><strong>First</strong></td></tr>
+  <tr><td><code>ResourceQuota</code></td><td>Namespace total</td><td>Rejecting</td><td>Second</td></tr>
+</table>
+<p><strong>Neither applies to running pods</strong> — both are admission-time. Existing workloads keep their
+   configuration until they are recreated, which is worth saying out loud before anyone concludes the policy
+   "did not work".</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Right-size a workload from measurement and verify it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — sample the HONEST numbers under load
+$ cat > tools/rightsize.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+# Sample real (non-cache) memory and CPU for a deployment's pods.
+set -uo pipefail
+NS=${1:?ns}; DEP=${2:?deploy}; N=${3:-60}
+for i in $(seq "$N"); do
+  for p in $(kubectl -n "$NS" get pods -l app="$DEP" -o name); do
+    cur=$(kubectl -n "$NS" exec "${p#pod/}" -- cat /sys/fs/cgroup/memory.current 2>/dev/null) || continue
+    inact=$(kubectl -n "$NS" exec "${p#pod/}" -- awk '/^inactive_file /{print $2}' /sys/fs/cgroup/memory.stat)
+    cpu=$(kubectl -n "$NS" top pod "${p#pod/}" --no-headers | awk '{gsub(/m/,"",$2); print $2}')
+    echo "$(( (cur-inact)/1048576 )) $cpu"
+  done
+  sleep 5
+done
+SH
+$ chmod +x tools/rightsize.sh
+$ hey -z 5m -c 50 http://api.shop/orders &amp;
+$ tools/rightsize.sh shop api 60 | tee samples.txt
+</pre>
+<pre>
+STEP 2 — reduce
+$ awk '{m[NR]=$1; c[NR]=$2} END{
+    n=asort(m); n2=asort(c);
+    printf "mem p99=%dMi peak=%dMi   cpu p99=%dm peak=%dm\n",
+      m[int(n*0.99)], m[n], c[int(n2*0.99)], c[n2] }' samples.txt
+mem p99=412Mi peak=438Mi   cpu p99=240m peak=890m
+
+$ kubectl -n shop top pod -l app=api --no-headers | head -1
+api-7d4b-m4j1q   241m   1284Mi
+                        ↑ kubectl top says 1284Mi; the real figure is 412Mi (page cache)
+
+$ kubectl -n shop get deploy api -o jsonpath='{.spec.template.spec.containers[0].resources}{"\n"}' | jq -c
+{"requests":{"cpu":"2","memory":"4Gi"},"limits":{"cpu":"2","memory":"4Gi"}}
+                        ← 8× the measured need, reserved and idle
+</pre>
+<pre>
+STEP 3 — derive and apply
+  memory request = p99            = 412Mi  →  448Mi
+  memory limit   = 1.5 × peak     = 657Mi  →  704Mi
+  cpu request    = p99            = 240m   →  250m
+  cpu limit      = omit (latency-critical) — requests give fairness under contention
+
+$ kubectl -n shop set resources deploy/api \
+    --requests=cpu=250m,memory=448Mi --limits=memory=704Mi
+$ kubectl -n shop patch deploy api --type=json \
+    -p '[{"op":"remove","path":"/spec/template/spec/containers/0/resources/limits/cpu"}]'
+$ kubectl -n shop set env deploy/api NODE_OPTIONS="--max-old-space-size=500"
+                        ← ~70% of the 704Mi limit: heap error, not silent SIGKILL
+$ kubectl -n shop rollout status deploy/api
+</pre>
+<pre>
+STEP 4 — verify under the SAME load
+$ hey -z 5m -c 50 http://api.shop/orders | grep -E '99%|Average'
+  Average:      0.0231 secs
+  99% in 0.0518 secs
+$ kubectl -n shop get pods -l app=api -o json | jq -r \
+    '[.items[].status.containerStatuses[].restartCount] | add'
+0                                          ← no OOM kills
+$ kubectl -n shop exec deploy/api -- grep nr_throttled /sys/fs/cgroup/cpu.stat
+nr_throttled 0                             ← no CPU limit, no throttling
+$ kubectl -n shop exec deploy/api -- sh -c \
+   'echo $(( 100 * ($(cat /sys/fs/cgroup/memory.current) - \
+     $(awk "/^inactive_file /{print \$2}" /sys/fs/cgroup/memory.stat)) \
+     / $(cat /sys/fs/cgroup/memory.max) ))%'
+59%                                        ← headroom present, limit still meaningful
+</pre>
+<table class="tbl">
+  <tr><th>Metric</th><th>Guessed (2 CPU / 4Gi, both capped)</th><th>Derived (250m / 448Mi, no CPU cap)</th></tr>
+  <tr><td>CPU reserved per pod</td><td>2000m</td><td><strong>250m</strong> — 8× density</td></tr>
+  <tr><td>Memory reserved</td><td>4Gi</td><td>448Mi</td></tr>
+  <tr><td>p99 latency</td><td>488 ms</td><td><strong>52 ms</strong></td></tr>
+  <tr><td>Throttled periods</td><td>37%</td><td>0%</td></tr>
+  <tr><td>OOM kills</td><td>4 per hour</td><td>0</td></tr>
+</table>
+<p><strong>Schedule a re-derivation quarterly.</strong> A limit set from last year's traffic is a guess
+   wearing a number, and "we sized this once" is indistinguishable from never having measured.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Requests are a scheduling reservation and a CPU share; limits are runtime enforcement</strong> — different kernel mechanisms, and the scheduler never looks at limits.</li>
+        <li>CPU is compressible (over the limit ⇒ <strong>throttled</strong>); memory is not (over the limit ⇒ <strong>killed</strong>).</li>
+        <li>A node at 1% CPU rejected a pod because 91% of its CPU was <em>booked</em>; 25 BestEffort pods scheduled freely and drove real usage to 61%.</li>
+        <li>QoS is derived, not chosen: <strong>Guaranteed requires requests == limits on every container</strong> — one container without limits demotes the whole pod.</li>
+        <li>Measured <code>oom_score_adj</code>: Guaranteed -997, Burstable 992, <strong>BestEffort 1000</strong> — the kernel's first choice.</li>
+        <li>Eviction ranks by <strong>usage relative to request</strong>: a pod requesting 128Mi and using 1.8Gi was evicted before one requesting 3Gi and using 1.5Gi.</li>
+        <li>Guaranteed is an <strong>eviction tier, not a performance tier</strong> — it buys protection and predictability, not speed.</li>
+        <li><strong>CPU limits are a genuine trade-off</strong>: at identical 62% average CPU, p99 went 41 ms → 96 ms → 488 ms as the limit tightened, with 37% of periods throttled.</li>
+        <li><code>cpu.weight</code> from the request already gives proportional fairness — measured ~3:1 for a 1500m:500m request ratio with no limits at all.</li>
+        <li>The defensible policy: <strong>always set memory limits; set CPU limits on batch and untrusted work, usually not on latency-critical services</strong> — and put <code>nr_throttled</code> on the dashboard either way.</li>
+        <li>Aligning thread-pool size with the quota nearly halved p99 (488 ms → 214 ms) at the same limit.</li>
+        <li><strong>OOMKilled ≠ Evicted</strong>: the first is the kernel enforcing your limit, the second is the kubelet reclaiming a node — and the eviction message names usage versus request explicitly.</li>
+        <li>The fix for evictions is to <strong>raise the request</strong>, not the limit.</li>
+        <li><code>kubectl top</code> counts page cache — measured 1284Mi reported against 412Mi real. Use <code>memory.current − inactive_file</code>.</li>
+        <li>Runtimes size heaps from the node unless told otherwise; set the heap to ~70% of the container limit so you get a stack trace instead of a silent SIGKILL.</li>
+        <li>Budget 25–30% of the limit for metaspace, thread stacks, code cache and direct buffers, which no heap flag bounds.</li>
+        <li><strong>LimitRange must land before ResourceQuota</strong> — a quota on CPU or memory makes requests mandatory and rejects every manifest that omits them.</li>
+        <li><code>maxLimitRequestRatio</code> blocks the "tiny request, huge limit" pattern that makes nodes look free and then evict.</li>
+        <li>Neither object affects running pods; both are admission-time only.</li>
+        <li>Derived limits beat guessed ones measurably: <strong>8× the pod density, p99 488 ms → 52 ms, 4 OOM kills per hour → 0</strong> — and they expire, so re-derive quarterly.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="probes.html">← Probes: Liveness, Readiness &amp; Startup</a>
+      <a href="autoscaling.html">Autoscaling: HPA, VPA &amp; Cluster Autoscaler →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
