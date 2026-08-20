@@ -1,0 +1,977 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jobs, CronJobs &amp; One-shot Work — Kubernetes — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Jobs, CronJobs &amp; One-shot Work <span class="level-badge level-int">Configuration &amp; State</span></h1>
+    <p><strong>What you'll master:</strong> the two retry mechanisms people constantly conflate —
+       <strong><code>restartPolicy</code> restarts the container, <code>backoffLimit</code> creates new
+       pods</strong> — and how choosing wrongly produces either lost logs or a hundred pod objects; the
+       exponential backoff schedule a failing Job actually follows; <code>activeDeadlineSeconds</code>, which is
+       the only thing that stops a hung Job running forever; Indexed completion and the work-queue pattern;
+       <code>podFailurePolicy</code>, which finally lets you tell an application bug from a preempted node;
+       CronJob semantics including <code>concurrencyPolicy</code> and the
+       <strong><code>startingDeadlineSeconds</code> trap that permanently stops a CronJob after 100 missed
+       schedules</strong>; why every Job must be idempotent because delivery is at-least-once; and the sidecar
+       that keeps a Job "running" for ever. Prerequisites: <a href="pods.html">Pods</a>,
+       <a href="deployments.html">Deployments</a>.</p>
+
+    <h2>Part 1 — A Job Runs Pods Until They Succeed</h2>
+
+<pre>
+apiVersion: batch/v1
+kind: Job
+metadata: { name: migrate }
+spec:
+  backoffLimit: 4                 ← how many POD failures before the Job gives up
+  activeDeadlineSeconds: 600      ← wall-clock cap on the whole Job
+  ttlSecondsAfterFinished: 3600   ← auto-delete an hour after finishing
+  template:
+    spec:
+      restartPolicy: Never        ← or OnFailure; NOT Always (rejected)
+      containers:
+      - name: migrate
+        image: myco/api:1.4.2
+        command: ["npm","run","migrate"]
+</pre>
+
+    <table class="tbl">
+      <tr><th>Field</th><th>Default</th><th>Controls</th></tr>
+      <tr><td><code>completions</code></td><td>1</td><td>How many pods must succeed</td></tr>
+      <tr><td><code>parallelism</code></td><td>1</td><td>How many run at once</td></tr>
+      <tr><td><code>backoffLimit</code></td><td>6</td><td><strong>Pod failures tolerated before the Job fails</strong></td></tr>
+      <tr><td><code>activeDeadlineSeconds</code></td><td>none</td><td>Wall-clock limit; overrides <code>backoffLimit</code></td></tr>
+      <tr><td><code>ttlSecondsAfterFinished</code></td><td>none</td><td>Auto-cleanup after completion</td></tr>
+      <tr><td><code>completionMode</code></td><td><code>NonIndexed</code></td><td><code>Indexed</code> gives each pod a fixed index</td></tr>
+      <tr><td><code>suspend</code></td><td>false</td><td>Pause without deleting</td></tr>
+    </table>
+
+    <h4>The two retry mechanisms</h4>
+
+<pre>
+restartPolicy: OnFailure         restartPolicy: Never
+  the CONTAINER restarts           a NEW POD is created per attempt
+  in the same pod                  ↓
+  ↓                                job-x8k2p  Error
+  job-x8k2p  0/1  CrashLoop        job-p9v3w  Error
+             RESTARTS: 4           job-t2h8n  Error
+                                   job-m4j1q  Error
+  · one pod object                 · one pod object PER attempt
+  · logs overwritten each restart  · every attempt's logs preserved
+  · faster (no scheduling)         · a fresh node, fresh volumes, fresh IP
+</pre>
+
+<pre>
+$ kubectl create job fail --image=busybox -- sh -c 'echo attempt; exit 1'
+$ kubectl patch job fail -p '{"spec":{"backoffLimit":4}}' 2>/dev/null
+$ sleep 300; kubectl get pods -l job-name=fail --no-headers | wc -l
+5                                ← 1 initial + 4 retries, each its own pod
+$ kubectl get job fail -o jsonpath='{.status.conditions[0].type}={.status.conditions[0].reason}{"\n"}'
+Failed=BackoffLimitExceeded
+</pre>
+
+    <div class="note">🔑 <strong><code>backoffLimit</code> counts pod failures, not container restarts.</strong>
+       With <code>restartPolicy: OnFailure</code> a container can restart many times inside one pod without
+       consuming the budget — so a Job can crash-loop far longer than <code>backoffLimit: 4</code> suggests. Use
+       <code>Never</code> when you want each attempt auditable and the budget honest;
+       <code>OnFailure</code> when retries are cheap and you want to avoid rescheduling.</div>
+
+    <p>The retries are not immediate. A failing Job backs off exactly as a container does:</p>
+
+<pre>
+retry delay:  10s → 20s → 40s → 80s → 160s → 320s (capped at 6 minutes)
+
+  a Job with backoffLimit: 6 that fails every time takes
+  10+20+40+80+160+320 ≈ 10.5 minutes before it reports Failed
+  → alerting on "job failed" is inherently delayed; alert on duration too
+</pre>
+
+    <h2>Part 2 — Parallelism, Indexed Jobs and Work Queues</h2>
+
+    <table class="tbl">
+      <tr><th>Pattern</th><th><code>completions</code></th><th><code>parallelism</code></th><th>Behaviour</th></tr>
+      <tr><td>Single task</td><td>1</td><td>1</td><td>One pod must succeed</td></tr>
+      <tr><td>Fixed count</td><td>10</td><td>3</td><td>10 successes, 3 at a time</td></tr>
+      <tr><td><strong>Work queue</strong></td><td><em>unset</em></td><td>5</td><td>5 workers; <strong>the Job ends when any pod exits 0 and none remain</strong></td></tr>
+      <tr><td><strong>Indexed</strong></td><td>10</td><td>3</td><td>Each pod gets a unique index 0–9</td></tr>
+    </table>
+
+<pre>
+spec:
+  completions: 6
+  parallelism: 3
+  completionMode: Indexed
+  template:
+    spec:
+      containers:
+      - name: shard
+        image: myco/processor
+        command: ["sh","-c",'./process --shard=$JOB_COMPLETION_INDEX --of=6']
+
+$ kubectl get pods -l job-name=shards -o custom-columns=\
+NAME:.metadata.name,INDEX:.metadata.annotations.batch\\.kubernetes\\.io/job-completion-index
+NAME             INDEX
+shards-0-x8k2p   0
+shards-1-p9v3w   1
+shards-2-t2h8n   2                ← the index is stable and in the pod NAME
+</pre>
+
+    <p>Indexed Jobs are the right tool whenever work partitions deterministically — sharded reprocessing, per-day
+       backfills, per-region exports — because each pod can compute its own slice with no coordinator and no
+       queue. The work-queue pattern is for the opposite case, where items arrive from an external queue and
+       workers are interchangeable.</p>
+
+    <h2>Part 3 — Distinguishing Your Bug From the Cluster's</h2>
+
+    <p>By default every pod failure is equal: an application exception, an OOM kill, and a node preemption all
+       consume one unit of <code>backoffLimit</code>. <code>podFailurePolicy</code> separates them:</p>
+
+<pre>
+spec:
+  backoffLimit: 3
+  podFailurePolicy:
+    rules:
+    - action: FailJob               ← stop immediately; retrying cannot help
+      onExitCodes: { containerName: main, operator: In, values: [42] }
+    - action: Ignore                ← do NOT count against backoffLimit
+      onPodConditions:
+      - { type: DisruptionTarget }  ← preemption, node drain, eviction
+    - action: Count
+      onExitCodes: { containerName: main, operator: In, values: [1] }
+</pre>
+
+    <table class="tbl">
+      <tr><th>Action</th><th>Effect</th><th>Use for</th></tr>
+      <tr><td><code>FailJob</code></td><td>Fail the whole Job now</td><td>Bad input, invalid config — retrying is pointless</td></tr>
+      <tr><td><code>Ignore</code></td><td>Retry <strong>without</strong> consuming the budget</td><td>Preemption, node drain, spot reclaim</td></tr>
+      <tr><td><code>Count</code></td><td>The default</td><td>Genuine application failures</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>Without this, a long Job on spot instances can never finish.</strong> Each
+       preemption consumes a retry, so a six-hour job with <code>backoffLimit: 6</code> fails after six
+       interruptions that had nothing to do with the code. <code>Ignore</code> on
+       <code>DisruptionTarget</code> is what makes batch work viable on preemptible capacity.</div>
+
+    <h2>Part 4 — CronJob: Schedules and the 100-Miss Trap</h2>
+
+<pre>
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: nightly }
+spec:
+  schedule: "0 3 * * *"
+  timeZone: "Europe/London"          ← without this: UTC (DST bugs twice a year)
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  suspend: false
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600
+      template:
+        spec:
+          restartPolicy: Never
+          containers: [{ name: c, image: myco/nightly }]
+</pre>
+
+    <table class="tbl">
+      <tr><th><code>concurrencyPolicy</code></th><th>If the previous run is still going</th><th>Use for</th></tr>
+      <tr><td><code>Allow</code> (default)</td><td>Start anyway — <strong>overlapping runs</strong></td><td>Independent, idempotent work</td></tr>
+      <tr><td><code>Forbid</code></td><td>Skip this occurrence entirely</td><td>Anything touching shared state</td></tr>
+      <tr><td><code>Replace</code></td><td>Kill the running Job, start a new one</td><td>Only the latest result matters</td></tr>
+    </table>
+
+<pre>
+THE TRAP: startingDeadlineSeconds and 100 missed schedules
+
+  The CronJob controller counts missed schedules since the last run. If it counts
+  more than 100 it gives up PERMANENTLY and logs:
+
+$ kubectl -n kube-system logs -l component=kube-controller-manager | grep -i cronjob
+Cannot determine if job needs to be started: too many missed start times (> 100).
+Set or decrease .spec.startingDeadlineSeconds or check clock skew
+
+$ kubectl get cronjob nightly
+NAME      SCHEDULE    SUSPEND   ACTIVE   LAST SCHEDULE
+nightly   */5 * * * *  False    0        &lt;none&gt;          ← never runs again
+</pre>
+
+    <div class="note">🔑 <strong>A control-plane outage longer than 100 schedule intervals silently kills the
+       CronJob.</strong> At <code>*/5</code> that is 8 hours; at <code>* * * * *</code> it is 100 minutes. Setting
+       <code>startingDeadlineSeconds</code> bounds the look-back window, so only misses within that window are
+       counted and the controller resumes normally. Every CronJob should set it — a value slightly larger than
+       one interval is usually right.</div>
+
+    <p>Two more schedule facts worth knowing. Without <code>timeZone</code>, schedules run in the
+       <strong>controller's</strong> time zone (UTC on managed clusters), which is why "the 3am job ran at 4am"
+       appears twice a year. And a CronJob guarantees <em>at least</em> one run per schedule, not exactly one —
+       which brings us to idempotency.</p>
+
+    <h2>Part 5 — At-Least-Once, and Idempotency</h2>
+
+<pre>
+Ways one logical execution becomes two:
+
+  · the node running the pod dies mid-job → the Job creates a replacement
+  · concurrencyPolicy: Allow and a slow run overlaps the next schedule
+  · a controller restart re-evaluates a schedule at the boundary
+  · someone re-runs it manually after a partial failure
+
+  → EVERY Job must be safe to run twice. This is not optional.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Non-idempotent work</th><th>Made idempotent by</th></tr>
+      <tr><td>"Send invoice emails"</td><td>A <code>sent_at</code> column, checked and set transactionally</td></tr>
+      <tr><td>"Charge every pending order"</td><td>An idempotency key per charge</td></tr>
+      <tr><td>"Increment a counter"</td><td>Recompute from source, or a per-run dedup key</td></tr>
+      <tr><td>"Apply migration 007"</td><td>A migrations table plus an advisory lock</td></tr>
+      <tr><td>"Delete records older than 30 days"</td><td>Naturally idempotent — safe</td></tr>
+    </table>
+
+<pre>
+For a true singleton, the Job takes a lock itself:
+
+  BEGIN;
+  SELECT pg_try_advisory_xact_lock(4815162342);   -- false ⇒ another run holds it
+  ...work...
+  COMMIT;                                          -- lock released automatically
+
+  Kubernetes cannot give you exactly-once. Coordination belongs in the workload,
+  and concurrencyPolicy: Forbid is a convenience, not a guarantee.
+</pre>
+
+    <h2>Part 6 — Sidecars, Cleanup and Monitoring</h2>
+
+    <p>A pod is <code>Succeeded</code> only when <em>all</em> containers exit. An ordinary sidecar — a mesh proxy,
+       a log shipper, a metrics agent — never exits, so the Job never completes. This is covered in full in
+       <a href="pods.html">Pods</a>; the fix is a <strong>native sidecar</strong>:</p>
+
+<pre>
+spec:
+  template:
+    spec:
+      initContainers:
+      - { name: proxy, image: envoyproxy/envoy, restartPolicy: Always }   ← native sidecar
+      containers:
+      - { name: work, image: myco/batch }
+</pre>
+
+    <table class="tbl">
+      <tr><th>Concern</th><th>Mechanism</th></tr>
+      <tr><td>Finished Jobs accumulating</td><td><code>ttlSecondsAfterFinished</code>; CronJob history limits</td></tr>
+      <tr><td>Hung Jobs</td><td><code>activeDeadlineSeconds</code> — the <em>only</em> real timeout</td></tr>
+      <tr><td>Pausing without deleting</td><td><code>suspend: true</code></td></tr>
+      <tr><td>Manual run of a CronJob</td><td><code>kubectl create job --from=cronjob/nightly manual-1</code></td></tr>
+      <tr><td>Alerting</td><td><code>kube_job_failed</code>, and <strong>time since last success</strong></td></tr>
+    </table>
+
+<pre>
+$ kubectl get jobs -A --no-headers | wc -l
+1847                             ← two years of nightly runs, all in etcd
+$ kubectl patch cronjob nightly -p '{"spec":{"successfulJobsHistoryLimit":3,"failedJobsHistoryLimit":3}}'
+$ sleep 60; kubectl get jobs -l cronjob=nightly --no-headers | wc -l
+6
+</pre>
+
+    <div class="note">⚠️ <strong>Alert on "time since last success", not on "a job failed".</strong> A failed Job
+       fires an alert; a CronJob that stopped scheduling — suspended, hit the 100-miss trap, or had its schedule
+       broken — fires nothing at all, because nothing is failing. The silent-stop failure mode is far more common
+       and far more damaging than a noisy failure.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A nightly CronJob with the default <code>concurrencyPolicy: Allow</code>, no
+         <code>startingDeadlineSeconds</code>, no <code>activeDeadlineSeconds</code>, non-idempotent work, a mesh
+         sidecar, and alerting only on failure.</strong> A slow run overlaps the next schedule, so two jobs
+         process the same queue simultaneously and customers receive duplicate invoices. One run hangs on a
+         network call and stays <code>Active</code> for eleven days, holding a database connection and blocking
+         nothing visibly. A three-hour control-plane upgrade means more than 100 missed <code>*/1</code>
+         schedules, so the controller gives up permanently — and because nothing failed, no alert fires and
+         nobody notices for a fortnight. The Envoy sidecar means every Job pod shows <code>1/2 Running</code> for
+         ever, so <code>Completions</code> stays at <code>0/1</code> and <code>Forbid</code> would have blocked
+         every subsequent run anyway. And two years of Job objects accumulate in etcd because nothing ever cleans
+         them up.</p>
+      <p>✅ <strong>Bound every dimension, make the work idempotent, and alert on absence rather than
+         failure.</strong> Set <code>concurrencyPolicy: Forbid</code> for anything touching shared state, but
+         treat it as a convenience rather than a guarantee — delivery is at-least-once, so the work itself must
+         be safe to run twice, with an idempotency key or an advisory lock doing the real coordination. Always set
+         <code>startingDeadlineSeconds</code> so a control-plane outage cannot silently retire the CronJob after
+         100 missed schedules, and <code>timeZone</code> so schedules do not drift with DST. Give every Job an
+         <code>activeDeadlineSeconds</code>, which is the only mechanism that stops a hung run, and
+         <code>ttlSecondsAfterFinished</code> plus history limits so finished objects do not accumulate in etcd.
+         Declare sidecars as init containers with <code>restartPolicy: Always</code> so the Job can actually
+         complete. Use <code>podFailurePolicy</code> to ignore <code>DisruptionTarget</code> failures, or batch
+         work on spot capacity exhausts its retry budget on preemptions. And <strong>alert on time since last
+         success</strong> — a CronJob that silently stopped scheduling produces no failures to alert on.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Confusing <code>restartPolicy</code> with <code>backoffLimit</code></td><td>One restarts containers, the other creates pods</td><td><code>Never</code> for auditable attempts</td></tr>
+      <tr><td><code>restartPolicy: Always</code> in a Job</td><td>Rejected by the API</td><td><code>Never</code> or <code>OnFailure</code></td></tr>
+      <tr><td>No <code>activeDeadlineSeconds</code></td><td>A hung Job runs for ever</td><td>Always set it</td></tr>
+      <tr><td>No <code>startingDeadlineSeconds</code></td><td><strong>100 missed schedules stops the CronJob permanently</strong></td><td>Slightly more than one interval</td></tr>
+      <tr><td>No <code>timeZone</code></td><td>Runs in UTC; drifts with DST</td><td>Set it explicitly</td></tr>
+      <tr><td>Default <code>concurrencyPolicy: Allow</code></td><td>Overlapping runs on shared state</td><td><code>Forbid</code> or <code>Replace</code></td></tr>
+      <tr><td>Assuming exactly-once</td><td>Node failure and overlap both duplicate work</td><td>Idempotency keys, advisory locks</td></tr>
+      <tr><td>Ordinary sidecar in a Job</td><td>The pod never reaches <code>Succeeded</code></td><td>Native sidecar (init + <code>restartPolicy: Always</code>)</td></tr>
+      <tr><td>No TTL or history limits</td><td>Thousands of Job objects in etcd</td><td><code>ttlSecondsAfterFinished</code> + history limits</td></tr>
+      <tr><td>Migrations as an init container</td><td>Every replica runs them concurrently</td><td>A Job with <code>service_completed_successfully</code> gating</td></tr>
+      <tr><td>Counting preemptions as failures</td><td>Spot interruptions exhaust <code>backoffLimit</code></td><td><code>podFailurePolicy</code> with <code>Ignore</code></td></tr>
+      <tr><td>Alerting only on failure</td><td>A stopped CronJob fails nothing</td><td>Alert on time since last success</td></tr>
+      <tr><td>Editing a Job's template</td><td>Immutable after creation</td><td>Delete and recreate</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between a Job and a Deployment?</summary>
+      <p><strong>A Deployment keeps pods running; a Job runs pods until they succeed and then stops.</strong></p>
+      <table class="tbl">
+        <tr><th></th><th>Deployment</th><th>Job</th></tr>
+        <tr><td>Goal</td><td>N pods always running</td><td>N pods successfully <em>completed</em></td></tr>
+        <tr><td><code>restartPolicy</code></td><td><code>Always</code></td><td><code>Never</code> or <code>OnFailure</code></td></tr>
+        <tr><td>Pod exits 0</td><td>Restarted</td><td>Counted as success</td></tr>
+        <tr><td>Ends</td><td>Never</td><td>When <code>completions</code> is met</td></tr>
+      </table>
+      <p><strong>Use a Job for:</strong> database migrations, backfills, batch processing, one-off imports.
+         A CronJob is a Job on a schedule.</p>
+      <p><strong>The follow-up worth pre-empting:</strong> why not run a migration as an init container in the
+         Deployment? Because every replica runs it concurrently — ten pods racing the same schema. A Job runs
+         once, and dependents gate on <code>service_completed_successfully</code>.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> A Job keeps creating new pods that fail. How do you control that?</summary>
+      <p><strong>Two independent knobs, and they do different things.</strong></p>
+<pre>
+restartPolicy: Never      → each attempt is a NEW POD (logs preserved per attempt)
+restartPolicy: OnFailure  → the CONTAINER restarts inside one pod (logs overwritten)
+
+backoffLimit: 4           → how many POD failures before the Job is marked Failed
+</pre>
+      <p>With <code>Never</code> and <code>backoffLimit: 4</code> you get 5 pod objects: the initial attempt plus
+         four retries. That is often mistaken for a runaway loop and is exactly the configured behaviour.</p>
+      <p><strong>The nuance:</strong> <code>backoffLimit</code> counts <em>pod</em> failures. With
+         <code>OnFailure</code>, a container can restart many times inside one pod without consuming the budget,
+         so the Job can crash-loop for much longer than the number suggests.</p>
+      <p><strong>Retries are also delayed</strong> — 10s, 20s, 40s, 80s, 160s, capped at six minutes — so a Job
+         with the default <code>backoffLimit: 6</code> takes over ten minutes to report failure.
+         <code>activeDeadlineSeconds</code> is the wall-clock cap that overrides all of it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A CronJob stopped running and nothing failed. What happened?</summary>
+      <p><strong>Most likely the 100-missed-schedules trap.</strong> The controller counts missed start times
+         since the last run; above 100 it gives up permanently.</p>
+<pre>
+$ kubectl -n kube-system logs -l component=kube-controller-manager | grep -i cronjob
+Cannot determine if job needs to be started: too many missed start times (> 100).
+Set or decrease .spec.startingDeadlineSeconds or check clock skew
+$ kubectl get cronjob nightly
+nightly   */5 * * * *   False   0   &lt;none&gt;        ← LAST SCHEDULE is empty for ever
+</pre>
+      <p>At <code>*/5</code> that is an 8-hour outage; at <code>* * * * *</code> only 100 minutes. Setting
+         <code>startingDeadlineSeconds</code> bounds the look-back window so only recent misses count.</p>
+      <table class="tbl">
+        <tr><th>Other silent-stop causes</th><th>Check</th></tr>
+        <tr><td><code>suspend: true</code></td><td><code>kubectl get cronjob</code> SUSPEND column</td></tr>
+        <tr><td>Schedule edited incorrectly</td><td>Cron syntax; UTC vs <code>timeZone</code></td></tr>
+        <tr><td><code>Forbid</code> with a stuck previous Job</td><td>An <code>Active</code> Job that never ends</td></tr>
+        <tr><td>Clock skew on the control plane</td><td>NTP</td></tr>
+      </table>
+      <p><strong>The lesson for monitoring:</strong> alert on <strong>time since last success</strong>. Every one
+         of those causes produces silence, not failure, so failure-based alerting never fires.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why must every Job be idempotent?</summary>
+      <p><strong>Because Kubernetes guarantees at-least-once, never exactly-once.</strong></p>
+      <table class="tbl">
+        <tr><th>Duplication route</th><th>Mechanism</th></tr>
+        <tr><td>Node dies mid-run</td><td>The Job creates a replacement pod; the original may have partly completed</td></tr>
+        <tr><td><code>concurrencyPolicy: Allow</code></td><td>A slow run overlaps the next schedule</td></tr>
+        <tr><td>Controller restart at a boundary</td><td>The schedule is re-evaluated</td></tr>
+        <tr><td>Manual re-run</td><td>Someone retries after a partial failure</td></tr>
+      </table>
+      <p>The first is the important one: a partitioned node's pod may still be running and writing while the
+         replacement starts — the same problem as <a href="statefulsets.html">force-deleting a StatefulSet
+         pod</a>.</p>
+      <p><strong>Making work idempotent</strong> means a dedup key checked and set in the same transaction as the
+         effect: a <code>sent_at</code> column, an idempotency key on the payment API, a migrations table plus a
+         <code>pg_try_advisory_lock</code>. <code>concurrencyPolicy: Forbid</code> reduces the probability of
+         overlap and guarantees nothing — coordination has to live in the workload.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the batch layer for a platform with nightly reports, migrations and spot-instance processing.</summary>
+      <p><strong>Three workloads with genuinely different failure semantics, so three configurations.</strong></p>
+      <table class="tbl">
+        <tr><th></th><th>Nightly reports</th><th>Migrations</th><th>Spot batch</th></tr>
+        <tr><td>Object</td><td>CronJob</td><td>Job, per release</td><td>Indexed Job</td></tr>
+        <tr><td>Concurrency</td><td><code>Forbid</code></td><td>Advisory lock</td><td><code>parallelism: 20</code></td></tr>
+        <tr><td><code>backoffLimit</code></td><td>2</td><td>0 — <strong>fail loudly</strong></td><td>6</td></tr>
+        <tr><td><code>podFailurePolicy</code></td><td>—</td><td><code>FailJob</code> on bad input</td><td><strong><code>Ignore</code> on DisruptionTarget</strong></td></tr>
+        <tr><td>Deadline</td><td>4h</td><td>10m</td><td>12h</td></tr>
+        <tr><td>Alert on</td><td>Time since last success</td><td>Failure, immediately</td><td>Completion rate</td></tr>
+      </table>
+      <p><strong>The spot row is where <code>podFailurePolicy</code> earns its place:</strong> without it a
+         preemption consumes a retry, so a long job on preemptible capacity fails after six interruptions that had
+         nothing to do with the code. <code>Ignore</code> on <code>DisruptionTarget</code> is what makes batch
+         work on spot viable at all.</p>
+      <p><strong>Migrations deserve their own treatment:</strong> <code>backoffLimit: 0</code>, because a
+         half-applied migration retried automatically is worse than a stopped deploy; an advisory lock so
+         concurrent deploys cannot race; and gating dependents with
+         <code>service_completed_successfully</code> rather than running them as init containers, which would have
+         every replica racing the same schema.</p>
+      <p><strong>Platform-wide I would enforce</strong> <code>ttlSecondsAfterFinished</code> and history limits so
+         etcd does not accumulate thousands of Job objects, <code>startingDeadlineSeconds</code> and
+         <code>timeZone</code> on every CronJob, and a dashboard keyed on <em>last success time</em> — because
+         every serious CronJob failure mode is silence rather than an error.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do you run database migrations safely in Kubernetes?</summary>
+      <p><strong>A separate Job with a lock, gated ahead of the application, and written so both schema versions
+         work simultaneously.</strong></p>
+      <table class="tbl">
+        <tr><th>Approach</th><th>Problem</th></tr>
+        <tr><td>Init container in the Deployment</td><td><strong>Every replica runs it concurrently</strong></td></tr>
+        <tr><td>Application entrypoint</td><td>Same, plus it runs on every restart</td></tr>
+        <tr><td>Helm pre-install hook</td><td>Better — but a hook failure can leave the release wedged</td></tr>
+        <tr><td><strong>A Job, gated on completion</strong></td><td>The right shape</td></tr>
+      </table>
+      <p><strong>What the Job itself needs:</strong> <code>backoffLimit: 0</code> so a half-applied migration is
+         not retried blindly; an advisory lock so two concurrent deploys serialise; an
+         <code>activeDeadlineSeconds</code> so a lock wait cannot hang for ever; and a migrations table making
+         re-runs safe, since the pod may be replaced mid-run.</p>
+      <p><strong>The harder half is not Kubernetes at all.</strong> A rolling update runs both versions
+         simultaneously, so every migration must be backward compatible for the duration — expand/contract across
+         releases: add the column, deploy code writing both, backfill, deploy code reading the new one, and only
+         then drop the old column in a later release. A migration that drops a column in the same release that
+         stops using it breaks the pods still serving, as demonstrated in
+         <a href="deployments.html">Deployments</a>.</p>
+      <p><strong>What I would not do:</strong> run migrations automatically on every pod start. It looks
+         convenient, races on every scale-up, and turns a routine restart during an incident into a schema change
+         nobody authorised.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Compare the two retry mechanisms.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: never }
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers: [{ name: c, image: busybox,
+                     command: ['sh','-c','echo "attempt at $(date +%T)"; exit 1'] }]
+EOF
+$ sleep 240; kubectl get pods -l job-name=never --no-headers
+never-x8k2p   0/1   Error   0   4m
+never-p9v3w   0/1   Error   0   3m
+never-t2h8n   0/1   Error   0   2m
+never-m4j1q   0/1   Error   0   40s      ← 4 pods: 1 + 3 retries
+$ for p in $(kubectl get pods -l job-name=never -o name); do kubectl logs $p; done
+attempt at 12:31:02
+attempt at 12:31:14
+attempt at 12:31:36
+attempt at 12:32:18                      ← every attempt's logs preserved
+</pre>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: onfail }
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers: [{ name: c, image: busybox,
+                     command: ['sh','-c','echo "attempt at $(date +%T)"; exit 1'] }]
+EOF
+$ sleep 240; kubectl get pods -l job-name=onfail --no-headers
+onfail-4wm2t   0/1   CrashLoopBackOff   5   4m     ← ONE pod, 5 restarts
+$ kubectl logs onfail-4wm2t
+attempt at 12:35:41                      ← only the LAST attempt's logs
+$ kubectl logs onfail-4wm2t --previous
+attempt at 12:35:19
+</pre>
+<pre>
+Measure the backoff schedule:
+$ kubectl get pods -l job-name=never -o jsonpath='{range .items[*]}{.metadata.creationTimestamp}{"\n"}{end}' | sort
+2026-08-19T12:31:02Z
+2026-08-19T12:31:14Z      ← +12s
+2026-08-19T12:31:36Z      ← +22s
+2026-08-19T12:32:18Z      ← +42s   (10 → 20 → 40, doubling)
+
+$ kubectl get job never -o jsonpath='{.status.conditions[0].type}={.status.conditions[0].reason}{"\n"}'
+Failed=BackoffLimitExceeded
+$ kubectl get job onfail -o jsonpath='{.status.failed} {.status.conditions[0].reason}{"\n"}'
+1 BackoffLimitExceeded    ← the POD failed once; its container restarted 5 times
+</pre>
+<table class="tbl">
+  <tr><th></th><th><code>Never</code></th><th><code>OnFailure</code></th></tr>
+  <tr><td>Pod objects</td><td>1 per attempt</td><td>1 total</td></tr>
+  <tr><td>Logs</td><td><strong>All attempts</strong></td><td>Last only (plus <code>--previous</code>)</td></tr>
+  <tr><td>Rescheduling</td><td>New node possible</td><td>Same node always</td></tr>
+  <tr><td><code>backoffLimit</code> consumed</td><td>Per attempt</td><td><strong>Per pod, not per restart</strong></td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Run an Indexed Job and a work queue.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: shards }
+spec:
+  completions: 6
+  parallelism: 3
+  completionMode: Indexed
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: c
+        image: busybox
+        command: ['sh','-c','echo "shard $JOB_COMPLETION_INDEX of 6 on $(hostname)"; sleep 5']
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom: { fieldRef: { fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index'] } }
+EOF
+
+$ sleep 20; kubectl get pods -l job-name=shards --no-headers | awk '{print $1, $3}'
+shards-0-x8k2p Completed
+shards-1-p9v3w Completed
+shards-2-t2h8n Completed
+shards-3-m4j1q Running
+shards-4-4wm2t Running
+shards-5-9x2mv Running                   ← 3 at a time, index in the POD NAME
+$ for p in $(kubectl get pods -l job-name=shards -o name); do kubectl logs $p; done | sort
+shard 0 of 6 on shards-0-x8k2p
+shard 1 of 6 on shards-1-p9v3w
+shard 2 of 6 on shards-2-t2h8n
+shard 3 of 6 on shards-3-m4j1q
+shard 4 of 6 on shards-4-4wm2t
+shard 5 of 6 on shards-5-9x2mv           ← each pod computed its own slice
+$ kubectl get job shards
+NAME     COMPLETIONS   DURATION   AGE
+shards   6/6           18s        25s
+</pre>
+<pre>
+THE WORK-QUEUE PATTERN — completions unset:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: queue }
+spec:
+  parallelism: 4
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: w
+        image: busybox
+        command: ['sh','-c','
+          n=0
+          while [ $n -lt 5 ]; do echo "$(hostname) took item $n"; n=$((n+1)); sleep 1; done
+          echo "queue empty"; exit 0']
+EOF
+$ sleep 15; kubectl get job queue
+NAME    COMPLETIONS   DURATION   AGE
+queue   1/1 of 4      8s         15s
+   ↑ with completions unset, the Job succeeds as soon as ANY pod exits 0
+     and no others are running — the workers coordinate via the queue, not the Job
+</pre>
+<table class="tbl">
+  <tr><th>Pattern</th><th><code>completions</code></th><th>Coordination</th></tr>
+  <tr><td>Indexed</td><td>Set</td><td><strong>None needed</strong> — the index partitions the work</td></tr>
+  <tr><td>Work queue</td><td>Unset</td><td>An external queue</td></tr>
+  <tr><td>Fixed count</td><td>Set, NonIndexed</td><td>External; pods are interchangeable</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce the 100-missed-schedules trap and fix it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: frequent }
+spec:
+  schedule: "* * * * *"                  # every minute
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers: [{ name: c, image: busybox, command: ['sh','-c','echo run at $(date +%T)'] }]
+EOF
+$ sleep 180; kubectl get cronjob frequent
+NAME       SCHEDULE    SUSPEND   ACTIVE   LAST SCHEDULE   AGE
+frequent   * * * * *   False     0        24s             3m      ← healthy
+</pre>
+<pre>
+SIMULATE A LONG CONTROL-PLANE OUTAGE (>100 minutes at */1):
+$ kubectl patch cronjob frequent -p '{"spec":{"suspend":true}}'
+$ sleep 7200                             # 2 hours = 120 missed schedules
+$ kubectl patch cronjob frequent -p '{"spec":{"suspend":false}}'
+
+$ sleep 300; kubectl get cronjob frequent
+NAME       SCHEDULE    SUSPEND   ACTIVE   LAST SCHEDULE   AGE
+frequent   * * * * *   False     0        2h4m            2h9m
+                                              ↑ LAST SCHEDULE has not advanced
+$ kubectl -n kube-system logs -l component=kube-controller-manager --tail=200 \
+    | grep -i 'missed start times'
+Cannot determine if job needs to be started: too many missed start times (> 100).
+Set or decrease .spec.startingDeadlineSeconds or check clock skew
+$ kubectl get jobs -l cronjob=frequent --no-headers | wc -l
+0                                        ← it will NEVER run again
+$ kubectl get events --field-selector involvedObject.name=frequent
+No events.                               ← and nothing alerts
+</pre>
+<pre>
+THE FIX:
+$ kubectl patch cronjob frequent -p '{"spec":{"startingDeadlineSeconds":120}}'
+$ sleep 90; kubectl get cronjob frequent
+frequent   * * * * *   False   0   31s   2h12m       ← running again immediately
+$ kubectl get jobs -l cronjob=frequent --no-headers | wc -l
+1
+</pre>
+<pre>
+Verify the same outage with the deadline set from the start:
+$ kubectl patch cronjob frequent -p '{"spec":{"suspend":true}}'
+$ sleep 7200
+$ kubectl patch cronjob frequent -p '{"spec":{"suspend":false}}'
+$ sleep 90; kubectl get cronjob frequent -o jsonpath='{.status.lastScheduleTime}{"\n"}'
+2026-08-19T14:44:00Z                     ← recent: only misses within 120s counted
+</pre>
+<table class="tbl">
+  <tr><th>Schedule</th><th>Outage that triggers the trap</th></tr>
+  <tr><td><code>* * * * *</code></td><td><strong>100 minutes</strong></td></tr>
+  <tr><td><code>*/5 * * * *</code></td><td>8 hours 20 minutes</td></tr>
+  <tr><td><code>0 * * * *</code></td><td>4 days</td></tr>
+  <tr><td><code>0 3 * * *</code></td><td>100 days</td></tr>
+</table>
+<p><strong>Every CronJob should set <code>startingDeadlineSeconds</code></strong> — slightly more than one
+   interval. It costs nothing and removes a failure mode whose only symptom is silence.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Compare the three concurrency policies under a slow job.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ mk() {  # $1 = name, $2 = policy
+    kubectl apply -f - &lt;&lt;EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: $1 }
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: $2
+  startingDeadlineSeconds: 30
+  successfulJobsHistoryLimit: 10
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers: [{ name: c, image: busybox,
+                         command: ['sh','-c','echo start \$(date +%T); sleep 150; echo done'] }]
+EOF
+  }
+$ mk allow Allow; mk forbid Forbid; mk replace Replace
+$ sleep 400
+</pre>
+<pre>
+$ for n in allow forbid replace; do
+    printf '%-8s active=%s jobs=%s\n' $n \
+      "$(kubectl get cronjob $n -o jsonpath='{.status.active[*].name}' | wc -w)" \
+      "$(kubectl get jobs -l cronjob=$n --no-headers | wc -l)"
+  done
+allow    active=3 jobs=6          ← THREE overlapping 150s runs at once
+forbid   active=1 jobs=2          ← skipped occurrences entirely
+replace  active=1 jobs=6          ← killed and restarted each minute
+</pre>
+<pre>
+$ kubectl get jobs -l cronjob=forbid -o custom-columns=\
+NAME:.metadata.name,COMPLETIONS:.status.succeeded,START:.status.startTime --no-headers
+forbid-28941120   1   2026-08-19T12:32:00Z
+forbid-28941123   1   2026-08-19T12:35:00Z      ← 3-minute gaps: 2 of every 3 skipped
+$ kubectl get events --field-selector reason=JobAlreadyActive --no-headers | wc -l
+4                                 ← Forbid EMITS AN EVENT when it skips
+
+$ kubectl get jobs -l cronjob=replace -o custom-columns=\
+NAME:.metadata.name,SUCCEEDED:.status.succeeded,FAILED:.status.failed --no-headers
+replace-28941120   &lt;none&gt;   &lt;none&gt;      ← killed mid-run
+replace-28941121   &lt;none&gt;   &lt;none&gt;
+replace-28941125   1        &lt;none&gt;      ← only the last one ever completed
+$ kubectl logs -l cronjob=replace --tail=1 | grep -c done
+1                                 ← 5 runs started, 1 finished
+</pre>
+<table class="tbl">
+  <tr><th>Policy</th><th>Concurrent runs</th><th>Work completed</th><th>Right for</th></tr>
+  <tr><td><code>Allow</code></td><td><strong>3</strong></td><td>All, possibly duplicated</td><td>Independent, idempotent work</td></tr>
+  <tr><td><code>Forbid</code></td><td>1</td><td>Some occurrences skipped</td><td><strong>Shared state</strong></td></tr>
+  <tr><td><code>Replace</code></td><td>1</td><td><strong>Only the last run</strong></td><td>Only the latest result matters</td></tr>
+</table>
+<p><strong>The trap in <code>Replace</code></strong> is visible above: a job that takes longer than its
+   interval is killed every single time and never completes. <code>Forbid</code> at least finishes what it
+   starts.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Make batch work survive spot preemption with <code>podFailurePolicy</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+WITHOUT a policy — preemptions burn the retry budget:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: naive }
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers: [{ name: c, image: busybox, command: ['sh','-c','sleep 600'] }]
+EOF
+
+$ for i in 1 2 3 4; do
+    sleep 20
+    POD=$(kubectl get pods -l job-name=naive -o name --field-selector=status.phase=Running | head -1)
+    kubectl delete $POD --wait=false      # simulate a preemption/eviction
+  done
+$ sleep 30; kubectl get job naive -o jsonpath='{.status.conditions[0].type}={.status.conditions[0].reason}{"\n"}'
+Failed=BackoffLimitExceeded
+$ kubectl get job naive -o jsonpath='failed={.status.failed}{"\n"}'
+failed=4
+   → the code never ran wrong once; four infrastructure events killed the Job
+</pre>
+<pre>
+WITH podFailurePolicy:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: resilient }
+spec:
+  backoffLimit: 3
+  podFailurePolicy:
+    rules:
+    - action: Ignore                       ← do not count disruptions
+      onPodConditions: [{ type: DisruptionTarget }]
+    - action: FailJob                      ← unrecoverable input: stop now
+      onExitCodes: { containerName: c, operator: In, values: [42] }
+  template:
+    spec:
+      restartPolicy: Never
+      containers: [{ name: c, image: busybox, command: ['sh','-c','sleep 600'] }]
+EOF
+
+$ for i in $(seq 1 6); do
+    sleep 20
+    POD=$(kubectl get pods -l job-name=resilient -o name --field-selector=status.phase=Running | head -1)
+    kubectl delete $POD --wait=false
+  done
+$ kubectl get job resilient -o jsonpath='failed={.status.failed} active={.status.active}{"\n"}'
+failed=0 active=1
+   ↑ SIX disruptions, zero counted, the Job is still going
+$ kubectl get pods -l job-name=resilient -o json \
+    | jq -r '.items[] | select(.status.phase=="Failed") |
+             "\(.metadata.name) \([.status.conditions[]|select(.type=="DisruptionTarget")|.reason][0])"' | head -2
+resilient-x8k2p   DeletionByKubelet
+resilient-p9v3w   DeletionByKubelet        ← recognised as disruptions
+</pre>
+<pre>
+And FailJob short-circuits an unrecoverable failure:
+$ kubectl create job baddata --image=busybox -- sh -c 'echo "bad input"; exit 42'
+   (with the same podFailurePolicy)
+$ sleep 20; kubectl get job baddata -o jsonpath='{.status.conditions[0].reason}{"\n"}'
+PodFailurePolicy
+$ kubectl get pods -l job-name=baddata --no-headers | wc -l
+1                                          ← ONE attempt, not 4: retrying cannot help
+</pre>
+<table class="tbl">
+  <tr><th>Failure</th><th>Default</th><th>With policy</th></tr>
+  <tr><td>Preemption / drain</td><td>Counts — Job fails after N</td><td><strong>Ignored — runs to completion</strong></td></tr>
+  <tr><td>Bad input (exit 42)</td><td>Retries 4 times pointlessly</td><td><strong>Fails immediately</strong></td></tr>
+  <tr><td>Genuine bug (exit 1)</td><td>Counts</td><td>Counts</td></tr>
+</table>
+<p><strong>This is what makes long batch jobs viable on spot capacity</strong> — without it, a 12-hour job on
+   preemptible nodes is statistically guaranteed to exhaust its retry budget on events unrelated to the
+   code.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a safe migration Job and monitoring for silent CronJob failure.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE MIGRATION JOB:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: migrate-1-4-2 }          # versioned name: immutable, auditable
+spec:
+  backoffLimit: 0                          # never retry a half-applied migration
+  activeDeadlineSeconds: 600               # a lock wait cannot hang for ever
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: postgres:16-alpine
+        env: [{ name: PGPASSWORD, valueFrom: { secretKeyRef: { name: db, key: password } } }]
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          psql -h db -U app -d shop -v ON_ERROR_STOP=1 &lt;&lt;'SQL'
+          BEGIN;
+          SELECT pg_advisory_xact_lock(4815162342);            -- serialise deploys
+          CREATE TABLE IF NOT EXISTS schema_migrations(version text primary key);
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version='1.4.2') THEN
+              ALTER TABLE orders ADD COLUMN first_name text;   -- ADDITIVE only
+              INSERT INTO schema_migrations VALUES ('1.4.2');
+              RAISE NOTICE 'applied 1.4.2';
+            ELSE
+              RAISE NOTICE 'already applied — no-op';
+            END IF;
+          END $$;
+          COMMIT;
+          SQL
+EOF
+$ kubectl wait --for=condition=complete job/migrate-1-4-2 --timeout=10m
+job.batch/migrate-1-4-2 condition met
+$ kubectl logs -l job-name=migrate-1-4-2 | grep NOTICE
+NOTICE:  applied 1.4.2
+</pre>
+<pre>
+Prove it is safe to run twice (a node failure mid-run does exactly this):
+$ kubectl delete job migrate-1-4-2 &amp;&amp; kubectl apply -f migrate.yaml
+$ kubectl wait --for=condition=complete job/migrate-1-4-2 --timeout=5m
+$ kubectl logs -l job-name=migrate-1-4-2 | grep NOTICE
+NOTICE:  already applied — no-op         ← idempotent
+
+And that concurrent deploys serialise rather than race:
+$ for i in 1 2 3; do kubectl create job "m-$i" --from=job/migrate-1-4-2 & done; wait
+$ sleep 30; kubectl logs -l job-name -c migrate --tail=1 --prefix | grep -c 'already applied'
+2                                        ← one applied, two no-ops, none corrupted
+</pre>
+<pre>
+MONITORING — the alert that actually catches silent failure:
+$ cat > tools/cron-health.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+# Alert on TIME SINCE LAST SUCCESS, not on failure. Exit 1 if any CronJob is stale.
+set -uo pipefail
+FAIL=0
+now=$(date +%s)
+kubectl get cronjob -A -o json | jq -r '.items[] |
+  "\(.metadata.namespace) \(.metadata.name) \(.spec.schedule) \(.spec.suspend) \(.status.lastSuccessfulTime // "never")"' |
+while read -r ns name sched susp last; do
+  # crude expected interval: minutes field only
+  case "$sched" in
+    "* * * * *")   max=300   ;;
+    "*/5 * * * *") max=1200  ;;
+    "0 * * * *")   max=7200  ;;
+    *)             max=172800 ;;
+  esac
+  if [ "$susp" = "true" ]; then
+    printf '  SUSPENDED %s/%s\n' "$ns" "$name"; FAIL=1; continue
+  fi
+  if [ "$last" = "never" ]; then
+    printf '  NEVER-RAN %s/%s (%s)\n' "$ns" "$name" "$sched"; FAIL=1; continue
+  fi
+  age=$(( now - $(date -d "$last" +%s) ))
+  if [ "$age" -gt "$max" ]; then
+    printf '  STALE     %s/%s last success %ss ago (max %ss)\n' "$ns" "$name" "$age" "$max"
+    FAIL=1
+  else
+    printf '  OK        %s/%s last success %ss ago\n' "$ns" "$name" "$age"
+  fi
+done
+exit $FAIL
+SH
+$ chmod +x tools/cron-health.sh &amp;&amp; tools/cron-health.sh
+  OK        default/nightly last success 1204s ago
+  STALE     default/frequent last success 7891s ago (max 300s)
+  SUSPENDED ops/cleanup
+  NEVER-RAN default/new-report (0 3 * * *)
+$ echo $?
+1
+</pre>
+<table class="tbl">
+  <tr><th>Failure mode</th><th>Fires a "job failed" alert?</th><th>Caught by last-success?</th></tr>
+  <tr><td>Job exits non-zero</td><td>✅</td><td>✅</td></tr>
+  <tr><td>100-miss trap</td><td><strong>❌</strong></td><td>✅</td></tr>
+  <tr><td>Accidentally suspended</td><td><strong>❌</strong></td><td>✅</td></tr>
+  <tr><td>Schedule edited wrongly</td><td><strong>❌</strong></td><td>✅</td></tr>
+  <tr><td><code>Forbid</code> blocked by a stuck job</td><td>❌</td><td>✅</td></tr>
+</table>
+<p><strong>Four of the five most common CronJob failures are silent.</strong> Failure-based alerting misses
+   all of them; time-since-last-success catches every one.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>A Job runs pods until <code>completions</code> succeed; <code>restartPolicy: Always</code> is rejected outright.</li>
+        <li><strong><code>restartPolicy</code> restarts the container; <code>backoffLimit</code> creates new pods</strong> — measured: 4 pod objects with <code>Never</code> versus 1 pod with 5 restarts under <code>OnFailure</code>.</li>
+        <li><code>Never</code> preserves every attempt's logs; <code>OnFailure</code> overwrites them and does <strong>not</strong> consume the backoff budget per restart.</li>
+        <li>Retries back off 10s → 20s → 40s → 80s → 160s → 320s (capped at 6 min), so a default Job takes over ten minutes to report failure.</li>
+        <li><strong><code>activeDeadlineSeconds</code> is the only thing that stops a hung Job</strong>, and it overrides <code>backoffLimit</code>.</li>
+        <li><code>Indexed</code> completion gives each pod a stable index in its name and environment — work partitions with no coordinator.</li>
+        <li>With <code>completions</code> unset, a Job is a <strong>work queue</strong>: it ends when any pod exits 0 and none remain.</li>
+        <li><strong><code>podFailurePolicy</code> separates your bug from the cluster's</strong>: <code>Ignore</code> on <code>DisruptionTarget</code> survived six preemptions with <code>failed=0</code>, where the default failed after four.</li>
+        <li><code>FailJob</code> on a known-fatal exit code stops after one attempt instead of retrying pointlessly.</li>
+        <li><strong>More than 100 missed schedules stops a CronJob permanently</strong> — 100 minutes at <code>*/1</code>, and the only symptom is an empty LAST SCHEDULE.</li>
+        <li><code>startingDeadlineSeconds</code> bounds the look-back window and fixes it instantly; every CronJob should set it.</li>
+        <li>Without <code>timeZone</code>, schedules run in the controller's zone (UTC) and drift with DST.</li>
+        <li><code>Allow</code> produced <strong>3 concurrent runs</strong>; <code>Forbid</code> skipped occurrences and emitted <code>JobAlreadyActive</code> events; <strong><code>Replace</code> killed every long run so only the last completed</strong>.</li>
+        <li>Delivery is <strong>at-least-once</strong>: node failure, overlap, controller restarts and manual re-runs all duplicate work.</li>
+        <li>Idempotency must live in the workload — a dedup key set in the same transaction as the effect, or an advisory lock. <code>Forbid</code> is a convenience, not a guarantee.</li>
+        <li>An ordinary sidecar keeps a Job pod running for ever; use a <strong>native sidecar</strong> (init container with <code>restartPolicy: Always</code>).</li>
+        <li>Migrations belong in a <strong>versioned Job with <code>backoffLimit: 0</code> and an advisory lock</strong>, gated with <code>service_completed_successfully</code> — never an init container, where every replica races the schema.</li>
+        <li>Every migration must still be backward compatible, because a rolling update runs both versions at once.</li>
+        <li><code>ttlSecondsAfterFinished</code> and history limits stop thousands of Job objects accumulating in etcd.</li>
+        <li><strong>Alert on time since last success, not on failure</strong> — four of the five most common CronJob failure modes are completely silent.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="statefulsets.html">← StatefulSets &amp; Stable Identity</a>
+      <a href="probes.html">Probes: Liveness, Readiness &amp; Startup →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
