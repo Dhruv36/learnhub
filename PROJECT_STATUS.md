@@ -6,60 +6,63 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-19)
+## ▶️ RESUME HERE (last updated 2026-08-20)
 
-**Last completed:** ✅ **Docker v4 (track 15) — COMPLETE.** All **21 lessons** rebuilt from 12 v3
-lessons (~10KB) to v4 depth (45–62KB, every one `det=12 ex=6`) across 6 sections, + **quiz bank
-retuned to the v4 curriculum** (80 swaps, sets retitled to the six sections, `10 200 0`, de-skewed
-72/61/67). Whole track passes `python validate.py tutorials/docker` with **0 errors and 0 warnings**
-(24 files); pushed & live.
+**Last completed:** ✅ **Kubernetes v4 (track 16) — COMPLETE.** All **22 lessons** rebuilt from 12 v3
+lessons (~10KB) to v4 depth (49–57KB, every one `det=12 ex=6`) across 6 sections, + **quiz bank
+rewritten to the v4 curriculum** (200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed
+69/78/53). Whole track passes `python validate.py tutorials/kubernetes` with **0 errors** (28 files);
+pushed & live.
 
-*§1 Foundations ×5* — `index.html` (**a container is a process, not a VM**; ~0.4s vs ~24s VM start;
-`exec format error` = architecture) · `images-containers.html` (whiteouts, secret extraction,
-copy-up) · `namespaces.html` (what they don't isolate, JVM heap trap) · `cgroups.html` (CFS
-throttling cliff, OOM vs SIGKILL, page-cache accounting) · `runtime-stack.html` (shim survives
-daemon restart; socket = host root)
-*§2 Building Images ×5* — `dockerfile.html` (**shell form → 10.3s stop + exit 137**; ARG leaks) ·
-`build-cache.html` (**RUN cached on the command STRING**; ordering 23.4s → 0.74s) ·
-`multi-stage.html` (**1.19GB → 14.2MB**; scratch needs CA certs + numeric USER) ·
-`buildkit.html` (graph not script; **cross-compile beat QEMU 15.4×**) ·
-`optimization.html` (**Alpine+Python = 38s → 24 MINUTES**; never squash)
-*§3 Running Containers ×4* — `process-model.html` (**PID 1 ignores unhandled signals**; 271 zombies)
-· `volumes.html` (**volumes pre-populate, binds hide**; copy-up 310×) ·
-`networking.html` (**published ports BYPASS UFW**) · `env-secrets.html` (four leak paths, `_FILE`)
-*§4 Composing Systems ×2* — `compose.html` (**client not runtime**; project name strands volumes;
-**YAML base-60: `22:22` → port 1342**; `.env` ≠ `env_file`; ports concatenate and can never be
-removed by an override; recreate = 37 failed requests) · `healthchecks.html` (**`depends_on` orders
-starts, not readiness** — 27–72% flake → 0; **`start_period` is a grace window, not a delay**;
-**nothing acts on `unhealthy`** — `RestartCount 0` under `unless-stopped`; liveness checking the DB
-turned an 8s blip into 160 failed requests; `ExitCode -1` = the probe could not run)
-*§5 Production ×4* — `security.html` (**UID 0 inside is UID 0 outside**, proven on a bind mount;
-`--cap-drop=ALL` works for nginx/Postgres/Redis/Node; **`--privileged` measured**: caps 14→40,
-seccomp 2→0, AppArmor unconfined, host block devices in `/dev`; distroless 0 vs ubuntu 17 CVEs) ·
-`resource-limits.html` (**exit 137 vs `.State.OOMKilled`**; **page cache reported 78.54% on a
-sleeping container**; **62% average CPU at every quota while p99 went 41→96→488ms**; `/proc` is not
-namespaced) · `logging.html` (**json-file has no size limit** — 1.4GB/minute; **`daemon.json` only
-affects NEW containers**; `rm` frees nothing, `truncate` does; **blocking driver took 3ms → 14,208ms**;
-`PYTHONUNBUFFERED`) · `debugging.html` (**125 = your flags, 126/127 = the image**; four causes of
-`exec format error`; **`attach` Ctrl-C kills the container**; refused vs timeout; **`127.0.0.1` bind
-is the #1 networking bug**; `compose run --entrypoint sh`)
-*§6 Supply Chain ×1* — `registry-supply-chain.html` (**tags are mutable pointers, digests are
-identity**; promote in 0.2s vs rebuild in 47s with a drifted dependency; **retention GC deletes
-pinned digests**; scanners miss malicious code; **SBOM query 6.8s vs 41min**; signing without
-verification is theatre; Hub's 100/6h is per source IP)
+*§1 Foundations ×5* — `index.html` (**level-triggered, not edge-triggered**; the scheduler writes one
+field; control-plane outage = "cannot change", not "everything down"; frozen endpoints black-holed
+11/30 requests; deletion is a request) · `objects-yaml.html` (three-way merge, **SSA field
+ownership**, HPA/Git conflict = 23 scale events in 10 min, `--dry-run=server`) · `pods.html`
+(namespace sharing proven, **native sidecars: Job 30min → 14s**, bare pods never rescheduled) ·
+`deployments.html` (**surge arithmetic measured 5 exist/3 ready**, ConfigMap change rolls out
+nothing, no auto-rollback after ProgressDeadlineExceeded) · `scheduling.html` (**requests not usage**,
+the hidden 300s toleration ≈341s to evict, spread 2/2/1 vs anti-affinity 3 Running 2 Pending)
+*§2 Networking ×4* — `services.html` (**ClusterIP has no process**; per-connection balancing
+200/0/0/0; `Local` gave 133/134/133 vs 400; preStop 22 → 0 dropped) · `dns-discovery.html`
+(**ndots:5 = 10 queries, 48ms → 7ms**; the 5.000s conntrack race; hostNetwork DNS trap;
+publishNotReadyAddresses deadlock) · `ingress-gateway.html` (Ingress is data not a proxy; **Prefix
+matches elements — /api ≠ /apifoo**; 1MB body-size default; Gateway API role split) ·
+`network-policy.html` (**one extra dash = OR**, hostile ns granted itself access; ClusterIP allow does
+nothing; **silent no-op on Flannel**)
+*§3 Config & State ×4* — `config-secrets.html` (Secret read from etcd; **env never / volume ~60s /
+subPath never**; create pods = get secrets) · `storage.html` (**reclaimPolicy Delete destroys the
+disk**; WaitForFirstConsumer zone trap; **RWO = one NODE, two writers proven**; CSI attach limits) ·
+`statefulsets.html` (identity survives rescheduling; ordered rollout blocks; **partition canary**;
+PVCs outlive everything; force-delete split brain) · `jobs-cronjobs.html` (**backoffLimit counts pods
+not restarts**; **100-miss trap kills a CronJob permanently**; podFailurePolicy for spot; alert on
+last success)
+*§4 Scaling & Reliability ×4* — `probes.html` (**a probe may only test what its remedy can fix** —
+liveness on the DB restarted 4/4 replicas, 137 failures → 0; startup probe: ready 94s AND 11s
+detection) · `resources.html` (QoS eviction by usage-vs-request; **62% avg CPU at every quota while
+p99 went 41→96→488ms**; LimitRange before ResourceQuota) · `autoscaling.html` (**utilisation is % of
+the REQUEST**; 300s scale-down window; HPA+VPA oscillation 3→23 replicas; CA scale-up 194s → 12s with
+balloons) · `disruptions.html` (**PDBs are voluntary-only**; eviction 429 vs delete; `--disable-eviction`
+bypasses every PDB; preStop 22 → 0)
+*§5 Security ×2* — `rbac.html` (**there is no User object**; create pods → every Secret AND any SA's
+permissions; escalate/bind/impersonate; projected tokens die with the pod) · `pod-security.html`
+(**hostPath read other pods' Secrets from a create-pods-only SA**; PSA validates PODS not Deployments;
+**mutation runs before validation**)
+*§6 Operating ×3* — `helm.html` (**release ledger in cluster Secrets**; `--set 1.20` → `1.2`;
+pending-upgrade wedges every deploy; **crds/ never upgraded**) · `gitops.html` (**Sync ≠ Health**;
+prune + empty render = everything deleted; **kubectl fix has a 3-minute half-life**) ·
+`debugging-production.html` (**events expire in ~1h**; status over spec; ephemeral containers for
+distroless; layered network test; event flood = diagnosis)
 
-Also: the orphaned v3 `internals.html` and `volumes-networking.html` are now **redirect stubs**
-(nav splits them into namespaces/cgroups/runtime-stack and volumes/networking); nothing links to them.
+Also: the five v3 files orphaned by the nav split (`pods-deployments`, `services-ingress`,
+`probes-resources`, `statefulsets-storage`, `rbac-network`) are now **redirect stubs**.
 
 ⚠️ **Scaffolding reminder:** any newly-copied `quiz.html` must be checked for BOTH the stale
 `← CSS Track` link AND mojibake (`Â·`, `â†’` — double-encoded UTF-8) before committing.
 
-**🚧 NEXT: Kubernetes v4 (track 16)** — `tutorials/kubernetes/`, 12 v3 lessons → ~20 at v4 depth.
-Write `nav.js` first, then lessons (commit every 1–2), then retune the quiz bank, then a whole-track
-validate.
+**🚧 NEXT: AWS v4 (track 17)** — `tutorials/aws/`, 12 v3 lessons → ~20 at v4 depth. Write `nav.js`
+first, then lessons (commit every 1–2), then retune the quiz bank, then a whole-track validate.
 
-
-**Then the remaining infra three:** AWS → CI/CD → MongoDB, each 12 v3 → ~20 at v4.
+**Then the remaining infra two:** CI/CD → MongoDB, each 12 v3 → ~20 at v4.
 
 **Tooling is committed in `tools/` — see `tools/README.md`. Nothing lives in a scratchpad.**
 ```
@@ -68,12 +71,12 @@ python tools/quizcheck.py tutorials/<track>                   # bank: 10 200 0, 
 node tools/quizshuffle.js tutorials/<track>                   # de-skew (idempotent)
 ```
 
-**The remaining infra tracks, in the user's order:** Kubernetes → AWS → CI/CD → MongoDB.
+**The remaining infra tracks, in the user's order:** AWS → CI/CD → MongoDB.
 
 | Track | Dir | Now | Target |
 |-------|-----|-----|--------|
 | Docker | `tutorials/docker/` | ✅ **21 at v4** | done |
-| Kubernetes | `tutorials/kubernetes/` | 12 | ~20 |
+| Kubernetes | `tutorials/kubernetes/` | ✅ **22 at v4** | done |
 | AWS | `tutorials/aws/` | 12 | ~20 |
 | CI/CD | `tutorials/cicd/` | 12 | ~20 |
 | MongoDB | `tutorials/mongodb/` | 12 | ~20 |
