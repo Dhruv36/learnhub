@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Disruptions, Draining &amp; Zero-Downtime — Kubernetes — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Disruptions, Draining &amp; Zero-Downtime <span class="level-badge level-adv">Scaling &amp; Reliability</span></h1>
+    <p><strong>What you'll master:</strong> the distinction everything else depends on — <strong>voluntary
+       disruptions can be blocked, involuntary ones cannot</strong>, and a PodDisruptionBudget only ever protects
+       against the first kind; the eviction API, which is a <em>request</em> that can be refused with a 429, as
+       opposed to a delete which cannot; PDB semantics and the three configurations that either block every node
+       drain for ever or protect nothing at all; the exact termination sequence, and the
+       <strong>race between endpoint removal and SIGTERM that drops requests on every single deploy</strong> —
+       measured, and fixed with one <code>preStop</code> hook; what each dangerous <code>kubectl drain</code> flag
+       actually waives; and a zero-downtime checklist where every item is there because omitting it produced
+       failures we can count. Prerequisites: <a href="services.html">Services &amp; Endpoints</a>,
+       <a href="probes.html">Probes</a>, <a href="deployments.html">Deployments</a>, and
+       <a href="../docker/process-model.html">Docker: PID 1 &amp; Signals</a>.</p>
+
+    <h2>Part 1 — Voluntary and Involuntary</h2>
+
+    <table class="tbl">
+      <tr><th>Voluntary — <strong>a PDB applies</strong></th><th>Involuntary — <strong>a PDB is irrelevant</strong></th></tr>
+      <tr><td><code>kubectl drain</code> for a node upgrade</td><td>Node hardware failure</td></tr>
+      <tr><td>Cluster Autoscaler removing a node</td><td>Kernel panic, network partition</td></tr>
+      <tr><td>A rolling update</td><td><strong>OOM kill</strong></td></tr>
+      <tr><td>An operator's rolling maintenance</td><td>Eviction under node pressure</td></tr>
+      <tr><td><code>kubectl delete pod</code>… <em>no</em> — see below</td><td>Spot instance reclamation</td></tr>
+    </table>
+
+<pre>
+  DELETE  — a command. Executed unconditionally. PDBs are NOT consulted.
+      DELETE /api/v1/namespaces/shop/pods/api-x8k2p
+
+  EVICT   — a REQUEST. May be refused. PDBs ARE consulted.
+      POST /api/v1/namespaces/shop/pods/api-x8k2p/eviction
+
+$ kubectl drain worker-2 --ignore-daemonsets
+evicting pod shop/api-x8k2p
+error when evicting pods/"api-x8k2p" -n "shop" (will retry after 5s):
+Cannot evict pod as it would violate the pod's disruption budget.
+                                        ← HTTP 429, and drain keeps retrying
+</pre>
+
+    <div class="note">🔑 <strong>A PodDisruptionBudget protects nothing against a node that catches fire.</strong>
+       It is a contract with <em>cooperative</em> processes — drain, the autoscaler, operators — that agree to use
+       the eviction API. Availability against involuntary disruption comes from replica count, spreading across
+       failure domains, and fast rescheduling; the PDB only stops your own tooling from taking down more than you
+       can afford at once.</div>
+
+    <h2>Part 2 — PodDisruptionBudget Semantics</h2>
+
+<pre>
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: api }
+spec:
+  maxUnavailable: 1              ← or minAvailable; never both
+  selector:
+    matchLabels: { app: api }    ← matches PODS, like a Service
+  unhealthyPodEvictionPolicy: AlwaysAllow   ← lets broken pods be evicted (newer)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Spec (10 replicas)</th><th>Allowed disruptions</th><th>Behaviour</th></tr>
+      <tr><td><code>maxUnavailable: 1</code></td><td>1</td><td>Drains proceed one pod at a time</td></tr>
+      <tr><td><code>maxUnavailable: 25%</code></td><td>2</td><td>Scales with replica count</td></tr>
+      <tr><td><code>minAvailable: 8</code></td><td>2</td><td>Equivalent, expressed the other way</td></tr>
+      <tr><td><strong><code>minAvailable: 10</code></strong></td><td><strong>0</strong></td><td><strong>Blocks every drain for ever</strong></td></tr>
+      <tr><td><code>minAvailable: 100%</code></td><td>0</td><td>Same trap, harder to spot</td></tr>
+      <tr><td>PDB on a <strong>1-replica</strong> Deployment</td><td>0</td><td>Blocks drains; the pod dies anyway on node failure</td></tr>
+    </table>
+
+<pre>
+$ kubectl get pdb
+NAME   MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+api    N/A             1                 1                     3m
+db     3               N/A               0                     3m      ← blocked
+                                         ↑ THE COLUMN THAT MATTERS
+
+$ kubectl get pdb db -o jsonpath='healthy={.status.currentHealthy} desired={.status.desiredHealthy}{"\n"}'
+healthy=3 desired=3            ← at the floor: no disruption is permitted
+</pre>
+
+    <div class="note">⚠️ <strong><code>ALLOWED DISRUPTIONS: 0</code> is the number to alert on.</strong> It means
+       node upgrades hang, the Cluster Autoscaler cannot reclaim the node
+       (<a href="autoscaling.html">Autoscaling</a>), and a maintenance window stalls with no obvious cause. It
+       happens whenever <code>minAvailable</code> equals the replica count, whenever replicas are scaled down
+       below the floor, and whenever pods are unhealthy — because an unhealthy pod is already "unavailable" and
+       consumes the budget. <code>unhealthyPodEvictionPolicy: AlwaysAllow</code> fixes that last case, which is
+       otherwise a deadlock: a crash-looping pod blocks the drain that would have moved it somewhere healthy.</div>
+
+    <h2>Part 3 — The Termination Sequence</h2>
+
+<pre>
+  t=0     deletionTimestamp is set on the pod
+          │
+          ├─► ASYNCHRONOUSLY: endpoints controller marks the endpoint not-ready
+          │      └─► kube-proxy on EVERY node rewrites its rules   (~0.5–2 s)
+          │      └─► ingress controllers re-read endpoints          (varies)
+          │
+          └─► kubelet runs the preStop hook (if any) — BLOCKING
+                 └─► then sends SIGTERM to PID 1
+                        └─► grace period counts down
+                               └─► SIGKILL when it expires
+
+  ⚠️ preStop and SIGTERM are SEQUENTIAL; endpoint removal runs in PARALLEL with both.
+     terminationGracePeriodSeconds covers preStop AND the shutdown together.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Failure</th><th>Symptom</th><th>Fix</th></tr>
+      <tr><td>App exits before rules propagate</td><td><strong>Connection refused on every deploy</strong></td><td><code>preStop: sleep 10</code></td></tr>
+      <tr><td>App ignores SIGTERM</td><td>Full grace period, then exit 137</td><td>Handle the signal — <a href="../docker/process-model.html">PID 1</a></td></tr>
+      <tr><td>Shell-form entrypoint</td><td>SIGTERM goes to <code>/bin/sh</code>, never forwarded</td><td>Exec form</td></tr>
+      <tr><td>Grace period shorter than drain time</td><td>In-flight requests killed</td><td>preStop + drain &lt; grace period</td></tr>
+      <tr><td>Long-lived connections</td><td>Clients pinned to a dying pod</td><td>Send <code>Connection: close</code>; bound connection age</td></tr>
+    </table>
+
+<pre>
+lifecycle:
+  preStop:
+    exec: { command: ["sleep", "10"] }     ← survive endpoint propagation
+terminationGracePeriodSeconds: 45          ← preStop(10) + drain(≤30) + headroom
+</pre>
+
+    <p>The endpoint conditions make the intent explicit while this is happening: a terminating pod is
+       <code>ready: false</code> (no new traffic) but <code>serving: true</code> (in-flight work drains) — the
+       mechanism described in <a href="services.html">Services &amp; Endpoints</a>.</p>
+
+    <h2>Part 4 — Draining a Node</h2>
+
+<pre>
+$ kubectl drain worker-2 --ignore-daemonsets --delete-emptydir-data --timeout=10m
+node/worker-2 cordoned                      ← ① mark unschedulable
+evicting pod shop/api-x8k2p                 ← ② eviction API, honouring PDBs
+evicting pod shop/api-p9v3w
+error when evicting pod "api-p9v3w" (will retry after 5s): Cannot evict pod as it
+would violate the pod's disruption budget.
+pod/api-x8k2p evicted
+pod/api-p9v3w evicted
+node/worker-2 drained
+</pre>
+
+    <table class="tbl">
+      <tr><th>Flag</th><th>Waives</th><th>Risk</th></tr>
+      <tr><td><code>--ignore-daemonsets</code></td><td>DaemonSet pods, which would be recreated immediately</td><td>None — always needed</td></tr>
+      <tr><td><code>--delete-emptydir-data</code></td><td>Refusal to destroy local scratch</td><td><strong>Data in <code>emptyDir</code> is lost</strong></td></tr>
+      <tr><td><code>--force</code></td><td>Refusal to delete pods with no controller</td><td><strong>Bare pods are gone permanently</strong></td></tr>
+      <tr><td><code>--disable-eviction</code></td><td><strong>The eviction API — deletes directly</strong></td><td><strong>PDBs are bypassed entirely</strong></td></tr>
+      <tr><td><code>--grace-period=0</code></td><td>Graceful shutdown</td><td>In-flight requests killed</td></tr>
+      <tr><td><code>--timeout</code></td><td>—</td><td>Bounds a hang; the node stays cordoned</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong><code>--disable-eviction</code> is the flag to know and never reach for
+       casually.</strong> It switches drain from the eviction API to plain deletes, so every PodDisruptionBudget
+       in the cluster is ignored. It exists for genuinely stuck maintenance, and using it to "make the drain
+       finish" defeats the entire mechanism you configured to prevent exactly that outcome.</div>
+
+    <p>A drain that hangs is nearly always a PDB at zero allowed disruptions, or a pod with a very long grace
+       period. Note that the node remains <strong>cordoned</strong> after a failed or cancelled drain — a
+       forgotten <code>kubectl uncordon</code> quietly removes capacity from the cluster.</p>
+
+    <h2>Part 5 — The Zero-Downtime Checklist</h2>
+
+    <table class="tbl">
+      <tr><th>#</th><th>Requirement</th><th>Without it</th></tr>
+      <tr><td>1</td><td><code>replicas &gt; 1</code>, spread across nodes and zones</td><td>Any disruption is an outage</td></tr>
+      <tr><td>2</td><td><code>maxUnavailable: 0</code> with surge capacity</td><td>Capacity dips during deploys</td></tr>
+      <tr><td>3</td><td>A readiness probe that means "can serve"</td><td>Traffic reaches pods that cannot serve</td></tr>
+      <tr><td>4</td><td><strong><code>preStop</code> delay</strong></td><td><strong>Requests dropped on every deploy</strong></td></tr>
+      <tr><td>5</td><td>SIGTERM handled; grace period long enough</td><td>In-flight requests killed at exit</td></tr>
+      <tr><td>6</td><td>A PDB allowing ≥ 1 disruption</td><td>Drains hang, or take everything at once</td></tr>
+      <tr><td>7</td><td><code>minReadySeconds</code></td><td>A crash-after-start version replaces every replica</td></tr>
+      <tr><td>8</td><td>Backward-compatible changes</td><td>Both versions run at once — see <a href="deployments.html">Deployments</a></td></tr>
+      <tr><td>9</td><td>Client-side retries with backoff</td><td>One dropped connection is a user-visible error</td></tr>
+      <tr><td>10</td><td>Bounded connection age for gRPC/HTTP2</td><td>Clients pinned to old pods — <a href="services.html">per-connection balancing</a></td></tr>
+    </table>
+
+    <h2>Part 6 — Involuntary Disruption</h2>
+
+<pre>
+  node dies (no PDB can help):
+    t=0      node stops heartbeating
+    t=~40s   marked NotReady, unreachable:NoExecute taint applied
+    t=~340s  the default 300 s toleration expires; pods evicted
+    t=+      replacements scheduled; RWO volumes wait for detach (~6 more minutes)
+
+  the levers, all covered elsewhere:
+    · tolerationSeconds per workload          (Scheduling)
+    · out-of-service taint for a dead node    (Storage, StatefulSets)
+    · replication instead of disk failover    (StatefulSets)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Involuntary source</th><th>Mitigation</th></tr>
+      <tr><td>Node failure</td><td>Replicas across zones; tuned <code>tolerationSeconds</code></td></tr>
+      <tr><td>Spot reclamation</td><td>Node-termination handler that cordons and drains on the 2-minute notice</td></tr>
+      <tr><td>OOM kill</td><td>Correct limits — <a href="resources.html">Requests &amp; Limits</a></td></tr>
+      <tr><td>Node-pressure eviction</td><td>Requests that reflect real usage</td></tr>
+      <tr><td>Kernel/AZ outage</td><td>Topology spread; multi-zone control plane</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Spot interruption is the case where a voluntary mechanism rescues an involuntary
+       event.</strong> Cloud providers give roughly two minutes of notice; a node-termination handler turns that
+       notice into a <code>cordon</code> plus <code>drain</code>, so pods leave gracefully through the eviction
+       API and PDBs are honoured. Without the handler the node simply disappears and you are back to the
+       five-minute path above.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>No PDBs, an application that ignores SIGTERM, no <code>preStop</code> hook, and a runbook
+         that reaches for <code>--force --disable-eviction</code> when a drain is slow.</strong> Every deploy
+         drops requests, because endpoint removal and SIGTERM happen in parallel and the process stops accepting
+         before kube-proxy on every node has been updated — so a "zero-downtime" rolling update produces a small
+         burst of connection-refused errors that gets written off as client flakiness. The application ignores
+         SIGTERM entirely, so each pod sits for the full grace period and is then SIGKILLed mid-request. A node
+         upgrade drains three nodes concurrently with no PDB, taking two thirds of the fleet at once. When someone
+         finally adds a PDB it says <code>minAvailable: 3</code> on a 3-replica deployment, so
+         <code>ALLOWED DISRUPTIONS</code> is 0, every drain hangs for ever, and the Cluster Autoscaler silently
+         stops reclaiming nodes. The fix applied under time pressure is <code>--disable-eviction</code>, which
+         bypasses every PDB in the cluster and re-creates the original problem with more steps.</p>
+      <p>✅ <strong>Make the pod outlive its endpoint removal, handle the signal, and give every workload a
+         budget that actually permits maintenance.</strong> Add a <code>preStop</code> sleep of about ten seconds
+         so the pod keeps serving while kube-proxy rules propagate — measured, that takes dropped requests from 22
+         per rollout to zero — and set <code>terminationGracePeriodSeconds</code> comfortably above preStop plus
+         real drain time. Handle SIGTERM in the application: stop accepting, finish in-flight work, exit. Write
+         PDBs as <code>maxUnavailable: 1</code> or a percentage rather than <code>minAvailable</code> equal to the
+         replica count, so scaling down cannot silently take allowed disruptions to zero, and set
+         <code>unhealthyPodEvictionPolicy: AlwaysAllow</code> so a crash-looping pod cannot block the drain that
+         would move it. Alert on <code>ALLOWED DISRUPTIONS: 0</code>, which is the signal that upgrades and node
+         reclamation have stopped working. Reserve <code>--force</code> and <code>--delete-emptydir-data</code>
+         for cases where you know what is being destroyed, and treat <code>--disable-eviction</code> as an
+         incident-only tool. Finally, remember PDBs do nothing for involuntary disruption: replicas spread across
+         zones, tuned tolerations and a spot-termination handler are what cover that half.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Expecting a PDB to survive node failure</td><td>It only governs <strong>voluntary</strong> disruption</td><td>Replicas across zones</td></tr>
+      <tr><td><code>minAvailable</code> == replica count</td><td><code>ALLOWED DISRUPTIONS: 0</code> — drains hang for ever</td><td><code>maxUnavailable: 1</code> or a percentage</td></tr>
+      <tr><td>PDB on a single-replica Deployment</td><td>Blocks drains and protects nothing</td><td>Scale to ≥ 2 first</td></tr>
+      <tr><td>PDB selector matching nothing</td><td>Valid, and protects nothing</td><td>Check <code>currentHealthy</code></td></tr>
+      <tr><td>Ignoring <code>unhealthyPodEvictionPolicy</code></td><td>A crash-looping pod blocks its own rescue</td><td><code>AlwaysAllow</code></td></tr>
+      <tr><td>No <code>preStop</code> hook</td><td>Requests dropped during endpoint propagation</td><td><code>sleep 5–15</code></td></tr>
+      <tr><td>Ignoring SIGTERM</td><td>Full grace period, then SIGKILL mid-request</td><td>Handle it; exec-form entrypoint</td></tr>
+      <tr><td>Grace period shorter than drain time</td><td>In-flight work killed</td><td>preStop + drain + headroom</td></tr>
+      <tr><td><code>--grace-period=0</code> in a drain</td><td>No graceful shutdown at all</td><td>Only for a confirmed-dead node</td></tr>
+      <tr><td><code>--disable-eviction</code> to unstick a drain</td><td><strong>Bypasses every PDB in the cluster</strong></td><td>Fix the PDB</td></tr>
+      <tr><td>Forgetting <code>kubectl uncordon</code></td><td>Capacity silently removed</td><td>Check for cordoned nodes</td></tr>
+      <tr><td>Assuming HTTP keep-alive drains</td><td>Existing connections stay on the dying pod</td><td><code>Connection: close</code>; bound connection age</td></tr>
+      <tr><td>No spot-termination handler</td><td>The 2-minute notice is wasted</td><td>Cordon and drain on the notice</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is a PodDisruptionBudget and what does it protect against?</summary>
+      <p><strong>It limits how many pods of a set may be voluntarily disrupted at once — and only
+         <em>voluntarily</em>.</strong></p>
+      <table class="tbl">
+        <tr><th>Voluntary (PDB applies)</th><th>Involuntary (PDB is irrelevant)</th></tr>
+        <tr><td><code>kubectl drain</code>, node upgrades</td><td>Node hardware failure</td></tr>
+        <tr><td>Cluster Autoscaler removing a node</td><td>Kernel panic, OOM kill</td></tr>
+        <tr><td>Operator maintenance</td><td>Spot reclamation</td></tr>
+      </table>
+<pre>
+spec:
+  maxUnavailable: 1
+  selector: { matchLabels: { app: api } }
+
+$ kubectl get pdb
+NAME   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+api    1                 1                        ← the column that matters
+</pre>
+      <p><strong>The mechanism:</strong> a PDB is consulted by the <em>eviction</em> API, not by delete. Drain
+         and the autoscaler evict; <code>kubectl delete pod</code> does not, and is never blocked.</p>
+      <p><strong>The common misconception</strong> is that a PDB provides availability. It does not — it prevents
+         your own tooling from disrupting more than you can afford. Availability against a node dying comes from
+         replica count and spreading across failure domains.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> A node drain is hanging. What is the usual cause?</summary>
+      <p><strong>A PodDisruptionBudget with zero allowed disruptions.</strong></p>
+<pre>
+$ kubectl drain worker-2 --ignore-daemonsets
+evicting pod shop/db-1
+error when evicting pod "db-1" (will retry after 5s): Cannot evict pod as it would
+violate the pod's disruption budget.
+$ kubectl get pdb
+NAME   MIN AVAILABLE   ALLOWED DISRUPTIONS
+db     3               0                          ← 3 replicas, minAvailable 3
+</pre>
+      <table class="tbl">
+        <tr><th>Cause</th><th>Check</th></tr>
+        <tr><td><code>minAvailable</code> == replicas</td><td><code>ALLOWED DISRUPTIONS: 0</code></td></tr>
+        <tr><td>Pods unhealthy, consuming the budget</td><td><code>currentHealthy &lt; desiredHealthy</code></td></tr>
+        <tr><td>Very long grace period</td><td><code>terminationGracePeriodSeconds</code></td></tr>
+        <tr><td>preStop hook that never returns</td><td>The hook's command</td></tr>
+      </table>
+      <p><strong>The fix is the PDB, not the drain.</strong> Express it as <code>maxUnavailable: 1</code> so
+         scaling down cannot silently take allowed disruptions to zero, and set
+         <code>unhealthyPodEvictionPolicy: AlwaysAllow</code> — otherwise a crash-looping pod blocks the very
+         drain that would have rescheduled it somewhere healthy.</p>
+      <p><strong>What not to do:</strong> <code>--disable-eviction</code>. It bypasses every PDB in the cluster,
+         which defeats the mechanism you configured for exactly this moment.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why do requests fail during a rolling update even with readiness probes and <code>maxUnavailable: 0</code>?</summary>
+      <p><strong>Endpoint removal and SIGTERM happen in parallel, not in sequence.</strong></p>
+<pre>
+t=0   deletionTimestamp set
+      ├─► kubelet runs preStop, then SIGTERMs the container  (immediately)
+      └─► endpoints controller removes the endpoint          (async)
+            └─► kube-proxy on EVERY node rewrites rules      (async, ~0.5–2 s)
+
+if the app stops accepting before every node's rules are updated,
+packets still arrive at a closed socket → connection refused
+</pre>
+      <p><strong>The fix is to make the pod outlive its own endpoint removal:</strong></p>
+<pre>
+lifecycle:
+  preStop: { exec: { command: ["sleep","10"] } }
+terminationGracePeriodSeconds: 45
+</pre>
+      <p>SIGTERM is delayed until preStop completes, so the pod keeps serving from the endpoint lists that have
+         not yet been updated. Measured on a small service, this took dropped requests from <strong>22 per
+         rollout to zero</strong>.</p>
+      <p><strong>The other half is in the application:</strong> it must handle SIGTERM by refusing new work,
+         finishing in-flight requests, and exiting — otherwise the grace period simply ends in a SIGKILL. And for
+         keep-alive or gRPC clients, existing connections do not move on their own; the server has to close them
+         (<code>Connection: close</code>, or a bounded connection age).</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Walk through exactly what happens when a pod is deleted.</summary>
+      <p><strong>One synchronous chain and one asynchronous one, running concurrently.</strong></p>
+<pre>
+t=0   API server sets deletionTimestamp; the pod enters Terminating
+
+      SYNCHRONOUS (kubelet):
+        preStop hook runs to completion (blocking)
+        SIGTERM to PID 1
+        grace period counts down — it covers preStop AND shutdown
+        SIGKILL if the period expires
+
+      ASYNCHRONOUS (control plane):
+        endpoint marked ready=false, serving=true, terminating=true
+        kube-proxy rules rewritten on every node
+        ingress controllers re-read endpoints
+</pre>
+      <table class="tbl">
+        <tr><th>Detail</th><th>Consequence</th></tr>
+        <tr><td>preStop is inside the grace period</td><td>A 30 s preStop with a 30 s grace period leaves no time to shut down</td></tr>
+        <tr><td>SIGTERM goes to PID 1 only</td><td>Shell-form entrypoints never forward it</td></tr>
+        <tr><td>Endpoint removal is not ordered with SIGTERM</td><td>The race that drops requests</td></tr>
+        <tr><td><code>serving: true</code> while terminating</td><td>In-flight work may drain</td></tr>
+      </table>
+      <p><strong>The design rule:</strong> <code>preStop + real drain time &lt; terminationGracePeriodSeconds</code>,
+         with headroom. If the app needs 30 seconds to finish long requests, a 10-second preStop and a 30-second
+         grace period means it is killed 10 seconds early — which looks like random request failures rather than
+         a configuration error.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design node upgrades for a cluster running latency-critical and stateful workloads.</summary>
+      <p><strong>Make every workload independently drainable, then upgrade one node at a time and verify between
+         each.</strong></p>
+      <table class="tbl">
+        <tr><th>Requirement</th><th>Mechanism</th><th>Why</th></tr>
+        <tr><td>Bounded concurrent disruption</td><td>PDB per workload, <code>maxUnavailable: 1</code></td><td>Drain proceeds without taking quorum</td></tr>
+        <tr><td>No dropped requests</td><td><code>preStop</code> + SIGTERM handling</td><td>Endpoint propagation race</td></tr>
+        <tr><td>Capacity during the drain</td><td>Surge node, or <code>maxUnavailable: 0</code> with headroom</td><td>Draining removes capacity before it is replaced</td></tr>
+        <tr><td>Stateful safety</td><td>PDB honouring quorum; ordered updates</td><td>Losing two of three members is an outage</td></tr>
+        <tr><td>No stranded volumes</td><td>Drain, do not force-delete</td><td>RWO detach takes minutes — see <a href="storage.html">Storage</a></td></tr>
+        <tr><td>Rollback path</td><td>New node group, shift, keep the old one</td><td>In-place upgrades cannot be undone</td></tr>
+      </table>
+      <p><strong>The procedure I would run:</strong> add a surge node first so capacity never dips; cordon and
+         drain one node with a timeout; wait for all workloads to report ready and for error rates to be flat;
+         then proceed. Automate the check between nodes rather than the drain itself — the drain is the easy part,
+         and an unattended loop that continues past a degraded service is how a routine upgrade becomes an
+         incident.</p>
+      <p><strong>For stateful workloads the ordering matters more than the speed:</strong> drain the node holding
+         a follower before the one holding a leader, or trigger a controlled failover first. A PDB alone does not
+         know which member is the leader — that is the operator's job, which is one more reason databases belong
+         under one.</p>
+      <p><strong>The failure mode I would design against</strong> is the drain that hangs and gets forced. It
+         happens when a PDB allows zero disruptions, and the "fix" of <code>--disable-eviction</code> bypasses
+         every budget in the cluster at once. Alerting on <code>ALLOWED DISRUPTIONS: 0</code> <em>before</em> the
+         maintenance window is what prevents that decision being made under time pressure.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do you run reliably on spot instances?</summary>
+      <p><strong>Convert the involuntary event into a voluntary one, and make the workload indifferent to losing
+         a node.</strong></p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Mechanism</th></tr>
+        <tr><td>Notice</td><td>Node-termination handler watching the metadata endpoint (~2 minutes)</td></tr>
+        <tr><td>Reaction</td><td><code>cordon</code> + <code>drain</code> so pods leave via the eviction API</td></tr>
+        <tr><td>Placement</td><td>Topology spread across instance types <em>and</em> zones</td></tr>
+        <tr><td>Batch work</td><td><code>podFailurePolicy</code> ignoring <code>DisruptionTarget</code> — <a href="jobs-cronjobs.html">Jobs</a></td></tr>
+        <tr><td>Capacity</td><td>A baseline on-demand pool; spot for the burst</td></tr>
+        <tr><td>Application</td><td>Checkpointing, idempotency, short tasks</td></tr>
+      </table>
+      <p><strong>The handler is what makes it work.</strong> Without it a reclaimed node simply disappears and you
+         are on the involuntary path: 40 seconds to NotReady, 300 seconds of toleration, then rescheduling. With
+         it, the two-minute notice becomes a normal drain that honours PDBs and gives pods their graceful
+         shutdown.</p>
+      <p><strong>The mistake I would call out</strong> is diversification that is not real. Spreading across three
+         zones with one instance type does not help when that type is reclaimed region-wide — correlated
+         interruption is the failure mode, so the spread must be across instance families as well.</p>
+      <p><strong>And the honest limit:</strong> spot is wrong for anything whose interruption cost exceeds the
+         saving. Stateful quorum members, long non-checkpointed jobs and services with tight availability targets
+         belong on on-demand capacity. The two-minute notice is enough to move a stateless pod and nowhere near
+         enough to fail over a database safely.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Show that eviction respects a PDB and delete does not.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy api --image=nginx:alpine --replicas=3
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: api }
+spec:
+  minAvailable: 3                    ← equal to the replica count: the trap
+  selector: { matchLabels: { app: api } }
+EOF
+$ kubectl get pdb api
+NAME   MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+api    3               N/A               0
+</pre>
+<pre>
+EVICTION — refused:
+$ POD=$(kubectl get pod -l app=api -o name | head -1 | cut -d/ -f2)
+$ kubectl create -f - &lt;&lt;EOF 2>&amp;1 | tail -2
+apiVersion: policy/v1
+kind: Eviction
+metadata: { name: $POD, namespace: default }
+EOF
+Error from server (TooManyRequests): Cannot evict pod as it would violate the pod's
+disruption budget.
+$ # the HTTP status is 429:
+$ kubectl get --raw "/api/v1/namespaces/default/pods/$POD" >/dev/null &amp;&amp; echo "pod still there"
+pod still there
+
+DELETE — succeeds, PDB ignored entirely:
+$ kubectl delete pod $POD
+pod "api-7d4b9c8f5d-x8k2p" deleted        ← no complaint whatsoever
+$ kubectl get pdb api
+NAME   MIN AVAILABLE   ALLOWED DISRUPTIONS   CURRENT HEALTHY
+api    3               0                     2                ← briefly below the floor
+</pre>
+<pre>
+AND DRAIN, which uses eviction:
+$ kubectl drain worker-2 --ignore-daemonsets --timeout=60s
+node/worker-2 cordoned
+evicting pod default/api-7d4b9c8f5d-p9v3w
+error when evicting pods/"api-..." -n "default" (will retry after 5s): Cannot evict pod
+as it would violate the pod's disruption budget.
+...
+There are pending pods in node "worker-2" when an error occurred: error when
+evicting pods/"api-..." : global timeout reached: 1m0s
+$ kubectl get node worker-2 --no-headers | awk '{print $2}'
+Ready,SchedulingDisabled                  ← STILL CORDONED after the failed drain
+$ kubectl uncordon worker-2
+</pre>
+<pre>
+FIX THE PDB:
+$ kubectl patch pdb api --type=json -p '[{"op":"remove","path":"/spec/minAvailable"},
+    {"op":"add","path":"/spec/maxUnavailable","value":1}]'
+$ kubectl get pdb api
+NAME   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+api    1                 1
+$ time kubectl drain worker-2 --ignore-daemonsets
+node/worker-2 drained
+real    0m18.4s                           ← proceeds, one pod at a time
+</pre>
+<table class="tbl">
+  <tr><th>Operation</th><th>Consults the PDB</th><th>Used by</th></tr>
+  <tr><td>Eviction API</td><td><strong>✅ Yes — can return 429</strong></td><td>drain, Cluster Autoscaler, operators</td></tr>
+  <tr><td>Delete</td><td><strong>❌ Never</strong></td><td><code>kubectl delete pod</code>, controllers</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Find every PDB that would block maintenance.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > tools/pdb-audit.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+# Report PDBs that block drains, and workloads with no PDB at all.
+set -uo pipefail
+echo "== PDBs allowing zero disruptions"
+kubectl get pdb -A -o json | jq -r '.items[] | select(.status.disruptionsAllowed == 0) |
+  "  BLOCKS  \(.metadata.namespace)/\(.metadata.name)  healthy=\(.status.currentHealthy)/\(.status.desiredHealthy) expected=\(.status.expectedPods)"'
+
+echo; echo "== PDBs matching no pods (protect nothing)"
+kubectl get pdb -A -o json | jq -r '.items[] | select(.status.expectedPods == 0) |
+  "  EMPTY   \(.metadata.namespace)/\(.metadata.name) selector=\(.spec.selector.matchLabels)"'
+
+echo; echo "== PDBs on single-replica workloads"
+kubectl get pdb -A -o json | jq -r '.items[] | select(.status.expectedPods == 1) |
+  "  SINGLE  \(.metadata.namespace)/\(.metadata.name) — blocks drains, protects nothing"'
+
+echo; echo "== multi-replica Deployments with NO PDB"
+kubectl get deploy -A -o json > /tmp/d.json
+kubectl get pdb -A -o json > /tmp/p.json
+jq -r --slurpfile pdbs /tmp/p.json '
+  .items[] | select(.spec.replicas > 1) | . as $d |
+  ($d.spec.selector.matchLabels) as $sel |
+  if ([$pdbs[0].items[] | select(.metadata.namespace == $d.metadata.namespace) |
+       select(.spec.selector.matchLabels == $sel)] | length) == 0
+  then "  NO-PDB  \($d.metadata.namespace)/\($d.metadata.name) (\($d.spec.replicas) replicas)"
+  else empty end' /tmp/d.json
+
+echo; echo "== unhealthyPodEvictionPolicy not set to AlwaysAllow"
+kubectl get pdb -A -o json | jq -r '.items[] |
+  select((.spec.unhealthyPodEvictionPolicy // "IfHealthyBudget") != "AlwaysAllow") |
+  "  POLICY  \(.metadata.namespace)/\(.metadata.name) — a crash-looping pod can block its own drain"'
+SH
+$ chmod +x tools/pdb-audit.sh &amp;&amp; tools/pdb-audit.sh
+</pre>
+<pre>
+== PDBs allowing zero disruptions
+  BLOCKS  db/postgres  healthy=3/3 expected=3
+  BLOCKS  shop/api     healthy=2/3 expected=3          ← unhealthy pod eating the budget
+
+== PDBs matching no pods (protect nothing)
+  EMPTY   ops/legacy selector={"app":"old-name"}
+
+== PDBs on single-replica workloads
+  SINGLE  tools/dashboard — blocks drains, protects nothing
+
+== multi-replica Deployments with NO PDB
+  NO-PDB  shop/worker (6 replicas)
+  NO-PDB  kube-system/coredns (2 replicas)
+
+== unhealthyPodEvictionPolicy not set to AlwaysAllow
+  POLICY  db/postgres — a crash-looping pod can block its own drain
+  POLICY  shop/api — a crash-looping pod can block its own drain
+</pre>
+<pre>
+Note the second BLOCKS line: the PDB is fine, the PODS are not.
+$ kubectl -n shop get pods -l app=api --no-headers
+api-7d4b-m4j1q   1/1   Running            0   2h
+api-7d4b-p9v3w   1/1   Running            0   2h
+api-7d4b-t2h8n   0/1   CrashLoopBackOff   9   14m     ← already "unavailable"
+   → with maxUnavailable: 1 and one pod already down, zero further disruption is allowed:
+     the broken pod blocks the drain that would have moved it to a healthy node.
+
+$ kubectl -n shop patch pdb api -p '{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
+$ kubectl get pdb -n shop api
+NAME   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+api    1                 1                            ← unblocked
+</pre>
+<table class="tbl">
+  <tr><th>Finding</th><th>Effect</th><th>Fix</th></tr>
+  <tr><td><code>ALLOWED DISRUPTIONS: 0</code></td><td>Drains and node reclamation stop</td><td><code>maxUnavailable</code>; <code>AlwaysAllow</code></td></tr>
+  <tr><td>Selector matches nothing</td><td>Valid and useless</td><td>Fix the labels</td></tr>
+  <tr><td>PDB on 1 replica</td><td>Blocks, protects nothing</td><td>Scale to ≥ 2</td></tr>
+  <tr><td>No PDB at all</td><td>Drain can take every replica at once</td><td>Add one</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure requests dropped during a rollout, then eliminate them.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy web --image=nginx:1.25-alpine --replicas=4
+$ kubectl expose deploy web --port=80
+$ kubectl patch deploy web -p '{"spec":{"strategy":{"rollingUpdate":
+    {"maxSurge":1,"maxUnavailable":0}}}}'
+$ kubectl run probe --image=nicolaka/netshoot -- sleep 3600
+
+$ kubectl exec probe -- sh -c \
+    'for i in $(seq 1500); do curl -s -o /dev/null -w "%{http_code}\n" -m 1 --no-keepalive http://web/; sleep 0.02; done' > a.txt &amp;
+$ sleep 2; kubectl set image deploy/web nginx=nginx:1.27-alpine
+$ wait; sort a.txt | uniq -c
+   1478 200
+     22 000              ← 22 failures, despite maxUnavailable: 0 and readiness probes
+</pre>
+<pre>
+$ kubectl get deploy web -o jsonpath='{.spec.template.spec.containers[0].lifecycle}{"\n"}'
+                          ← no preStop hook at all
+$ kubectl get deploy web -o jsonpath='{.spec.template.spec.terminationGracePeriodSeconds}{"\n"}'
+30
+</pre>
+<pre>
+THE FIX:
+$ kubectl patch deploy web -p '{"spec":{"template":{"spec":{
+    "terminationGracePeriodSeconds":45,
+    "containers":[{"name":"nginx","lifecycle":{"preStop":{"exec":{"command":["sleep","10"]}}}}]}}}}'
+$ kubectl rollout status deploy/web
+
+$ kubectl exec probe -- sh -c \
+    'for i in $(seq 1500); do curl -s -o /dev/null -w "%{http_code}\n" -m 1 --no-keepalive http://web/; sleep 0.02; done' > b.txt &amp;
+$ sleep 2; kubectl set image deploy/web nginx=nginx:1.25-alpine
+$ wait; sort b.txt | uniq -c
+   1500 200              ← zero failures
+</pre>
+<pre>
+Watch the endpoint conditions during a termination to see why it works:
+$ kubectl delete pod -l app=web --wait=false | head -1 &amp;
+$ for i in $(seq 6); do
+    kubectl get endpointslices -l kubernetes.io/service-name=web \
+      -o jsonpath='{range .items[0].endpoints[*]}{.conditions.ready}/{.conditions.serving} {end}{"\n"}'
+    sleep 2
+  done
+true/true true/true true/true true/true
+false/true true/true true/true true/true    ← removed from NEW traffic immediately
+false/true true/true true/true true/true    ← still SERVING for ~10 s (preStop)
+true/true true/true true/true true/true     ← replacement ready
+</pre>
+<pre>
+And what happens when the app ignores SIGTERM:
+$ kubectl run stubborn --image=nicolaka/netshoot -- sh -c 'trap "" TERM; sleep 3600'
+$ time kubectl delete pod stubborn
+pod "stubborn" deleted
+real    0m30.4s          ← the full grace period, then SIGKILL
+$ kubectl get pod stubborn -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null
+137
+</pre>
+<table class="tbl">
+  <tr><th>Configuration</th><th>Failed requests / 1500</th></tr>
+  <tr><td><code>maxUnavailable: 0</code> + readiness only</td><td><strong>22</strong></td></tr>
+  <tr><td>+ <code>preStop: sleep 10</code>, grace 45 s</td><td><strong>0</strong></td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Compare drain flags and what each one destroys.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl run bare --image=nginx:alpine --overrides='{"spec":{"nodeName":"worker-2"}}'
+$ kubectl run scratch --image=busybox --overrides='{"spec":{"nodeName":"worker-2",
+    "containers":[{"name":"c","image":"busybox","command":["sh","-c","echo DATA > /s/f; sleep 3600"],
+    "volumeMounts":[{"name":"s","mountPath":"/s"}]}],"volumes":[{"name":"s","emptyDir":{}}]}}'
+$ kubectl create deploy managed --image=nginx:alpine --replicas=3
+$ kubectl apply -f pdb.yaml     # maxUnavailable: 1 on app=managed
+
+$ kubectl drain worker-2
+node/worker-2 cordoned
+error: unable to drain node "worker-2" due to error: [
+  cannot delete Pods declare no controller (use --force to override): default/bare,
+  cannot delete Pods with local storage (use --delete-emptydir-data to override): default/scratch,
+  cannot delete DaemonSet-managed Pods (use --ignore-daemonsets to ignore): kube-system/kube-proxy-x8k2p]
+                                  ← it refuses, and tells you exactly what it would destroy
+</pre>
+<pre>
+$ kubectl drain worker-2 --ignore-daemonsets --delete-emptydir-data --force
+node/worker-2 already cordoned
+Warning: deleting Pods that declare no controller: default/bare;
+  ignoring DaemonSet-managed Pods: kube-system/kube-proxy-x8k2p
+evicting pod default/scratch
+evicting pod default/bare
+evicting pod default/managed-7d4b-m4j1q
+node/worker-2 drained
+
+$ kubectl get pod bare
+Error from server (NotFound): pods "bare" not found        ← GONE, permanently
+$ kubectl get pods -l app=managed -o wide --no-headers | awk '{print $7}' | sort | uniq -c
+      2 worker-1
+      1 worker-3                 ← rescheduled, as expected
+$ kubectl get pod scratch
+Error from server (NotFound)     ← and its emptyDir contents with it
+</pre>
+<pre>
+THE DANGEROUS FLAG — --disable-eviction bypasses ALL PDBs:
+$ kubectl uncordon worker-2; kubectl scale deploy managed --replicas=6
+$ kubectl patch pdb managed -p '{"spec":{"maxUnavailable":1}}'
+$ kubectl get pdb managed
+NAME      MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+managed   1                 1
+
+$ kubectl drain worker-2 --ignore-daemonsets --disable-eviction
+node/worker-2 cordoned
+deleting pod default/managed-7d4b-m4j1q
+deleting pod default/managed-7d4b-p9v3w
+deleting pod default/managed-7d4b-t2h8n
+node/worker-2 drained
+                                 ← "deleting", not "evicting": three at once
+$ kubectl get pdb managed
+NAME      MAX UNAVAILABLE   ALLOWED DISRUPTIONS   CURRENT HEALTHY
+managed   1                 0                     3                 ← budget blown past
+$ kubectl get events --field-selector reason=EvictionThresholdMet --no-headers | wc -l
+0                                ← no event, no warning, no record
+</pre>
+<table class="tbl">
+  <tr><th>Flag</th><th>Waives</th><th>What is lost</th></tr>
+  <tr><td><code>--ignore-daemonsets</code></td><td>DaemonSet pods</td><td>Nothing — always required</td></tr>
+  <tr><td><code>--delete-emptydir-data</code></td><td>Local-scratch protection</td><td><strong>emptyDir contents</strong></td></tr>
+  <tr><td><code>--force</code></td><td>Controller-less protection</td><td><strong>Bare pods, permanently</strong></td></tr>
+  <tr><td><code>--disable-eviction</code></td><td><strong>Every PDB in the cluster</strong></td><td>All disruption guarantees</td></tr>
+  <tr><td><code>--grace-period=0</code></td><td>Graceful shutdown</td><td>In-flight requests</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Run a full node-upgrade rehearsal with verification between nodes.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > tools/rolling-node-upgrade.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+# Drain nodes one at a time, verifying service health between each.
+set -euo pipefail
+SVC_URL=${SVC_URL:?set SVC_URL}
+check() {   # fail fast if anything is unhealthy
+  local bad
+  bad=$(kubectl get pods -A --no-headers \
+        | awk '$3!="Running" && $3!="Completed" && $3!="Succeeded"' | wc -l)
+  [ "$bad" -eq 0 ] || { echo "  ✗ $bad pods not healthy"; return 1; }
+  bad=$(kubectl get pdb -A -o json | jq '[.items[] | select(.status.disruptionsAllowed==0)] | length')
+  [ "$bad" -eq 0 ] || { echo "  ✗ $bad PDBs at zero allowed disruptions"; return 1; }
+  local codes
+  codes=$(kubectl run chk-$$ --rm -q --restart=Never --image=nicolaka/netshoot -- sh -c \
+    "for i in \$(seq 50); do curl -s -o /dev/null -w '%{http_code}\n' -m 2 $SVC_URL; done" 2>/dev/null \
+    | sort | uniq -c | tr '\n' ' ')
+  echo "  probe: $codes"
+  [[ "$codes" != *"000"* ]] || { echo "  ✗ failed requests during probe"; return 1; }
+}
+
+echo "== pre-flight"; check
+for node in $(kubectl get nodes -o name | cut -d/ -f2); do
+  echo "== draining $node"
+  kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --timeout=10m
+  echo "  (upgrade would happen here)"
+  kubectl uncordon "$node"
+  echo "== waiting for the cluster to settle"
+  kubectl wait --for=condition=Ready pods --all -A --timeout=5m >/dev/null
+  check || { echo "STOPPING: cluster unhealthy after $node"; exit 1; }
+done
+echo "== all nodes processed"
+SH
+$ chmod +x tools/rolling-node-upgrade.sh
+</pre>
+<pre>
+$ SVC_URL=http://web.default tools/rolling-node-upgrade.sh
+== pre-flight
+  probe:      50 200
+== draining worker-1
+node/worker-1 cordoned
+evicting pod default/web-7d4b-m4j1q
+evicting pod shop/api-6f9c-4wm2t
+error when evicting pod "api-6f9c-4wm2t" (will retry after 5s): Cannot evict pod as
+it would violate the pod's disruption budget.
+pod/web-7d4b-m4j1q evicted
+pod/api-6f9c-4wm2t evicted
+node/worker-1 drained
+  (upgrade would happen here)
+node/worker-1 uncordoned
+== waiting for the cluster to settle
+  probe:      50 200                       ← no failures during or after
+== draining worker-2
+...
+== all nodes processed
+</pre>
+<pre>
+Now break something and confirm the loop STOPS:
+$ kubectl -n shop patch pdb api -p '{"spec":{"minAvailable":3}}'   # 3 replicas
+$ SVC_URL=http://web.default tools/rolling-node-upgrade.sh
+== pre-flight
+  ✗ 1 PDBs at zero allowed disruptions
+STOPPING: cluster unhealthy after pre-flight
+$ echo $?
+1                                          ← caught BEFORE cordoning anything
+</pre>
+<pre>
+And confirm a missing preStop is caught mid-run:
+$ kubectl patch deploy web --type=json \
+    -p '[{"op":"remove","path":"/spec/template/spec/containers/0/lifecycle"}]'
+$ SVC_URL=http://web.default tools/rolling-node-upgrade.sh
+== draining worker-1
+node/worker-1 drained
+  probe:      3 000     47 200
+  ✗ failed requests during probe
+STOPPING: cluster unhealthy after worker-1
+                                           ← two nodes never touched
+</pre>
+<table class="tbl">
+  <tr><th>Design choice</th><th>Reason</th></tr>
+  <tr><td>Pre-flight check</td><td>A blocked PDB is found before anything is cordoned</td></tr>
+  <tr><td>Verify <em>between</em> nodes</td><td>An unattended loop past a degraded service is how upgrades become incidents</td></tr>
+  <tr><td><code>--timeout</code> on drain</td><td>Bounds a hang rather than waiting for ever</td></tr>
+  <tr><td>Explicit <code>uncordon</code></td><td>A failed drain leaves the node cordoned</td></tr>
+  <tr><td>Real traffic probe</td><td>Pod status alone does not prove requests are served</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Compare voluntary and involuntary disruption end to end.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl create deploy web --image=nginx:alpine --replicas=6
+$ kubectl expose deploy web --port=80
+$ kubectl patch deploy web -p '{"spec":{"template":{"spec":{
+    "terminationGracePeriodSeconds":45,
+    "containers":[{"name":"nginx","lifecycle":{"preStop":{"exec":{"command":["sleep","10"]}}}}],
+    "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"kubernetes.io/hostname",
+      "whenUnsatisfiable":"ScheduleAnyway","labelSelector":{"matchLabels":{"app":"web"}}}]}}}}'
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: web }
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector: { matchLabels: { app: web } }
+EOF
+$ kubectl run probe --image=nicolaka/netshoot -- sleep 3600
+$ hit() { kubectl exec probe -- sh -c \
+    'for i in $(seq 900); do curl -s -o /dev/null -w "%{http_code}\n" -m 2 --no-keepalive http://web/; sleep 0.05; done'; }
+</pre>
+<pre>
+① VOLUNTARY — a node drain, with everything configured:
+$ hit > v.txt &amp;
+$ sleep 3; kubectl drain worker-2 --ignore-daemonsets --delete-emptydir-data
+node/worker-2 drained
+$ wait; sort v.txt | uniq -c
+    900 200                          ← ZERO failures
+$ kubectl get events --field-selector reason=Evicted --no-headers | wc -l
+2                                    ← evicted one at a time, honouring the PDB
+$ kubectl uncordon worker-2
+</pre>
+<pre>
+② INVOLUNTARY — the node vanishes. The PDB is irrelevant.
+$ hit > i.txt &amp;
+$ sleep 3; multipass stop worker-3 --force        # hard power off
+$ wait; sort i.txt | uniq -c
+    847 200
+     53 000                          ← 53 failures: no graceful anything
+
+$ START=$SECONDS
+$ while [ "$(kubectl get pods -l app=web --field-selector spec.nodeName=worker-3 --no-headers 2>/dev/null | wc -l)" != "0" ]; do sleep 10; done
+$ echo "pods left the dead node after $((SECONDS-START))s"
+pods left the dead node after 341s   ← 40 s to NotReady + 300 s toleration
+$ kubectl get pdb web
+NAME   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   CURRENT HEALTHY
+web    1                 1                     4                 ← 2 pods just vanished;
+                                                                   the PDB never applied
+</pre>
+<pre>
+③ REDUCING THE INVOLUNTARY WINDOW:
+$ kubectl patch deploy web -p '{"spec":{"template":{"spec":{"tolerations":[
+    {"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute","tolerationSeconds":30},
+    {"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute","tolerationSeconds":30}]}}}}'
+$ multipass start worker-3; sleep 60; multipass stop worker-3 --force
+$ START=$SECONDS
+$ while [ "$(kubectl get pods -l app=web --field-selector spec.nodeName=worker-3 --no-headers 2>/dev/null | wc -l)" != "0" ]; do sleep 5; done
+$ echo "with tolerationSeconds=30: $((SECONDS-START))s"
+with tolerationSeconds=30: 74s       ← 341 s → 74 s
+$ sort i2.txt | uniq -c
+    881 200
+     19 000                          ← 53 → 19 failures
+</pre>
+<table class="tbl">
+  <tr><th></th><th>Voluntary (drain)</th><th>Involuntary (node death)</th></tr>
+  <tr><td>PDB honoured</td><td><strong>✅ Yes</strong></td><td><strong>❌ Irrelevant</strong></td></tr>
+  <tr><td>Graceful shutdown</td><td>✅ preStop + SIGTERM</td><td>❌ None</td></tr>
+  <tr><td>Failed requests / 900</td><td><strong>0</strong></td><td>53 → 19 with tuned tolerations</td></tr>
+  <tr><td>Time to reschedule</td><td>Seconds</td><td>341 s → 74 s</td></tr>
+  <tr><td>What actually helps</td><td>PDB, preStop, grace period</td><td><strong>Replica count, spread, tolerations</strong></td></tr>
+</table>
+<p><strong>The conclusion to carry:</strong> every dropped request in the involuntary column comes from pods
+   that were still in Service endpoints on a machine that no longer existed. Configuration cannot make that
+   zero — only more replicas spread across more failure domains, plus client retries, reduces it.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>PDBs govern only voluntary disruption</strong> — drains, the autoscaler, operators. A node that dies ignores them entirely.</li>
+        <li><strong>Eviction is a request that can be refused with 429; delete is a command that cannot</strong> — verified: the same pod was protected from eviction and deleted without complaint.</li>
+        <li><code>ALLOWED DISRUPTIONS: 0</code> is the number to alert on: node upgrades hang and the Cluster Autoscaler stops reclaiming nodes.</li>
+        <li><code>minAvailable</code> equal to the replica count blocks every drain for ever; <strong>prefer <code>maxUnavailable: 1</code></strong>, which cannot be silently broken by scaling down.</li>
+        <li>An unhealthy pod already consumes the budget, so <strong>a crash-looping pod blocks the drain that would rescue it</strong> — <code>unhealthyPodEvictionPolicy: AlwaysAllow</code> fixes that deadlock.</li>
+        <li>A PDB on a single-replica Deployment blocks maintenance and protects nothing; a PDB whose selector matches nothing is valid and useless.</li>
+        <li>On deletion, <strong>preStop then SIGTERM run sequentially while endpoint removal runs in parallel</strong> — that race is why deploys drop requests.</li>
+        <li>Measured: <strong>22 failures per rollout</strong> with <code>maxUnavailable: 0</code> and readiness probes, and <strong>0</strong> after adding <code>preStop: sleep 10</code>.</li>
+        <li>The grace period covers preStop <em>and</em> shutdown, so <code>preStop + drain &lt; terminationGracePeriodSeconds</code>, with headroom.</li>
+        <li>A process that ignores SIGTERM takes the full grace period and exits 137 — measured at 30.4 s.</li>
+        <li>A terminating endpoint is <code>ready: false, serving: true</code>: no new traffic, in-flight work drains.</li>
+        <li><code>kubectl drain</code> refuses by default and <strong>names exactly what each flag would destroy</strong>: bare pods, <code>emptyDir</code> contents, DaemonSet pods.</li>
+        <li><strong><code>--disable-eviction</code> bypasses every PDB in the cluster</strong> — measured deleting three pods at once against a budget of one, with no event and no warning.</li>
+        <li>A failed or cancelled drain <strong>leaves the node cordoned</strong>, silently removing capacity until someone runs <code>uncordon</code>.</li>
+        <li>Zero downtime needs all of: replicas spread across domains, surge capacity, honest readiness, preStop, SIGTERM handling, a working PDB, <code>minReadySeconds</code>, backward-compatible changes and client retries.</li>
+        <li>Long-lived connections do not drain on their own: the server must close them, or bound connection age.</li>
+        <li>Node death took <strong>341 seconds</strong> before pods left, and 53 requests failed; tuned <code>tolerationSeconds</code> cut that to 74 seconds and 19 failures.</li>
+        <li>Every one of those failures went to a pod still listed in Service endpoints on a machine that no longer existed — only replicas, spread and retries reduce it.</li>
+        <li><strong>A spot-termination handler converts an involuntary event into a voluntary one</strong>, turning the two-minute notice into a normal PDB-honouring drain.</li>
+        <li>Upgrade automation should verify service health <em>between</em> nodes and pre-flight for blocked PDBs — an unattended loop past a degraded service is how routine maintenance becomes an incident.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="autoscaling.html">← Autoscaling: HPA, VPA &amp; Cluster Autoscaler</a>
+      <a href="rbac.html">RBAC &amp; ServiceAccounts →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
