@@ -61,7 +61,7 @@ Also: the five v3 files orphaned by the nav split (`pods-deployments`, `services
 
 **🚧 IN PROGRESS: AWS v4 (track 17)** — `tutorials/aws/`, rebuilding 12 v3 lessons (~12KB) into
 **20 lessons at v4 depth** (56–75KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
-**5 of 20 done — §1 Foundations COMPLETE:**
+**7 of 20 done — §1 Foundations and §2 Networking COMPLETE:**
 
 *§1 Foundations ×4* — ✅ `index.html` (**the shared-responsibility line moves per service**; AZ *names*
 are randomised per account so cross-account placement must use **Zone IDs**; the `us-east-1` control-plane
@@ -99,8 +99,27 @@ survive rule revocation** and the untracked-flow inversion; NACLs stateless and 
 diagnosed from an ACCEPT/REJECT pair in flow logs; **EKS caps at 29 pods/m5.large** and `FailedCreatePodSandBox`
 is a *scheduling success* — **prefix delegation → 110 pods**, no renumbering; five faults, one identical
 timeout, and a fixed read-only debugging order)
-**⏳ NEXT: `connectivity.html` (NEW — peering vs TGW, PrivateLink, VPN/Direct Connect)**, then
-`edge-dns.html` (NEW) to finish §2.
+✅ `connectivity.html` (**network vs service reachability** is the question that picks the technology;
+**peering is non-transitive and the API *refuses* the route** — same rule blocks a peer's IGW/NAT/gateway
+endpoints; n(n−1)/2 mesh growth; **create a TGW with default association AND propagation disabled** or the
+segmentation does not exist; TGW route tables as an **isolation proof diffed in CI and tested to fail**, plus
+an SCP so drift cannot happen; **$0.05/hr per attachment is not free** ($2,295/mo for 30 + 60 TB); **appliance
+mode** for stateful inspection; **PrivateLink proven between two VPCs both on `10.0.0.0/16`** with
+`ip route get` showing traffic never leaves; **`--private-dns-enabled` is a VPC-wide DNS change** that removes
+the public fallback; **DX carries NO encryption** and one circuit has no SLA; **hybrid DNS is two separate
+systems** — inbound *and* outbound resolver endpoints, both UDP and TCP/53) ·
+✅ `edge-dns.html` (**a CNAME can never sit at the apex** → the alias record, free + health-aware; **lower TTLs
+the day BEFORE**; **weighted DNS splits resolver answers not requests** — a 5% weight measured **3.4% one day,
+17% another** — so canary at the ALB with weighted target groups; **failover measured at 47s best case and
+NEVER on a default JVM** (`networkaddress.cache.ttl=-1`); **a health check on the LB reports healthy while
+every target fails**, and a deep check on a *shared global* dependency turns a partial outage into a total one;
+**NLB client-IP preservation is OFF by default for IP targets over TCP/TLS**; **ALB cross-zone is free+always
+on, NLB's is off+billable**; **backend keepalive must EXCEED the ALB idle timeout** — Node's 5s default gives
+502s with no app log, and `headersTimeout` must exceed `keepAliveTimeout`; the 5xx decoder keyed on
+`target_status_code="-"` + `target_processing_time`; **CloudFront cache key 0.3% → 94.1%** by moving fields to
+the *origin request* policy, with over-collapsing named as the dangerous direction)
+**⏳ NEXT: §3 Compute — `ec2-compute.html` (v3 rewrite — EC2, EBS &amp; Auto Scaling)**, then
+`containers.html` and `lambda-serverless.html` (both v3 rewrites).
 
 *Remaining sections:* §3 Compute ×3 (`ec2-compute`, `containers`, `lambda-serverless` — all v3 rewrites) · §4 Data ×4
 (`s3` NEW, `rds-aurora` NEW, `dynamodb` NEW, `messaging` v3 rewrite) · §5 Operations ×3
