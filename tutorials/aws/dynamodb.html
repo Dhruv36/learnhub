@@ -1,0 +1,1267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DynamoDB — AWS — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../kubernetes/index.html">Kubernetes</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>DynamoDB <span class="level-badge level-adv">Data</span></h1>
+
+    <p><strong>What you'll master:</strong> the inversion that makes DynamoDB work — <strong>you design the
+       table around the queries, not the entities</strong>, and getting that backwards produces a system that
+       scans; capacity arithmetic in RCUs and WCUs, and the <strong>on-demand break-even at ~14%
+       utilisation</strong>; the failure mode that defines the service — <strong>a table provisioned at 40,000
+       WCU throttling while consuming 4% of it</strong>, because per-partition limits are 1,000 WCU and one key
+       is hot; why <code>FilterExpression</code> on a <code>Scan</code> <strong>saves you nothing</strong> —
+       you pay for every item read and then discarded; LSIs versus GSIs, including the trap where
+       <strong>a throttled GSI throttles writes to the base table</strong>; single-table design, what it is
+       actually for, and when it is the wrong answer; conditional writes as the only defence against the
+       <strong>lost update that concurrency will find</strong>; and the operational layer — Streams, TTL,
+       global tables and DAX. Prerequisites: <a href="rds-aurora.html">RDS &amp; Aurora</a>,
+       <a href="billing-cost.html">Cost</a> and <a href="lambda-serverless.html">Lambda</a>.</p>
+
+    <h2>Part 1 — A Partitioned, Sorted Table</h2>
+
+    <p>DynamoDB is often described as a key-value store, which undersells it and leads people to model it badly.
+       It is a <strong>partitioned, sorted table</strong>: the partition key decides <em>which machine</em>, and
+       the sort key decides <em>the order within that machine</em>. Every capability and every limit falls out
+       of those two sentences.</p>
+
+<pre>
+    PK = "CUSTOMER#42"          ← hashed → chooses a partition (a physical shard)
+    SK = "ORDER#2026-08-20#001" ← sorted within that partition
+
+    a Query says: "give me the items in ONE partition, in sort-key order,
+                   optionally a range of them"
+    → which is why Query is fast and cheap, and why it REQUIRES the partition key.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Concept</th><th>Reality</th><th>Consequence</th></tr>
+      <tr><td>Partition key</td><td>Hashed to choose a shard</td><td><strong>No key = no Query</strong>. You can only Scan.</td></tr>
+      <tr><td>Sort key</td><td>Ordered <em>within</em> a partition</td><td>Ranges, prefixes, "most recent N" are cheap</td></tr>
+      <tr><td>Item</td><td>Max <strong>400 KB</strong></td><td>Large blobs go in S3 with a pointer here</td></tr>
+      <tr><td>Schema</td><td>Only the key attributes are fixed</td><td>Different item <em>types</em> can share a table</td></tr>
+      <tr><td>Partition</td><td>~10 GB, 3,000 RCU, <strong>1,000 WCU</strong></td><td>The limit that causes most incidents — Part 3</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Relational modelling starts from entities and discovers queries later;
+       DynamoDB modelling starts from the queries and derives the keys.</strong> Write down every access pattern
+       first — "get a customer's 20 most recent orders", "find all orders in status X for today" — and then
+       choose keys that answer each one with a single <code>Query</code>. If you find yourself writing a
+       <code>Scan</code> in normal operation, the model is wrong, not the query.</div>
+
+<pre>
+$ aws dynamodb create-table --table-name Orders \
+    --attribute-definitions AttributeName=PK,AttributeType=S AttributeName=SK,AttributeType=S \
+    --key-schema AttributeName=PK,KeyType=HASH AttributeName=SK,KeyType=RANGE \
+    --billing-mode PAY_PER_REQUEST
+
+$ aws dynamodb query --table-name Orders \
+    --key-condition-expression 'PK = :c AND begins_with(SK, :p)' \
+    --expression-attribute-values '{":c":{"S":"CUSTOMER#42"},":p":{"S":"ORDER#2026-08"}}' \
+    --scan-index-forward false --limit 20 \
+    --return-consumed-capacity TOTAL \
+    --query '[Count,ConsumedCapacity.CapacityUnits]' --output text
+20   2.5                                           ← 20 items, 2.5 RCU. One partition.
+</pre>
+
+    <h2>Part 2 — Capacity Arithmetic</h2>
+
+<pre>
+  1 WCU  = one write per second of up to 1 KB      (round UP)
+  1 RCU  = one STRONGLY consistent read per second of up to 4 KB
+         = two EVENTUALLY consistent reads per second of up to 4 KB
+  transactional operations cost DOUBLE.
+
+  a 6.5 KB item:
+      write   ceil(6.5 / 1) = 7 WCU
+      read    ceil(6.5 / 4) = 2 RCU strong,  1 RCU eventual
+      transactional write   = 14 WCU
+</pre>
+
+<pre>
+NEVER GUESS — ask the API what it charged you:
+$ aws dynamodb put-item --table-name Orders --item file://item.json \
+    --return-consumed-capacity TOTAL --query 'ConsumedCapacity.CapacityUnits' --output text
+7.0
+
+$ aws dynamodb get-item --table-name Orders \
+    --key '{"PK":{"S":"CUSTOMER#42"},"SK":{"S":"ORDER#001"}}' \
+    --consistent-read --return-consumed-capacity TOTAL \
+    --query 'ConsumedCapacity.CapacityUnits' --output text
+2.0
+$ aws dynamodb get-item --table-name Orders \
+    --key '{"PK":{"S":"CUSTOMER#42"},"SK":{"S":"ORDER#001"}}' \
+    --return-consumed-capacity TOTAL --query 'ConsumedCapacity.CapacityUnits' --output text
+1.0                                                ← eventually consistent: half price
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>On-demand</th><th>Provisioned</th></tr>
+      <tr><td>Price</td><td>$1.25 / M writes, $0.25 / M reads</td><td>$0.00065 / WCU-hr, $0.00013 / RCU-hr</td></tr>
+      <tr><td>Scaling</td><td>Instant, unlimited (soft limits apply)</td><td>Auto scaling reacts in minutes</td></tr>
+      <tr><td>Break-even</td><td colspan="2"><strong>≈14% sustained utilisation</strong> — below it on-demand wins, above it provisioned is up to 7× cheaper</td></tr>
+      <tr><td>Right for</td><td>New, spiky, or unpredictable</td><td>Steady, predictable baseline</td></tr>
+    </table>
+
+<pre>
+THE ARITHMETIC BEHIND 14%:
+  1 WCU sustained for a month = 3,600 × 730     = 2,628,000 writes
+  provisioned  $0.00065 × 730                   = $0.4745
+  on-demand    2.628 M × $1.25 / M              = $3.2850
+                                          ratio   6.92×
+  → on-demand is cheaper below 1/6.92 ≈ 14.4% sustained utilisation.
+
+✅ the usual right answer for a steady workload with peaks:
+   provisioned at the FLOOR + auto scaling for the peaks.
+$ aws application-autoscaling register-scalable-target --service-namespace dynamodb \
+    --resource-id table/Orders --scalable-dimension dynamodb:table:WriteCapacityUnits \
+    --min-capacity 200 --max-capacity 4000
+$ aws application-autoscaling put-scaling-policy --service-namespace dynamodb \
+    --resource-id table/Orders --scalable-dimension dynamodb:table:WriteCapacityUnits \
+    --policy-name write-target --policy-type TargetTrackingScaling \
+    --target-tracking-scaling-policy-configuration '{"TargetValue":70.0,
+      "PredefinedMetricSpecification":{"PredefinedMetricType":"DynamoDBWriteCapacityUtilization"}}'
+</pre>
+
+    <h2>Part 3 — Hot Partitions: The Failure Mode That Defines DynamoDB</h2>
+
+    <p>Table-level capacity is <em>spread across partitions</em>. A single item, or a single partition key, can
+       only ever get one partition's worth of throughput — and that is the number people never plan for.</p>
+
+<pre>
+    PER PARTITION, HARD:      3,000 RCU     1,000 WCU     ~10 GB
+
+    a table provisioned at 40,000 WCU spread over 40 partitions gives 1,000 WCU each.
+    if 95% of writes go to ONE partition key:
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/DynamoDB \
+    --metric-name ConsumedWriteCapacityUnits --dimensions Name=TableName,Value=Events \
+    --period 60 --statistics Sum --start-time $(date -u -d '10 min ago' +%FT%TZ) \
+    --end-time $(date -u +%FT%TZ) --query 'max(Datapoints[].Sum)' --output text
+96420.0                                            ← 1,607 WCU/s of 40,000 = 4%
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/DynamoDB \
+    --metric-name ThrottledRequests --dimensions Name=TableName,Value=Events \
+    --period 60 --statistics Sum ... --query 'sum(Datapoints[].Sum)' --output text
+184022.0                                           ← 184,022 throttles
+</pre>
+
+    <div class="note">⚠️ <strong>4% consumed and throttling hard is the signature of a hot partition</strong>, and
+       it is genuinely confusing the first time: every table-level metric says there is spare capacity, because
+       there is — just not where the traffic is going. Adding capacity does not help; it adds partitions the
+       traffic will not use. The fix is always the <em>key</em>.</div>
+
+<pre>
+FIND THE HOT KEY — CloudWatch Contributor Insights, not guesswork:
+$ aws dynamodb update-contributor-insights --table-name Events \
+    --contributor-insights-action ENABLE
+$ aws cloudwatch get-insight-rule-report \
+    --rule-name 'DynamoDBContributorInsights-PKC-Events' \
+    --start-time $(date -u -d '1 hour ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --period 3600 --max-contributor-count 3 \
+    --query 'Contributors[].[Keys[0],ApproximateAggregateValue]' --output text
+TENANT#acme      8412004                           ← 95% of writes, one key
+TENANT#globex     201884
+TENANT#initech    188402
+</pre>
+
+<pre>
+✅ WRITE SHARDING — spread one logical key across N physical partitions:
+
+  ❌ PK = "TENANT#acme"                     → one partition, 1,000 WCU ceiling
+  ✅ PK = "TENANT#acme#" + str(random(0,19)) → 20 partitions, 20,000 WCU ceiling
+
+  writing:
+      shard = random.randint(0, 19)
+      put_item(PK=f"TENANT#acme#{shard}", SK=f"EVT#{ts}#{uuid}")
+
+  reading "all events for acme" now needs 20 queries, run in parallel:
+      results = await gather(*[query(PK=f"TENANT#acme#{s}") for s in range(20)])
+</pre>
+
+    <table class="tbl">
+      <tr><th>Sharding strategy</th><th>Read cost</th><th>Use when</th></tr>
+      <tr><td>Random suffix (0–N)</td><td><strong>N queries</strong>, merged client-side</td><td>Writes dominate; reads are rare or batched</td></tr>
+      <tr><td>Calculated suffix (<code>hash(id) % N</code>)</td><td><strong>1 query</strong> if you know the id</td><td>You can derive the shard at read time — <strong>preferred</strong></td></tr>
+      <tr><td>Time-based suffix (<code>#2026-08-20-13</code>)</td><td>1 query per time bucket</td><td>Time-series data</td></tr>
+      <tr><td>Better natural key</td><td>1 query</td><td><strong>Always try this first</strong></td></tr>
+    </table>
+
+    <div class="note">💡 <strong>Adaptive capacity mitigates this but does not remove it.</strong> DynamoDB
+       automatically shifts unused table capacity toward a hot partition, and does so within seconds — which is
+       why moderate skew often never surfaces. But it can never exceed the hard per-partition ceiling of 1,000
+       WCU / 3,000 RCU, so a genuinely hot key still throttles. Treat adaptive capacity as headroom for
+       imperfect distribution, not as a licence to design a hot key.</div>
+
+    <h2>Part 4 — Query, Scan, and the Indexes</h2>
+
+<pre>
+THE MOST EXPENSIVE MISCONCEPTION IN DYNAMODB:
+
+  FilterExpression is applied AFTER the items are read.
+  You pay full capacity for every item examined and then discarded.
+
+$ aws dynamodb scan --table-name Orders \
+    --filter-expression '#s = :st' \
+    --expression-attribute-names '{"#s":"status"}' \
+    --expression-attribute-values '{":st":{"S":"REFUNDED"}}' \
+    --return-consumed-capacity TOTAL \
+    --query '[Count,ScannedCount,ConsumedCapacity.CapacityUnits]' --output text
+12   482104   60263.0
+     │  │        └─ 60,263 RCU consumed
+     │  └─ 482,104 items READ
+     └─ 12 items returned
+   → you paid to read half a million items to return twelve.
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th><code>Query</code></th><th><code>Scan</code></th></tr>
+      <tr><td>Requires</td><td><strong>The partition key</strong></td><td>Nothing</td></tr>
+      <tr><td>Reads</td><td>Only the matching partition</td><td><strong>The entire table</strong></td></tr>
+      <tr><td>Cost</td><td>Proportional to results</td><td><strong>Proportional to table size</strong></td></tr>
+      <tr><td>Scales as data grows</td><td>✅ constant</td><td><strong>❌ linearly worse forever</strong></td></tr>
+      <tr><td>Acceptable for</td><td>Everything</td><td>Migrations, one-off exports, tiny tables</td></tr>
+    </table>
+
+<pre>
+INDEXES — the two kinds, and they are not interchangeable:
+
+  LSI  Local Secondary Index
+       SAME partition key, DIFFERENT sort key
+       ⚠️ can ONLY be created WITH the table — never added later
+       ✅ supports strongly consistent reads
+       ⚠️ 10 GB limit per partition key value, for the table + all its LSIs
+
+  GSI  Global Secondary Index
+       ANY partition key and sort key
+       ✅ can be added or removed at any time
+       ⚠️ EVENTUALLY consistent only
+       ⚠️ its OWN capacity — and see the trap below
+</pre>
+
+<pre>
+$ aws dynamodb update-table --table-name Orders \
+    --attribute-definitions AttributeName=status,AttributeType=S \
+                            AttributeName=createdAt,AttributeType=S \
+    --global-secondary-index-updates '[{"Create":{
+        "IndexName":"status-createdAt-index",
+        "KeySchema":[{"AttributeName":"status","KeyType":"HASH"},
+                     {"AttributeName":"createdAt","KeyType":"RANGE"}],
+        "Projection":{"ProjectionType":"INCLUDE",
+                      "NonKeyAttributes":["customerId","total"]}}}]'
+
+$ aws dynamodb query --table-name Orders --index-name status-createdAt-index \
+    --key-condition-expression '#s = :st AND #c > :d' \
+    --expression-attribute-names '{"#s":"status","#c":"createdAt"}' \
+    --expression-attribute-values '{":st":{"S":"REFUNDED"},":d":{"S":"2026-08-01"}}' \
+    --return-consumed-capacity TOTAL \
+    --query '[Count,ScannedCount,ConsumedCapacity.CapacityUnits]' --output text
+12   12   1.5                                      ← 60,263 RCU → 1.5 RCU
+</pre>
+
+    <div class="note">⚠️ <strong>A throttled GSI throttles writes to the base table.</strong> Every write to the
+       table must also be written to each GSI whose keys it contains; if the GSI has insufficient capacity, the
+       write cannot complete and DynamoDB rejects it at the table. So an under-provisioned index — often one
+       nobody reads any more — takes down writes to the table itself. Provision GSIs for the <em>write</em>
+       rate of the base table, not for how often you query them, and delete indexes you have stopped using.</div>
+
+    <table class="tbl">
+      <tr><th>Projection type</th><th>Stores</th><th>Cost</th><th>Note</th></tr>
+      <tr><td><code>KEYS_ONLY</code></td><td>Keys only</td><td>Cheapest</td><td>Requires a second read to fetch attributes</td></tr>
+      <tr><td><strong><code>INCLUDE</code></strong></td><td>Keys + named attributes</td><td>Middle</td><td><strong>Usually correct</strong> — project what the query returns</td></tr>
+      <tr><td><code>ALL</code></td><td>Everything</td><td>Doubles storage and write cost</td><td>Convenient, and the default people regret</td></tr>
+    </table>
+
+<pre>
+SPARSE INDEXES — a GSI only contains items that HAVE its key attributes:
+
+  items with  needsReview = "Y"   → appear in the index
+  items without that attribute    → do NOT appear at all
+
+  → an index over 400 pending items on a 500 M-item table, costing almost nothing.
+    Delete the attribute when the work is done and the item leaves the index.
+</pre>
+
+    <h2>Part 5 — Modelling, and Writing Safely</h2>
+
+<pre>
+SINGLE-TABLE DESIGN — one table, many item types, keys overloaded:
+
+  PK                SK                        type      attributes
+  CUSTOMER#42       PROFILE                   customer  name, email
+  CUSTOMER#42       ORDER#2026-08-20#001      order     total, status
+  CUSTOMER#42       ORDER#2026-08-19#004      order     total, status
+  CUSTOMER#42       ADDRESS#home              address   line1, city
+  ORDER#001         ITEM#sku-9f2a             lineitem  qty, price
+
+  Query(PK="CUSTOMER#42")                        → the customer AND everything about them,
+                                                   in ONE request, ONE partition
+  Query(PK="CUSTOMER#42", SK begins_with "ORDER#") → just the orders, newest first
+</pre>
+
+    <div class="note">🔑 <strong>Single-table design is a technique for known access patterns at scale, not a
+       universal best practice.</strong> It exists because a Query against one partition is the cheapest,
+       fastest operation DynamoDB offers, and co-locating related items lets one request replace several. It
+       costs you readability, ad-hoc queryability, and the ability to change access patterns cheaply. Use it
+       when the patterns are stable and the scale is real; use separate tables when you are still discovering
+       the domain, because <strong>a wrong single-table model is far more expensive to change than a wrong set
+       of tables</strong>.</div>
+
+<pre>
+CONDITIONAL WRITES — the only defence against a lost update:
+
+  ❌ read-modify-write, two clients, no condition:
+     A: GET stock → 10        B: GET stock → 10
+     A: PUT stock = 9         B: PUT stock = 9
+     → two items sold, stock decremented once. Money lost, silently.
+
+  ✅ atomic, server-side:
+$ aws dynamodb update-item --table-name Inventory \
+    --key '{"PK":{"S":"SKU#9f2a"}}' \
+    --update-expression 'SET stock = stock - :one' \
+    --condition-expression 'stock >= :one' \
+    --expression-attribute-values '{":one":{"N":"1"}}'
+An error occurred (ConditionalCheckFailedException)   ← when stock is 0. Correct.
+</pre>
+
+<pre>
+OPTIMISTIC CONCURRENCY with a version attribute:
+$ aws dynamodb update-item --table-name Orders \
+    --key '{"PK":{"S":"ORDER#001"},"SK":{"S":"META"}}' \
+    --update-expression 'SET #s = :new, version = :v1' \
+    --condition-expression 'version = :v0' \
+    --expression-attribute-names '{"#s":"status"}' \
+    --expression-attribute-values '{":new":{"S":"SHIPPED"},":v0":{"N":"7"},":v1":{"N":"8"}}'
+   → the write succeeds only if nobody else changed the item since you read it.
+     On ConditionalCheckFailedException: re-read and retry.
+</pre>
+
+<pre>
+TRANSACTIONS — for the cases a condition cannot cover:
+$ aws dynamodb transact-write-items --transact-items '[
+    {"Update":{"TableName":"Inventory","Key":{"PK":{"S":"SKU#9f2a"}},
+      "UpdateExpression":"SET stock = stock - :one",
+      "ConditionExpression":"stock >= :one",
+      "ExpressionAttributeValues":{":one":{"N":"1"}}}},
+    {"Put":{"TableName":"Orders","Item":{"PK":{"S":"ORDER#002"},"SK":{"S":"META"}},
+      "ConditionExpression":"attribute_not_exists(PK)"}}]'
+   ⚠️ all-or-nothing across up to 100 items, and it costs DOUBLE the capacity.
+     Use a single conditional write where one suffices; transactions are for
+     genuinely multi-item invariants.
+</pre>
+
+    <h2>Part 6 — Streams, TTL, Global Tables, DAX</h2>
+
+    <table class="tbl">
+      <tr><th>Feature</th><th>What it gives you</th><th>The catch</th></tr>
+      <tr><td><strong>Streams</strong></td><td>An ordered change log per partition, 24 h retention</td><td>Poison-pill records block a shard — see <a href="lambda-serverless.html">Lambda</a></td></tr>
+      <tr><td><strong>TTL</strong></td><td><strong>Free deletes</strong> of expired items</td><td><strong>Up to 48 h late</strong> — filter expired items in your reads anyway</td></tr>
+      <tr><td>PITR</td><td>Restore to any second in 35 days</td><td>Restores to a <strong>new table</strong></td></tr>
+      <tr><td>Global tables</td><td>Multi-Region, multi-active</td><td><strong>Last-writer-wins</strong> — concurrent writes to one item silently lose one</td></tr>
+      <tr><td>DAX</td><td>Microsecond cached reads</td><td>Write-through; a stale cache on out-of-band writes</td></tr>
+      <tr><td>Export to S3</td><td>Full table export, <strong>no capacity consumed</strong></td><td>Point-in-time only; use for analytics instead of Scan</td></tr>
+    </table>
+
+<pre>
+TTL — the free delete, and the trap:
+$ aws dynamodb update-time-to-live --table-name Sessions \
+    --time-to-live-specification 'Enabled=true,AttributeName=expiresAt'
+   the attribute must be a NUMBER, in epoch SECONDS. A millisecond timestamp
+   means the item expires in the year 57000, silently.
+
+  ⚠️ deletion happens within ~48 hours, not at the instant. So:
+$ aws dynamodb query --table-name Sessions \
+    --key-condition-expression 'PK = :u' \
+    --filter-expression 'expiresAt > :now' \
+    --expression-attribute-values '{":u":{"S":"USER#42"},":now":{"N":"1755700000"}}'
+   → always filter on expiry in the read path too. TTL is a cost optimisation,
+     not a correctness mechanism.
+</pre>
+
+<pre>
+EXPORT TO S3 instead of scanning for analytics:
+$ aws dynamodb export-table-to-point-in-time \
+    --table-arn arn:aws:dynamodb:us-east-1:111122223333:table/Orders \
+    --s3-bucket acme-exports --export-format DYNAMODB_JSON
+   → 500 M items exported, ZERO read capacity consumed, no impact on production.
+     Then query it in Athena. A full Scan would have cost 60,000+ RCU and hours.
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A table modelled from entities, Scans with filters in the request path, one tenant as a
+         partition key, a GSI projecting <code>ALL</code> with a fraction of the base table's write capacity,
+         read-modify-write with no condition, TTL trusted for correctness, and a nightly Scan for
+         reporting.</strong> The table was designed like a relational schema, so the common access patterns have
+         no matching key and every one is a Scan with a <code>FilterExpression</code> — reading 482,104 items to
+         return 12 and consuming 60,263 RCU each time. The biggest customer is a single partition key, so the
+         table throttles 184,000 requests while consuming 4% of its provisioned capacity, and someone keeps
+         raising the capacity because every table-level metric shows headroom. A GSI projects every attribute
+         and is provisioned for how often it is queried rather than how often the base table is written, so it
+         throttles and takes the table's writes down with it. Inventory is decremented by reading, subtracting
+         and writing, so under concurrency two orders sell the same unit and the discrepancy is discovered at
+         stock-take. Sessions are read without checking expiry because TTL "deletes them", and expired sessions
+         remain valid for up to two days. And the reporting job Scans the whole table every night, doubling the
+         capacity bill to answer questions Athena could answer for free.</p>
+      <p>✅ <strong>Model from the access patterns, Query never Scan, distribute the partition key, provision
+         GSIs for the write rate, make every mutation conditional, filter on expiry anyway, and export instead
+         of scanning.</strong> Write the access patterns down before the schema and choose keys so each one is a
+         single <code>Query</code>; a Scan in the request path means the model is wrong, not the query. Find hot
+         keys with Contributor Insights rather than guessing, and shard them — a calculated suffix if you can
+         derive it at read time, a random one if writes dominate — remembering that adaptive capacity smooths
+         imperfect distribution but can never exceed 1,000 WCU on one partition. Project <code>INCLUDE</code>
+         with the attributes the query returns rather than <code>ALL</code>, provision each GSI for the base
+         table's write rate, and delete indexes nobody reads, because an unused index can still stop your
+         writes. Replace every read-modify-write with a <code>condition-expression</code> or an atomic
+         <code>SET x = x - :n</code>, and use transactions only for genuine multi-item invariants since they
+         cost double. Treat TTL as a cost optimisation and filter expired items in the read path. And export to
+         S3 for analytics — full table exports consume no capacity at all and leave production untouched.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Modelling entities first, queries later</td><td>No key answers the common patterns, so everything becomes a Scan</td><td><strong>Write the access patterns first</strong>, then derive keys</td></tr>
+      <tr><td>Believing <code>FilterExpression</code> saves capacity</td><td>Filters apply <strong>after</strong> the read — <strong>482,104 items read to return 12, at 60,263 RCU</strong></td><td>A GSI turned the same query into <strong>1.5 RCU</strong></td></tr>
+      <tr><td>Scanning in the request path</td><td>Cost grows linearly with the table, forever</td><td>Query. If you cannot, the model is wrong</td></tr>
+      <tr><td>One tenant / one date / one status as the partition key</td><td><strong>Throttling at 4% consumed capacity</strong> — per-partition limits are 1,000 WCU / 3,000 RCU</td><td>Shard the key; find it with Contributor Insights</td></tr>
+      <tr><td>Raising table capacity to fix throttling</td><td>Adds partitions the traffic will not use; changes nothing</td><td>Fix the <strong>key</strong>, not the capacity</td></tr>
+      <tr><td>Trusting adaptive capacity to absorb a hot key</td><td>It cannot exceed the <strong>hard per-partition ceiling</strong></td><td>Treat it as headroom for imperfect distribution only</td></tr>
+      <tr><td>On-demand for a steady workload</td><td>Up to <strong>7× the provisioned rate</strong> above ~14% utilisation</td><td>Provisioned at the floor + auto scaling</td></tr>
+      <tr><td>Provisioned for a spiky new workload</td><td>Throttles during spikes; auto scaling reacts in minutes</td><td>On-demand until the pattern is known</td></tr>
+      <tr><td>Under-provisioning a GSI</td><td><strong>A throttled GSI throttles writes to the base table</strong></td><td>Provision GSIs for the base table's <em>write</em> rate</td></tr>
+      <tr><td>Projecting <code>ALL</code> into every GSI</td><td>Doubles storage and write cost per index</td><td><code>INCLUDE</code> exactly what the query returns</td></tr>
+      <tr><td>Keeping unused indexes</td><td>Every write still pays for them — and they can throttle you</td><td>Delete indexes nobody queries</td></tr>
+      <tr><td>Wanting an LSI after table creation</td><td><strong>Impossible</strong> — LSIs exist only at creation time</td><td>Use a GSI, or plan LSIs up front</td></tr>
+      <tr><td>Read-modify-write without a condition</td><td><strong>Lost updates</strong> — two sales, one decrement, found at stock-take</td><td><code>condition-expression</code>, or atomic <code>SET x = x - :n</code></td></tr>
+      <tr><td>Transactions for everything</td><td><strong>Double capacity</strong> for invariants a single condition covers</td><td>Conditional writes first; transactions for real multi-item invariants</td></tr>
+      <tr><td>Trusting TTL for correctness</td><td>Deletion is <strong>up to 48 hours late</strong> — expired sessions stay valid</td><td>Filter on expiry in the read path too</td></tr>
+      <tr><td>TTL attribute in milliseconds</td><td>The item expires in the year 57000, silently</td><td>Epoch <strong>seconds</strong>, as a Number</td></tr>
+      <tr><td>Scanning for analytics</td><td>Doubles the capacity bill and competes with production traffic</td><td><strong>Export to S3</strong> — zero capacity consumed — then Athena</td></tr>
+      <tr><td>Assuming global tables resolve conflicts</td><td><strong>Last-writer-wins</strong>: a concurrent write to one item is silently lost</td><td>Partition writes by Region, or accept and design for it</td></tr>
+      <tr><td>Storing large blobs as items</td><td>The <strong>400 KB item limit</strong>, and huge read costs</td><td>S3 for the blob, DynamoDB for the pointer</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between a Query and a Scan?</summary>
+      <p><strong>A <code>Query</code> reads one partition; a <code>Scan</code> reads the entire table.</strong> A
+         Query requires the partition key, optionally narrows by a sort-key condition, and costs in proportion to
+         what it returns. A Scan requires nothing, reads every item, and costs in proportion to the table's
+         size — so it gets worse forever as the data grows.</p>
+      <p><strong>The point most people miss</strong> is that <code>FilterExpression</code> does not make a Scan
+         cheap. Filters are applied <em>after</em> items are read, so you pay full capacity for everything
+         examined and then discarded:</p>
+<pre>
+Count: 12    ScannedCount: 482,104    ConsumedCapacity: 60,263 RCU
+</pre>
+      <p>Twelve results, half a million items paid for. The fix is a <strong>GSI</strong> whose partition key is
+         the attribute you were filtering on, which turned that same query into <strong>1.5 RCU</strong>. Scans
+         are legitimate for migrations, one-off exports and genuinely tiny tables; a Scan in the request path
+         means the data model does not support the access pattern.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How do you choose between on-demand and provisioned capacity?</summary>
+      <p><strong>By sustained utilisation, and the break-even is about 14%.</strong></p>
+<pre>
+  1 WCU for a month = 2,628,000 writes
+  provisioned  $0.00065 × 730          = $0.4745
+  on-demand    2.628 M × $1.25 / M     = $3.2850      → 6.92× more
+  → on-demand wins below ~14% utilisation; provisioned is up to 7× cheaper above it
+</pre>
+      <table class="tbl">
+        <tr><th>Choose on-demand</th><th>Choose provisioned</th></tr>
+        <tr><td>New table, unknown pattern</td><td>Steady, predictable baseline</td></tr>
+        <tr><td>Spiky or unpredictable traffic</td><td>Sustained above ~14% utilisation</td></tr>
+        <tr><td>Development and test</td><td>Production at scale</td></tr>
+      </table>
+      <p><strong>The answer for most production workloads is both:</strong> provisioned at the floor with auto
+         scaling for the peaks. Start on-demand until you have a month of data — committing before measuring is
+         how tables end up either throttling or paying seven times over. And note that neither choice protects
+         you from a hot partition: capacity mode is about cost, not about distribution.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A table is throttling while CloudWatch shows it consuming 4% of provisioned capacity. Explain.</summary>
+      <p><strong>A hot partition.</strong> Table capacity is spread across partitions, and each partition has a
+         hard ceiling of <strong>1,000 WCU and 3,000 RCU</strong> regardless of what the table is provisioned
+         for. If most traffic targets one partition key, that key hits its ceiling while the other partitions
+         sit idle — so the table-level metrics honestly report spare capacity that the traffic cannot reach.</p>
+      <p><strong>Adding capacity makes it worse, not better:</strong> it creates more partitions the traffic will
+         not use, and increases the bill. This is the moment to stop scaling and start looking at keys.</p>
+<pre>
+$ aws cloudwatch get-insight-rule-report --rule-name 'DynamoDBContributorInsights-PKC-Events' ...
+TENANT#acme     8,412,004      ← 95% of writes, one key
+</pre>
+      <table class="tbl">
+        <tr><th>Fix</th><th>Read cost afterwards</th></tr>
+        <tr><td><strong>A better natural key</strong></td><td>1 Query — try this first</td></tr>
+        <tr><td>Calculated shard (<code>hash(id) % N</code>)</td><td><strong>1 Query</strong>, if the shard is derivable at read time</td></tr>
+        <tr><td>Random shard suffix</td><td>N parallel Queries, merged client-side</td></tr>
+        <tr><td>Time-bucketed suffix</td><td>1 Query per bucket — good for time series</td></tr>
+      </table>
+      <p><strong>On adaptive capacity:</strong> DynamoDB does shift unused capacity toward hot partitions within
+         seconds, which is why mild skew rarely surfaces — but it cannot exceed the per-partition ceiling. It
+         buys tolerance for imperfect distribution, not permission to design a hot key.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Writes to a table start failing after you add a GSI. Why?</summary>
+      <p><strong>Because every write to the base table must also be written to each GSI whose key attributes it
+         contains — and if the GSI cannot accept the write, DynamoDB rejects it at the table.</strong> An
+         under-provisioned index therefore takes down writes to the table itself, which is counter-intuitive
+         because the index is usually thought of as a read-side concern.</p>
+      <table class="tbl">
+        <tr><th>Cause</th><th>Fix</th></tr>
+        <tr><td>GSI provisioned for query rate, not write rate</td><td>Provision it for the <strong>base table's write rate</strong></td></tr>
+        <tr><td>GSI partition key is hot (e.g. <code>status</code>)</td><td>The same hot-partition problem, one level down — pick a distributed key</td></tr>
+        <tr><td>Projection <code>ALL</code> on large items</td><td><code>INCLUDE</code> only what the query returns</td></tr>
+        <tr><td>The table is on-demand but the GSI is provisioned</td><td>Match capacity modes</td></tr>
+      </table>
+      <p><strong>Two things worth adding.</strong> A GSI with a low-cardinality partition key — <code>status</code>
+         with five values, say — concentrates all writes onto five partitions and will throttle no matter how
+         much capacity it has. And <strong>an index nobody reads still costs every write</strong> and can still
+         throttle you, so deleting unused indexes is a real availability improvement, not just a cost one.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> When is single-table design the right choice, and when is it not?</summary>
+      <p><strong>It is a technique for known access patterns at scale, not a default.</strong> The reason it
+         exists is that a Query against one partition is the cheapest and fastest operation DynamoDB offers, so
+         co-locating related items under one partition key lets a single request replace what would otherwise be
+         several — a customer, their orders and their addresses in one round trip, one partition, a few RCU.</p>
+      <table class="tbl">
+        <tr><th>Use it when</th><th>Do not when</th></tr>
+        <tr><td>Access patterns are known and stable</td><td>You are still discovering the domain</td></tr>
+        <tr><td>You need related items in one request</td><td>Entities are genuinely independent</td></tr>
+        <tr><td>Scale makes the round trips matter</td><td>Scale is modest and clarity matters more</td></tr>
+        <tr><td>The team understands the pattern</td><td>The team will maintain it without that context</td></tr>
+        <tr><td>Analytics happens elsewhere (S3/Athena)</td><td>You need ad-hoc queries against live data</td></tr>
+      </table>
+      <p><strong>The costs are real and usually understated:</strong> the table is unreadable without the access
+         pattern documentation, every new pattern may need a new GSI or a migration, ad-hoc investigation is
+         painful, and onboarding is slow. Most importantly, <strong>a wrong single-table model is far more
+         expensive to change than a wrong set of tables</strong>, because the keys encode the access patterns
+         and changing keys means rewriting every item.</p>
+      <p><strong>What I would actually advise:</strong> start with separate tables while the domain is
+         uncertain — DynamoDB tables are free when idle and on-demand billing makes many small tables cheap —
+         and consolidate deliberately when patterns stabilise and round trips are measurably hurting. Treat
+         single-table design as an optimisation you earn the right to, not a purity test. And whichever you
+         choose, write the access patterns down as documentation that lives with the code; that artefact is
+         what makes either model maintainable.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the data model for a multi-tenant SaaS event store: 50k writes/sec, per-tenant queries by time range, and a 90-day retention policy.</summary>
+      <p><strong>Three requirements, and each one pins a different part of the key design.</strong></p>
+      <p><strong>The write rate forces sharding.</strong> 50,000 writes/sec against a 1,000 WCU per-partition
+         ceiling means at least 50 partitions actively receiving writes, and tenants are never evenly sized —
+         one large customer will be most of the traffic. So the partition key must combine tenant, a time
+         bucket, and a shard:</p>
+<pre>
+  PK = TENANT#&lt;id&gt;#&lt;yyyy-mm-dd-hh&gt;#&lt;shard 0..N&gt;
+  SK = &lt;timestamp&gt;#&lt;event-id&gt;
+
+  N sized per tenant: large tenants get 32 shards, small ones get 1.
+  Store N per tenant in a config item so readers know how many to fan out to.
+</pre>
+      <p><strong>The query pattern is satisfied by the time bucket in the key.</strong> "Events for tenant X
+         between two times" becomes a bounded fan-out: one Query per (hour × shard) in range, run in parallel,
+         merged client-side. That is a known, bounded cost rather than a Scan. The sort key gives ordering
+         within each partition for free.</p>
+      <p><strong>Retention is where the design earns its keep.</strong> TTL is the obvious answer, and it is the
+         wrong primary one at this volume: TTL deletes are free but arrive up to 48 hours late, and at 50k/sec
+         the deletion backlog itself becomes significant. The better pattern is a <strong>table per time
+         period</strong> — a monthly or weekly table — because dropping a table is instant, free and consumes no
+         capacity, whereas expiring billions of items individually does not. Keep TTL as a secondary safety net
+         for stragglers.</p>
+      <table class="tbl">
+        <tr><th>Concern</th><th>Mechanism</th></tr>
+        <tr><td>50k writes/sec</td><td>Tenant + hour + shard partition key; per-tenant shard counts</td></tr>
+        <tr><td>Per-tenant time-range query</td><td>Bounded parallel Query fan-out over hour × shard</td></tr>
+        <tr><td>90-day retention</td><td><strong>Monthly tables, dropped whole</strong>; TTL as a backstop</td></tr>
+        <tr><td>Noisy-neighbour isolation</td><td>Per-tenant shard counts; Contributor Insights to detect drift</td></tr>
+        <tr><td>Analytics</td><td>Streams → Firehose → S3 Parquet; <strong>never Scan</strong></td></tr>
+        <tr><td>Capacity mode</td><td>Provisioned at the floor + auto scaling — at this volume on-demand is ~7×</td></tr>
+      </table>
+      <p><strong>What I would flag explicitly:</strong> shard counts must be adjustable per tenant without a
+         migration, because tenant sizes change and today's small customer is next year's hot partition. Storing
+         the count as data rather than a constant is the difference between a config change and a rewrite. And
+         analytics must go to S3 via Streams from day one — the moment someone Scans this table for a report,
+         the production workload suffers and the capacity bill doubles.</p>
+    </details>
+
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Predict the capacity cost of reads and writes from item
+       size, then verify every prediction against the API.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ python3 -c "
+import json
+item = {'PK':{'S':'CUSTOMER#42'},'SK':{'S':'ORDER#001'},
+        'payload':{'S':'x'*6300}}
+open('item.json','w').write(json.dumps(item))
+print('approx item size:', len(json.dumps(item)), 'bytes')"
+approx item size: 6412 bytes                       ← ~6.3 KB
+
+PREDICT:
+  write         ceil(6.3 / 1)  =  7 WCU
+  read strong   ceil(6.3 / 4)  =  2 RCU
+  read eventual 2 / 2           =  1 RCU
+  transactional write           = 14 WCU
+</pre>
+<pre>
+VERIFY EACH ONE:
+$ aws dynamodb put-item --table-name Orders --item file://item.json \
+    --return-consumed-capacity TOTAL --query 'ConsumedCapacity.CapacityUnits' --output text
+7.0                                                ✅
+
+$ aws dynamodb get-item --table-name Orders --consistent-read \
+    --key '{"PK":{"S":"CUSTOMER#42"},"SK":{"S":"ORDER#001"}}' \
+    --return-consumed-capacity TOTAL --query 'ConsumedCapacity.CapacityUnits' --output text
+2.0                                                ✅
+
+$ aws dynamodb get-item --table-name Orders \
+    --key '{"PK":{"S":"CUSTOMER#42"},"SK":{"S":"ORDER#001"}}' \
+    --return-consumed-capacity TOTAL --query 'ConsumedCapacity.CapacityUnits' --output text
+1.0                                                ✅ eventually consistent, half price
+
+$ aws dynamodb transact-write-items --transact-items \
+    '[{"Put":{"TableName":"Orders","Item":'"$(cat item.json)"'}}]' \
+    --return-consumed-capacity TOTAL --query 'ConsumedCapacity[0].CapacityUnits' --output text
+14.0                                               ✅ double
+</pre>
+<pre>
+NOW THE ONE THAT SURPRISES PEOPLE — PROJECTION DOES NOT REDUCE READ COST:
+$ aws dynamodb get-item --table-name Orders \
+    --key '{"PK":{"S":"CUSTOMER#42"},"SK":{"S":"ORDER#001"}}' \
+    --projection-expression 'PK' \
+    --return-consumed-capacity TOTAL --query 'ConsumedCapacity.CapacityUnits' --output text
+1.0                                                ← SAME as fetching everything
+   → the whole item is read from storage; projection only trims what crosses the wire.
+     It saves bandwidth, never capacity.
+</pre>
+<pre>
+AND THE ARITHMETIC THAT MATTERS AT SCALE:
+$ python3 -c "
+size_kb = 6.3
+writes_per_sec = 2000
+wcu = -(-size_kb // 1) * writes_per_sec
+print(f'{wcu:,.0f} WCU needed')
+print(f'provisioned: \${wcu * 0.00065 * 730:,.2f}/month')
+print(f'on-demand:   \${writes_per_sec * 3600 * 730 / 1e6 * 1.25:,.2f}/month')"
+14,000 WCU needed
+provisioned: $6,643.00/month
+on-demand:   $6,570.00/month
+   → at 100% utilisation they are nearly identical, because on-demand pricing is
+     calibrated to ~14% of provisioned. Below that, on-demand wins outright.
+</pre>
+<table class="tbl">
+  <tr><th>Operation</th><th>Formula</th><th>6.3 KB item</th></tr>
+  <tr><td>Write</td><td><code>ceil(KB / 1)</code></td><td>7 WCU</td></tr>
+  <tr><td>Strongly consistent read</td><td><code>ceil(KB / 4)</code></td><td>2 RCU</td></tr>
+  <tr><td>Eventually consistent read</td><td><code>ceil(KB / 4) / 2</code></td><td>1 RCU</td></tr>
+  <tr><td>Transactional write</td><td><code>2 × write</code></td><td>14 WCU</td></tr>
+  <tr><td>Transactional read</td><td><code>2 × strong read</code></td><td>4 RCU</td></tr>
+  <tr><td>Projection</td><td><strong>No effect</strong></td><td>Same</td></tr>
+</table>
+<div class="note">💡 Make <code>--return-consumed-capacity TOTAL</code> a habit in development and in any load
+   test. It converts capacity from something you estimate into something you measure, and it is the fastest way
+   to discover that a query you believed was cheap is reading the whole table.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove that <code>FilterExpression</code> does not save
+       capacity, then fix the query with an index and measure the difference.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE TABLE: 482,104 orders, of which 12 are refunded.
+$ aws dynamodb describe-table --table-name Orders \
+    --query 'Table.[ItemCount,TableSizeBytes]' --output text
+482104   1204882944
+</pre>
+<pre>
+THE "OBVIOUS" QUERY:
+$ aws dynamodb scan --table-name Orders \
+    --filter-expression '#s = :st' \
+    --expression-attribute-names '{"#s":"status"}' \
+    --expression-attribute-values '{":st":{"S":"REFUNDED"}}' \
+    --return-consumed-capacity TOTAL \
+    --query '{returned:Count, read:ScannedCount, rcu:ConsumedCapacity.CapacityUnits}' --output json
+{ "returned": 12, "read": 482104, "rcu": 60263.0 }
+
+    12 results.  482,104 items read.  60,263 RCU.
+    ratio: 40,175 items read per item returned.
+</pre>
+<pre>
+WHAT THAT COSTS, RUN HOURLY:
+$ python3 -c "
+rcu = 60263
+print(f'on-demand: \${rcu/4/1e6*0.25*24*30:,.2f}/month')   # RCU→RRU, 4KB units
+print(f'and it competes with production reads every time')"
+on-demand: $2.71/month
+   ...which sounds trivial until the table is 50× bigger, and it CONSUMES
+   production capacity for 60,263 RCU-seconds every hour, throttling real traffic.
+</pre>
+<pre>
+✅ A GSI WHOSE PARTITION KEY IS WHAT YOU WERE FILTERING ON:
+$ aws dynamodb update-table --table-name Orders \
+    --attribute-definitions AttributeName=status,AttributeType=S \
+                            AttributeName=createdAt,AttributeType=S \
+    --global-secondary-index-updates '[{"Create":{
+        "IndexName":"status-createdAt-index",
+        "KeySchema":[{"AttributeName":"status","KeyType":"HASH"},
+                     {"AttributeName":"createdAt","KeyType":"RANGE"}],
+        "Projection":{"ProjectionType":"INCLUDE",
+                      "NonKeyAttributes":["customerId","total"]}}}]'
+$ aws dynamodb describe-table --table-name Orders \
+    --query 'Table.GlobalSecondaryIndexes[0].IndexStatus' --output text
+ACTIVE
+</pre>
+<pre>
+THE SAME QUESTION, AS A QUERY:
+$ aws dynamodb query --table-name Orders --index-name status-createdAt-index \
+    --key-condition-expression '#s = :st' \
+    --expression-attribute-names '{"#s":"status"}' \
+    --expression-attribute-values '{":st":{"S":"REFUNDED"}}' \
+    --return-consumed-capacity TOTAL \
+    --query '{returned:Count, read:ScannedCount, rcu:ConsumedCapacity.CapacityUnits}' --output json
+{ "returned": 12, "read": 12, "rcu": 1.5 }
+</pre>
+<table class="tbl">
+  <tr><th></th><th>Scan + Filter</th><th>Query on GSI</th><th>Factor</th></tr>
+  <tr><td>Items returned</td><td>12</td><td>12</td><td>—</td></tr>
+  <tr><td>Items read</td><td><strong>482,104</strong></td><td><strong>12</strong></td><td>40,175×</td></tr>
+  <tr><td>RCU consumed</td><td>60,263</td><td><strong>1.5</strong></td><td><strong>40,175×</strong></td></tr>
+  <tr><td>Latency</td><td>18.4 s (paginated)</td><td><strong>11 ms</strong></td><td>1,672×</td></tr>
+  <tr><td>Cost as the table grows</td><td><strong>Linear, forever</strong></td><td>Constant</td><td>—</td></tr>
+</table>
+<pre>
+⚠️ AND THE SPARSE-INDEX REFINEMENT — this index contains every order, which is
+   expensive when only refunds matter. Write the attribute ONLY when it is true:
+
+   item has  refundedAt = "2026-08-20"   → in the index
+   item lacks it entirely                → NOT in the index
+
+$ aws dynamodb query --table-name Orders --index-name refundedAt-index \
+    --key-condition-expression 'refundedAt > :d' ...
+   → an index over 12 items on a 482,104-item table. Near-zero storage and write cost.
+</pre>
+<div class="note">🔑 <strong><code>ScannedCount</code> versus <code>Count</code> is the single most useful
+   diagnostic in DynamoDB.</strong> If they differ by more than a small factor, you are paying to read data you
+   throw away, and the fix is an index rather than a cheaper filter. Log the ratio in development — a query
+   that reads 40,000 items per result is invisible in a small test dataset and catastrophic in
+   production.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Build a hot partition, watch a table throttle at 4%
+       utilisation, then fix it with sharding and measure.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws dynamodb create-table --table-name Events \
+    --attribute-definitions AttributeName=PK,AttributeType=S AttributeName=SK,AttributeType=S \
+    --key-schema AttributeName=PK,KeyType=HASH AttributeName=SK,KeyType=RANGE \
+    --provisioned-throughput ReadCapacityUnits=1000,WriteCapacityUnits=40000
+
+$ cat &gt; hot.py &lt;&lt;'PY'
+import boto3, uuid, time, concurrent.futures as cf, collections, sys
+d = boto3.client("dynamodb")
+KEY, N = sys.argv[1], int(sys.argv[2])
+res = collections.Counter()
+def w(i):
+    try:
+        d.put_item(TableName="Events",
+                   Item={"PK":{"S":KEY},"SK":{"S":f"EVT#{time.time_ns()}#{uuid.uuid4()}"}})
+        return "ok"
+    except d.exceptions.ProvisionedThroughputExceededException:
+        return "throttled"
+t0=time.time()
+with cf.ThreadPoolExecutor(max_workers=300) as ex:
+    for r in ex.map(w, range(N)): res[r]+=1
+print(dict(res), f"{N/(time.time()-t0):.0f}/s")
+PY
+</pre>
+<pre>
+ALL WRITES TO ONE PARTITION KEY:
+$ python3 hot.py 'TENANT#acme' 200000
+{'ok': 61204, 'throttled': 138796} 1002/s
+   → 69% throttled. Throughput plateaued at ~1,000/s.
+     THE TABLE IS PROVISIONED FOR 40,000.
+</pre>
+<pre>
+LOOK AT THE METRICS THE WAY AN ON-CALL ENGINEER WOULD:
+$ aws cloudwatch get-metric-statistics --namespace AWS/DynamoDB \
+    --metric-name ConsumedWriteCapacityUnits --dimensions Name=TableName,Value=Events \
+    --period 60 --statistics Sum --start-time $(date -u -d '5 min ago' +%FT%TZ) \
+    --end-time $(date -u +%FT%TZ) --query 'max(Datapoints[].Sum)' --output text
+60120.0
+$ python3 -c "print(f'{60120/60:.0f} WCU/s of 40000 = {60120/60/40000:.1%}')"
+1002 WCU/s of 40000 = 2.5%
+   ⚠️ 2.5% consumed, 69% throttled. Every table-level metric says "plenty of room".
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/DynamoDB \
+    --metric-name ThrottledRequests --dimensions Name=TableName,Value=Events \
+    --period 60 --statistics Sum ... --query 'sum(Datapoints[].Sum)' --output text
+138796.0
+</pre>
+<pre>
+CONFIRM THE CAUSE RATHER THAN GUESSING:
+$ aws dynamodb update-contributor-insights --table-name Events \
+    --contributor-insights-action ENABLE
+$ sleep 300
+$ aws cloudwatch get-insight-rule-report \
+    --rule-name 'DynamoDBContributorInsights-PKC-Events' \
+    --start-time $(date -u -d '10 min ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --period 600 --max-contributor-count 3 \
+    --query 'Contributors[].[Keys[0],ApproximateAggregateValue]' --output text
+TENANT#acme   61204                                ← 100% of writes, one key
+</pre>
+<pre>
+❌ THE INSTINCT — raise capacity. Prove it does nothing:
+$ aws dynamodb update-table --table-name Events \
+    --provisioned-throughput ReadCapacityUnits=1000,WriteCapacityUnits=80000
+$ python3 hot.py 'TENANT#acme' 200000
+{'ok': 60918, 'throttled': 139082} 998/s
+   → identical. Double the capacity, double the bill, zero improvement.
+</pre>
+<pre>
+✅ SHARD THE KEY:
+$ cat &gt; sharded.py &lt;&lt;'PY'
+import boto3, uuid, time, random, concurrent.futures as cf, collections, sys
+d = boto3.client("dynamodb")
+BASE, N, SHARDS = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+res = collections.Counter()
+def w(i):
+    try:
+        d.put_item(TableName="Events",
+            Item={"PK":{"S":f"{BASE}#{random.randrange(SHARDS)}"},
+                  "SK":{"S":f"EVT#{time.time_ns()}#{uuid.uuid4()}"}})
+        return "ok"
+    except d.exceptions.ProvisionedThroughputExceededException:
+        return "throttled"
+t0=time.time()
+with cf.ThreadPoolExecutor(max_workers=300) as ex:
+    for r in ex.map(w, range(N)): res[r]+=1
+print(dict(res), f"{N/(time.time()-t0):.0f}/s")
+PY
+$ python3 sharded.py 'TENANT#acme' 200000 32
+{'ok': 200000} 21840/s                             ✅ zero throttles, 21.8× throughput
+</pre>
+<pre>
+AND THE READ SIDE — fan out across the shards, in parallel:
+$ cat &gt; readshards.py &lt;&lt;'PY'
+import boto3, concurrent.futures as cf, sys
+d = boto3.client("dynamodb")
+BASE, SHARDS = sys.argv[1], int(sys.argv[2])
+def q(s):
+    return d.query(TableName="Events",
+        KeyConditionExpression="PK = :p",
+        ExpressionAttributeValues={":p":{"S":f"{BASE}#{s}"}},
+        ScanIndexForward=False, Limit=20)["Items"]
+with cf.ThreadPoolExecutor(max_workers=SHARDS) as ex:
+    items = [i for r in ex.map(q, range(SHARDS)) for i in r]
+items.sort(key=lambda i: i["SK"]["S"], reverse=True)
+print(len(items), "merged;", "newest:", items[0]["SK"]["S"][:24])
+PY
+$ python3 readshards.py 'TENANT#acme' 32
+640 merged; newest: EVT#1755701842910238
+</pre>
+<table class="tbl">
+  <tr><th></th><th>1 partition key</th><th>32 shards</th></tr>
+  <tr><td>Write throughput</td><td>1,002/s</td><td><strong>21,840/s</strong></td></tr>
+  <tr><td>Throttled</td><td><strong>69%</strong></td><td><strong>0%</strong></td></tr>
+  <tr><td>Table utilisation</td><td>2.5%</td><td>55%</td></tr>
+  <tr><td>Read for "latest 20"</td><td>1 Query</td><td>32 parallel Queries, merged</td></tr>
+  <tr><td>Provisioned capacity needed</td><td>80,000 (useless)</td><td>40,000 (used)</td></tr>
+</table>
+<div class="note">🔑 <strong>Prefer a <em>calculated</em> shard to a random one where you can.</strong> If the
+   shard is derivable from data you already have at read time — <code>hash(order_id) % 32</code> — then reads
+   stay a single Query and you get the write distribution for free. Random suffixes are the fallback for
+   write-dominated workloads where reads are rare or already batched, because they force an N-way fan-out on
+   every read. And size N per tenant, stored as configuration, so a growing customer is a config change rather
+   than a migration.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Make a GSI throttle, and prove it takes the base table's
+       writes down with it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+A TABLE WITH PLENTY OF CAPACITY, AND AN INDEX WITHOUT:
+$ aws dynamodb update-table --table-name Orders \
+    --provisioned-throughput ReadCapacityUnits=500,WriteCapacityUnits=5000 \
+    --attribute-definitions AttributeName=PK,AttributeType=S AttributeName=SK,AttributeType=S \
+                            AttributeName=status,AttributeType=S \
+    --global-secondary-index-updates '[{"Create":{
+        "IndexName":"status-index",
+        "KeySchema":[{"AttributeName":"status","KeyType":"HASH"},
+                     {"AttributeName":"SK","KeyType":"RANGE"}],
+        "Projection":{"ProjectionType":"ALL"},
+        "ProvisionedThroughput":{"ReadCapacityUnits":100,"WriteCapacityUnits":50}}}]'
+                                                    ↑ table 5,000 WCU, index 50 WCU
+</pre>
+<pre>
+WRITE TO THE TABLE — well within the TABLE's capacity:
+$ python3 - &lt;&lt;'PY'
+import boto3, uuid, collections, concurrent.futures as cf, time
+d = boto3.client("dynamodb"); res = collections.Counter()
+def w(i):
+    try:
+        d.put_item(TableName="Orders", Item={
+            "PK":{"S":f"CUSTOMER#{i%1000}"},"SK":{"S":f"ORDER#{uuid.uuid4()}"},
+            "status":{"S":"PENDING"},"total":{"N":"42"}})
+        return "ok"
+    except Exception as e:
+        return type(e).__name__
+t0=time.time()
+with cf.ThreadPoolExecutor(max_workers=200) as ex:
+    for r in ex.map(w, range(50000)): res[r]+=1
+print(dict(res), f"{50000/(time.time()-t0):.0f}/s")
+PY
+{'ok': 3812, 'ProvisionedThroughputExceededException': 46188} 51/s
+   ⚠️ 92% of writes to the TABLE failed. The table has 5,000 WCU and used ~50.
+</pre>
+<pre>
+WHERE IS THE THROTTLING? Look at the INDEX dimension, not the table:
+$ for idx in "" "Name=GlobalSecondaryIndexName,Value=status-index"; do
+    printf '%-30s ' "${idx:-TABLE}"
+    aws cloudwatch get-metric-statistics --namespace AWS/DynamoDB \
+      --metric-name ThrottledRequests \
+      --dimensions Name=TableName,Value=Orders $idx \
+      --period 60 --statistics Sum --start-time $(date -u -d '5 min ago' +%FT%TZ) \
+      --end-time $(date -u +%FT%TZ) --query 'sum(Datapoints[].Sum)' --output text
+  done
+TABLE                          46188.0
+GlobalSecondaryIndexName=...   46188.0             ← the SAME throttles
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/DynamoDB \
+    --metric-name ConsumedWriteCapacityUnits --dimensions Name=TableName,Value=Orders \
+    --period 60 --statistics Sum ... --query 'max(Datapoints[].Sum)' --output text
+3060.0
+$ python3 -c "print(f'{3060/60:.0f} WCU/s of 5000 table = 1.0%; of 50 index = 102%')"
+51 WCU/s of 5000 table = 1.0%; of 50 index = 102%
+</pre>
+<p><strong>The base table is at 1% and rejecting 92% of writes.</strong> Every write carries
+   <code>status</code>, so it must also be written to <code>status-index</code>; the index cannot accept it, so
+   the write fails at the table. The index is a write-side dependency, not just a read-side convenience.</p>
+<pre>
+✅ FIX 1 — provision the GSI for the BASE TABLE's write rate:
+$ aws dynamodb update-table --table-name Orders \
+    --global-secondary-index-updates '[{"Update":{"IndexName":"status-index",
+        "ProvisionedThroughput":{"ReadCapacityUnits":100,"WriteCapacityUnits":5000}}}]'
+$ python3 - &lt;&lt;'PY'
+...same load...
+PY
+{'ok': 50000} 4180/s                               ✅
+</pre>
+<pre>
+⚠️ FIX 2 — BUT THE INDEX KEY IS ALSO WRONG. `status` has 5 distinct values:
+$ aws dynamodb scan --table-name Orders --projection-expression '#s' \
+    --expression-attribute-names '{"#s":"status"}' --max-items 5000 \
+    --query 'Items[].status.S' --output text | tr '\t' '\n' | sort | uniq -c
+   4812 PENDING
+    102 SHIPPED
+     54 DELIVERED
+     20 CANCELLED
+     12 REFUNDED
+   → 96% of index writes go to ONE index partition key. Even at 5,000 WCU the
+     index will throttle at ~1,000 WCU/s on the PENDING partition.
+
+✅ make it a SPARSE index over the rare states instead:
+   write `needsAttention = SK` only for CANCELLED/REFUNDED items; index that.
+   → the index holds 32 items instead of 5,000, and takes almost no write capacity.
+</pre>
+<table class="tbl">
+  <tr><th>Symptom</th><th>Real cause</th><th>Fix</th></tr>
+  <tr><td>Table writes throttled, table at 1%</td><td><strong>GSI under-provisioned</strong></td><td>Provision the GSI for the table's write rate</td></tr>
+  <tr><td>GSI still throttles at high capacity</td><td><strong>Low-cardinality index partition key</strong></td><td>A distributed key, or a sparse index</td></tr>
+  <tr><td>Writes slow after adding an index</td><td><code>Projection: ALL</code> on large items</td><td><code>INCLUDE</code> only what the query returns</td></tr>
+  <tr><td>Cost rose with no query change</td><td>An index nobody reads still costs every write</td><td>Delete unused indexes</td></tr>
+</table>
+<div class="note">⚠️ <strong>This is the DynamoDB failure that looks least like its cause.</strong> The alarm
+   fires on the table, the table has 99% headroom, and the culprit is an index someone added months ago for a
+   dashboard nobody opens. Always break <code>ThrottledRequests</code> down by the
+   <code>GlobalSecondaryIndexName</code> dimension before investigating anything else — and audit indexes
+   periodically, because an unused GSI is not merely wasted cost, it is a live availability risk.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Given a set of access patterns, produce a single-table
+       model and prove each pattern is one Query.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE ACCESS PATTERNS — written down FIRST, which is the whole method:
+  A1  get a customer's profile
+  A2  get a customer's 20 most recent orders
+  A3  get one order with all its line items
+  A4  get all orders in a given status, newest first          (admin)
+  A5  get a customer's saved addresses
+  A6  get all orders placed on a given day                    (ops)
+</pre>
+<pre>
+THE MODEL — one table, keys overloaded, GSIs for the inverted patterns:
+
+  PK                 SK                       GSI1PK          GSI1SK
+  ─────────────────  ───────────────────────  ──────────────  ────────────────────
+  CUSTOMER#42        PROFILE                  —               —
+  CUSTOMER#42        ADDRESS#home             —               —
+  CUSTOMER#42        ADDRESS#work             —               —
+  CUSTOMER#42        ORDER#2026-08-20#001     STATUS#SHIPPED  2026-08-20T13:04:21Z
+  CUSTOMER#42        ORDER#2026-08-19#004     STATUS#PENDING  2026-08-19T09:12:00Z
+  ORDER#001          ITEM#sku-9f2a            —               —
+  ORDER#001          ITEM#sku-7d2e            —               —
+  ORDER#001          META                     DAY#2026-08-20  2026-08-20T13:04:21Z
+</pre>
+<pre>
+A1 — customer profile:
+$ aws dynamodb get-item --table-name App \
+    --key '{"PK":{"S":"CUSTOMER#42"},"SK":{"S":"PROFILE"}}' \
+    --return-consumed-capacity TOTAL --query '[Item.name.S,ConsumedCapacity.CapacityUnits]' --output text
+Ada Lovelace   0.5
+
+A2 — 20 most recent orders (sort key ordering does the work):
+$ aws dynamodb query --table-name App \
+    --key-condition-expression 'PK = :c AND begins_with(SK, :p)' \
+    --expression-attribute-values '{":c":{"S":"CUSTOMER#42"},":p":{"S":"ORDER#"}}' \
+    --scan-index-forward false --limit 20 --return-consumed-capacity TOTAL \
+    --query '{n:Count,rcu:ConsumedCapacity.CapacityUnits}' --output json
+{ "n": 20, "rcu": 2.5 }
+
+A3 — one order and every line item, in ONE request:
+$ aws dynamodb query --table-name App \
+    --key-condition-expression 'PK = :o' \
+    --expression-attribute-values '{":o":{"S":"ORDER#001"}}' \
+    --return-consumed-capacity TOTAL \
+    --query '{n:Count,rcu:ConsumedCapacity.CapacityUnits}' --output json
+{ "n": 7, "rcu": 1.0 }                             ← META + 6 line items. One partition.
+</pre>
+<pre>
+A4 and A6 need DIFFERENT partition keys → one overloaded GSI serves both:
+$ aws dynamodb update-table --table-name App \
+    --attribute-definitions AttributeName=GSI1PK,AttributeType=S AttributeName=GSI1SK,AttributeType=S \
+    --global-secondary-index-updates '[{"Create":{"IndexName":"GSI1",
+        "KeySchema":[{"AttributeName":"GSI1PK","KeyType":"HASH"},
+                     {"AttributeName":"GSI1SK","KeyType":"RANGE"}],
+        "Projection":{"ProjectionType":"INCLUDE",
+                      "NonKeyAttributes":["PK","SK","total","customerId"]}}}]'
+
+A4 — orders by status, newest first:
+$ aws dynamodb query --table-name App --index-name GSI1 \
+    --key-condition-expression 'GSI1PK = :s' \
+    --expression-attribute-values '{":s":{"S":"STATUS#SHIPPED"}}' \
+    --scan-index-forward false --limit 50 --return-consumed-capacity TOTAL \
+    --query '{n:Count,scanned:ScannedCount,rcu:ConsumedCapacity.CapacityUnits}' --output json
+{ "n": 50, "scanned": 50, "rcu": 3.0 }
+
+A6 — orders placed on a day, same index, different key prefix:
+$ aws dynamodb query --table-name App --index-name GSI1 \
+    --key-condition-expression 'GSI1PK = :d' \
+    --expression-attribute-values '{":d":{"S":"DAY#2026-08-20"}}' \
+    --return-consumed-capacity TOTAL \
+    --query '{n:Count,scanned:ScannedCount,rcu:ConsumedCapacity.CapacityUnits}' --output json
+{ "n": 1204, "scanned": 1204, "rcu": 78.5 }
+   → ONE index, TWO unrelated access patterns, by overloading its partition key.
+</pre>
+<pre>
+A5 — addresses, same partition as the customer:
+$ aws dynamodb query --table-name App \
+    --key-condition-expression 'PK = :c AND begins_with(SK, :p)' \
+    --expression-attribute-values '{":c":{"S":"CUSTOMER#42"},":p":{"S":"ADDRESS#"}}' \
+    --return-consumed-capacity TOTAL --query '{n:Count,rcu:ConsumedCapacity.CapacityUnits}' --output json
+{ "n": 2, "rcu": 0.5 }
+</pre>
+<table class="tbl">
+  <tr><th>Pattern</th><th>Mechanism</th><th>Requests</th><th>RCU</th><th><code>ScannedCount</code> = <code>Count</code>?</th></tr>
+  <tr><td>A1 profile</td><td>GetItem</td><td>1</td><td>0.5</td><td>✅</td></tr>
+  <tr><td>A2 recent orders</td><td>Query, SK prefix, reversed</td><td>1</td><td>2.5</td><td>✅</td></tr>
+  <tr><td>A3 order + items</td><td>Query, one partition</td><td><strong>1</strong></td><td>1.0</td><td>✅</td></tr>
+  <tr><td>A4 by status</td><td>Query on GSI1</td><td>1</td><td>3.0</td><td>✅</td></tr>
+  <tr><td>A5 addresses</td><td>Query, SK prefix</td><td>1</td><td>0.5</td><td>✅</td></tr>
+  <tr><td>A6 by day</td><td>Query on GSI1 (overloaded)</td><td>1</td><td>78.5</td><td>✅</td></tr>
+</table>
+<pre>
+⚠️ THE HOT-PARTITION REVIEW, before shipping — check every key for skew:
+  CUSTOMER#&lt;id&gt;   → millions of values                       ✅ distributed
+  ORDER#&lt;id&gt;      → millions of values                       ✅ distributed
+  STATUS#PENDING  → ONE value, most of the writes            ⚠️ hot GSI partition
+  DAY#2026-08-20  → ONE value per day, ALL of today's writes ⚠️ hot GSI partition
+
+  → shard the GSI keys: STATUS#PENDING#&lt;0..9&gt;, DAY#2026-08-20#&lt;0..9&gt;
+    A4 and A6 become 10 parallel Queries; writes spread over 10 partitions.
+</pre>
+<div class="note">🔑 <strong>Every pattern is one Query and <code>ScannedCount</code> equals
+   <code>Count</code> everywhere — that is the test that the model is right.</strong> Note also the hot-partition
+   review at the end: the base table keys are naturally distributed, but <em>both</em> GSI keys concentrate all
+   of today's writes onto a single partition, which is exactly the failure from Exercise 3 one level down. Run
+   that review on every key, including index keys, before shipping — it is much cheaper than discovering it
+   under load.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Reproduce a lost update under concurrency, then eliminate
+       it with conditional writes and prove the fix.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws dynamodb put-item --table-name Inventory \
+    --item '{"PK":{"S":"SKU#9f2a"},"stock":{"N":"1000"},"version":{"N":"1"}}'
+
+❌ READ-MODIFY-WRITE, the way it is usually written:
+$ cat &gt; naive.py &lt;&lt;'PY'
+import boto3, concurrent.futures as cf
+d = boto3.client("dynamodb")
+def sell(_):
+    cur = int(d.get_item(TableName="Inventory", Key={"PK":{"S":"SKU#9f2a"}},
+                         ConsistentRead=True)["Item"]["stock"]["N"])
+    if cur <= 0: return "out"
+    d.put_item(TableName="Inventory",
+               Item={"PK":{"S":"SKU#9f2a"},"stock":{"N":str(cur-1)},"version":{"N":"1"}})
+    return "sold"
+with cf.ThreadPoolExecutor(max_workers=100) as ex:
+    sold = sum(1 for r in ex.map(sell, range(1000)) if r == "sold")
+final = int(d.get_item(TableName="Inventory", Key={"PK":{"S":"SKU#9f2a"}},
+                       ConsistentRead=True)["Item"]["stock"]["N"])
+print(f"sold={sold}  stock_now={final}  expected_stock={1000-sold}")
+PY
+$ python3 naive.py
+sold=1000  stock_now=947  expected_stock=0
+   ⚠️ 1,000 units sold. Stock says 947 remaining. 947 units sold twice.
+     Nothing errored. Nothing logged. Discovered at stock-take.
+</pre>
+<pre>
+✅ FIX 1 — ATOMIC UPDATE WITH A CONDITION. No read at all:
+$ cat &gt; atomic.py &lt;&lt;'PY'
+import boto3, concurrent.futures as cf
+d = boto3.client("dynamodb")
+def sell(_):
+    try:
+        d.update_item(TableName="Inventory", Key={"PK":{"S":"SKU#9f2a"}},
+            UpdateExpression="SET stock = stock - :one",
+            ConditionExpression="stock >= :one",
+            ExpressionAttributeValues={":one":{"N":"1"}})
+        return "sold"
+    except d.exceptions.ConditionalCheckFailedException:
+        return "out"
+with cf.ThreadPoolExecutor(max_workers=100) as ex:
+    r = [x for x in ex.map(sell, range(1500))]
+final = int(d.get_item(TableName="Inventory", Key={"PK":{"S":"SKU#9f2a"}},
+                       ConsistentRead=True)["Item"]["stock"]["N"])
+print(f"sold={r.count('sold')}  refused={r.count('out')}  stock_now={final}")
+PY
+$ aws dynamodb update-item --table-name Inventory --key '{"PK":{"S":"SKU#9f2a"}}' \
+    --update-expression 'SET stock = :s' --expression-attribute-values '{":s":{"N":"1000"}}'
+$ python3 atomic.py
+sold=1000  refused=500  stock_now=0                ✅ exactly 1,000 sold, never oversold
+</pre>
+<pre>
+✅ FIX 2 — OPTIMISTIC CONCURRENCY, when the update is not a simple arithmetic step:
+$ cat &gt; occ.py &lt;&lt;'PY'
+import boto3, concurrent.futures as cf, collections
+d = boto3.client("dynamodb"); stats = collections.Counter()
+def update_status(_):
+    for attempt in range(5):
+        it = d.get_item(TableName="Orders",
+              Key={"PK":{"S":"ORDER#001"},"SK":{"S":"META"}}, ConsistentRead=True)["Item"]
+        v = int(it["version"]["N"])
+        try:
+            d.update_item(TableName="Orders",
+                Key={"PK":{"S":"ORDER#001"},"SK":{"S":"META"}},
+                UpdateExpression="SET #s = :new, version = :v1",
+                ConditionExpression="version = :v0",
+                ExpressionAttributeNames={"#s":"status"},
+                ExpressionAttributeValues={":new":{"S":"SHIPPED"},
+                                           ":v0":{"N":str(v)}, ":v1":{"N":str(v+1)}})
+            stats[f"ok_attempt_{attempt+1}"] += 1
+            return
+        except d.exceptions.ConditionalCheckFailedException:
+            continue
+    stats["gave_up"] += 1
+with cf.ThreadPoolExecutor(max_workers=50) as ex:
+    list(ex.map(update_status, range(50)))
+print(dict(stats))
+PY
+$ python3 occ.py
+{'ok_attempt_1': 12, 'ok_attempt_2': 21, 'ok_attempt_3': 14, 'ok_attempt_4': 3}
+   → every update applied exactly once; contention resolved by retry, never by loss.
+</pre>
+<pre>
+✅ FIX 3 — A TRANSACTION, for an invariant spanning two items:
+$ aws dynamodb transact-write-items --transact-items '[
+    {"Update":{"TableName":"Inventory","Key":{"PK":{"S":"SKU#9f2a"}},
+      "UpdateExpression":"SET stock = stock - :one",
+      "ConditionExpression":"stock >= :one",
+      "ExpressionAttributeValues":{":one":{"N":"1"}}}},
+    {"Put":{"TableName":"Orders",
+      "Item":{"PK":{"S":"ORDER#9f2a-1"},"SK":{"S":"META"},"sku":{"S":"SKU#9f2a"}},
+      "ConditionExpression":"attribute_not_exists(PK)"}}]' \
+    --return-consumed-capacity TOTAL --query 'sum(ConsumedCapacity[].CapacityUnits)' --output text
+4.0                                                ← 2 items, DOUBLE capacity
+   → either both happen or neither does. Use only when one condition cannot cover it.
+</pre>
+<table class="tbl">
+  <tr><th>Technique</th><th>Prevents</th><th>Cost</th><th>Use for</th></tr>
+  <tr><td>Read-modify-write</td><td><strong>Nothing</strong></td><td>1 read + 1 write</td><td><strong>Never, under concurrency</strong></td></tr>
+  <tr><td><strong>Atomic <code>SET x = x - :n</code> + condition</strong></td><td>Lost updates, oversell</td><td><strong>1 write, no read</strong></td><td>Counters, stock, balances</td></tr>
+  <tr><td>Version + <code>ConditionExpression</code></td><td>Lost updates on complex changes</td><td>1 read + 1 write, plus retries</td><td>Arbitrary field updates</td></tr>
+  <tr><td><code>attribute_not_exists(PK)</code></td><td>Duplicate creation</td><td>1 write</td><td>Idempotent inserts</td></tr>
+  <tr><td>TransactWriteItems</td><td>Cross-item inconsistency</td><td><strong>2×</strong></td><td>Genuine multi-item invariants</td></tr>
+</table>
+<div class="note">🔑 <strong>The naive version cost nothing to run and was silently wrong 94.7% of the
+   time</strong> — no exception, no error metric, no log line, and it passes every single-threaded test. That is
+   the shape of the bug: it is invisible until reconciliation, and by then the money is gone. The atomic version
+   is also <em>cheaper</em>, because it needs no read at all — so correctness here costs less capacity than the
+   incorrect version, which is a rare and worth-remembering alignment.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li>DynamoDB is a <strong>partitioned, sorted table</strong>: the partition key chooses a shard, the sort key orders within it. Every capability and limit follows from that.</li>
+        <li><strong>Model from access patterns, not entities.</strong> Write the queries down first and derive keys that answer each with one <code>Query</code>; a Scan in the request path means the model is wrong.</li>
+        <li>Capacity: <strong>1 WCU = 1 KB write, 1 RCU = 4 KB strong read or 8 KB eventual</strong>, transactions double. Verify with <code>--return-consumed-capacity</code> rather than estimating.</li>
+        <li><code>ProjectionExpression</code> saves bandwidth, <strong>never capacity</strong> — the whole item is read regardless.</li>
+        <li>On-demand versus provisioned breaks even at <strong>~14% sustained utilisation</strong>; above it provisioned is up to 7× cheaper. Provisioned at the floor plus auto scaling is usually right.</li>
+        <li><strong>Per-partition limits are 1,000 WCU and 3,000 RCU</strong>, hard — so a table provisioned at 40,000 WCU throttled 69% of writes while consuming <strong>2.5%</strong>.</li>
+        <li>Raising capacity to fix a hot partition <strong>changes nothing</strong> and doubles the bill — proven. Fix the key.</li>
+        <li>Find hot keys with <strong>Contributor Insights</strong>, not guesswork; sharding took throughput from 1,002/s to <strong>21,840/s with zero throttles</strong>.</li>
+        <li>Prefer a <strong>calculated</strong> shard (derivable at read time, 1 Query) over a random one (N-way fan-out); store shard counts as config so growth is not a migration.</li>
+        <li><strong>Adaptive capacity smooths imperfect distribution but cannot exceed the per-partition ceiling</strong> — it is headroom, not permission.</li>
+        <li><strong><code>FilterExpression</code> is applied after the read</strong>: 482,104 items read and 60,263 RCU to return 12. A GSI made the same query <strong>1.5 RCU</strong>.</li>
+        <li><strong><code>ScannedCount</code> versus <code>Count</code></strong> is the fastest diagnostic in DynamoDB — a large ratio means you are paying for data you discard.</li>
+        <li>LSIs can <strong>only be created with the table</strong> and share its partition key; GSIs can be added any time, are eventually consistent, and have their own capacity.</li>
+        <li><strong>A throttled GSI throttles writes to the base table</strong> — measured 92% of writes rejected while the table sat at 1% utilisation. Provision GSIs for the base table's <em>write</em> rate.</li>
+        <li>A low-cardinality GSI partition key (like <code>status</code>) throttles at any capacity; use a <strong>sparse index</strong> over the rare values instead.</li>
+        <li>An index nobody reads still costs every write <strong>and can stop your writes</strong> — deleting unused GSIs is an availability improvement.</li>
+        <li>Project <code>INCLUDE</code> with exactly what the query returns; <code>ALL</code> doubles storage and write cost per index.</li>
+        <li><strong>Single-table design is for known access patterns at scale</strong>, not a default — and a wrong single-table model is far harder to change than a wrong set of tables.</li>
+        <li><strong>Read-modify-write loses updates silently</strong>: 1,000 sold, 947 still in stock, no error anywhere. Atomic <code>SET x = x - :n</code> with a condition is correct <em>and cheaper</em>, needing no read.</li>
+        <li>Use a version attribute plus <code>ConditionExpression</code> for complex updates, and transactions only for genuine multi-item invariants since they cost double.</li>
+        <li><strong>TTL deletes are free but up to 48 hours late</strong> — filter on expiry in the read path too, and store epoch <em>seconds</em> or items expire in the year 57000.</li>
+        <li><strong>Export to S3 consumes zero capacity</strong> — use it for analytics instead of a Scan that doubles the bill and competes with production.</li>
+        <li>Global tables resolve conflicts by <strong>last-writer-wins</strong>: concurrent writes to one item silently lose one. Partition writes by Region or design for it.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="rds-aurora.html">← RDS &amp; Aurora</a>
+      <a href="messaging.html">SQS, SNS, EventBridge &amp; Kinesis →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
