@@ -61,7 +61,7 @@ Also: the five v3 files orphaned by the nav split (`pods-deployments`, `services
 
 **🚧 IN PROGRESS: AWS v4 (track 17)** — `tutorials/aws/`, rebuilding 12 v3 lessons (~12KB) into
 **20 lessons at v4 depth** (56–75KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
-**7 of 20 done — §1 Foundations and §2 Networking COMPLETE:**
+**10 of 20 done — §1 Foundations, §2 Networking and §3 Compute COMPLETE:**
 
 *§1 Foundations ×4* — ✅ `index.html` (**the shared-responsibility line moves per service**; AZ *names*
 are randomised per account so cross-account placement must use **Zone IDs**; the `us-east-1` control-plane
@@ -118,10 +118,38 @@ on, NLB's is off+billable**; **backend keepalive must EXCEED the ALB idle timeou
 502s with no app log, and `headersTimeout` must exceed `keepAliveTimeout`; the 5xx decoder keyed on
 `target_status_code="-"` + `target_processing_time`; **CloudFront cache key 0.3% → 94.1%** by moving fields to
 the *origin request* policy, with over-collapsing named as the dangerous direction)
-**⏳ NEXT: §3 Compute — `ec2-compute.html` (v3 rewrite — EC2, EBS &amp; Auto Scaling)**, then
-`containers.html` and `lambda-serverless.html` (both v3 rewrites).
+*§3 Compute ×3* — ✅ `ec2-compute.html` (**a vCPU is a hyperthread** — 4.72× scaling vs Graviton's 7.90×, making
+a 15% price gap an **88% price/perf gap**; the two *silent* burstable failures — **T2 throttles to 20%** with p99
+178→**4,241 ms** while the graph looks idle, **T3 bills $884/mo of surplus** with no symptom; **gp2 IOPS tied to
+size** and the burst cliff measured **2,987→301**, while the *instance's* EBS baseline is the real ceiling; Nitro
+`/dev/nvme*` breaking fstab; **snapshots restore LAZILY** — 1,204 vs 11,890 IOPS, **an hour to reach baseline
+under load**, and FSR costs ~$547/mo per snapshot per AZ; **`HealthCheckType: EC2` never replaces a dead app** —
+capacity leaked 6→3 while desired still read 6 — and fixing it without a grace period gives an infinite boot
+loop; **target tracking oscillates when time-to-serve (252 s) exceeds the evaluation window (180 s)** — 4→19→5→17,
+fixed with `--default-instance-warmup` + warm pools, cutting p99 **and** instance-hours together; **CloudWatch has
+no memory metric**) ·
+✅ `containers.html` (**ECS/EKS are orchestrators, Fargate is a capacity provider** — "ECS or Fargate?" is a
+category error; **execution role = the agent, task role = your code**, proven from the container credential
+endpoint which serves *only* the task role; **`awsvpc` ENI density capped an m5.large at 2 tasks with 45% CPU
+idle** → 10 with trunking — **density is an addressing limit before a resource limit**; Fargate's **fixed
+CPU/memory menu** forcing wasted vCPU on memory-heavy work; **the utilisation crossover is ~61%**, and a cluster
+measured at **17% used made Fargate 55% cheaper**; IRSA `sub` pinning; **EKS access entries replaced `aws-auth`**
+— and the **node-group role must be recreated as `EC2_LINUX` before the one-way switch** or every node goes
+NotReady; ECR pull-through cache for the **Docker Hub per-IP limit that fails deploys while scaling out**;
+**exit 137 with NO OutOfMemoryError in the log = a JVM sized to the whole cgroup limit**) ·
+✅ `lambda-serverless.html` (**INIT runs once per environment, the handler once per invocation** — 412→**71 ms**
+warm, and the same reuse **leaks one user's state to the next**; **concurrency = rps × duration**, reserved
+concurrency is a **floor AND a ceiling** and **0 disables the function**; the shared account pool means **any
+function's bug is every function's outage** — 947 of 1,000 held by a thumbnailer; **async retries twice then
+silently drops** (~2,996 events/week lost); **one poison record blocks a shard for 24 h** with **IteratorAge
+growing LINEARLY** — `BisectBatchOnFunctionError` isolated it in 15 splits; **Lambda vs RDS is a structural
+mismatch** — 387 connections vs 90, and raising `max_connections` traded refusals for **8.4-second queries**;
+**API Gateway's 29 s wall returns 504 while the function completes and bills** — 47 customers charged twice,
+fixed **idempotency-first**; SnapStart's shared-snapshot uniqueness trap)
+**⏳ NEXT: §4 Data — `s3.html` (NEW)**, then `rds-aurora.html` (NEW), `dynamodb.html` (NEW),
+`messaging.html` (v3 rewrite).
 
-*Remaining sections:* §3 Compute ×3 (`ec2-compute`, `containers`, `lambda-serverless` — all v3 rewrites) · §4 Data ×4
+*Remaining sections:* §4 Data ×4
 (`s3` NEW, `rds-aurora` NEW, `dynamodb` NEW, `messaging` v3 rewrite) · §5 Operations ×3
 (`observability`, `iac` v3 rewrites, `security-ops` NEW) · §6 Architecture ×3 (`well-architected` v3
 rewrite, `resilience-dr` NEW, `scaling-patterns` NEW).
