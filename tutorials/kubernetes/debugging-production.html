@@ -3,138 +3,961 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Debugging Production Incidents — LearnHub</title>
+<title>Debugging Production Clusters — Kubernetes — LearnHub</title>
 <link rel="stylesheet" href="../../css/style.css">
 </head>
 <body>
 
 <header class="site-header">
   <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
-  <nav><a href="index.html">← Kubernetes Track</a><a href="quiz.html">Quizzes</a></nav>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
 </header>
 
 <div class="tutorial-layout">
   <aside class="sidebar" id="sidebar"></aside>
 
   <main class="content">
-    <h1>Debugging Production Incidents <span class="level-badge level-ultra">Advanced</span></h1>
-    <p>This is the lesson that separates senior engineers from certificate holders: when Pods won't start,
-       traffic 503s, or nodes go sideways, you need a systematic method and knowledge of the specific failure
-       signatures. Here are the commands, the common Pod statuses decoded, and the mental model for triaging
-       Kubernetes incidents fast.</p>
+    <h1>Debugging Production Clusters <span class="level-badge level-adv">Operating Clusters</span></h1>
+    <p><strong>What you'll master:</strong> a triage order that identifies the failing layer before you start
+       guessing; how to read every pod state as a pointer to a specific subsystem — <code>Pending</code> is the
+       scheduler, <code>ContainerCreating</code> is CNI or volumes, <code>Running 0/1</code> is readiness; the
+       fact that wastes more incident time than any other — <strong>Events expire after about an hour, so
+       <code>describe</code> on an old problem shows nothing at all</strong>; <code>kubectl debug</code> and
+       ephemeral containers, which are how you get a shell into a distroless pod that has none; a layered network
+       test that separates DNS from policy from endpoints in three commands; node-level triage with
+       <code>crictl</code> when the kubelet and the API disagree; and the cluster-wide symptoms — a failing
+       webhook, etcd latency, an event flood — that look like every application being broken at once.
+       Prerequisites: the whole track, particularly <a href="pods.html">Pods</a>,
+       <a href="services.html">Services</a>, <a href="resources.html">Requests &amp; Limits</a>.</p>
 
-    <h2>The Triage Toolkit</h2>
-    <pre>kubectl get pods -o wide            // status, restarts, node — the overview
-kubectl describe pod &lt;p&gt;            // EVENTS at the bottom — scheduling failures, probe fails, pulls
-kubectl logs &lt;p&gt;  [-p] [-c &lt;ctr&gt;]  // app logs; -p = PREVIOUS container (after a crash); -c = container
-kubectl get events --sort-by=.lastTimestamp   // cluster-wide recent events
-kubectl top pod / kubectl top node  // live resource usage (needs metrics-server)
-kubectl exec -it &lt;p&gt; -- sh          // shell into a running container
-kubectl debug &lt;p&gt; -it --image=busybox --target=&lt;ctr&gt;   // ephemeral debug container (distroless Pods)
-kubectl get pod &lt;p&gt; -o yaml         // full spec/status (conditions, container states)</pre>
-    <div class="note">🔬 <strong>describe first, then logs.</strong> <code>kubectl describe pod</code> shows
-      the Events — the single richest source for WHY a Pod won't run (can't schedule, image pull failed,
-      probe failing, OOMKilled). If the container started but crashes, <code>kubectl logs -p</code> (previous
-      instance) shows what it printed before dying. This two-step resolves the majority of Pod incidents.</p></div>
+    <h2>Part 1 — Triage Order</h2>
 
-    <h2>Decoding Pod Statuses (the signatures)</h2>
+<pre>
+  ① WHAT LAYER?           is one pod broken, one service, one node, or everything?
+  ② EVENTS FIRST          kubectl get events --sort-by=.lastTimestamp   ← THEY EXPIRE
+  ③ STATUS, NOT SPEC      .status.conditions, containerStatuses, lastState
+  ④ LOGS                  --previous for a restarted container
+  ⑤ INSIDE                exec, or an ephemeral container
+  ⑥ THE NODE              conditions, kubelet, crictl
+  ⑦ THE CONTROL PLANE     apiserver latency, webhooks, etcd
+</pre>
+
     <table class="tbl">
-      <tr><th>Status</th><th>Meaning</th><th>Where to look / fix</th></tr>
-      <tr><td><strong>Pending</strong></td><td>Not scheduled onto a node</td><td>describe events: insufficient CPU/mem, taints, affinity, no PV — adjust requests/nodes/tolerations</td></tr>
-      <tr><td><strong>ImagePullBackOff / ErrImagePull</strong></td><td>Can't pull the image</td><td>Bad tag/name, private registry auth (imagePullSecrets), registry down</td></tr>
-      <tr><td><strong>CrashLoopBackOff</strong></td><td>Container starts then crashes repeatedly</td><td>logs -p: app error, bad config/env, failing liveness, missing dependency</td></tr>
-      <tr><td><strong>OOMKilled</strong> (exit 137)</td><td>Exceeded memory limit</td><td>Raise memory limit or fix the leak (probes/resources lesson)</td></tr>
-      <tr><td><strong>CreateContainerConfigError</strong></td><td>Missing ConfigMap/Secret referenced</td><td>Create the referenced object / fix the name</td></tr>
-      <tr><td><strong>Init:Error / Init:CrashLoop</strong></td><td>An init container is failing</td><td>logs -c &lt;init&gt;: migration/dependency-wait failing</td></tr>
-      <tr><td><strong>Terminating</strong> (stuck)</td><td>Won't finish terminating</td><td>Finalizers, long graceful shutdown, or node gone</td></tr>
+      <tr><th>Symptom scope</th><th>Start at</th></tr>
+      <tr><td>One pod</td><td><code>describe pod</code> → events → logs</td></tr>
+      <tr><td>Every pod of one workload</td><td>The image, the config, the probe</td></tr>
+      <tr><td>Every pod on one node</td><td><strong>The node</strong> — conditions, kubelet, disk</td></tr>
+      <tr><td>One service unreachable</td><td>EndpointSlices → DNS → NetworkPolicy</td></tr>
+      <tr><td>Everything, all at once</td><td><strong>Control plane</strong> — webhooks, etcd, DNS</td></tr>
+      <tr><td>Nothing can be created</td><td>An admission webhook, or quota</td></tr>
     </table>
 
-    <h2>"The Service Returns 503 / No Endpoints"</h2>
-    <pre>kubectl get endpoints &lt;svc&gt;      // EMPTY? → the Service matches no Ready Pods
-// Checklist:
-//   - Service selector matches the Pod labels? (typo = no endpoints)
-//   - Are the Pods READY? (readiness probe failing → removed from endpoints)
-//   - Right targetPort (the container's actual port)?
-//   - NetworkPolicy blocking the traffic? (rbac-network lesson)
-//   - Ingress: is the Ingress Controller running and routing to this Service?
-// "503 with empty endpoints" is almost always a selector mismatch or failing readiness probe.</pre>
+    <div class="note">⚠️ <strong>Events expire — by default after one hour.</strong>
+       <code>kubectl describe pod</code> on a pod that failed this morning shows
+       <code>Events: &lt;none&gt;</code>, which reads as "no information" and actually means "the information was
+       deleted". This is the single biggest time-waster in Kubernetes debugging, and the fix is to ship events to
+       your logging pipeline so they outlive the incident.</div>
 
-    <h2>A Systematic Incident Method</h2>
-    <pre>1. SCOPE it: one Pod? one Service? one node? whole cluster? (kubectl get pods -A -o wide, get nodes)
-2. WHAT CHANGED: recent deploy/config? (kubectl rollout history; Git/GitOps log) → consider rollback.
-3. READ THE SIGNALS: describe (events) → logs (-p) → metrics (top) → events (cluster).
-4. FORM A HYPOTHESIS from the status signature (Pending vs CrashLoop vs OOM vs 503).
-5. MITIGATE FAST: rollback the bad release / scale / cordon+drain a bad node BEFORE deep root-causing.
-6. ROOT-CAUSE after stability is restored; write the postmortem.</pre>
+<pre>
+$ kubectl get events --sort-by=.lastTimestamp -A | tail -20
+$ kubectl get events --field-selector involvedObject.name=api-x8k2p,type=Warning
+$ kubectl get events -w                      ← live, during a reproduction
+$ kubectl get events -A -o json | jq -r '.items[] |
+    "\(.lastTimestamp) \(.type) \(.reason) \(.involvedObject.kind)/\(.involvedObject.name): \(.message)"' \
+  | sort | tail -30
+</pre>
 
-    <h2>Node & Cluster-Level Issues</h2>
-    <pre>kubectl get nodes                        // NotReady? → kubelet/network/disk issue on that node
-kubectl describe node &lt;n&gt;                // conditions: MemoryPressure, DiskPressure, PIDPressure
-kubectl cordon &lt;n&gt;                       // stop scheduling new Pods there
-kubectl drain &lt;n&gt; --ignore-daemonsets    // evict Pods to safely take a node out (maintenance)
-// A NotReady node's NoExecute taint evicts Pods (scheduling lesson) → they reschedule elsewhere.</pre>
+    <h2>Part 2 — Every Pod State Points Somewhere</h2>
+
+    <table class="tbl">
+      <tr><th>State</th><th>Layer</th><th>First command</th></tr>
+      <tr><td><code>Pending</code></td><td><strong>Scheduler</strong></td><td><code>describe pod</code> → <code>FailedScheduling</code> message</td></tr>
+      <tr><td><code>ContainerCreating</code></td><td>CNI, volumes, image pull</td><td><code>describe pod</code> events</td></tr>
+      <tr><td><code>ImagePullBackOff</code></td><td>Registry or credentials</td><td>The image reference; <code>imagePullSecrets</code></td></tr>
+      <tr><td><code>CrashLoopBackOff</code></td><td>The application</td><td><strong><code>logs --previous</code></strong></td></tr>
+      <tr><td><code>Running</code> with <code>0/1</code></td><td><strong>Readiness probe</strong></td><td><code>describe</code> → probe events</td></tr>
+      <tr><td><code>Init:0/2</code></td><td>An init container</td><td><code>logs -c &lt;init-name&gt;</code></td></tr>
+      <tr><td><code>Terminating</code> (stuck)</td><td>preStop, finalizers, or a dead node</td><td><code>.metadata.finalizers</code>, node status</td></tr>
+      <tr><td><code>Evicted</code></td><td><strong>The node ran short</strong></td><td><code>.status.message</code>, node conditions</td></tr>
+      <tr><td><code>OOMKilled</code></td><td>The container's own limit</td><td><code>lastState.terminated</code></td></tr>
+      <tr><td><code>Completed</code></td><td>Normal for Jobs</td><td>—</td></tr>
+      <tr><td><code>Error</code></td><td>Non-zero exit, not yet backing off</td><td>Exit code + logs</td></tr>
+      <tr><td><code>Unknown</code></td><td>The node stopped reporting</td><td>Node, not pod</td></tr>
+    </table>
+
+<pre>
+$ kubectl get pod api -o jsonpath='{range .status.containerStatuses[*]}
+ready={.ready} restarts={.restartCount}
+state={.state}
+lastState={.lastState}{"\n"}{end}' | head -6
+ready=false restarts=7
+state={"waiting":{"reason":"CrashLoopBackOff","message":"back-off 5m0s restarting..."}}
+lastState={"terminated":{"exitCode":137,"reason":"OOMKilled","finishedAt":"..."}}
+        ↑ THE ANSWER: it is being OOM-killed, not "crash-looping" as a cause
+</pre>
+
+    <table class="tbl">
+      <tr><th>Exit code</th><th>Meaning</th></tr>
+      <tr><td>0</td><td>Clean exit — with <code>restartPolicy: Always</code>, still restarted</td></tr>
+      <tr><td>1 / 2</td><td>Application error</td></tr>
+      <tr><td><strong>137</strong></td><td>SIGKILL — OOM if <code>reason: OOMKilled</code>, otherwise a stop timeout</td></tr>
+      <tr><td>143</td><td>SIGTERM — a clean shutdown</td></tr>
+      <tr><td>139</td><td>Segfault</td></tr>
+      <tr><td>126 / 127</td><td>Not executable / not found — see <a href="../docker/debugging.html">Docker: Debugging</a></td></tr>
+    </table>
+
+    <h2>Part 3 — Getting Inside, Including Distroless</h2>
+
+<pre>
+$ kubectl logs api --previous                     ← the container that DIED
+$ kubectl logs api --all-containers --timestamps
+$ kubectl logs -l app=api --max-log-requests=20 --tail=50    ← across replicas
+$ kubectl exec -it api -- sh                      ← needs a shell in the image
+
+$ kubectl exec -it api -- sh
+OCI runtime exec failed: exec: "sh": executable file not found in $PATH
+                                                  ← distroless: there is no shell
+</pre>
+
+<pre>
+EPHEMERAL CONTAINERS — a debug container in the SAME pod, sharing its namespaces:
+
+$ kubectl debug -it api --image=nicolaka/netshoot --target=api
+Defaulting debug container name to debugger-x8k2p.
+~ # ps aux                       ← --target shares the PID namespace
+PID   USER     COMMAND
+1     1000     /server
+~ # ls /proc/1/root/app          ← the target's FILESYSTEM, via /proc
+config.yaml  server
+~ # cat /proc/1/environ | tr '\0' '\n' | grep -v TOKEN
+~ # ss -ltnp                     ← its sockets: the same network namespace
+~ # curl -s localhost:8080/healthz
+</pre>
+
+    <table class="tbl">
+      <tr><th>Command</th><th>Gives you</th><th>Use when</th></tr>
+      <tr><td><code>kubectl debug -it POD --image=... --target=C</code></td><td>A container inside the running pod</td><td><strong>Distroless, or no tools</strong></td></tr>
+      <tr><td><code>kubectl debug POD --copy-to=X --set-image=*=busybox</code></td><td>A copy of the pod with a different image</td><td>The container will not start at all</td></tr>
+      <tr><td><code>kubectl debug POD --copy-to=X --share-processes</code></td><td>A copy with a shared PID namespace</td><td>Inspecting another container's processes</td></tr>
+      <tr><td><code>kubectl debug node/NODE -it --image=busybox</code></td><td>A pod on the node with its filesystem at <code>/host</code></td><td><strong>Node-level triage</strong></td></tr>
+      <tr><td><code>kubectl cp</code></td><td>Files in or out</td><td>Heap dumps, profiles</td></tr>
+      <tr><td><code>kubectl port-forward</code></td><td>A local tunnel to the pod</td><td>Debug endpoints, profilers</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Ephemeral containers cannot be removed.</strong> They persist for the pod's
+       lifetime and appear in <code>describe</code> output, so a debugged pod is permanently marked. That is
+       usually acceptable — but on a pod you intend to keep, prefer
+       <code>--copy-to</code>, which leaves the original untouched and gives you something you can delete.</div>
+
+    <h2>Part 4 — Network Triage in Layers</h2>
+
+<pre>
+  test in this order; each step eliminates a layer
+
+  ① pod → pod by IP             works? the CNI is fine
+  ② DNS resolution              works? CoreDNS and search paths are fine
+  ③ pod → Service ClusterIP     works? endpoints and kube-proxy are fine
+  ④ external → Ingress          works? the controller and its rules are fine
+</pre>
+
+<pre>
+$ kubectl debug -it probe --image=nicolaka/netshoot -- bash
+# ① raw connectivity
+nc -zv 10.244.2.4 8080
+# ② DNS
+getent hosts api.shop            # NXDOMAIN → name/namespace; timeout → policy/CoreDNS
+dig +short api.shop.svc.cluster.local
+# ③ the Service
+curl -m3 -o /dev/null -w '%{http_code}\n' http://api.shop:80/
+# ④ from outside
+curl -m3 -H 'Host: shop.example.com' http://$INGRESS_IP/
+</pre>
+
+    <table class="tbl">
+      <tr><th>Result</th><th>Diagnosis</th><th>Next</th></tr>
+      <tr><td>① fails</td><td>CNI, or NetworkPolicy</td><td><a href="network-policy.html">Policies</a>; CNI pods</td></tr>
+      <tr><td>① works, ② NXDOMAIN</td><td>Wrong name or namespace</td><td><a href="dns-discovery.html">Search paths</a></td></tr>
+      <tr><td>① works, ② times out</td><td><strong>Policy blocking port 53</strong>, or CoreDNS down</td><td>Egress rules; CoreDNS endpoints</td></tr>
+      <tr><td>②   works, ③ fails</td><td><strong>Zero endpoints</strong>, or wrong <code>targetPort</code></td><td><code>get endpointslices</code></td></tr>
+      <tr><td>③ works, ④ 503</td><td>The ingress sees no endpoints</td><td>Ingress class, backend service name</td></tr>
+      <tr><td>③ works, ④ 502</td><td>Backend reached, refused</td><td>Port, protocol — <a href="ingress-gateway.html">Ingress</a></td></tr>
+    </table>
+
+    <h2>Part 5 — When It Is the Node</h2>
+
+<pre>
+$ kubectl get nodes -o wide
+$ kubectl describe node worker-2 | grep -A8 Conditions
+  Type             Status  Reason
+  MemoryPressure   True    KubeletHasInsufficientMemory        ← evictions incoming
+  DiskPressure     False
+  PIDPressure      False
+  Ready            True
+
+$ kubectl describe node worker-2 | grep -A6 'Allocated resources'
+  cpu     3900m (97%)      ← booked, not used — see Scheduling
+  memory  6.8Gi (89%)
+
+$ kubectl debug node/worker-2 -it --image=busybox
+# chroot /host
+# journalctl -u kubelet --since '10 min ago' | tail -20
+# df -h /var/lib/kubelet /var/lib/containerd
+# crictl ps -a | head
+# crictl logs &lt;container-id&gt;
+</pre>
+
+    <table class="tbl">
+      <tr><th>Node symptom</th><th>Cause</th><th>Check</th></tr>
+      <tr><td><code>MemoryPressure</code></td><td>Overcommitted requests, or a leak</td><td>Evicted pods; <a href="resources.html">requests vs usage</a></td></tr>
+      <tr><td><code>DiskPressure</code></td><td>Images, logs, or <code>emptyDir</code></td><td><code>df</code>, <code>crictl imagefsinfo</code></td></tr>
+      <tr><td><code>PIDPressure</code></td><td>A fork or thread leak</td><td><code>pids.current</code> per pod</td></tr>
+      <tr><td><code>NotReady</code></td><td>Kubelet or CNI down</td><td><code>journalctl -u kubelet</code></td></tr>
+      <tr><td>Pods stuck <code>ContainerCreating</code></td><td>CNI failure, or volume attach</td><td>CNI pod logs; <code>describe pod</code></td></tr>
+      <tr><td>API and reality disagree</td><td>Kubelet cache or runtime issue</td><td><strong><code>crictl ps</code></strong> — ground truth</td></tr>
+    </table>
+
+    <h2>Part 6 — "Everything Is Broken"</h2>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Likely cause</th><th>Confirm with</th></tr>
+      <tr><td>Every write fails, reads work</td><td><strong>A failing admission webhook</strong></td><td><code>kubectl get validatingwebhookconfigurations</code></td></tr>
+      <tr><td>Everything is slow</td><td>etcd latency, or apiserver saturation</td><td><code>apiserver_request_duration_seconds</code>, etcd fsync</td></tr>
+      <tr><td>Nothing schedules</td><td>Scheduler down, or every node tainted</td><td>Scheduler pod; node taints</td></tr>
+      <tr><td>Name resolution fails cluster-wide</td><td>CoreDNS, or an egress policy</td><td>CoreDNS endpoints; <a href="dns-discovery.html">DNS</a></td></tr>
+      <tr><td>Deploys hang, running pods fine</td><td>Control plane unavailable</td><td><a href="index.html">Blast radius</a></td></tr>
+      <tr><td>etcd is full</td><td><strong>Event churn</strong>, or too many objects</td><td><code>etcd_mvcc_db_total_size_in_bytes</code></td></tr>
+    </table>
+
+<pre>
+$ kubectl get --raw='/readyz?verbose' | grep -v ok$
+[+]etcd ok
+[-]poststarthook/rbac/bootstrap-roles failed: not finished
+$ kubectl get --raw /metrics | grep 'apiserver_request_duration_seconds_bucket{.*verb="LIST".*le="1"' | head -2
+$ kubectl get events -A --field-selector type=Warning -o json \
+    | jq -r '.items[] | .reason' | sort | uniq -c | sort -rn | head -5
+   4821 FailedCreate                 ← an event FLOOD is itself a diagnosis
+    193 Unhealthy
+     47 FailedScheduling
+</pre>
+
+    <div class="note">🔑 <strong>A sudden event flood is a symptom worth alerting on.</strong> Thousands of
+       identical warnings mean a controller is retrying something that will never succeed — and because Events
+       live in etcd, a flood also consumes the database, which can turn one broken workload into cluster-wide
+       slowness. Counting events by reason is often faster than reading any of them.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Debugging by restarting things, reading <code>spec</code> instead of <code>status</code>, and
+         reaching for logs before events.</strong> A pod is crash-looping, so someone deletes it — which destroys
+         the evidence and the <code>--previous</code> logs along with it, and the replacement crash-loops
+         identically. <code>kubectl describe</code> shows <code>Events: &lt;none&gt;</code> because they expired an
+         hour ago, and that is read as "nothing wrong here" rather than "the record is gone". The real cause was
+         <code>lastState.terminated.reason: OOMKilled</code>, visible in the status the whole time, but everyone
+         is reading the manifest instead. A service is unreachable, so three people simultaneously check DNS, the
+         ingress and the application logs, and nobody checks the EndpointSlice — which has been empty since a
+         readiness probe started failing. Meanwhile every write in the cluster is failing after a ten-second
+         timeout because a webhook's Service was deleted, and each team debugs their own application in
+         isolation.</p>
+      <p>✅ <strong>Establish the layer first, read events before logs, and read status before spec.</strong> Ask
+         whether one pod, one workload, one node, or everything is affected — that single question eliminates most
+         of the search space before any command is run. Then get the events, sorted by timestamp and
+         <strong>early</strong>, because they expire in about an hour; ship them to your logging pipeline so they
+         outlive the incident. Read <code>status.containerStatuses[].lastState</code>, which distinguishes
+         <code>OOMKilled</code> from a plain crash and points at limits rather than code. Never delete a broken
+         pod before capturing <code>logs --previous</code> and <code>describe</code> — the replacement will fail
+         the same way and you will have destroyed the evidence. For unreachable services, test in layers: pod IP,
+         then DNS, then ClusterIP, then ingress, each step eliminating one subsystem. When the symptom is
+         "everything at once", stop debugging applications and check webhooks, etcd and CoreDNS — a
+         cluster-wide cause never looks like a cluster-wide cause from inside a single namespace.</p>
+    </div>
 
     <h2>Common Mistakes</h2>
+
     <table class="tbl">
-      <tr><th>Mistake</th><th>Consequence</th><th>Better</th></tr>
-      <tr><td>Jumping to logs before describe</td><td>Miss scheduling/pull/probe events</td><td>describe (events) first, then logs</td></tr>
-      <tr><td>Forgetting logs -p after a crash</td><td>See only the restarted container</td><td>-p shows the crashed instance's output</td></tr>
-      <tr><td>Root-causing before mitigating</td><td>Prolonged outage</td><td>Rollback/scale/cordon first, investigate after</td></tr>
-      <tr><td>Ignoring recent changes</td><td>Chasing ghosts</td><td>Check what deployed/changed; consider revert</td></tr>
-      <tr><td>Not checking endpoints for 503s</td><td>Wrong theories</td><td>get endpoints → selector/readiness</td></tr>
-      <tr><td>No metrics-server</td><td>Blind to resource pressure</td><td>Install it; kubectl top</td></tr>
+      <tr><th>Mistake</th><th>Why it is wrong</th><th>What to do instead</th></tr>
+      <tr><td>Deleting the broken pod first</td><td>Destroys evidence and <code>--previous</code> logs</td><td>Capture, then delete</td></tr>
+      <tr><td>Reading <code>Events: &lt;none&gt;</code> as "fine"</td><td><strong>They expire after ~1 hour</strong></td><td>Ship events to logging</td></tr>
+      <tr><td><code>kubectl logs</code> on a CrashLoopBackOff pod</td><td>The current container has not started</td><td><code>--previous</code></td></tr>
+      <tr><td>Reading <code>spec</code> to diagnose</td><td>Controllers report reality in <code>status</code></td><td><code>status.conditions</code>, <code>lastState</code></td></tr>
+      <tr><td>Treating <code>CrashLoopBackOff</code> as a cause</td><td>It is a restart <em>delay</em></td><td>Exit code + previous logs</td></tr>
+      <tr><td>Assuming exit 137 is always OOM</td><td>Also a stop timeout</td><td>Check <code>reason: OOMKilled</code></td></tr>
+      <tr><td>Debugging a Service without endpoints</td><td>Half the causes are eliminated in one command</td><td><code>get endpointslices</code> first</td></tr>
+      <tr><td>Skipping the layer question</td><td>Everyone debugs their own namespace during a cluster outage</td><td>One pod / one node / everything?</td></tr>
+      <tr><td>Trusting <code>kubectl get pods</code> over the node</td><td>The kubelet can disagree with the API</td><td><code>crictl ps</code> on the node</td></tr>
+      <tr><td>Not using ephemeral containers</td><td>Distroless images have no shell</td><td><code>kubectl debug --target</code></td></tr>
+      <tr><td>Attaching instead of exec'ing</td><td>Ctrl-C signals PID 1 and kills the container</td><td><code>kubectl exec</code></td></tr>
+      <tr><td>Ignoring an event flood</td><td>It fills etcd and is itself a diagnosis</td><td>Count events by reason</td></tr>
+      <tr><td>Restarting the control plane blindly</td><td>Usually a webhook or etcd, not the components</td><td><code>/readyz?verbose</code></td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1: A Pod is stuck in CrashLoopBackOff. How do you debug it?</summary>
-      <p>CrashLoopBackOff means the container starts and then exits/crashes repeatedly, so Kubernetes backs
-         off between restart attempts. I first run kubectl describe pod to read the Events and the container's
-         last state (including the exit code and reason — e.g., OOMKilled/137 points to a memory limit). Then
-         kubectl logs -p (the previous, crashed instance) to see what the app printed before dying — the most
-         common causes are an application error, a missing or wrong config/env value or referenced
-         ConfigMap/Secret, an unreachable dependency at startup, or a failing liveness probe restarting a
-         process that's actually fine. If it's an init container, I check its logs with -c. I correlate with
-         what recently changed (a new image or config) and, if a deploy caused it, roll back to restore
-         service while investigating. The fix follows the signature: raise memory or fix a leak for OOM,
-         correct config/secrets for config errors, fix the dependency or move its check into readiness for
-         probe-induced loops.</p></details>
-    <details class="solution"><summary>Q2: A Service returns 503 / has no endpoints. Walk through it.</summary>
-      <p>An empty endpoints list (kubectl get endpoints &lt;svc&gt;) means the Service isn't backed by any Ready
-         Pods, and that's almost always one of two things. First, a selector mismatch: the Service's selector
-         labels don't match the Pods' labels (a typo or a changed label), so it selects nothing — I compare
-         the Service selector to the Pod labels. Second, the Pods aren't Ready: a failing readiness probe
-         removes Pods from the endpoints, so I check the Pods' readiness with describe/logs and fix the probe
-         or the underlying condition it's detecting. I also verify the Service's targetPort matches the
-         container's actual listening port, that the app binds to 0.0.0.0, and that no NetworkPolicy is
-         blocking the traffic. If the 503 comes through an Ingress, I confirm the Ingress Controller is
-         running and its rules point to the right Service and port. Systematically: endpoints → selector →
-         readiness → port → network policy → ingress.</p></details>
-    <details class="solution"><summary>Q3: Describe your systematic approach to a Kubernetes production incident.</summary>
-      <p>I start by scoping the blast radius — is it one Pod, one Service, one node, or cluster-wide? — using
-         kubectl get pods -A -o wide and get nodes, because that shapes everything. Next I ask what changed:
-         recent deploys or config changes are the most likely trigger, so I check rollout history and the
-         Git/GitOps log; if a recent release correlates, I'm ready to roll back. Then I read the signals in
-         order: kubectl describe (Events) for scheduling/pull/probe problems, kubectl logs -p for crash
-         output, kubectl top and cluster events for resource pressure. From the Pod status signature
-         (Pending, ImagePullBackOff, CrashLoopBackOff, OOMKilled, 503/empty-endpoints) I form a hypothesis.
-         Crucially, I mitigate before deep root-causing — roll back the bad release, scale out, or cordon and
-         drain a bad node to restore service quickly — and only after stability is restored do I root-cause
-         thoroughly and write a postmortem. The discipline is: scope, identify the change, read the signals,
-         mitigate fast, then investigate.</p></details>
 
-    <div class="exercise"><strong>🏋️ Practice:</strong> deliberately break things and diagnose each: a bad image tag (ImagePullBackOff), a crashing command (CrashLoopBackOff — read logs -p), a too-low memory limit (OOMKilled/137), a missing ConfigMap (CreateContainerConfigError), a mismatched Service selector (empty endpoints/503), a failing readiness probe (removed from endpoints), and a Pod that can't schedule (Pending — describe events). Practice cordon/drain on a node and a rollout undo as a mitigation.</div>
+    <details class="solution"><summary><strong>Beginner:</strong> A pod is in <code>CrashLoopBackOff</code>. Walk through debugging it.</summary>
+      <p><strong><code>CrashLoopBackOff</code> is a restart delay, not a cause — the container started, exited, and
+         Kubernetes is waiting before trying again.</strong></p>
+<pre>
+$ kubectl logs api
+Error from server (BadRequest): container "api" in pod "api" is waiting to start:
+CrashLoopBackOff                       ← the CURRENT container has not started
+$ kubectl logs api --previous          ← the one that DIED
+Error: connect ECONNREFUSED 10.96.140.22:5432
+$ kubectl get pod api -o jsonpath='{.status.containerStatuses[0].lastState.terminated}' | jq -c
+{"exitCode":1,"reason":"Error","finishedAt":"..."}
+$ kubectl describe pod api | tail -5    ← events, if they have not expired
+</pre>
+      <table class="tbl">
+        <tr><th><code>lastState</code></th><th>Cause</th></tr>
+        <tr><td><code>reason: OOMKilled</code>, exit 137</td><td>Memory limit — <a href="resources.html">limits</a></td></tr>
+        <tr><td>exit 1/2</td><td>Application error — the previous logs have it</td></tr>
+        <tr><td>exit 127</td><td>Command not found</td></tr>
+        <tr><td>exit 0 with <code>restartPolicy: Always</code></td><td>A process that exits normally in a Deployment</td></tr>
+      </table>
+      <p><strong>The mistake to avoid</strong> is deleting the pod to "try again". That destroys the
+         <code>--previous</code> logs, and the replacement fails identically. Capture first.</p>
+    </details>
 
-    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li>describe (Events) first, then logs -p (previous instance for crashes); top/events/exec/debug round out the toolkit.</li>
-      <li>Learn the status signatures: Pending (scheduling), ImagePullBackOff (image/auth), CrashLoopBackOff (app/config/probe), OOMKilled/137 (memory).</li>
-      <li>503 with empty endpoints ≈ selector mismatch or failing readiness probe — check kubectl get endpoints, then port/policy/ingress.</li>
-      <li>Method: scope → what changed → read signals → hypothesize from the signature → MITIGATE fast (rollback/scale/cordon) → root-cause after.</li>
-      <li>Node NotReady: check conditions (Memory/Disk/PIDPressure); cordon + drain for maintenance; NoExecute taints reschedule Pods.</li>
-    </ul></div>
+    <details class="solution"><summary><strong>Beginner:</strong> <code>kubectl describe pod</code> shows <code>Events: &lt;none&gt;</code>. What does that mean?</summary>
+      <p><strong>Almost always that the events expired, not that nothing happened.</strong> Events have a TTL —
+         one hour by default — and are deleted by the API server afterwards.</p>
+<pre>
+$ kubectl describe pod api | tail -2
+Events:  &lt;none&gt;                        ← the pod failed three hours ago
+$ kubectl get pod api -o jsonpath='{.status.containerStatuses[0].lastState}' | jq -c
+{"terminated":{"exitCode":137,"reason":"OOMKilled","finishedAt":"2026-08-19T09:14:22Z"}}
+                                       ← STATUS persists; events do not
+</pre>
+      <table class="tbl">
+        <tr><th>Source</th><th>Survives?</th></tr>
+        <tr><td>Events</td><td><strong>❌ ~1 hour</strong></td></tr>
+        <tr><td><code>status.lastState</code></td><td>✅ While the pod exists</td></tr>
+        <tr><td><code>restartCount</code></td><td>✅</td></tr>
+        <tr><td>Container logs</td><td>Until the pod is deleted (or rotated)</td></tr>
+        <tr><td>Shipped events / metrics</td><td>✅ As long as you retain them</td></tr>
+      </table>
+      <p><strong>The fix is architectural:</strong> ship events to your logging pipeline (an events exporter is a
+         small DaemonSet or Deployment). Otherwise every post-incident investigation starts by discovering that
+         the most useful record was deleted while people were still on the call.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A Service is unreachable. What is your test order?</summary>
+      <p><strong>Layer by layer, so each test eliminates a subsystem.</strong> Start with endpoints, because that
+         single command splits the problem in half.</p>
+<pre>
+$ kubectl get endpointslices -l kubernetes.io/service-name=api
+   no addresses      → selector matches nothing, or no pod is Ready
+   ready=false       → readiness failing
+   ready=true        → the Service is fine; look further out
+
+then, from a debug pod:
+  ① nc -zv &lt;pod-ip&gt; 8080        raw connectivity — CNI/NetworkPolicy
+  ② getent hosts api.shop       DNS
+  ③ curl http://api.shop/       the Service VIP and kube-proxy
+  ④ curl -H 'Host: ...' $LB     the ingress
+</pre>
+      <table class="tbl">
+        <tr><th>Failure point</th><th>Diagnosis</th></tr>
+        <tr><td>① fails</td><td>NetworkPolicy or CNI</td></tr>
+        <tr><td>② NXDOMAIN</td><td>Wrong name/namespace</td></tr>
+        <tr><td>② times out</td><td><strong>Policy blocking port 53</strong></td></tr>
+        <tr><td>③ fails, endpoints exist</td><td>Wrong <code>targetPort</code></td></tr>
+        <tr><td>④ 503</td><td>Ingress sees no endpoints</td></tr>
+        <tr><td>④ 502</td><td>Backend refused — port or protocol</td></tr>
+      </table>
+      <p><strong>The distinction that saves the most time</strong> is between "no endpoints" and "endpoints that
+         refuse". The first is a Service problem — selector or readiness; the second is an application or port
+         problem. They look identical from a client and are one command apart.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you debug a distroless container with no shell?</summary>
+      <p><strong>An ephemeral container in the same pod, sharing its namespaces.</strong></p>
+<pre>
+$ kubectl exec -it api -- sh
+OCI runtime exec failed: exec: "sh": executable file not found in $PATH
+
+$ kubectl debug -it api --image=nicolaka/netshoot --target=api
+~ # ps aux                     ← --target shares the PID namespace
+1 1000 /server
+~ # ls /proc/1/root/app        ← the target's filesystem, through /proc
+~ # ss -ltnp                   ← its sockets: same network namespace
+~ # curl -s localhost:8080/healthz
+</pre>
+      <table class="tbl">
+        <tr><th>Variant</th><th>Use when</th></tr>
+        <tr><td><code>--target=C</code></td><td>The container is running; you need its processes and files</td></tr>
+        <tr><td><code>--copy-to=X --set-image=*=busybox</code></td><td><strong>It will not start at all</strong></td></tr>
+        <tr><td><code>--copy-to=X --share-processes</code></td><td>A disposable copy with a shared PID namespace</td></tr>
+        <tr><td><code>kubectl debug node/N</code></td><td>Node-level triage, filesystem at <code>/host</code></td></tr>
+      </table>
+      <p><strong>Two caveats:</strong> ephemeral containers <strong>cannot be removed</strong> and persist for the
+         pod's lifetime, so use <code>--copy-to</code> on a pod you intend to keep. And under
+         <a href="pod-security.html">restricted Pod Security</a> the debug image must satisfy the same policy —
+         which is why the <code>--profile</code> flag exists.</p>
+      <p><strong>The alternative people reach for and should not</strong> is shipping a <code>:debug</code> image
+         variant with a shell to production. That reintroduces exactly the attack surface distroless removed.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> "Everything is broken." How do you triage a cluster-wide incident?</summary>
+      <p><strong>Determine the layer before touching any application.</strong> Cluster-wide causes never look
+         cluster-wide from inside one namespace, which is why ten teams debug ten symptoms of one problem.</p>
+      <table class="tbl">
+        <tr><th>Signature</th><th>Cause</th><th>Confirm</th></tr>
+        <tr><td>Writes fail, reads work</td><td><strong>A failing admission webhook</strong></td><td><code>get validatingwebhookconfigurations</code></td></tr>
+        <tr><td>Everything slow</td><td>etcd latency / apiserver saturation</td><td><code>apiserver_request_duration_seconds</code></td></tr>
+        <tr><td>Name resolution fails everywhere</td><td>CoreDNS or an egress policy</td><td>CoreDNS endpoints</td></tr>
+        <tr><td>Nothing schedules</td><td>Scheduler down; nodes tainted</td><td>Scheduler pod; node taints</td></tr>
+        <tr><td>Deploys hang, traffic fine</td><td>Control plane unavailable</td><td><code>/readyz?verbose</code></td></tr>
+        <tr><td>Pods failing on one node only</td><td>The node</td><td>Node conditions, kubelet</td></tr>
+      </table>
+      <p><strong>The first command I run</strong> is an event histogram, not a log:</p>
+<pre>
+$ kubectl get events -A --field-selector type=Warning -o json \
+    | jq -r '.items[].reason' | sort | uniq -c | sort -rn | head
+   4821 FailedCreate
+    193 Unhealthy
+</pre>
+      <p>Four thousand identical warnings tell you which controller is retrying something impossible, and that is
+         usually the whole diagnosis. An event flood also consumes etcd, so it can convert one broken workload
+         into cluster-wide slowness — a second reason to alert on the rate.</p>
+      <p><strong>The webhook case deserves naming explicitly</strong> because it is the most common and the most
+         confusing: admission is synchronous, so a webhook whose Service is gone makes every write in the cluster
+         fail after its timeout while reads stay perfectly healthy. Everything else in Kubernetes retries and
+         converges; admission is the one step that stops convergence.</p>
+      <p><strong>What I would have prepared in advance:</strong> events shipped to logging, control-plane metrics
+         with alerts on apiserver latency and etcd fsync, and a runbook whose first line is the layer question —
+         because under pressure people debug what they can see rather than what is broken.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> What would you put in place so incidents are debuggable at all?</summary>
+      <p><strong>Everything that matters is either ephemeral or invisible by default. The work is making it
+         outlive the incident.</strong></p>
+      <table class="tbl">
+        <tr><th>Signal</th><th>Default</th><th>Fix</th></tr>
+        <tr><td><strong>Events</strong></td><td><strong>Deleted after ~1 hour</strong></td><td>Ship to logging with an events exporter</td></tr>
+        <tr><td>Container logs</td><td>Lost when the pod is deleted</td><td>Node-level log shipping</td></tr>
+        <tr><td>Metrics</td><td>Absent unless scraped</td><td>Prometheus, with per-pod and per-node series</td></tr>
+        <tr><td>OOM kills, evictions</td><td>Invisible in logs</td><td>Alert on the <em>events</em></td></tr>
+        <tr><td>CPU throttling</td><td>Invisible in utilisation</td><td><code>nr_throttled</code> — <a href="resources.html">limits</a></td></tr>
+        <tr><td>Endpoint counts</td><td>No alert exists by default</td><td>Alert on zero endpoints</td></tr>
+        <tr><td>API audit trail</td><td>Off in many distributions</td><td>Audit logging to storage</td></tr>
+      </table>
+      <p><strong>The principle:</strong> anything that can kill your process cannot be observed <em>by</em> your
+         process. A SIGKILLed container writes nothing, so OOM kills, evictions and node failures must be observed
+         from outside — events, kernel messages and externally-scraped metrics are the layers that survive.</p>
+      <p><strong>What I would add beyond signals:</strong> a debug image standardised and pre-pulled (so
+         <code>kubectl debug</code> works in an air-gapped or rate-limited cluster), RBAC that permits
+         <code>pods/exec</code> and ephemeral containers through an audited break-glass path rather than
+         standing access, and a triage runbook that starts with the layer question.</p>
+      <p><strong>And one cultural item:</strong> capture before you restart. The instinct to delete a broken pod
+         is strong, it destroys the only copy of the evidence, and the replacement reproduces the fault anyway —
+         so a one-line "capture" script that dumps describe, previous logs and events into a file is worth more
+         than most dashboards.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Read the cause from status rather than guessing.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl run oom --image=python:3.12-alpine --restart=Always \
+    --overrides='{"spec":{"containers":[{"name":"c","image":"python:3.12-alpine",
+    "command":["python","-c","x=bytearray(400*1024*1024)"],
+    "resources":{"limits":{"memory":"128Mi"}}}]}}'
+$ sleep 60; kubectl get pod oom
+NAME  READY   STATUS             RESTARTS   AGE
+oom   0/1     CrashLoopBackOff   3          60s
+</pre>
+<pre>
+❌ THE GUESS: "it is crash-looping, the app must be broken"
+$ kubectl logs oom
+Error from server (BadRequest): container "c" in pod "oom" is waiting to start:
+CrashLoopBackOff
+$ kubectl logs oom --previous
+                                     ← EMPTY: SIGKILL, nothing was flushed
+
+✅ THE STATUS:
+$ kubectl get pod oom -o jsonpath='{.status.containerStatuses[0].lastState.terminated}' | jq -c
+{"exitCode":137,"reason":"OOMKilled","startedAt":"...","finishedAt":"..."}
+                                     ← the answer, in one field
+$ kubectl get pod oom -o jsonpath='{.status.containerStatuses[0].restartCount}{"\n"}'
+3
+</pre>
+<pre>
+Distinguish it from the OTHER cause of exit 137:
+$ kubectl run stubborn --image=busybox --restart=Never -- sh -c 'trap "" TERM; sleep 3600'
+$ sleep 5; time kubectl delete pod stubborn
+real    0m30.4s
+$ kubectl get pod stubborn -o jsonpath='{.status.containerStatuses[0].state.terminated}' 2>/dev/null | jq -c
+{"exitCode":137,"reason":"Error"}    ← same code, reason is NOT OOMKilled
+</pre>
+<pre>
+A capture script, so evidence survives a restart:
+$ cat > tools/capture.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+NS=${1:?ns}; POD=${2:?pod}; OUT="capture-$POD-$(date +%s)"
+mkdir -p "$OUT"
+kubectl -n "$NS" describe pod "$POD"                       > "$OUT/describe.txt" 2>&1
+kubectl -n "$NS" get pod "$POD" -o yaml                    > "$OUT/pod.yaml" 2>&1
+kubectl -n "$NS" logs "$POD" --all-containers --timestamps > "$OUT/logs.txt" 2>&1
+kubectl -n "$NS" logs "$POD" --all-containers --previous --timestamps > "$OUT/logs-previous.txt" 2>&1
+kubectl -n "$NS" get events --field-selector "involvedObject.name=$POD" \
+  --sort-by=.lastTimestamp                                 > "$OUT/events.txt" 2>&1
+kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[*].lastState}' \
+  | jq . > "$OUT/laststate.json" 2>&1
+echo "captured to $OUT"
+SH
+$ chmod +x tools/capture.sh &amp;&amp; tools/capture.sh default oom
+captured to capture-oom-1755598931
+$ cat capture-oom-*/laststate.json | jq -r '.terminated.reason'
+OOMKilled                            ← preserved, even after the pod is deleted
+</pre>
+<table class="tbl">
+  <tr><th>Source</th><th>Tells you</th><th>Survives pod deletion</th></tr>
+  <tr><td><code>STATUS</code> column</td><td>The symptom</td><td>❌</td></tr>
+  <tr><td><code>lastState.terminated</code></td><td><strong>The cause</strong></td><td>❌</td></tr>
+  <tr><td><code>logs --previous</code></td><td>The app's own account</td><td>❌</td></tr>
+  <tr><td>A capture file</td><td>All of it</td><td><strong>✅</strong></td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove that events expire, and make them outlive the incident.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl run bad --image=nginx:does-not-exist-9.9.9
+$ sleep 60; kubectl describe pod bad | tail -6
+Events:
+  Type     Reason     Age   Message
+  Normal   Scheduled  60s   Successfully assigned default/bad to worker-2
+  Normal   Pulling    59s   Pulling image "nginx:does-not-exist-9.9.9"
+  Warning  Failed     58s   Failed to pull image: not found
+  Warning  Failed     58s   Error: ErrImagePull
+  Normal   BackOff    30s   Back-off pulling image
+</pre>
+<pre>
+$ kubectl -n kube-system get pod -l component=kube-apiserver \
+    -o jsonpath='{.items[0].spec.containers[0].command}' | tr ',' '\n' | grep -i event-ttl
+"--event-ttl=1h0m0s"                 ← the default
+
+$ sleep 3700                          # just over an hour
+$ kubectl describe pod bad | tail -2
+Events:  &lt;none&gt;                       ← the pod is STILL broken; the record is gone
+$ kubectl get pod bad
+NAME  READY   STATUS             RESTARTS   AGE
+bad   0/1     ImagePullBackOff   0          62m
+$ kubectl get pod bad -o jsonpath='{.status.containerStatuses[0].state.waiting}' | jq -c
+{"reason":"ImagePullBackOff","message":"Back-off pulling image \"nginx:does-not-exist-9.9.9\""}
+                                     ← status persists and still names the cause
+</pre>
+<pre>
+SHIP THEM — a minimal exporter:
+$ kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: event-logger, namespace: kube-system }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: event-logger } }
+  template:
+    metadata: { labels: { app: event-logger } }
+    spec:
+      serviceAccountName: event-logger
+      containers:
+      - name: c
+        image: bitnami/kubectl
+        command:
+        - sh
+        - -c
+        - |
+          kubectl get events -A -o json --watch-only | while read -r line; do
+            echo "$line" | jq -c '{ts: .lastTimestamp, type: .type, reason: .reason,
+              obj: "\(.involvedObject.namespace)/\(.involvedObject.kind)/\(.involvedObject.name)",
+              msg: .message}'
+          done
+EOF
+$ kubectl -n kube-system logs deploy/event-logger --tail=3
+{"ts":"2026-08-19T13:02:11Z","type":"Warning","reason":"Failed","obj":"default/Pod/bad","msg":"Failed to pull image..."}
+   → now in your logging pipeline, with your retention, not the API server's hour
+</pre>
+<pre>
+And an alert on the flood, which is itself a diagnosis:
+$ kubectl get events -A --field-selector type=Warning -o json \
+    | jq -r '.items[].reason' | sort | uniq -c | sort -rn | head -3
+   4821 FailedCreate
+    193 Unhealthy
+     47 FailedScheduling
+$ kubectl get --raw /metrics | grep etcd_mvcc_db_total_size_in_bytes
+etcd_mvcc_db_total_size_in_bytes 3.284598784e+09      ← events consume etcd too
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Debug a distroless pod three ways.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl run api --image=gcr.io/distroless/static-debian12 --restart=Never \
+    --overrides='{"spec":{"containers":[{"name":"api","image":"myco/api-distroless:1.4",
+    "ports":[{"containerPort":8080}]}]}}'
+$ kubectl exec -it api -- sh
+OCI runtime exec failed: exec: "sh": executable file not found in $PATH
+$ kubectl exec -it api -- /bin/ls
+OCI runtime exec failed: exec: "/bin/ls": stat /bin/ls: no such file or directory
+</pre>
+<pre>
+① EPHEMERAL CONTAINER — into the RUNNING pod:
+$ kubectl debug -it api --image=nicolaka/netshoot --target=api
+Defaulting debug container name to debugger-4wm2t.
+~ # ps aux
+PID   USER     COMMAND
+1     1000     /server                        ← the target's process (shared PID ns)
+~ # ls /proc/1/root/
+config.yaml  server                           ← its filesystem, via /proc
+~ # cat /proc/1/root/config.yaml | head -3
+~ # ss -ltnp
+LISTEN 0 4096 *:8080 *:*                      ← same network namespace
+~ # curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/healthz
+200
+~ # exit
+
+$ kubectl get pod api -o jsonpath='{.spec.ephemeralContainers[*].name}{"\n"}'
+debugger-4wm2t                                ← PERMANENT: cannot be removed
+</pre>
+<pre>
+② COPY — when the container will not start at all:
+$ kubectl run broken --image=myco/api-distroless:1.4 --restart=Never \
+    --overrides='{"spec":{"containers":[{"name":"api","image":"myco/api-distroless:1.4",
+    "command":["/server","--config=/etc/missing.yaml"]}]}}'
+$ kubectl get pod broken
+broken   0/1   CrashLoopBackOff   3   2m
+$ kubectl debug broken --copy-to=broken-dbg --set-image=api=nicolaka/netshoot -- sleep 3600
+$ kubectl exec -it broken-dbg -- ls -la /etc/ | grep -c missing.yaml
+0                                             ← the file genuinely is not there
+$ kubectl exec -it broken-dbg -- env | grep CONFIG
+CONFIG_PATH=/etc/config/app.yaml              ← the env var says a different path
+$ kubectl delete pod broken-dbg               ← a copy CAN be deleted
+</pre>
+<pre>
+③ NODE-LEVEL:
+$ kubectl debug node/worker-2 -it --image=busybox
+Creating debugging pod node-debugger-worker-2-x8k2p with container debugger
+/ # chroot /host
+# crictl ps --name api -o table
+CONTAINER    IMAGE                    STATE     NAME
+7a3d2f1994   myco/api-distroless:1.4  Running   api
+# crictl inspect 7a3d2f1994 | jq -r '.info.runtimeSpec.process.args'
+["/server"]
+# crictl logs 7a3d2f1994 --tail 5
+# ls /var/lib/kubelet/pods/$(crictl inspect 7a3d2f1994 | jq -r .info.config.metadata.uid)/volumes/
+kubernetes.io~configmap  kubernetes.io~projected
+</pre>
+<pre>
+Under restricted Pod Security, the debug image must comply too:
+$ kubectl -n restricted debug -it api --image=nicolaka/netshoot --target=api
+error: ephemeral container creation failed: pods "api" is forbidden: violates
+PodSecurity "restricted:latest": allowPrivilegeEscalation != false, ...
+$ kubectl -n restricted debug -it api --image=nicolaka/netshoot --target=api \
+    --profile=restricted
+~ #                                           ← the profile sets a compliant securityContext
+</pre>
+<table class="tbl">
+  <tr><th>Method</th><th>Target must be running</th><th>Removable</th><th>Sees</th></tr>
+  <tr><td><code>--target</code></td><td>✅</td><td><strong>❌ Permanent</strong></td><td>Processes, files via /proc, sockets</td></tr>
+  <tr><td><code>--copy-to</code></td><td>❌</td><td>✅</td><td>The same spec, different image</td></tr>
+  <tr><td><code>debug node/</code></td><td>n/a</td><td>✅</td><td><strong>The node, crictl, kubelet state</strong></td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Run the layered network test against four different faults.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > tools/net-triage.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+# Layered connectivity test: each step eliminates one subsystem.
+set -uo pipefail
+NS=${1:?ns}; SVC=${2:?svc}; PORT=${3:-80}
+say() { printf '  %-28s %s\n' "$1" "$2"; }
+
+EPS=$(kubectl -n "$NS" get endpointslices -l "kubernetes.io/service-name=$SVC" \
+      -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}={.conditions.ready} {end}')
+say "endpoints" "${EPS:-NONE}"
+TP=$(kubectl -n "$NS" get svc "$SVC" -o jsonpath='{.spec.ports[0].targetPort}')
+say "targetPort" "$TP"
+IP=$(echo "$EPS" | awk '{print $1}' | cut -d= -f1)
+
+kubectl -n "$NS" run nettriage-$$ --rm -i --restart=Never --image=nicolaka/netshoot -- sh -c "
+  echo '  --- 1 pod IP';  nc -zv -w3 ${IP:-1.2.3.4} $TP 2>&1 | tail -1
+  echo '  --- 2 DNS';     getent hosts $SVC.$NS || echo 'FAILED'
+  echo '  --- 3 service'; curl -s -o /dev/null -m3 -w '%{http_code}\n' http://$SVC.$NS:$PORT/
+" 2>/dev/null
+SH
+$ chmod +x tools/net-triage.sh
+</pre>
+<pre>
+FAULT ① readiness failing → no endpoints
+$ kubectl -n shop patch deploy api -p '{"spec":{"template":{"spec":{"containers":
+    [{"name":"api","readinessProbe":{"httpGet":{"path":"/nope","port":8080}}}]}}}}'
+$ sleep 30; tools/net-triage.sh shop api
+  endpoints                    10.244.1.7=false
+  targetPort                   8080
+  --- 1 pod IP    10.244.1.7 (10.244.1.7:8080) open      ← the app IS listening
+  --- 2 DNS       10.96.140.22  api.shop.svc.cluster.local
+  --- 3 service   000                                     ← no READY endpoint to route to
+   → readiness, not networking
+
+FAULT ② wrong targetPort
+$ kubectl -n shop patch svc api -p '{"spec":{"ports":[{"port":80,"targetPort":9999}]}}'
+$ tools/net-triage.sh shop api
+  endpoints                    10.244.1.7=true
+  targetPort                   9999
+  --- 1 pod IP    nc: connect to 10.244.1.7 port 9999 (tcp) failed
+  --- 2 DNS       10.96.140.22
+  --- 3 service   000
+   → endpoints exist and the PORT is wrong
+</pre>
+<pre>
+FAULT ③ NetworkPolicy blocking DNS
+$ kubectl -n shop apply -f deny-egress.yaml     # no port 53 rule
+$ tools/net-triage.sh shop api
+  endpoints                    10.244.1.7=true
+  --- 1 pod IP    10.244.1.7 (10.244.1.7:8080) open       ← direct IP works
+  --- 2 DNS       FAILED                                  ← resolution does not
+  --- 3 service   000
+   → the signature of a policy blocking 53: pod IP fine, names broken
+
+FAULT ④ selector typo
+$ kubectl -n shop patch svc api -p '{"spec":{"selector":{"app":"apu"}}}'
+$ tools/net-triage.sh shop api
+  endpoints                    NONE
+  --- 1 pod IP    nc: connect to 1.2.3.4 ... failed        (no endpoint to test)
+  --- 2 DNS       10.96.140.22                             ← the Service still resolves
+  --- 3 service   000
+   → zero endpoints with healthy pods = selector
+</pre>
+<table class="tbl">
+  <tr><th>Endpoints</th><th>Pod IP</th><th>DNS</th><th>Diagnosis</th></tr>
+  <tr><td>ready=false</td><td>✅</td><td>✅</td><td><strong>Readiness probe</strong></td></tr>
+  <tr><td>ready=true</td><td>❌</td><td>✅</td><td>Wrong <code>targetPort</code></td></tr>
+  <tr><td>ready=true</td><td>✅</td><td><strong>❌</strong></td><td><strong>Policy blocking port 53</strong></td></tr>
+  <tr><td>NONE</td><td>n/a</td><td>✅</td><td>Selector matches nothing</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Diagnose a node-level failure the API cannot explain.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kubectl get pods -o wide --no-headers | awk '$3!="Running"' | head -5
+worker-2-app-x8k2p   0/1   ContainerCreating   0   14m   &lt;none&gt;   worker-2
+worker-2-api-p9v3w   0/1   ContainerCreating   0   14m   &lt;none&gt;   worker-2
+worker-2-web-t2h8n   0/1   ContainerCreating   0   13m   &lt;none&gt;   worker-2
+$ kubectl get pods -o wide --no-headers | awk '{print $7}' | sort | uniq -c
+     18 worker-1
+      3 worker-2                     ← ALL failures are on ONE node → node-level
+     16 worker-3
+</pre>
+<pre>
+$ kubectl describe node worker-2 | grep -A8 Conditions
+  Type             Status  Reason                       Message
+  MemoryPressure   False   KubeletHasSufficientMemory
+  DiskPressure     True    KubeletHasDiskPressure       ← there it is
+  PIDPressure      False
+  Ready            True
+$ kubectl describe pod worker-2-app-x8k2p | tail -3
+  Warning  FailedCreatePodSandBox  failed to create pod sandbox: rpc error: code =
+  Unknown desc = failed to get sandbox image "registry.k8s.io/pause:3.9": failed to
+  pull image: no space left on device
+</pre>
+<pre>
+$ kubectl debug node/worker-2 -it --image=busybox
+/ # chroot /host
+# df -h | grep -E 'Filesystem|/var'
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p1  100G   99G  0.5G  99% /
+# du -sh /var/lib/containerd /var/lib/kubelet /var/log 2>/dev/null | sort -h
+1.2G    /var/log
+8.4G    /var/lib/kubelet
+78G     /var/lib/containerd          ← images
+# crictl imagefsinfo | jq -r '.imageFilesystems[0].usedBytes.value'
+83751534592
+# crictl images | wc -l
+412                                  ← 412 images, most unused
+# journalctl -u kubelet --since '20 min ago' | grep -i 'garbage\|eviction' | tail -3
+eviction_manager: attempting to reclaim ephemeral-storage
+image_gc_manager: failed to garbage collect required amount of images
+</pre>
+<pre>
+$ crictl rmi --prune
+Deleted: sha256:9f21c0e4b1...
+... (287 images)
+# df -h / | tail -1
+/dev/nvme0n1p1  100G   34G   66G  34% /
+# exit
+$ sleep 60; kubectl get nodes worker-2 -o jsonpath='{.status.conditions[?(@.type=="DiskPressure")].status}{"\n"}'
+False
+$ kubectl get pods -o wide --no-headers | awk '$7=="worker-2"' | awk '{print $3}' | sort | uniq -c
+      3 Running                      ← all three recovered
+</pre>
+<pre>
+WHEN THE API AND THE NODE DISAGREE:
+$ kubectl get pod ghost -o jsonpath='{.status.phase}{"\n"}'
+Running
+$ kubectl debug node/worker-2 -it --image=busybox -- chroot /host crictl ps --name ghost
+CONTAINER   IMAGE   STATE   NAME
+                                     ← NOT RUNNING. The API is stale.
+# journalctl -u kubelet --since '5 min ago' | grep -i 'ghost' | tail -2
+Error syncing pod, skipping: failed to "StartContainer" ... context deadline exceeded
+   → crictl is ground truth; the API reflects what the kubelet last managed to report
+</pre>
+<table class="tbl">
+  <tr><th>Clue</th><th>Points at</th></tr>
+  <tr><td>All failures on one node</td><td><strong>The node, not the workloads</strong></td></tr>
+  <tr><td><code>FailedCreatePodSandBox</code></td><td>CNI, or image pull, or disk</td></tr>
+  <tr><td><code>DiskPressure: True</code></td><td>Images, logs or <code>emptyDir</code></td></tr>
+  <tr><td>API and <code>crictl</code> disagree</td><td>Kubelet or runtime problem</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a whole-cluster triage script and use it on a cluster-wide fault.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat > tools/cluster-triage.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+# Read-only whole-cluster triage. Answers "what layer?" before anything else.
+set -uo pipefail
+hdr() { printf '\n== %s\n' "$1"; }
+
+hdr "control plane readiness"
+kubectl get --raw='/readyz?verbose' 2>/dev/null | grep -v ' ok$' | head -5 || echo "  apiserver UNREACHABLE"
+
+hdr "nodes not Ready, or under pressure"
+kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n |
+  (.status.conditions[] | select((.type=="Ready" and .status!="True")
+     or (.type|test("Pressure")) and .status=="True")) |
+  "  \($n): \(.type)=\(.status) (\(.reason))"'
+
+hdr "pods not Running/Completed, grouped by node"
+kubectl get pods -A -o json | jq -r '.items[] |
+  select(.status.phase != "Running" and .status.phase != "Succeeded") |
+  "\(.spec.nodeName // "unscheduled")"' | sort | uniq -c | sort -rn | head -5 | sed 's/^/  /'
+
+hdr "pods not Running, grouped by reason"
+kubectl get pods -A -o json | jq -r '.items[] |
+  select(.status.phase != "Running" and .status.phase != "Succeeded") |
+  ([.status.containerStatuses[]?.state.waiting.reason] | first) // .status.reason // .status.phase' \
+  | sort | uniq -c | sort -rn | head -5 | sed 's/^/  /'
+
+hdr "warning events by reason (last hour)"
+kubectl get events -A --field-selector type=Warning -o json 2>/dev/null \
+  | jq -r '.items[].reason' | sort | uniq -c | sort -rn | head -5 | sed 's/^/  /'
+
+hdr "admission webhooks (a failing one blocks ALL writes)"
+for k in validatingwebhookconfigurations mutatingwebhookconfigurations; do
+  kubectl get "$k" -o json | jq -r --arg k "$k" '.items[] |
+    select(.metadata.name | startswith("kube-") | not) | .metadata.name as $n |
+    .webhooks[]? | select((.failurePolicy // "Fail") == "Fail") |
+    "  \($k)/\($n): failurePolicy=Fail svc=\(.clientConfig.service.namespace)/\(.clientConfig.service.name)"'
+done
+
+hdr "core services with zero endpoints"
+for ns_svc in kube-system/kube-dns ingress-nginx/ingress-nginx-controller; do
+  ns=${ns_svc%/*}; svc=${ns_svc#*/}
+  n=$(kubectl -n "$ns" get endpointslices -l "kubernetes.io/service-name=$svc" \
+      -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]} {end}' 2>/dev/null | wc -w)
+  [ "$n" -eq 0 ] && echo "  ZERO ENDPOINTS: $ns_svc" || echo "  ok $ns_svc ($n)"
+done
+SH
+$ chmod +x tools/cluster-triage.sh
+</pre>
+<pre>
+NOW BREAK EVERYTHING with a webhook and run it:
+$ kubectl apply -f dangerous-webhook.yaml     # failurePolicy: Fail, missing Service
+$ kubectl create deploy canary --image=nginx:alpine
+Error from server (InternalError): failed calling webhook "dangerous.example.com"
+
+$ tools/cluster-triage.sh
+== control plane readiness
+(no output — everything ok)
+
+== nodes not Ready, or under pressure
+(none)
+
+== pods not Running/Completed, grouped by node
+(none)
+
+== pods not Running, grouped by reason
+(none)
+
+== warning events by reason (last hour)
+     94 FailedCreate                       ← controllers retrying impossible writes
+
+== admission webhooks (a failing one blocks ALL writes)
+  validatingwebhookconfigurations/dangerous: failurePolicy=Fail svc=default/nonexistent
+                                            ← THE ANSWER
+== core services with zero endpoints
+  ok kube-system/kube-dns (2)
+  ok ingress-nginx/ingress-nginx-controller (2)
+</pre>
+<pre>
+$ kubectl get svc -n default nonexistent
+Error from server (NotFound): services "nonexistent" not found
+$ kubectl delete validatingwebhookconfiguration dangerous
+$ kubectl create deploy canary --image=nginx:alpine
+deployment.apps/canary created
+$ tools/cluster-triage.sh | grep -A2 'warning events'
+== warning events by reason (last hour)
+     94 FailedCreate                       ← historical; the rate has stopped
+</pre>
+<pre>
+The same script on a NODE-level fault gives a different shape:
+== nodes not Ready, or under pressure
+  worker-2: DiskPressure=True (KubeletHasDiskPressure)
+== pods not Running/Completed, grouped by node
+      7 worker-2                            ← concentrated on ONE node
+== pods not Running, grouped by reason
+      7 ContainerCreating
+</pre>
+<table class="tbl">
+  <tr><th>Signature</th><th>Layer</th></tr>
+  <tr><td>Failures concentrated on one node</td><td><strong>The node</strong></td></tr>
+  <tr><td>All pods of one workload</td><td>Image, config or probe</td></tr>
+  <tr><td>Writes fail, nothing else wrong</td><td><strong>An admission webhook</strong></td></tr>
+  <tr><td>Zero endpoints on kube-dns</td><td>DNS — everything will look broken</td></tr>
+  <tr><td>A huge event count for one reason</td><td>A controller retrying the impossible</td></tr>
+</table>
+<p><strong>Run it first, every time.</strong> It answers the layer question in a few seconds, which is the
+   step people skip and the one that determines whether the next hour is spent usefully.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Ask what layer is failing before running anything else</strong>: one pod, one workload, one node, or everything — that question eliminates most of the search space.</li>
+        <li>Failures concentrated on a single node mean the node, not the workloads.</li>
+        <li><strong>Events expire after about an hour</strong>, so <code>Events: &lt;none&gt;</code> means the record was deleted, not that nothing happened.</li>
+        <li>Ship events to your logging pipeline — otherwise every post-incident review starts by discovering the most useful record is gone.</li>
+        <li><strong>Read <code>status</code>, not <code>spec</code></strong>: <code>lastState.terminated</code> distinguished <code>OOMKilled</code> from a plain crash where the logs were completely empty.</li>
+        <li>Exit 137 is SIGKILL — OOM only when <code>reason: OOMKilled</code>; otherwise a stop timeout on an ignored SIGTERM.</li>
+        <li><code>CrashLoopBackOff</code> is a restart <em>delay</em>, not a cause; <code>logs --previous</code> is where the evidence lives.</li>
+        <li><strong>Capture before you restart</strong> — deleting a broken pod destroys <code>--previous</code> logs, and the replacement fails identically.</li>
+        <li>Each pod state names a subsystem: <code>Pending</code> → scheduler, <code>ContainerCreating</code> → CNI/volumes, <code>Running 0/1</code> → readiness, <code>Evicted</code> → the node.</li>
+        <li><strong>Ephemeral containers</strong> (<code>kubectl debug --target</code>) give a shell into a distroless pod, sharing its PID and network namespaces with its filesystem at <code>/proc/1/root</code>.</li>
+        <li>They <strong>cannot be removed</strong>; <code>--copy-to</code> leaves the original untouched and is right when the container will not start at all.</li>
+        <li>Under restricted Pod Security the debug image must comply too — that is what <code>--profile</code> is for.</li>
+        <li>Test networking in layers — pod IP, DNS, ClusterIP, ingress — because each step eliminates one subsystem.</li>
+        <li><strong>Pod IP works but names fail</strong> is the signature of a NetworkPolicy blocking port 53; <strong>zero endpoints with healthy pods</strong> is a selector problem.</li>
+        <li><code>kubectl debug node/</code> plus <code>crictl</code> is ground truth when the API and the node disagree — a pod reported <code>Running</code> that was not running at all.</li>
+        <li><code>DiskPressure</code> from accumulated images left every pod on one node in <code>ContainerCreating</code>; <code>crictl rmi --prune</code> recovered 44 GB and all three pods.</li>
+        <li>"Everything is broken" with reads working and writes failing is <strong>an admission webhook</strong> — the one synchronous step that can stop cluster-wide convergence.</li>
+        <li><strong>An event flood is itself a diagnosis</strong>: counting warnings by reason names the controller retrying something impossible, and the flood also consumes etcd.</li>
+        <li>Anything that can kill your process cannot be observed by your process — events, kernel messages and externally-scraped metrics are the layers that survive.</li>
+        <li>A triage script that answers the layer question in seconds is worth more than any dashboard, because under pressure people debug what they can see rather than what is broken.</li>
+      </ul>
+    </div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="gitops.html">← GitOps</a>
-      <a class="btn" href="quiz.html">Take the Kubernetes Quizzes →</a>
+      <a href="gitops.html">← GitOps with Argo CD &amp; Flux</a>
+      <a href="quiz.html">📝 Kubernetes Quizzes →</a>
     </div>
   </main>
 </div>
