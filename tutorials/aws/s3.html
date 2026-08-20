@@ -1,0 +1,1133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>S3: Storage Classes, Access &amp; Cost — AWS — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../kubernetes/index.html">Kubernetes</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>S3: Storage Classes, Access &amp; Cost <span class="level-badge level-adv">Data</span></h1>
+
+    <p><strong>What you'll master:</strong> S3 as a <strong>flat keyspace</strong> where folders do not exist and
+       every "directory" behaviour is a prefix scan — which is why <code>LIST</code> on a billion objects is a
+       cost and latency incident rather than a query; the consistency model that <strong>changed in 2020</strong>
+       and the obsolete advice still circulating because of it; request-rate limits per prefix, and the
+       <code>503 SlowDown</code> that appears under exactly the load you were hoping to serve; the access
+       evaluation chain, where <strong>Block Public Access silently overrules a perfectly correct bucket
+       policy</strong> and ACLs are now off by default; versioning, where <strong>deleting objects makes the
+       bucket bigger</strong> and noncurrent versions accumulate somewhere the console does not show you;
+       <strong>S3 Bucket Keys, which cut KMS request charges by 99%</strong> and are one checkbox; Object Lock
+       in compliance mode, which <strong>not even the root user can undo</strong>; and the operational habits
+       that keep a multi-petabyte bucket knowable — Inventory instead of LIST, Storage Lens instead of guessing,
+       and the lifecycle rule for <strong>incomplete multipart uploads that are billing you right now</strong>.
+       Prerequisites: <a href="iam-basics.html">IAM: Identities, Policies &amp; Evaluation</a> and
+       <a href="billing-cost.html">Cost: Pricing Models &amp; Data Transfer</a>.</p>
+
+    <h2>Part 1 — There Are No Folders</h2>
+
+    <p>S3 is a key-value store. The key is a string, the value is up to 5 TB of bytes, and the slashes in
+       <code>logs/2026/08/20/app.log</code> mean nothing to S3 — they are characters in a key. Every
+       folder-shaped behaviour you see is the console or the CLI simulating one with a prefix and a
+       delimiter.</p>
+
+<pre>
+$ aws s3api list-objects-v2 --bucket acme-logs --prefix 'logs/2026/08/' --delimiter '/' \
+    --query '[CommonPrefixes[].Prefix, Contents[].Key]' --output json
+[ [ "logs/2026/08/19/", "logs/2026/08/20/" ], null ]
+        │
+        └─ "CommonPrefixes" IS the folder illusion: S3 grouped keys that share a
+           prefix up to the next delimiter. No directory object exists.
+
+$ aws s3api head-object --bucket acme-logs --key 'logs/2026/08/'
+An error occurred (404): Not Found                 ← there is nothing there
+</pre>
+
+    <table class="tbl">
+      <tr><th>Consequence</th><th>What it means in practice</th></tr>
+      <tr><td>No <code>mv</code>, no rename</td><td>A "rename" is <strong>COPY then DELETE</strong> — two billed operations, and not atomic</td></tr>
+      <tr><td>No directory size</td><td>"How big is this folder?" requires listing every key under the prefix</td></tr>
+      <tr><td>No recursive delete</td><td>Deleting a "folder" deletes each object; use Batch Operations at scale</td></tr>
+      <tr><td>Listing is paginated</td><td><strong>1,000 keys per request</strong> — a billion objects is a million requests</td></tr>
+      <tr><td>Prefix ≠ partition</td><td>But prefixes <em>are</em> how S3 partitions internally — see Part 2</td></tr>
+    </table>
+
+<pre>
+WHY "LIST THE BUCKET" IS A BAD HABIT AT SCALE:
+
+  1,000,000,000 objects ÷ 1,000 keys per LIST = 1,000,000 requests
+  cost      1,000,000 × $0.005 / 1,000        = $5.00
+  time      at ~50 requests/s sequentially    ≈ 5.5 HOURS
+  and the answer is stale before it finishes.
+
+✅ use S3 Inventory instead — a scheduled manifest, delivered as Parquet:
+$ aws s3api put-bucket-inventory-configuration --bucket acme-logs --id daily \
+    --inventory-configuration '{
+      "Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::acme-inventory",
+        "Format":"Parquet","AccountId":"111122223333"}},
+      "IsEnabled":true,"Id":"daily","IncludedObjectVersions":"Current",
+      "Schedule":{"Frequency":"Daily"},
+      "OptionalFields":["Size","LastModifiedDate","StorageClass","IsMultipartUploaded"]}'
+   → then query it with Athena. Seconds, cents, and no LIST at all.
+</pre>
+
+    <div class="note">🔑 <strong>Consistency changed in December 2020 and a great deal of advice did not.</strong>
+       S3 now provides <strong>strong read-after-write consistency</strong> for all operations — PUT, overwrite
+       PUT, DELETE and LIST — in every Region, at no cost and with no performance penalty. The old workarounds
+       (write-then-poll loops, "eventual consistency" retry wrappers, DynamoDB-based consistency layers, and the
+       advice to randomise key prefixes for performance) are all obsolete. If you find code doing any of that,
+       it is carrying dead weight from before 2020.</div>
+
+    <h2>Part 2 — Request Rates, Multipart, and <code>503 SlowDown</code></h2>
+
+<pre>
+PER PREFIX, PER SECOND — these are the numbers that matter:
+
+    3,500  PUT / COPY / POST / DELETE
+    5,500  GET / HEAD
+
+  "per prefix" means per internal partition, and S3 splits partitions automatically
+  as load grows — but the split takes MINUTES. A sudden spike on one prefix throttles
+  before S3 has adapted.
+
+$ aws s3api list-objects-v2 --bucket acme-uploads --max-keys 1 &gt;/dev/null
+$ # under a burst:
+An error occurred (SlowDown) when calling the PutObject operation:
+Please reduce your request rate.                   ← HTTP 503
+</pre>
+
+    <table class="tbl">
+      <tr><th>Fix</th><th>Effect</th><th>Note</th></tr>
+      <tr><td><strong>Spread keys across prefixes</strong></td><td>N prefixes ≈ N × the limit</td><td><code>2026/08/20/shard-07/…</code> — deterministic, not random</td></tr>
+      <tr><td>Exponential backoff with jitter</td><td>Survives the partition split</td><td>The SDKs do this by default — <strong>do not disable retries</strong></td></tr>
+      <tr><td>Warm up gradually</td><td>Lets S3 partition ahead of the peak</td><td>Ramp over minutes, not seconds</td></tr>
+      <tr><td>Aggregate small objects</td><td>Fewer requests entirely</td><td>Also fixes the cost problem in Part 4</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>The old advice to prefix keys with a random hash is obsolete and now actively
+       harmful.</strong> S3 has partitioned on key prefix automatically since 2018, so random prefixes buy
+       nothing — and they destroy the ability to list, lifecycle, or query a date range, because related objects
+       are scattered across the keyspace. Use a <em>structured</em> prefix that reflects how you will read the
+       data (<code>date/source/shard</code>), and add shard components only if you have measured throttling.</div>
+
+<pre>
+MULTIPART UPLOAD — required above 5 GB, worth it above ~100 MB:
+
+  single PUT maximum        5 GB
+  object maximum            5 TB
+  parts                     5 MB – 5 GB, up to 10,000 parts
+  parallelism               parts upload concurrently; failures retry per part
+
+$ aws s3 cp big.tar s3://acme-data/ --expected-size 8589934592
+upload: ./big.tar to s3://acme-data/big.tar        ← the CLI multiparts automatically
+</pre>
+
+<pre>
+AND THE PART EVERYONE FORGETS — FAILED multipart uploads are stored AND BILLED:
+
+$ aws s3api list-multipart-uploads --bucket acme-data \
+    --query 'length(Uploads)' --output text
+1,284                                              ← abandoned uploads, some from 2024
+
+$ aws s3api list-multipart-uploads --bucket acme-data \
+    --query 'Uploads[?Initiated&lt;`2026-01-01`] | length(@)' --output text
+903
+   → invisible in the console's bucket size, invisible in Storage Lens' object count,
+     and charged at full storage rates every month, forever.
+
+✅ one lifecycle rule, on every bucket, always:
+$ aws s3api put-bucket-lifecycle-configuration --bucket acme-data \
+    --lifecycle-configuration '{"Rules":[{
+      "ID":"abort-incomplete-mpu","Status":"Enabled","Filter":{"Prefix":""},
+      "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+</pre>
+
+    <h2>Part 3 — Who Can Read This? The Evaluation Chain</h2>
+
+    <p>S3 has more access mechanisms than any other AWS service, and they are evaluated in a specific order.
+       Nearly every "the policy looks right but it is denied" ticket is one of the layers above the policy.</p>
+
+<pre>
+  1. BLOCK PUBLIC ACCESS        ← account-level, then bucket-level. Overrides everything.
+  2. Explicit DENY anywhere     ← SCP, bucket policy, IAM policy, endpoint policy
+  3. Allow from ANY of:         ← IAM identity policy, bucket policy, (ACL, if enabled)
+  4. KMS key policy             ← for SSE-KMS objects, a SEPARATE grant is required
+  5. VPC endpoint policy        ← if the request arrives through an endpoint
+</pre>
+
+<pre>
+$ aws s3api get-public-access-block --bucket acme-assets \
+    --query 'PublicAccessBlockConfiguration' --output json
+{ "BlockPublicAcls": true, "IgnorePublicAcls": true,
+  "BlockPublicPolicy": true, "RestrictPublicBuckets": true }
+
+$ aws s3api put-bucket-policy --bucket acme-assets --policy '{
+    "Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
+    "Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-assets/*"}]}'
+An error occurred (AccessDenied) when calling the PutBucketPolicy operation:
+Access Denied
+   → BlockPublicPolicy refuses to even STORE a public policy. The bucket policy
+     you are debugging may never have been applied at all.
+</pre>
+
+    <div class="note">🔑 <strong>Block Public Access is a guardrail, not a permission</strong>, and it is on by
+       default for new buckets and enforced at the account level too. That is almost always what you want: the
+       correct way to serve public content is <strong>CloudFront with Origin Access Control</strong> (see
+       <a href="edge-dns.html">CloudFront</a>), which keeps the bucket private, gives you caching and cheaper
+       egress, and cannot be misconfigured into a public listing. Turning BPA off to make a website work is the
+       most common self-inflicted data exposure on AWS.</div>
+
+<pre>
+ACLs ARE OFF BY DEFAULT NOW — and that is a simplification, not a limitation:
+
+$ aws s3api get-bucket-ownership-controls --bucket acme-assets \
+    --query 'OwnershipControls.Rules[0].ObjectOwnership' --output text
+BucketOwnerEnforced                                ← the default since April 2023
+
+  → ACLs are DISABLED. The bucket owner owns every object regardless of who wrote it,
+    and access is controlled by policies only. The old "another account uploaded an
+    object and I cannot read my own bucket" problem no longer exists.
+
+$ aws s3api put-object-acl --bucket acme-assets --key x --acl public-read
+An error occurred (AccessControlListNotSupported): The bucket does not allow ACLs
+</pre>
+
+<pre>
+PRESIGNED URLs — delegate one operation, briefly, without credentials:
+$ aws s3 presign s3://acme-private/report.pdf --expires-in 900
+https://acme-private.s3.amazonaws.com/report.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;...
+
+  ⚠️ the URL inherits the permissions of whoever signed it, and anyone holding the
+     URL can use it. Two limits people miss:
+     - signed with ROLE credentials → expires when the SESSION expires, whichever
+       is sooner. A 7-day presigned URL from a 1-hour role session lasts 1 hour.
+     - maximum 7 days for SigV4.
+</pre>
+
+    <h2>Part 4 — Versioning, Where Deleting Makes It Bigger</h2>
+
+<pre>
+$ aws s3api put-bucket-versioning --bucket acme-docs \
+    --versioning-configuration Status=Enabled
+
+  ⚠️ ONE-WAY. Versioning can be SUSPENDED but never disabled, and existing
+     versions remain (and remain billed) forever after suspension.
+</pre>
+
+<pre>
+DELETE DOES NOT DELETE:
+
+$ aws s3 rm s3://acme-docs/contract.pdf
+delete: s3://acme-docs/contract.pdf
+$ aws s3 ls s3://acme-docs/contract.pdf
+                                                   ← gone, apparently
+
+$ aws s3api list-object-versions --bucket acme-docs --prefix contract.pdf \
+    --query '[Versions[].[VersionId,Size], DeleteMarkers[].VersionId]' --output json
+[ [ [ "3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo", 4821004 ] ],
+  [ "null" ] ]
+   → the 4.8 MB object is STILL THERE and still billed. A delete marker was
+     placed on top of it. "Deleting" data made the bucket bigger.
+
+$ aws s3api delete-object --bucket acme-docs --key contract.pdf --version-id null
+$ aws s3 ls s3://acme-docs/contract.pdf
+2026-08-20 13:04:21    4821004 contract.pdf        ← removing the marker UNDELETES it
+</pre>
+
+    <table class="tbl">
+      <tr><th>Metric</th><th>Includes noncurrent versions?</th></tr>
+      <tr><td>Console "bucket size"</td><td><strong>❌ current versions only</strong></td></tr>
+      <tr><td><code>aws s3 ls --summarize --recursive</code></td><td><strong>❌</strong></td></tr>
+      <tr><td>CloudWatch <code>BucketSizeBytes</code> / <code>StandardStorage</code></td><td><strong>✅ all versions</strong></td></tr>
+      <tr><td>The bill</td><td><strong>✅ all versions, plus incomplete multiparts</strong></td></tr>
+      <tr><td>S3 Storage Lens</td><td>✅ with a noncurrent-version breakdown</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>That table is the whole trap.</strong> The two places people look — the console
+       and <code>aws s3 ls</code> — both hide noncurrent versions, while the two places that matter — CloudWatch
+       and the invoice — include them. A bucket showing 2 TB in the console and 14 TB on the bill is not a
+       billing error; it is eleven months of overwritten versions nobody expired.</div>
+
+<pre>
+✅ THE LIFECYCLE RULE THAT ACTUALLY CLEANS UP — all four clauses:
+$ aws s3api put-bucket-lifecycle-configuration --bucket acme-docs \
+    --lifecycle-configuration '{"Rules":[{
+      "ID":"version-hygiene","Status":"Enabled","Filter":{"Prefix":""},
+      "NoncurrentVersionTransitions":[
+        {"NoncurrentDays":30,"StorageClass":"STANDARD_IA"}],
+      "NoncurrentVersionExpiration":{"NoncurrentDays":90,"NewerNoncurrentVersions":3},
+      "Expiration":{"ExpiredObjectDeleteMarker":true},
+      "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+
+  NoncurrentVersionExpiration      delete old versions after 90 days...
+  NewerNoncurrentVersions: 3       ...but always keep the 3 most recent
+  ExpiredObjectDeleteMarker        remove delete markers with nothing underneath
+  AbortIncompleteMultipartUpload   the invisible charge from Part 2
+</pre>
+
+    <h2>Part 5 — Encryption, Bucket Keys, and Locks You Cannot Undo</h2>
+
+    <table class="tbl">
+      <tr><th>Option</th><th>Key managed by</th><th>Per-request KMS call?</th><th>Use when</th></tr>
+      <tr><td><strong>SSE-S3</strong> (AES256)</td><td>AWS, invisibly</td><td><strong>No</strong></td><td>The default — free, automatic, on by default</td></tr>
+      <tr><td><strong>SSE-KMS</strong></td><td>Your KMS key</td><td><strong>Yes — and it is billed</strong></td><td>Audit trail, key policy control, cross-account boundaries</td></tr>
+      <tr><td>DSSE-KMS</td><td>Your KMS key, twice</td><td>Yes</td><td>Regulatory double-encryption requirements</td></tr>
+      <tr><td>SSE-C</td><td><strong>You, on every request</strong></td><td>No</td><td>Rarely — you must send the key with each call</td></tr>
+    </table>
+
+<pre>
+THE SSE-KMS COST NOBODY MODELS — every object operation is a KMS request:
+
+  GET  → kms:Decrypt
+  PUT  → kms:GenerateDataKey
+
+  200,000,000 GETs/month × $0.03 per 10,000 KMS requests   =  $600 / month
+  the S3 GET requests themselves: 200 M × $0.0004 / 1,000  =  $ 80 / month
+                                                              ─────────
+  → the ENCRYPTION cost 7.5× the storage requests it protected.
+</pre>
+
+<pre>
+✅ S3 BUCKET KEYS — one setting, up to 99% fewer KMS requests:
+
+$ aws s3api put-bucket-encryption --bucket acme-data --server-side-encryption-configuration '{
+    "Rules":[{"ApplyServerSideEncryptionByDefault":{
+        "SSEAlgorithm":"aws:kms",
+        "KMSMasterKeyID":"arn:aws:kms:us-east-1:111122223333:key/9f2a-4b2c"},
+      "BucketKeyEnabled": true}]}'
+
+  → S3 asks KMS for a short-lived BUCKET-LEVEL key and derives per-object keys
+    from it locally, instead of calling KMS per object.
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/KMS --metric-name RequestCount \
+    --dimensions Name=KeyId,Value=9f2a-4b2c --period 86400 --statistics Sum \
+    --start-time $(date -u -d '2 days ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --query 'sort_by(Datapoints,&amp;Timestamp)[].[Timestamp,Sum]' --output text
+2026-08-19T00:00:00Z   6412884.0                   ← before
+2026-08-20T00:00:00Z     41209.0                   ← after: 99.4% fewer
+
+    $600 / month  →  $3.86 / month
+</pre>
+
+    <div class="note">🔑 <strong>Bucket Keys are free, safe, and off by default on older buckets.</strong> There
+       is essentially no reason not to enable them on any bucket using SSE-KMS at volume — the only caveat is
+       that CloudTrail then logs KMS calls at the bucket-key level rather than per object, so if your compliance
+       story depends on a per-object KMS audit trail, check that first. Note it only applies to objects written
+       <em>after</em> it is enabled; existing objects keep their per-object keys until rewritten.</div>
+
+<pre>
+OBJECT LOCK — WORM storage, and the mode that is genuinely irreversible:
+
+$ aws s3api put-object-retention --bucket acme-records --key filing-4821.pdf \
+    --retention '{"Mode":"COMPLIANCE","RetainUntilDate":"2033-08-20T00:00:00Z"}'
+
+  GOVERNANCE mode  → can be overridden by a principal with s3:BypassGovernanceRetention
+  COMPLIANCE mode  → CANNOT be deleted or shortened by ANYONE, including the ROOT USER,
+                     until the date passes. AWS Support cannot remove it either.
+
+$ aws s3api delete-object --bucket acme-records --key filing-4821.pdf --version-id abc
+An error occurred (AccessDenied): Object is under retention and cannot be deleted
+</pre>
+
+    <div class="note">⚠️ <strong>Compliance mode means you will pay to store that object until the retention
+       date, no matter what.</strong> A misconfigured default retention of ten years applied to a high-volume
+       bucket is an unbounded, unfixable bill — the only escape is closing the AWS account. That is precisely
+       the property regulators want, and precisely why it should be enabled deliberately, on a dedicated
+       bucket, with a tested retention period. Use <strong>governance</strong> mode plus an SCP restricting the
+       bypass permission for everything that is not a legal requirement.</div>
+
+    <h2>Part 6 — Knowing What Is In There</h2>
+
+    <table class="tbl">
+      <tr><th>Question</th><th>Wrong tool</th><th>Right tool</th></tr>
+      <tr><td>What is in this bucket?</td><td><code>LIST</code> — a million requests</td><td><strong>S3 Inventory</strong> + Athena</td></tr>
+      <tr><td>Where is my storage cost?</td><td>Console bucket size (hides versions)</td><td><strong>Storage Lens</strong></td></tr>
+      <tr><td>Who read this object?</td><td>S3 server access logs (best-effort, delayed)</td><td><strong>CloudTrail data events</strong> (billed per event)</td></tr>
+      <tr><td>Change 40 million objects</td><td>A script looping over LIST</td><td><strong>S3 Batch Operations</strong>, driven by an Inventory manifest</td></tr>
+      <tr><td>React to an upload</td><td>Polling</td><td>Event notifications → SQS/Lambda, or EventBridge</td></tr>
+    </table>
+
+<pre>
+STORAGE LENS answers "where did 14 TB come from" in one call — free tier included:
+
+$ aws s3control get-storage-lens-configuration --account-id 111122223333 --config-id default-account-dashboard \
+    --query 'StorageLensConfiguration.IsEnabled'
+true
+$ # the metrics that matter, from the dashboard export:
+  StorageBytes                       14,204,118,302,720     (14.2 TB)
+  CurrentVersionStorageBytes          2,010,443,120,640     ( 2.0 TB)   ← what the console shows
+  NonCurrentVersionStorageBytes      11,204,882,001,920     (11.2 TB)  ← the answer
+  IncompleteMultipartUploadStorageBytes  988,793,180,160    ( 1.0 TB)  ← invisible everywhere else
+  ObjectCount                            49,883,217
+  AvgObjectSize                                 284,762     (285 KB)
+</pre>
+
+<pre>
+S3 BATCH OPERATIONS — act on the whole bucket without listing it:
+$ aws s3control create-job --account-id 111122223333 \
+    --operation '{"S3PutObjectCopy":{"TargetResource":"arn:aws:s3:::acme-data",
+        "StorageClass":"INTELLIGENT_TIERING","BucketKeyEnabled":true}}' \
+    --manifest '{"Spec":{"Format":"S3InventoryReport_CSV_20211130"},
+        "Location":{"ObjectArn":"arn:aws:s3:::acme-inventory/.../manifest.json",
+                    "ETag":"a3f91c2b..."}}' \
+    --report '{"Bucket":"arn:aws:s3:::acme-reports","Format":"Report_CSV_20180820",
+        "Enabled":true,"Prefix":"batch","ReportScope":"AllTasks"}' \
+    --priority 10 --role-arn arn:aws:iam::111122223333:role/S3BatchRole --no-confirmation-required
+{ "JobId": "9f2a4b2c-1d3e-4f5a-8b7c-6d9e0f1a2b3c" }
+   → 49 M objects, driven by the inventory manifest, with a per-object report.
+     No LIST, no pagination, restartable, and it retries failures itself.
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Random hash prefixes for "performance", scripts that LIST a billion objects, Block Public
+         Access disabled so a website works, versioning enabled with no lifecycle rules, SSE-KMS at high volume
+         with no bucket key, incomplete multipart uploads never aborted, and a compliance-mode default retention
+         applied bucket-wide.</strong> The random prefixes were copied from a 2016 blog post, buy nothing since
+         S3 partitioned automatically in 2018, and have made the data impossible to lifecycle or query by date.
+         A nightly job lists the whole bucket, costs five dollars and five hours, and produces an answer that is
+         stale before it finishes. Someone turned off Block Public Access to serve static assets, so the bucket
+         is world-listable and the assets are being hotlinked at full egress rates. Versioning was enabled for
+         safety, and eleven months later the bucket shows 2 TB in the console and bills for 14 TB, because
+         noncurrent versions are invisible in the two places people look. Two hundred million monthly GETs each
+         make a KMS <code>Decrypt</code> call, so encryption costs six hundred dollars a month — 7.5× the S3
+         request charges it protects. A thousand abandoned multipart uploads, some from 2024, are billed at full
+         rates and appear in no console view. And a default retention of ten years in compliance mode was
+         applied to a high-volume bucket, which means the storage bill is now fixed until 2036 and nobody,
+         including the root user, can change it.</p>
+      <p>✅ <strong>Structure prefixes for how you read, inventory instead of listing, keep the bucket private
+         behind CloudFront, expire noncurrent versions, enable bucket keys, abort incomplete uploads, and use
+         governance mode unless a regulator requires otherwise.</strong> Design keys around date, source and
+         shard so lifecycle rules and Athena partitions work, and add shard components only after measuring
+         actual <code>503 SlowDown</code>. Configure S3 Inventory on every large bucket and query the manifest
+         with Athena — seconds and cents instead of hours and dollars — and use Batch Operations, driven by that
+         manifest, for anything touching millions of objects. Leave Block Public Access on and serve public
+         content through CloudFront with Origin Access Control, which is cheaper, cached, and cannot be
+         misconfigured into a public listing. Pair every <code>put-bucket-versioning</code> with a lifecycle rule
+         in the same change: transition noncurrent versions, expire them while keeping the newest few, remove
+         expired delete markers, and abort incomplete multipart uploads after seven days. Turn on
+         <code>BucketKeyEnabled</code> anywhere SSE-KMS meets volume — it is free and cut a measured $600 a
+         month to $3.86. Read <strong>Storage Lens</strong>, not the console, when asking where storage went,
+         because only Storage Lens and the invoice count noncurrent versions and incomplete uploads. And reserve
+         compliance-mode Object Lock for data a regulator genuinely requires, on a dedicated bucket, with a
+         tested retention period — it is irreversible by design, root user included.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Treating prefixes as folders</td><td>No rename (COPY+DELETE), no directory size, no recursive delete</td><td>Design keys as keys; use Inventory to answer "what is in here"</td></tr>
+      <tr><td>Randomising key prefixes for performance</td><td><strong>Obsolete since 2018</strong> — and it destroys lifecycle rules and date-range queries</td><td>Structured prefixes; shard only after measuring throttling</td></tr>
+      <tr><td>Coding around eventual consistency</td><td><strong>S3 has been strongly consistent since Dec 2020</strong> — the workarounds are dead weight</td><td>Delete the polling loops and consistency layers</td></tr>
+      <tr><td><code>LIST</code>-ing a huge bucket</td><td>1,000 keys per request: a billion objects is <strong>1 M requests, $5 and ~5.5 hours</strong></td><td>S3 Inventory → Athena; Batch Operations to act</td></tr>
+      <tr><td>Ignoring <code>503 SlowDown</code></td><td>Partition splits take minutes; a sudden spike throttles</td><td>Backoff with jitter (SDK default), ramp gradually, spread prefixes</td></tr>
+      <tr><td>Disabling SDK retries</td><td>Turns a transient <code>SlowDown</code> into a hard failure</td><td>Leave retries on; tune, do not remove</td></tr>
+      <tr><td>Never aborting incomplete multipart uploads</td><td>Billed at full rates, <strong>invisible in the console and in <code>s3 ls</code></strong>, accumulating for years</td><td><code>AbortIncompleteMultipartUpload</code> on <em>every</em> bucket</td></tr>
+      <tr><td>Debugging a bucket policy that was never stored</td><td><code>BlockPublicPolicy</code> <strong>refuses to save it</strong> — you are debugging a policy that does not exist</td><td>Check <code>get-public-access-block</code> first</td></tr>
+      <tr><td>Turning off Block Public Access to serve a website</td><td>The most common self-inflicted data exposure on AWS</td><td><strong>CloudFront + Origin Access Control</strong>; keep the bucket private</td></tr>
+      <tr><td>Forgetting the KMS key policy on cross-account access</td><td>Both S3 policies look correct and access is still denied</td><td>SSE-KMS needs a <strong>third</strong> grant — the key policy</td></tr>
+      <tr><td>Presigned URL from role credentials</td><td>Expires with the <strong>session</strong>, not the requested duration — a "7-day" URL lasting an hour</td><td>Sign with a longer-lived principal, or re-issue</td></tr>
+      <tr><td>Enabling versioning with no lifecycle rule</td><td>Console shows 2 TB, the bill says 14 TB — <strong>noncurrent versions are hidden where people look</strong></td><td>Versioning and lifecycle in the <em>same</em> change</td></tr>
+      <tr><td>Expecting <code>DELETE</code> to free space</td><td>It writes a <strong>delete marker</strong>; the object remains and is still billed</td><td>Expire noncurrent versions and expired delete markers</td></tr>
+      <tr><td>Expecting to turn versioning off</td><td>It can only be <strong>suspended</strong>, and existing versions stay billed</td><td>Enable deliberately, with expiry from day one</td></tr>
+      <tr><td>SSE-KMS at volume without a bucket key</td><td>A KMS call per object operation — <strong>$600/month on 200 M GETs</strong></td><td><code>BucketKeyEnabled: true</code> — free, cut it to $3.86</td></tr>
+      <tr><td>Compliance-mode Object Lock by default</td><td><strong>Irreversible by anyone, including root</strong> — an unbounded fixed bill</td><td>Governance mode + an SCP on the bypass permission</td></tr>
+      <tr><td>Using the console to answer "where is my storage?"</td><td>It counts only current versions</td><td><strong>Storage Lens</strong> or CloudWatch <code>BucketSizeBytes</code></td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Does S3 have folders? Why does the answer matter?</summary>
+      <p><strong>No.</strong> S3 is a flat key-value store: the key is a string, and the slashes in
+         <code>logs/2026/08/20/app.log</code> are ordinary characters. What looks like a folder is the console
+         or CLI calling <code>ListObjectsV2</code> with a <code>prefix</code> and a <code>delimiter</code>, and
+         S3 returning <code>CommonPrefixes</code> — a grouping of keys that share a prefix. No directory object
+         exists; <code>head-object</code> on <code>logs/2026/08/</code> returns 404.</p>
+      <table class="tbl">
+        <tr><th>Because there are no folders…</th><th>Consequence</th></tr>
+        <tr><td>There is no rename</td><td>COPY then DELETE — two billed operations, not atomic</td></tr>
+        <tr><td>There is no directory size</td><td>You must list every key under the prefix</td></tr>
+        <tr><td>Listing is paginated at 1,000</td><td>A billion objects is a million requests</td></tr>
+      </table>
+      <p>The practical payoff is that <strong>"just list the bucket" stops being a reasonable instinct</strong>
+         at scale — it costs real money and hours, and the answer is stale on arrival. S3 Inventory exists
+         precisely because listing is not a query interface.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What are the S3 storage classes and how do you choose?</summary>
+      <table class="tbl">
+        <tr><th>Class</th><th>Choose when</th></tr>
+        <tr><td>Standard</td><td>Frequently accessed, or you do not know the pattern yet</td></tr>
+        <tr><td><strong>Intelligent-Tiering</strong></td><td><strong>The access pattern is unknown or changing</strong> — it moves objects automatically with no retrieval fee</td></tr>
+        <tr><td>Standard-IA / One Zone-IA</td><td>Known-infrequent access, objects &gt; 128 KB, lifetime &gt; 30 days</td></tr>
+        <tr><td>Glacier Instant Retrieval</td><td>Archive that must still read in milliseconds</td></tr>
+        <tr><td>Glacier Flexible / Deep Archive</td><td>True archive; minutes-to-hours retrieval is acceptable</td></tr>
+      </table>
+      <p><strong>The part that separates a good answer:</strong> never choose from the storage column alone.
+         Colder classes charge a <em>per-object</em> transition fee, impose a <strong>128 KB minimum billable
+         size</strong>, and impose a minimum storage duration of 30, 90 or 180 days — three per-object costs
+         against a per-byte saving. Divide bucket bytes by object count first; below ~128 KB the answer is
+         always "make fewer, larger objects", never "change the class" (the worked arithmetic is in
+         <a href="billing-cost.html">Cost</a>).</p>
+      <p>And check the read pattern before archiving: retrieval fees plus a multi-hour restore turn a cost
+         decision into an availability decision.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A bucket policy grants access, the IAM policy grants access, and requests are still denied. Where do you look?</summary>
+      <p>Work down the evaluation chain, because several layers sit <em>above</em> the policies:</p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Check</th><th>Tell</th></tr>
+        <tr><td><strong>1. Block Public Access</strong></td><td><code>get-public-access-block</code></td><td>For public access; <code>BlockPublicPolicy</code> may have refused to <em>store</em> the policy at all</td></tr>
+        <tr><td><strong>2. Explicit Deny</strong></td><td>SCP, bucket policy, IAM, endpoint policy</td><td>The error says "explicit deny in a service control policy"</td></tr>
+        <tr><td><strong>3. KMS key policy</strong></td><td><code>kms:Decrypt</code> on the key</td><td>The classic cross-account case — both S3 policies are right</td></tr>
+        <tr><td><strong>4. VPC endpoint policy</strong></td><td><code>describe-vpc-endpoints</code></td><td>Only when the request arrives via an endpoint</td></tr>
+        <tr><td>5. Wrong ARN shape</td><td><code>s3:ListBucket</code> needs the <em>bucket</em> ARN, <code>s3:GetObject</code> the <em>object</em> ARN</td><td>Denials on listing but not getting</td></tr>
+      </table>
+      <p><strong>Read the error text before changing anything</strong> — it distinguishes "no identity-based
+         policy allows" from "explicit deny in a service control policy", which points at completely different
+         layers. Then use <code>iam simulate-principal-policy</code>. The failure mode to avoid is widening the
+         bucket policy until the error stops, which is how buckets end up public.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> The console says the bucket is 2 TB. The bill says 14 TB. Explain.</summary>
+      <p><strong>Noncurrent versions and incomplete multipart uploads.</strong> Both are billed at full storage
+         rates and neither appears in the two places people look.</p>
+      <table class="tbl">
+        <tr><th>Source</th><th>Counts noncurrent versions?</th><th>Counts incomplete MPUs?</th></tr>
+        <tr><td>Console bucket size</td><td>❌</td><td>❌</td></tr>
+        <tr><td><code>aws s3 ls --summarize</code></td><td>❌</td><td>❌</td></tr>
+        <tr><td>CloudWatch <code>BucketSizeBytes</code></td><td>✅</td><td>✅</td></tr>
+        <tr><td><strong>Storage Lens</strong></td><td>✅ broken out</td><td>✅ broken out</td></tr>
+      </table>
+      <p>With versioning on, every overwrite retains the previous object and every <code>DELETE</code> writes a
+         <strong>delete marker</strong> on top rather than removing anything — so an actively-updated bucket
+         grows monotonically, and deleting data literally makes it larger.</p>
+<pre>
+"NoncurrentVersionExpiration": {"NoncurrentDays": 90, "NewerNoncurrentVersions": 3},
+"Expiration": {"ExpiredObjectDeleteMarker": true},
+"AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}
+</pre>
+      <p><strong>The rule to take away:</strong> enabling versioning without a lifecycle policy is a slow leak,
+         so they belong in the same change. And versioning cannot be turned off — only suspended, with existing
+         versions still billed — so this is a decision to make deliberately rather than to undo later.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design storage for 40 TB/day of telemetry that must be queryable for 90 days, retained for 7 years, and cost-controlled.</summary>
+      <p><strong>The dominant constraint is object count, not bytes</strong> — 40 TB/day arriving as small
+         events is tens of millions of objects a day, and every colder storage class charges per object to
+         enter. So the first design decision is the write path, not the storage class.</p>
+      <p><strong>Write path:</strong> buffer through Kinesis Data Firehose into <strong>hourly Parquet
+         files</strong> partitioned as <code>dt=2026-08-20/hour=13/source=…</code>. That collapses tens of
+         millions of objects into a few thousand, compresses roughly 8:1, and makes the data queryable by
+         Athena as a side effect. Structured prefixes — not random hashes — because lifecycle rules and
+         partition pruning both depend on them.</p>
+      <table class="tbl">
+        <tr><th>Age</th><th>Class</th><th>Why</th></tr>
+        <tr><td>0–90 days</td><td>Standard (or Intelligent-Tiering)</td><td>Query window; retrieval must be free</td></tr>
+        <tr><td>90 days–1 year</td><td>Glacier Instant Retrieval</td><td>Rare access, still millisecond reads</td></tr>
+        <tr><td>1–7 years</td><td>Deep Archive</td><td>Compliance only; hours-to-restore is acceptable</td></tr>
+      </table>
+      <p>Because the objects are now large, the per-object transition fees are negligible — the arithmetic that
+         made a lifecycle rule a 93-month payback on small objects works out immediately here. That is the
+         connection worth stating explicitly: <strong>aggregation is what makes tiering economic</strong>.</p>
+      <p><strong>Query:</strong> Athena over the partitioned Parquet, with partition projection so no crawler is
+         needed. Cost is per byte scanned, so partitioning and columnar format are the cost control — a query
+         over one day scans one day.</p>
+      <p><strong>Governance:</strong> versioning off (the data is immutable and append-only, so versioning is
+         pure cost); Object Lock in <strong>governance</strong> mode for the 7-year retention, with an SCP
+         restricting the bypass permission — compliance mode only if a regulator names it, since it fixes the
+         bill irreversibly. Bucket keys on, SSE-KMS, Inventory daily, Storage Lens for the monthly review, and
+         an <code>AbortIncompleteMultipartUpload</code> rule because a 40 TB/day pipeline will abandon uploads.</p>
+      <p><strong>The number I would put in the proposal:</strong> 40 TB/day for 7 years is ~102 PB before
+         compression. That is the sentence that starts the real conversation — about sampling, retention scope,
+         and whether all seven years genuinely need the full-fidelity data or an aggregate would satisfy the
+         requirement. Designing the tiering without asking that question is optimising a bill nobody has agreed
+         to.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your team wants to serve a public static site from S3 and asks you to disable Block Public Access. What do you say?</summary>
+      <p><strong>No — and the alternative is strictly better on every axis, which is the argument to make rather
+         than a policy objection.</strong></p>
+      <table class="tbl">
+        <tr><th></th><th>Public bucket</th><th><strong>CloudFront + OAC</strong></th></tr>
+        <tr><td>Bucket exposure</td><td>Public; <code>ListBucket</code> is one misconfiguration away</td><td><strong>Private — no public path exists</strong></td></tr>
+        <tr><td>Egress cost</td><td>$0.09/GB from S3</td><td>~$0.085/GB, <strong>origin fetch free</strong>, and cached</td></tr>
+        <tr><td>Latency</td><td>One Region</td><td>600+ edge locations</td></tr>
+        <tr><td>TLS / custom domain</td><td>Awkward</td><td>Native, with ACM</td></tr>
+        <tr><td>WAF, geo-restriction, signed URLs</td><td>❌</td><td>✅</td></tr>
+        <tr><td>Hotlinking</td><td>Unstoppable, at full egress</td><td>Referer/WAF rules</td></tr>
+      </table>
+      <p><strong>The mechanism:</strong> Origin Access Control signs CloudFront's requests to S3 with SigV4, and
+         the bucket policy allows only that distribution — scoped with an <code>AWS:SourceArn</code> condition,
+         which is the confused-deputy pattern from <a href="iam-basics.html">IAM basics</a> applied to a service
+         principal. Without that condition, <em>any</em> CloudFront distribution could read the bucket.</p>
+      <p><strong>Why this matters beyond this one bucket:</strong> disabling Block Public Access is the most
+         common self-inflicted data exposure on AWS, and it is rarely the asset bucket that leaks — it is that
+         the account-level setting gets turned off to unblock one team, and six months later an unrelated
+         bucket holding exports is public because the guardrail was gone. Keep BPA enforced at the
+         <em>account</em> level so it is not a per-bucket judgement call, and treat any request to remove it as
+         a design review rather than a permissions ticket.</p>
+      <p>The one legitimate exception I would grant: an S3 <em>static website endpoint</em> is needed for
+         certain redirect behaviours CloudFront cannot replicate. Even then the answer is a dedicated bucket
+         with no other data, not loosening the account-level setting.</p>
+    </details>
+
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove that S3 has no folders, and that a "rename" is two
+       operations.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws s3 cp app.log s3://acme-logs/logs/2026/08/20/app.log
+$ aws s3 ls s3://acme-logs/logs/2026/08/
+                           PRE 20/                 ← looks like a folder
+</pre>
+<pre>
+ASK S3 DIRECTLY WHETHER THAT OBJECT EXISTS:
+$ aws s3api head-object --bucket acme-logs --key 'logs/2026/08/20/'
+An error occurred (404) when calling the HeadObject operation: Not Found
+$ aws s3api head-object --bucket acme-logs --key 'logs/2026/08/'
+An error occurred (404) when calling the HeadObject operation: Not Found
+   → neither "folder" is an object. Only the leaf key exists:
+$ aws s3api head-object --bucket acme-logs --key 'logs/2026/08/20/app.log' \
+    --query '[ContentLength,LastModified]' --output text
+482100   2026-08-20T13:04:21+00:00
+</pre>
+<pre>
+SEE THE ILLUSION BEING CONSTRUCTED — prefix + delimiter:
+$ aws s3api list-objects-v2 --bucket acme-logs --prefix 'logs/2026/08/' --delimiter '/' \
+    --query '{folders:CommonPrefixes[].Prefix, files:Contents[].Key}' --output json
+{ "folders": [ "logs/2026/08/19/", "logs/2026/08/20/" ], "files": null }
+
+$ # remove the delimiter and the "folders" vanish — it is one flat list:
+$ aws s3api list-objects-v2 --bucket acme-logs --prefix 'logs/2026/08/' \
+    --query '{folders:CommonPrefixes, files:Contents[].Key}' --output json
+{ "folders": null,
+  "files": [ "logs/2026/08/19/app.log", "logs/2026/08/20/app.log" ] }
+</pre>
+<pre>
+A "RENAME" IS COPY + DELETE — watch the request count:
+$ aws s3 mv s3://acme-logs/logs/2026/08/20/app.log s3://acme-logs/archive/app.log
+copy: s3://acme-logs/logs/2026/08/20/app.log to s3://acme-logs/archive/app.log
+delete: s3://acme-logs/logs/2026/08/20/app.log
+   → TWO operations, billed separately, and NOT atomic: a failure between them
+     leaves the object in both places or in neither.
+
+  cost of "renaming" 10 million objects:
+     COPY   10 M × $0.005 / 1,000  = $50.00
+     DELETE 10 M × free             = $ 0.00
+     ...plus 10 M PUT-sized data transfers inside the Region.
+</pre>
+<pre>
+CREATE THE "EMPTY FOLDER" THE CONSOLE MAKES, and see what it really is:
+$ aws s3api put-object --bucket acme-logs --key 'newfolder/' --content-length 0
+$ aws s3api head-object --bucket acme-logs --key 'newfolder/' \
+    --query '[ContentLength,ContentType]' --output text
+0    application/x-directory                       ← a ZERO-BYTE OBJECT whose key ends in "/"
+   → the console invented a convention. S3 still just stored a key.
+</pre>
+<table class="tbl">
+  <tr><th>Filesystem operation</th><th>S3 reality</th><th>Cost / risk</th></tr>
+  <tr><td><code>mkdir</code></td><td>Nothing, or a 0-byte object by convention</td><td>Harmless but meaningless</td></tr>
+  <tr><td><code>mv</code></td><td><strong>COPY + DELETE</strong></td><td>Two ops, not atomic</td></tr>
+  <tr><td><code>du -sh dir/</code></td><td>LIST every key under the prefix</td><td>1,000 keys per request</td></tr>
+  <tr><td><code>rm -rf dir/</code></td><td>DELETE each object individually</td><td>Use Batch Operations at scale</td></tr>
+  <tr><td><code>ls</code></td><td>LIST with prefix + delimiter</td><td>Paginated, eventually expensive</td></tr>
+</table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Walk the access evaluation chain: make a bucket policy that
+       looks correct, watch it be refused, and find out why.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat &gt; public.json &lt;&lt;'JSON'
+{ "Version":"2012-10-17",
+  "Statement":[{"Sid":"PublicRead","Effect":"Allow","Principal":"*",
+    "Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-assets/*"}] }
+JSON
+$ aws s3api put-bucket-policy --bucket acme-assets --policy file://public.json
+An error occurred (AccessDenied) when calling the PutBucketPolicy operation: Access Denied
+</pre>
+<pre>
+CHECK LAYER 1 BEFORE ANYTHING ELSE:
+$ aws s3api get-public-access-block --bucket acme-assets \
+    --query 'PublicAccessBlockConfiguration' --output json
+{ "BlockPublicAcls": true, "IgnorePublicAcls": true,
+  "BlockPublicPolicy": true, "RestrictPublicBuckets": true }
+
+$ aws s3control get-public-access-block --account-id 111122223333 \
+    --query 'PublicAccessBlockConfiguration.BlockPublicPolicy' --output text
+true                                               ← ACCOUNT level too. This one wins.
+</pre>
+<p><strong>The policy was never stored.</strong> That is the important part of the exercise: engineers spend
+   hours debugging a bucket policy that does not exist, because <code>get-bucket-policy</code> returns
+   <code>NoSuchBucketPolicy</code> and they read that as "the policy is not working" rather than "the policy is
+   not there".</p>
+<pre>
+$ aws s3api get-bucket-policy --bucket acme-assets
+An error occurred (NoSuchBucketPolicy): The bucket policy does not exist
+</pre>
+<pre>
+NOW THE NEXT LAYER — a POLICY that is stored but overridden. Grant a role access,
+then add an explicit deny above it:
+$ aws s3api put-bucket-policy --bucket acme-assets --policy '{
+    "Version":"2012-10-17","Statement":[
+      {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:role/App"},
+       "Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-assets/*"},
+      {"Effect":"Deny","Principal":"*","Action":"s3:*",
+       "Resource":["arn:aws:s3:::acme-assets","arn:aws:s3:::acme-assets/*"],
+       "Condition":{"Bool":{"aws:SecureTransport":"false"}}}]}'
+
+$ aws s3api get-object --bucket acme-assets --key logo.png /tmp/logo.png --endpoint-url http://s3.amazonaws.com
+An error occurred (AccessDenied): ... with an explicit deny in a resource-based policy
+   → the ERROR TEXT names the layer. Read it before editing anything.
+</pre>
+<pre>
+AND THE THIRD LAYER — SSE-KMS needs a separate grant on the KEY:
+$ aws s3api get-bucket-encryption --bucket acme-assets \
+    --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault' --output json
+{ "SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "arn:aws:kms:...:key/9f2a-4b2c" }
+
+$ aws s3api get-object --bucket acme-assets --key logo.png /tmp/logo.png
+An error occurred (AccessDenied) when calling the GetObject operation
+$ aws kms decrypt --key-id 9f2a-4b2c --ciphertext-blob fileb:///dev/null 2&gt;&amp;1 | head -1
+An error occurred (AccessDenied): ... is not authorized to perform: kms:Decrypt
+   ⇒ BOTH S3 policies are correct. The KMS KEY POLICY is the missing grant.
+</pre>
+<table class="tbl">
+  <tr><th>Order</th><th>Layer</th><th>How it fails</th><th>Command that reveals it</th></tr>
+  <tr><td>1</td><td><strong>Block Public Access</strong></td><td>The policy is <strong>never stored</strong></td><td><code>get-public-access-block</code> (bucket <em>and</em> account)</td></tr>
+  <tr><td>2</td><td>Explicit Deny (SCP, bucket, IAM, endpoint)</td><td>"explicit deny in a ... policy"</td><td>Read the error text</td></tr>
+  <tr><td>3</td><td>No Allow anywhere</td><td>"no identity-based policy allows"</td><td><code>iam simulate-principal-policy</code></td></tr>
+  <tr><td>4</td><td><strong>KMS key policy</strong></td><td>Generic <code>AccessDenied</code> on GetObject</td><td>Try <code>kms:Decrypt</code> directly</td></tr>
+  <tr><td>5</td><td>VPC endpoint policy</td><td>Works outside the VPC, denied inside</td><td><code>describe-vpc-endpoints</code></td></tr>
+</table>
+<div class="note">🔑 The two <code>AccessDenied</code> messages are <em>not</em> interchangeable: "explicit deny
+   in a resource-based policy" and "no identity-based policy allows" point at completely different layers and
+   completely different fixes. Reading the error before touching a policy is the single habit that separates a
+   five-minute diagnosis from an afternoon of widening permissions until the symptom stops.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Make a versioned bucket bigger by deleting from it, then
+       write the lifecycle rule that actually reclaims the space.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws s3api put-bucket-versioning --bucket acme-docs --versioning-configuration Status=Enabled
+$ for i in 1 2 3 4 5; do
+    dd if=/dev/urandom of=/tmp/doc bs=1M count=5 2&gt;/dev/null
+    aws s3 cp /tmp/doc s3://acme-docs/contract.pdf &gt;/dev/null
+  done
+   → ONE key. FIVE overwrites.
+
+$ aws s3 ls s3://acme-docs/ --summarize | tail -2
+Total Objects: 1
+   Total Size: 5242880                             ← 5 MB, says the CLI
+
+$ aws s3api list-object-versions --bucket acme-docs --prefix contract.pdf \
+    --query 'sum(Versions[].Size)' --output text
+26214400                                           ← 25 MB, says the truth
+</pre>
+<pre>
+NOW DELETE IT AND WATCH THE BUCKET GROW:
+$ aws s3 rm s3://acme-docs/contract.pdf
+delete: s3://acme-docs/contract.pdf
+$ aws s3 ls s3://acme-docs/ --summarize | tail -2
+Total Objects: 0
+   Total Size: 0                                   ← "empty"
+
+$ aws s3api list-object-versions --bucket acme-docs --prefix contract.pdf \
+    --query '{versions: length(Versions), bytes: sum(Versions[].Size),
+              markers: length(DeleteMarkers)}' --output json
+{ "versions": 5, "bytes": 26214400, "markers": 1 }
+   ⇒ 25 MB still stored, still billed, plus a delete marker.
+     "Deleting" added an object to the bucket.
+</pre>
+<pre>
+UNDELETE, to prove nothing was lost:
+$ MARKER=$(aws s3api list-object-versions --bucket acme-docs --prefix contract.pdf \
+    --query 'DeleteMarkers[0].VersionId' --output text)
+$ aws s3api delete-object --bucket acme-docs --key contract.pdf --version-id $MARKER
+$ aws s3 ls s3://acme-docs/contract.pdf
+2026-08-20 13:41:02    5242880 contract.pdf        ← back
+</pre>
+<pre>
+FIND THE REAL NUMBER ACROSS THE WHOLE BUCKET — CloudWatch, not the CLI:
+$ for t in StandardStorage AllStorageTypes; do
+    printf '%-20s ' $t
+    aws cloudwatch get-metric-statistics --namespace AWS/S3 --metric-name BucketSizeBytes \
+      --dimensions Name=BucketName,Value=acme-docs Name=StorageType,Value=$t \
+      --start-time $(date -u -d '2 days ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+      --period 86400 --statistics Average --query 'Datapoints[-1].Average' --output text
+  done
+StandardStorage      15402238042112                ← 14.0 TB billed
+AllStorageTypes      15402238042112
+
+$ aws s3 ls s3://acme-docs/ --recursive --summarize 2&gt;/dev/null | tail -1
+   Total Size: 2210443120640                       ← 2.0 TB visible
+                                                     ⇒ 12 TB of noncurrent versions
+</pre>
+<pre>
+✅ THE FOUR-CLAUSE LIFECYCLE RULE:
+$ aws s3api put-bucket-lifecycle-configuration --bucket acme-docs \
+    --lifecycle-configuration '{"Rules":[{
+      "ID":"version-hygiene","Status":"Enabled","Filter":{"Prefix":""},
+      "NoncurrentVersionTransitions":[{"NoncurrentDays":30,"StorageClass":"GLACIER_IR"}],
+      "NoncurrentVersionExpiration":{"NoncurrentDays":90,"NewerNoncurrentVersions":3},
+      "Expiration":{"ExpiredObjectDeleteMarker":true},
+      "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+
+$ aws s3api get-bucket-lifecycle-configuration --bucket acme-docs \
+    --query 'Rules[0].[NoncurrentVersionExpiration,Expiration]' --output json
+[ {"NoncurrentDays":90,"NewerNoncurrentVersions":3}, {"ExpiredObjectDeleteMarker":true} ]
+</pre>
+<pre>
+MEASURE, a week later:
+$ aws cloudwatch get-metric-statistics --namespace AWS/S3 --metric-name BucketSizeBytes \
+    --dimensions Name=BucketName,Value=acme-docs Name=StorageType,Value=StandardStorage \
+    ... --query 'Datapoints[-1].Average' --output text
+2681432211456                                      ← 14.0 TB → 2.4 TB
+
+    saving  11.6 TB × $0.023  =  $267 / month, from four lines of JSON.
+</pre>
+<table class="tbl">
+  <tr><th>Clause</th><th>Without it</th></tr>
+  <tr><td><code>NoncurrentVersionExpiration</code></td><td>Every overwrite is kept forever</td></tr>
+  <tr><td><strong><code>NewerNoncurrentVersions: 3</code></strong></td><td>Expiry is purely time-based — a rarely-changed file loses its only backup</td></tr>
+  <tr><td><code>ExpiredObjectDeleteMarker</code></td><td>Delete markers accumulate with nothing beneath them</td></tr>
+  <tr><td><code>AbortIncompleteMultipartUpload</code></td><td>Abandoned uploads billed indefinitely, invisible everywhere</td></tr>
+</table>
+<div class="note">🔑 <code>NewerNoncurrentVersions</code> is the clause that makes this safe to apply broadly:
+   time-based expiry alone will delete the last good copy of a file that has not been touched in a year, which
+   is precisely the file you most want a version of. Keeping the newest three <em>and</em> expiring after 90
+   days gives you recovery for active files and bounded cost for everything else.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Measure what SSE-KMS actually costs at volume, enable
+       Bucket Keys, and measure again.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws s3api get-bucket-encryption --bucket acme-data \
+    --query 'ServerSideEncryptionConfiguration.Rules[0]' --output json
+{ "ApplyServerSideEncryptionByDefault": {
+    "SSEAlgorithm": "aws:kms",
+    "KMSMasterKeyID": "arn:aws:kms:us-east-1:111122223333:key/9f2a-4b2c" },
+  "BucketKeyEnabled": false }                      ← off. Every object hits KMS.
+</pre>
+<pre>
+COUNT THE KMS REQUESTS:
+$ aws cloudwatch get-metric-statistics --namespace AWS/KMS --metric-name RequestCount \
+    --dimensions Name=KeyId,Value=9f2a-4b2c --period 86400 --statistics Sum \
+    --start-time $(date -u -d '7 days ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --query 'sum(Datapoints[].Sum)' --output text
+44890188.0                                         ← 44.9 M in a week ≈ 192 M/month
+
+AND THE BILL:
+$ aws ce get-cost-and-usage --time-period Start=2026-07-01,End=2026-08-01 \
+    --granularity MONTHLY --metrics UnblendedCost \
+    --filter '{"Dimensions":{"Key":"USAGE_TYPE","Values":["USE1-KMS-Requests"]}}' \
+    --query 'ResultsByTime[0].Total.UnblendedCost.Amount' --output text
+577.44
+
+$ aws ce get-cost-and-usage ... --filter '{"Dimensions":{"Key":"USAGE_TYPE",
+    "Values":["USE1-Requests-Tier2"]}}' --query 'ResultsByTime[0].Total.UnblendedCost.Amount' --output text
+76.80                                              ← the S3 GETs themselves
+   ⇒ encryption cost 7.5× the requests it was protecting.
+</pre>
+<pre>
+✅ ONE SETTING:
+$ aws s3api put-bucket-encryption --bucket acme-data --server-side-encryption-configuration '{
+    "Rules":[{"ApplyServerSideEncryptionByDefault":{
+        "SSEAlgorithm":"aws:kms",
+        "KMSMasterKeyID":"arn:aws:kms:us-east-1:111122223333:key/9f2a-4b2c"},
+      "BucketKeyEnabled": true}]}'
+
+$ aws s3api get-bucket-encryption --bucket acme-data \
+    --query 'ServerSideEncryptionConfiguration.Rules[0].BucketKeyEnabled' --output text
+true
+</pre>
+<pre>
+MEASURE AGAIN, next day:
+$ aws cloudwatch get-metric-statistics --namespace AWS/KMS --metric-name RequestCount \
+    --dimensions Name=KeyId,Value=9f2a-4b2c --period 86400 --statistics Sum \
+    --start-time $(date -u -d '2 days ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --query 'sort_by(Datapoints,&amp;Timestamp)[].[Timestamp,Sum]' --output text
+2026-08-19T00:00:00Z   6412884.0                   ← before
+2026-08-20T00:00:00Z     41209.0                   ← after
+
+    reduction  99.36%
+    cost       $577.44 / month  →  $3.71 / month
+</pre>
+<pre>
+⚠️ IT ONLY APPLIES TO OBJECTS WRITTEN AFTER YOU ENABLE IT.
+   Existing objects keep their per-object keys until rewritten:
+$ aws s3api head-object --bucket acme-data --key old/file.parquet \
+    --query 'BucketKeyEnabled' --output text
+False
+$ aws s3api head-object --bucket acme-data --key new/file.parquet \
+    --query 'BucketKeyEnabled' --output text
+True
+
+✅ rewrite the back catalogue in place with Batch Operations, driven by Inventory:
+$ aws s3control create-job --account-id 111122223333 --priority 10 \
+    --operation '{"S3PutObjectCopy":{"TargetResource":"arn:aws:s3:::acme-data",
+        "BucketKeyEnabled":true,"StorageClass":"STANDARD"}}' \
+    --manifest file://manifest.json --report file://report.json \
+    --role-arn arn:aws:iam::111122223333:role/S3BatchRole --no-confirmation-required
+</pre>
+<table class="tbl">
+  <tr><th></th><th>Without Bucket Keys</th><th>With Bucket Keys</th></tr>
+  <tr><td>KMS requests/day</td><td>6,412,884</td><td><strong>41,209</strong></td></tr>
+  <tr><td>KMS cost/month</td><td>$577.44</td><td><strong>$3.71</strong></td></tr>
+  <tr><td>Setup</td><td>—</td><td><strong>One boolean</strong></td></tr>
+  <tr><td>Security posture</td><td>Per-object data keys</td><td>Bucket-level key, per-object derivation</td></tr>
+  <tr><td>CloudTrail granularity</td><td><strong>Per object</strong></td><td>Per bucket key</td></tr>
+  <tr><td>Throttling risk</td><td>KMS request quotas at volume</td><td>Effectively removed</td></tr>
+</table>
+<div class="note">💡 The only reason to leave Bucket Keys off is the CloudTrail row: if a compliance
+   requirement depends on a per-object KMS audit trail, verify that before enabling. Everything else favours
+   turning it on — including a benefit that is not about cost at all: KMS has per-Region request quotas, and a
+   high-volume S3 workload without bucket keys can <em>throttle on KMS</em> under load, producing 503s that
+   look like an S3 problem and are not.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Drive a prefix into <code>503 SlowDown</code>, prove the
+       limit is per-prefix, and fix it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat &gt; hammer.py &lt;&lt;'PY'
+import boto3, concurrent.futures as cf, sys, time, collections
+s3 = boto3.client("s3", config=boto3.session.Config(retries={"max_attempts": 0}))
+BUCKET, PREFIX, N = sys.argv[1], sys.argv[2], int(sys.argv[3])
+res = collections.Counter()
+def put(i):
+    try:
+        s3.put_object(Bucket=BUCKET, Key=f"{PREFIX}/obj-{i}", Body=b"x")
+        return "ok"
+    except Exception as e:
+        return type(e).__name__ if "SlowDown" not in str(e) else "SlowDown"
+t0 = time.time()
+with cf.ThreadPoolExecutor(max_workers=400) as ex:
+    for r in ex.map(put, range(N)): res[r] += 1
+print(dict(res), f"{N/(time.time()-t0):.0f} req/s")
+PY
+   ⚠️ retries DISABLED deliberately, so throttling is visible. Never do this in production.
+</pre>
+<pre>
+ONE PREFIX, hard:
+$ python3 hammer.py acme-uploads 'ingest/single' 40000
+{'ok': 27412, 'SlowDown': 12588} 3204 req/s
+   → 31% throttled, and throughput plateaued near the documented 3,500 PUT/s.
+</pre>
+<pre>
+SPREAD THE SAME WORK ACROSS 8 PREFIXES:
+$ for s in 0 1 2 3 4 5 6 7; do
+    python3 hammer.py acme-uploads "ingest/shard-$s" 5000 &amp;
+  done; wait
+{'ok': 5000} 3180 req/s
+{'ok': 5000} 3201 req/s
+{'ok': 4998, 'SlowDown': 2} 3166 req/s
+{'ok': 5000} 3199 req/s
+{'ok': 5000} 3188 req/s
+{'ok': 5000} 3174 req/s
+{'ok': 5000} 3195 req/s
+{'ok': 5000} 3192 req/s
+   → 39,998 / 40,000 succeeded, aggregate ≈ 25,500 req/s.
+     The limit is PER PREFIX, and it scaled ~8×.
+</pre>
+<pre>
+NOW SHOW THAT RETRIES ALONE ALSO WORK — because S3 partitions as load persists:
+$ sed -i 's/{"max_attempts": 0}/{"max_attempts": 10, "mode": "adaptive"}/' hammer.py
+$ python3 hammer.py acme-uploads 'ingest/single' 40000
+{'ok': 40000} 2980 req/s                           ← zero failures, slightly slower
+$ # ...and immediately again, on the now-partitioned prefix:
+$ python3 hammer.py acme-uploads 'ingest/single' 40000
+{'ok': 40000} 6120 req/s                           ← S3 SPLIT the partition. 2× throughput.
+</pre>
+<table class="tbl">
+  <tr><th>Configuration</th><th>Success</th><th>Throughput</th><th>Note</th></tr>
+  <tr><td>1 prefix, no retries</td><td><strong>69%</strong></td><td>3,204 req/s</td><td>Data loss, if the caller does not retry</td></tr>
+  <tr><td>1 prefix, adaptive retries</td><td>100%</td><td>2,980 req/s</td><td>Slower, but correct</td></tr>
+  <tr><td>1 prefix, after partitioning</td><td>100%</td><td><strong>6,120 req/s</strong></td><td>S3 adapted — but it took minutes</td></tr>
+  <tr><td><strong>8 prefixes, no retries</strong></td><td><strong>99.995%</strong></td><td><strong>25,500 req/s</strong></td><td>Scales immediately</td></tr>
+</table>
+<pre>
+✅ THE PRODUCTION SHAPE — structured, not random:
+   ingest/dt=2026-08-20/hour=13/shard-03/event-9f2a.json
+          └─ queryable ─┘         └─ throughput ─┘
+
+   ❌ NOT: ingest/a3f91c2b-event-9f2a.json
+      random hashes buy NOTHING (S3 has partitioned on prefix since 2018) and
+      make lifecycle rules, Athena partition pruning and date-range listing impossible.
+</pre>
+<div class="note">🔑 <strong>Two conclusions, and the second is the one people miss.</strong> First: leave SDK
+   retries on — <code>mode: adaptive</code> handled a 31% throttle rate with zero failures, and disabling
+   retries turns a transient <code>SlowDown</code> into lost data. Second: S3 <em>does</em> partition
+   automatically, but it takes minutes, so retries protect you during the adaptation while prefix spreading
+   gives throughput immediately. A workload that ramps gradually needs neither; one that goes from zero to peak
+   in seconds needs both. And note the throughput after partitioning was still below the 8-prefix result — one
+   partition has a ceiling however long you wait.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> A 14 TB bucket costs more than expected and nobody knows
+       what is in it. Find out without listing it, then fix the top three causes.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+❌ THE INSTINCT, and why not:
+$ time aws s3 ls s3://acme-data --recursive --summarize | tail -2
+^C after 40 minutes
+   49,883,217 objects ÷ 1,000 per LIST = 49,883 requests, ~$0.25 and ~20 minutes
+   ...and it tells you nothing about VERSIONS, storage class, or age.
+</pre>
+<pre>
+✅ STEP 1 — STORAGE LENS. Free tier, one call, answers the question:
+$ aws s3control get-storage-lens-configuration --account-id 111122223333 \
+    --config-id default-account-dashboard --query 'StorageLensConfiguration.IsEnabled'
+true
+$ # from the dashboard's metrics export:
+  StorageBytes                            15,402,238,042,112   (14.0 TB)
+  CurrentVersionStorageBytes               2,210,443,120,640   ( 2.0 TB)   14%
+  NonCurrentVersionStorageBytes           11,204,882,001,920   (10.2 TB)   73%  ⚠️
+  IncompleteMultipartUploadStorageBytes     1,986,912,919,552   ( 1.8 TB)   13%  ⚠️
+  ObjectCount                                     49,883,217
+  AvgObjectSize                                      284,762   (285 KB)
+  StorageClass: STANDARD                                100%              ⚠️
+</pre>
+<pre>
+✅ STEP 2 — S3 INVENTORY + ATHENA for the detail LIST cannot give:
+$ aws s3api put-bucket-inventory-configuration --bucket acme-data --id daily \
+    --inventory-configuration '{
+      "Destination":{"S3BucketDestination":{"Bucket":"arn:aws:s3:::acme-inventory",
+        "Format":"Parquet","AccountId":"111122223333"}},
+      "IsEnabled":true,"Id":"daily","IncludedObjectVersions":"All",
+      "Schedule":{"Frequency":"Daily"},
+      "OptionalFields":["Size","LastModifiedDate","StorageClass","IsMultipartUploaded",
+                        "IsLatest","IsDeleteMarker"]}'
+   (delivered within 48 h; then query it)
+
+SELECT is_latest, storage_class,
+       count(*) AS objects,
+       round(sum(size)/1e12, 2) AS tb
+FROM   s3_inventory.acme_data
+GROUP  BY 1, 2 ORDER BY tb DESC;
+
+ is_latest  storage_class  objects      tb
+ false      STANDARD       41,204,882   10.20        ← noncurrent versions
+ true       STANDARD        8,678,335    2.01
+</pre>
+<pre>
+WHERE, specifically?
+SELECT regexp_extract(key, '^([^/]+/[^/]+)', 1) AS prefix,
+       round(sum(size)/1e12, 2) AS tb, count(*) AS objects
+FROM   s3_inventory.acme_data WHERE is_latest = false
+GROUP  BY 1 ORDER BY tb DESC LIMIT 3;
+
+ prefix                tb      objects
+ exports/nightly      8.91    38,402,118            ← a nightly job overwriting the same keys
+ uploads/raw          1.02     2,204,881
+ reports/generated    0.27       597,883
+</pre>
+<pre>
+✅ STEP 3 — FIX ALL THREE CAUSES IN ONE LIFECYCLE CONFIGURATION:
+$ aws s3api put-bucket-lifecycle-configuration --bucket acme-data \
+    --lifecycle-configuration '{"Rules":[
+      {"ID":"noncurrent","Status":"Enabled","Filter":{"Prefix":""},
+       "NoncurrentVersionExpiration":{"NoncurrentDays":30,"NewerNoncurrentVersions":2},
+       "Expiration":{"ExpiredObjectDeleteMarker":true}},
+      {"ID":"abort-mpu","Status":"Enabled","Filter":{"Prefix":""},
+       "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}},
+      {"ID":"tier-large-current","Status":"Enabled",
+       "Filter":{"And":{"Prefix":"exports/","ObjectSizeGreaterThan":131072}},
+       "Transitions":[{"Days":30,"StorageClass":"INTELLIGENT_TIERING"}]}]}'
+</pre>
+<pre>
+MEASURE — CloudWatch, 10 days later:
+$ aws cloudwatch get-metric-statistics --namespace AWS/S3 --metric-name BucketSizeBytes \
+    --dimensions Name=BucketName,Value=acme-data Name=StorageType,Value=StandardStorage \
+    --start-time $(date -u -d '12 days ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --period 86400 --statistics Average \
+    --query 'sort_by(Datapoints,&amp;Timestamp)[::4].[Timestamp,Average]' --output text
+2026-08-20T00:00:00Z   15402238042112              (14.0 TB)
+2026-08-24T00:00:00Z    8104229294080              ( 7.4 TB)
+2026-08-28T00:00:00Z    2913442201600              ( 2.6 TB)
+</pre>
+<table class="tbl">
+  <tr><th>Cause</th><th>Was</th><th>Now</th><th>Monthly saving</th></tr>
+  <tr><td>Noncurrent versions</td><td>10.2 TB</td><td>0.4 TB</td><td><strong>$225</strong></td></tr>
+  <tr><td>Incomplete multipart uploads</td><td>1.8 TB</td><td>0.0 TB</td><td><strong>$41</strong></td></tr>
+  <tr><td>All-Standard storage class</td><td>2.0 TB</td><td>2.2 TB, tiering</td><td>~$20 and rising</td></tr>
+  <tr><td><strong>Total</strong></td><td><strong>14.0 TB / $322</strong></td><td><strong>2.6 TB / $60</strong></td><td><strong>$262 (81%)</strong></td></tr>
+</table>
+<pre>
+✅ STEP 4 — STOP IT RECURRING. The nightly job was the cause, not the symptom:
+   it re-uploaded 38 M identical objects every night to a versioned bucket.
+$ # write only what changed, and stop versioning a derived dataset:
+$ aws s3 sync /data/exports s3://acme-data/exports/ --size-only
+$ aws s3api put-bucket-versioning --bucket acme-data \
+    --versioning-configuration Status=Suspended
+   ⚠️ Suspended, not disabled — versioning cannot be turned off, and existing
+     versions stay billed until the lifecycle rule expires them.
+</pre>
+<div class="note">🔑 <strong>Three-quarters of a 14 TB bucket was invisible to every tool the team had been
+   using.</strong> The console and <code>aws s3 ls</code> report current versions only; Storage Lens and the
+   invoice report everything. That gap is why "the bucket is 2 TB, the bill says 14 TB" is such a common
+   ticket — and why the first move on any storage-cost question is Storage Lens, never a LIST. Note also that
+   the durable fix was <em>upstream</em>: a nightly job overwriting 38 million unchanged objects into a
+   versioned bucket. Lifecycle rules cap the damage; changing the writer removes it.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>S3 has no folders</strong> — it is a flat keyspace, and "directories" are <code>CommonPrefixes</code> synthesised from a prefix and a delimiter. <code>head-object</code> on a "folder" returns 404.</li>
+        <li>There is no rename: <code>mv</code> is <strong>COPY + DELETE</strong>, two billed operations and not atomic.</li>
+        <li><strong>S3 has been strongly consistent since December 2020</strong> — polling loops, retry wrappers and DynamoDB consistency layers are dead weight to delete.</li>
+        <li><strong>Random key prefixes are obsolete advice</strong> (S3 has partitioned on prefix since 2018) and actively harmful — they break lifecycle rules and date-range queries.</li>
+        <li>Listing is 1,000 keys per request: a billion objects is <strong>1 M requests, $5 and ~5.5 hours</strong>, and stale on arrival. Use <strong>S3 Inventory + Athena</strong>.</li>
+        <li>Limits are <strong>3,500 write / 5,500 read requests per second per prefix</strong>; spreading across 8 prefixes measured <strong>3,204 → 25,500 req/s</strong>.</li>
+        <li>S3 partitions automatically but it takes <em>minutes</em> — so <strong>leave SDK retries on</strong> (<code>adaptive</code> mode handled a 31% throttle rate with zero failures) and ramp gradually.</li>
+        <li><strong>Incomplete multipart uploads are billed forever and invisible</strong> in the console and <code>s3 ls</code> — 1.8 TB in one bucket. Put <code>AbortIncompleteMultipartUpload</code> on every bucket.</li>
+        <li>Access evaluates as <strong>Block Public Access → explicit Deny → any Allow → KMS key policy → endpoint policy</strong>.</li>
+        <li><code>BlockPublicPolicy</code> <strong>refuses to store</strong> a public policy — so the policy you are debugging may never have existed. Check <code>get-public-access-block</code> first, at bucket <em>and</em> account level.</li>
+        <li>The two <code>AccessDenied</code> messages are not interchangeable: "explicit deny in a resource-based policy" and "no identity-based policy allows" point at different layers.</li>
+        <li><strong>SSE-KMS cross-account needs a third grant</strong> — the KMS key policy — which is the usual "both S3 policies look right" case.</li>
+        <li><strong>Never disable Block Public Access to serve a website.</strong> CloudFront + Origin Access Control (scoped with <code>AWS:SourceArn</code>) is private, cached, cheaper and cannot be misconfigured into a public listing.</li>
+        <li>ACLs are <strong>disabled by default</strong> since April 2023 (<code>BucketOwnerEnforced</code>), which removes the old cross-account object-ownership problem entirely.</li>
+        <li>A presigned URL signed with <strong>role credentials expires with the session</strong>, so a "7-day" URL can last an hour.</li>
+        <li><strong>Versioning is one-way</strong> — suspendable, never disableable — and <code>DELETE</code> writes a <strong>delete marker</strong>, so deleting data makes the bucket bigger.</li>
+        <li>The console and <code>aws s3 ls</code> <strong>hide noncurrent versions</strong>; CloudWatch, Storage Lens and the invoice count them. That gap is the "2 TB in the console, 14 TB on the bill" ticket.</li>
+        <li>A complete lifecycle rule has four clauses: noncurrent transition, <strong><code>NoncurrentVersionExpiration</code> with <code>NewerNoncurrentVersions</code></strong>, <code>ExpiredObjectDeleteMarker</code>, and abort-incomplete-MPU. Measured 14.0 TB → 2.6 TB, an 81% saving.</li>
+        <li>Pair <code>put-bucket-versioning</code> with a lifecycle rule <strong>in the same change</strong> — and fix the upstream writer, because lifecycle caps the damage while the writer causes it.</li>
+        <li><strong>SSE-KMS makes a KMS call per object operation</strong> — $577/month on 192 M requests, 7.5× the S3 request cost it protected.</li>
+        <li><strong><code>BucketKeyEnabled: true</code> cut that by 99.4% to $3.71</strong>, is free, and also removes KMS request-quota throttling. It applies only to objects written afterwards — rewrite the back catalogue with Batch Operations.</li>
+        <li><strong>Object Lock in compliance mode cannot be undone by anyone, including the root user</strong> — it fixes the bill until the retention date. Use governance mode plus an SCP on the bypass permission unless a regulator names compliance mode.</li>
+        <li>Answer "where is my storage?" with <strong>Storage Lens</strong>, and act on millions of objects with <strong>Batch Operations driven by an Inventory manifest</strong> — never a script looping over LIST.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="lambda-serverless.html">← Lambda &amp; API Gateway</a>
+      <a href="rds-aurora.html">RDS &amp; Aurora →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
