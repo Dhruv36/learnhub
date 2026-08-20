@@ -1,0 +1,1325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Encryption, Secrets &amp; Audit — AWS — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../kubernetes/index.html">Kubernetes</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Encryption, Secrets &amp; Audit <span class="level-badge level-ultra">Operations</span></h1>
+
+    <p><strong>What you'll master:</strong> KMS as the thing everything else is built on — <strong>envelope
+       encryption</strong>, and the rule that surprises people every time: <strong>the key policy is
+       authoritative, so an IAM policy granting <code>kms:Decrypt</code> can grant nothing at all</strong>;
+       what "encrypted at rest" actually costs you operationally, including the fact that
+       <strong>an unencrypted RDS instance cannot be encrypted in place</strong> — the only path is snapshot,
+       copy, restore, cut over; secrets that live in Secrets Manager or Parameter Store instead of in
+       environment variables, images and Terraform state, and rotation that the application actually picks up;
+       the detective services — GuardDuty, Security Hub, Config, Inspector, Macie, Access Analyzer — and the
+       uncomfortable truth that <strong>a finding nobody routes to a human is not a control</strong>; the
+       incident-response moves specific to AWS, where <strong>revoking a leaked temporary credential is a deny
+       on <code>aws:TokenIssueTime</code></strong> and forensics means snapshotting before terminating; and the
+       account baseline that should exist on day one, shipped as StackSets. Prerequisites:
+       <a href="iam-basics.html">IAM</a>, <a href="iam-deep-dive.html">IAM Advanced</a>,
+       <a href="s3.html">S3</a> and <a href="iac.html">Infrastructure as Code</a>.</p>
+
+    <h2>Part 1 — KMS: Envelope Encryption and an Authoritative Key Policy</h2>
+
+<pre>
+KMS NEVER ENCRYPTS YOUR DATA. It encrypts the key that encrypts your data:
+
+  1. GenerateDataKey        → returns { Plaintext: K, CiphertextBlob: E(K) }
+  2. encrypt the object locally with K, using AES-256
+  3. throw away K; store E(K) alongside the ciphertext
+  4. to read: send E(K) to KMS → Decrypt → K → decrypt locally
+
+  → your 5 GB file never crosses the network to KMS. Only a 32-byte key does.
+    (KMS's own Encrypt API is limited to 4 KB, which is why this pattern exists.)
+</pre>
+
+<pre>
+$ aws kms generate-data-key --key-id alias/acme-data --key-spec AES_256 \
+    --query '[length(Plaintext),length(CiphertextBlob)]' --output text
+44   200                                           ← base64: a 32-byte key, and its wrapped form
+
+$ aws kms decrypt --ciphertext-blob fileb://encrypted-key.bin \
+    --encryption-context 'purpose=customer-export,tenant=acme' \
+    --query Plaintext --output text | head -c 20
+   ⚠️ the ENCRYPTION CONTEXT is authenticated additional data: decrypt fails unless
+     it matches exactly, and it is recorded in CloudTrail — so the audit log shows
+     WHAT was decrypted, not merely that a key was used.
+</pre>
+
+    <div class="note">🔑 <strong>The key policy is authoritative, not the IAM policy.</strong> Unlike almost
+       everything else in AWS, a KMS key's resource policy must <em>either</em> grant the principal directly
+       <em>or</em> explicitly delegate to IAM (the default policy does the latter with a
+       <code>kms:CallerAccount</code> condition). If someone replaces that default policy with a narrow one, an
+       identity policy granting <code>kms:Decrypt</code> on <code>*</code> grants <strong>nothing</strong> —
+       which is the root of most "the IAM policy is clearly correct and it is still denied" tickets, and of the
+       cross-account SSE-KMS failures from the <a href="iam-basics.html">IAM lesson</a>.</div>
+
+    <table class="tbl">
+      <tr><th>Key type</th><th>You control</th><th>Cost</th><th>Rotation</th></tr>
+      <tr><td>AWS owned</td><td>Nothing — invisible</td><td>Free</td><td>AWS decides</td></tr>
+      <tr><td>AWS managed (<code>aws/s3</code>)</td><td>Nothing; policy is fixed</td><td>Free</td><td>Automatic, annual</td></tr>
+      <tr><td><strong>Customer managed</strong></td><td><strong>Policy, grants, rotation, deletion</strong></td><td>$1/month + $0.03 per 10k requests</td><td>Optional automatic</td></tr>
+      <tr><td>Multi-Region</td><td>Same key material in several Regions</td><td>$1 per replica</td><td>Automatic</td></tr>
+      <tr><td>Imported material</td><td>You supply and can delete the material</td><td>$1/month</td><td>Manual</td></tr>
+    </table>
+
+<pre>
+SCOPE A KEY TO A SERVICE — so a stolen credential cannot use it directly:
+  { "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::111122223333:role/AppRole" },
+    "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+    "Resource": "*",
+    "Condition": {
+      "StringEquals": {
+        "kms:ViaService": "s3.us-east-1.amazonaws.com",
+        "kms:EncryptionContext:tenant": "acme" } } }
+   → AppRole can decrypt ONLY through S3, and ONLY for tenant acme.
+     A leaked credential cannot call kms:Decrypt directly on arbitrary ciphertext.
+</pre>
+
+<pre>
+ROTATION AND DELETION — both behave differently from how people assume:
+$ aws kms enable-key-rotation --key-id 9f2a-4b2c
+   → new backing material each year. OLD MATERIAL IS RETAINED, so ciphertext
+     encrypted years ago still decrypts. Rotation does NOT re-encrypt anything.
+
+$ aws kms schedule-key-deletion --key-id 9f2a-4b2c --pending-window-in-days 30
+{ "DeletionDate": "2026-09-19T00:00:00Z", "KeyState": "PendingDeletion" }
+   ⚠️ 7–30 days, and it is the ONLY destructive action in AWS with a mandatory
+     waiting period — because deleting a key destroys every ciphertext it protects,
+     permanently and unrecoverably. Alarm on ScheduleKeyDeletion.
+</pre>
+
+    <h2>Part 2 — Encryption in Practice, and the One You Cannot Retrofit</h2>
+
+    <table class="tbl">
+      <tr><th>Service</th><th>Default</th><th>Retrofit an existing resource?</th></tr>
+      <tr><td>S3</td><td><strong>SSE-S3 on, automatically</strong></td><td>✅ re-copy objects (Batch Operations)</td></tr>
+      <tr><td>EBS</td><td>Off unless the Region default is set</td><td><strong>❌ not in place</strong> — snapshot → copy encrypted → new volume</td></tr>
+      <tr><td><strong>RDS / Aurora</strong></td><td>Off unless specified</td><td><strong>❌ not in place</strong> — snapshot → copy encrypted → restore → cut over</td></tr>
+      <tr><td>DynamoDB</td><td><strong>Always encrypted</strong></td><td>✅ switch to a CMK any time</td></tr>
+      <tr><td>EFS / FSx</td><td>Off unless specified</td><td>❌ create new, copy data</td></tr>
+      <tr><td>Secrets Manager / SSM SecureString</td><td>Always</td><td>—</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>"Encrypt the database" is a migration, not a setting.</strong> RDS encryption is
+       fixed at creation, so retrofitting means snapshot, copy the snapshot with a KMS key, restore the copy,
+       and cut the application over — which involves a new endpoint and a maintenance window (see the restore
+       caveats in <a href="rds-aurora.html">RDS &amp; Aurora</a>). Turn on the account-level EBS default and
+       create every database encrypted from the start; the retrofit is the expensive path and it is entirely
+       avoidable.</div>
+
+<pre>
+SET THE DEFAULTS ONCE PER REGION, so nobody has to remember:
+$ aws ec2 enable-ebs-encryption-by-default
+$ aws ec2 modify-ebs-default-kms-key-id --kms-key-id alias/acme-ebs
+$ aws ec2 get-ebs-encryption-by-default --query EbsEncryptionByDefault --output text
+true
+   ⚠️ per-Region. A new Region starts unencrypted again.
+</pre>
+
+<pre>
+ENFORCE TLS IN TRANSIT — a bucket policy, not a hope:
+  { "Sid": "DenyInsecureTransport",
+    "Effect": "Deny", "Principal": "*", "Action": "s3:*",
+    "Resource": ["arn:aws:s3:::acme-data", "arn:aws:s3:::acme-data/*"],
+    "Condition": { "Bool": { "aws:SecureTransport": "false" } } }
+
+$ aws s3api get-object --bucket acme-data --key x /tmp/x --endpoint-url http://s3.amazonaws.com
+An error occurred (AccessDenied): ... explicit deny in a resource-based policy
+
+  and the same idea as an SCP, so it applies everywhere at once:
+  { "Effect": "Deny", "Action": "s3:*", "Resource": "*",
+    "Condition": { "Bool": { "aws:SecureTransport": "false" } } }
+</pre>
+
+    <h2>Part 3 — Secrets: Where They Live and How They Rotate</h2>
+
+    <table class="tbl">
+      <tr><th></th><th>Secrets Manager</th><th>SSM Parameter Store</th></tr>
+      <tr><td>Cost</td><td>$0.40 per secret/month + API</td><td><strong>Standard: free</strong>; Advanced $0.05</td></tr>
+      <tr><td>Built-in rotation</td><td><strong>✅ with Lambda</strong></td><td>❌</td></tr>
+      <tr><td>Cross-account access</td><td>✅ resource policy</td><td>Advanced only</td></tr>
+      <tr><td>Size</td><td>64 KB</td><td>4 KB standard / 8 KB advanced</td></tr>
+      <tr><td>Versioning + staging labels</td><td>✅ (<code>AWSCURRENT</code>/<code>AWSPENDING</code>)</td><td>Version history</td></tr>
+      <tr><td>Use for</td><td><strong>Credentials that rotate</strong></td><td>Configuration, and secrets that do not rotate</td></tr>
+    </table>
+
+<pre>
+WHERE SECRETS SHOULD NEVER BE — and all of these are common:
+
+  ❌ git                          searchable forever, even after the commit is "removed"
+  ❌ a container image layer      `docker history` shows it; the registry keeps it
+  ❌ an AMI                       anyone who can launch it can read it
+  ❌ Terraform state              PLAINTEXT, regardless of `sensitive`
+  ❌ CloudFormation parameters    stored in the stack's template history
+  ⚠️ Lambda environment variables  encrypted at rest, but readable by ANYONE with
+                                   lambda:GetFunctionConfiguration
+</pre>
+
+    <div class="note">💡 <strong>Lambda environment variables are the nuanced case, so state the nuance.</strong>
+       They <em>are</em> encrypted at rest, and for low-sensitivity values they are fine. But the value is
+       returned in plaintext by <code>GetFunctionConfiguration</code>, which is granted by
+       <code>ReadOnlyAccess</code> — so "read-only" access to the account reveals every secret stored that way.
+       For anything that matters, fetch from Secrets Manager at runtime and cache it in the INIT phase (see
+       <a href="lambda-serverless.html">Lambda</a>), or use the Parameters and Secrets extension, which caches
+       for you.</div>
+
+<pre>
+ROTATION — and the half of it teams forget:
+$ aws secretsmanager rotate-secret --secret-id prod/db \
+    --rotation-lambda-arn arn:aws:lambda:us-east-1:1111:function:SecretsManagerRDSRotation \
+    --rotation-rules AutomaticallyAfterDays=30
+
+  the four-step rotation the Lambda implements:
+    createSecret  → generate a new password as AWSPENDING
+    setSecret     → set it on the database
+    testSecret    → connect using AWSPENDING and verify
+    finishSecret  → move the AWSCURRENT label to the new version
+
+  ⚠️ ROTATION IS ONLY HALF THE JOB. If the application read the secret once at
+    startup and cached it forever, rotation BREAKS IT at the finish step.
+</pre>
+
+<pre>
+✅ the application side — cache with a TTL, and retry once on an auth failure:
+  _cache = {"value": None, "at": 0}
+  def get_secret(name, ttl=300):
+      now = time.time()
+      if _cache["value"] is None or now - _cache["at"] > ttl:
+          _cache.update(value=sm.get_secret_value(SecretId=name)["SecretString"], at=now)
+      return _cache["value"]
+
+  def connect():
+      try:
+          return db.connect(get_secret("prod/db"))
+      except AuthError:
+          _cache["at"] = 0                # force a refresh — the secret just rotated
+          return db.connect(get_secret("prod/db"))
+</pre>
+
+    <h2>Part 4 — Detective Controls, and Whether Anyone Reads Them</h2>
+
+    <table class="tbl">
+      <tr><th>Service</th><th>Detects</th><th>Reads</th></tr>
+      <tr><td><strong>GuardDuty</strong></td><td>Threats: crypto-mining, credential exfiltration, malicious IPs, unusual API use</td><td>CloudTrail, Flow Logs, DNS logs, EKS audit, EBS malware, RDS logins</td></tr>
+      <tr><td><strong>Config</strong></td><td>Configuration non-compliance, and the history of every change</td><td>Resource configuration</td></tr>
+      <tr><td><strong>Security Hub</strong></td><td>Nothing itself — <strong>aggregates and scores</strong> against CIS, PCI, AWS FSBP</td><td>The others</td></tr>
+      <tr><td>Inspector</td><td>CVEs in EC2, ECR images and Lambda packages</td><td>Software inventory</td></tr>
+      <tr><td>Macie</td><td>PII and credentials sitting in S3</td><td>S3 objects</td></tr>
+      <tr><td><strong>Access Analyzer</strong></td><td><strong>External access</strong>, and <strong>unused permissions</strong></td><td>Policies + CloudTrail</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>All of these are detective, and a finding nobody routes anywhere is not a
+       control.</strong> The common failure is switching on GuardDuty and Security Hub, generating four hundred
+       findings, and looking at the dashboard once. Route findings to a workflow instead: high-severity to a
+       pager, medium to a ticket queue, and a small set of specific finding types to <em>automated
+       remediation</em>. A control is something that changes what happens; a dashboard is not.</div>
+
+<pre>
+ROUTE AND AUTO-REMEDIATE — GuardDuty findings via EventBridge:
+$ aws events put-rule --name guardduty-high --event-pattern '{
+    "source": ["aws.guardduty"],
+    "detail-type": ["GuardDuty Finding"],
+    "detail": { "severity": [{"numeric": [">=", 7]}] }}'
+$ aws events put-targets --rule guardduty-high --targets '[
+    {"Id":"page","Arn":"arn:aws:sns:us-east-1:1111:security-pager"},
+    {"Id":"respond","Arn":"arn:aws:lambda:us-east-1:1111:function:auto-contain",
+     "DeadLetterConfig":{"Arn":"arn:aws:sqs:us-east-1:1111:sec-dlq"}}]'
+</pre>
+
+<pre>
+CONFIG WITH AUTOMATIC REMEDIATION — for the unambiguous cases:
+$ aws configservice put-config-rule --config-rule '{
+    "ConfigRuleName":"s3-bucket-public-read-prohibited",
+    "Source":{"Owner":"AWS","SourceIdentifier":"S3_BUCKET_PUBLIC_READ_PROHIBITED"}}'
+$ aws configservice put-remediation-configurations --remediation-configurations '[{
+    "ConfigRuleName":"s3-bucket-public-read-prohibited",
+    "TargetType":"SSM_DOCUMENT","TargetId":"AWS-DisableS3BucketPublicReadWrite",
+    "Automatic":true,"MaximumAutomaticAttempts":3,"RetryAttemptSeconds":60,
+    "Parameters":{"S3BucketName":{"ResourceValue":{"Value":"RESOURCE_ID"}},
+                  "AutomationAssumeRole":{"StaticValue":{"Values":["arn:aws:iam::1111:role/ConfigRemediation"]}}}}]'
+   → a bucket made public is closed automatically within minutes, and the event
+     is recorded. Reserve automation for cases where the correct action is
+     never ambiguous.
+</pre>
+
+<pre>
+ACCESS ANALYZER — the two kinds of finding, and both matter:
+$ aws accessanalyzer create-analyzer --analyzer-name external --type ORGANIZATION
+$ aws accessanalyzer list-findings --analyzer-arn $A \
+    --filter '{"status":{"eq":["ACTIVE"]}}' \
+    --query 'findings[].[resourceType,resource,principal.AWS,isPublic]' --output text
+AWS::S3::Bucket   arn:aws:s3:::acme-legacy-assets   *              True    ⚠️
+AWS::IAM::Role    arn:aws:iam::1111:role/Partner    999988887777   False
+
+$ aws accessanalyzer create-analyzer --analyzer-name unused --type ORGANIZATION_UNUSED_ACCESS \
+    --configuration '{"unusedAccess":{"unusedAccessAge":90}}'
+   → roles, permissions and access keys granted and never used in 90 days.
+     This is the input to least-privilege that is based on evidence rather than guesswork.
+</pre>
+
+    <h2>Part 5 — Incident Response, the AWS-Specific Moves</h2>
+
+<pre>
+THE ORDER MATTERS: PRESERVE → CONTAIN → INVESTIGATE → ERADICATE → RECOVER.
+Terminating the instance first destroys the evidence you need.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Compromise</th><th>Containment move</th><th>Why this one</th></tr>
+      <tr><td>Leaked long-lived access key</td><td><code>update-access-key --status Inactive</code>, then delete</td><td>Deactivate first — reversible if you are wrong</td></tr>
+      <tr><td><strong>Leaked temporary credentials</strong></td><td><strong>Deny on <code>aws:TokenIssueTime</code></strong></td><td><strong>They cannot be deleted</strong>, only outlived or denied</td></tr>
+      <tr><td>Compromised instance</td><td>Snapshot, <em>then</em> swap to a quarantine SG</td><td>Preserve memory/disk before isolating or stopping</td></tr>
+      <tr><td>Compromised role</td><td>Revoke sessions, then fix the trust policy</td><td>Fixing trust alone leaves live sessions working</td></tr>
+      <tr><td>Public bucket</td><td>Account-level Block Public Access</td><td>One call, covers every bucket at once</td></tr>
+      <tr><td>Unknown scope</td><td>CloudTrail Lake / Athena over the trail</td><td>The only complete record of what was done</td></tr>
+    </table>
+
+<pre>
+THE TEMPORARY-CREDENTIAL REVOCATION, which is the one people improvise badly:
+$ cat &gt; revoke.json &lt;&lt;'EOF'
+{ "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Deny", "Action": "*", "Resource": "*",
+    "Condition": { "DateLessThan": { "aws:TokenIssueTime": "2026-08-20T14:06:00Z" } } }] }
+EOF
+$ aws iam put-role-policy --role-name CompromisedRole \
+    --policy-name AWSRevokeOlderSessions --policy-document file://revoke.json
+   → every session issued BEFORE that timestamp is denied everything, instantly.
+     Workloads that refresh from IMDS or a task role recover on their next refresh.
+</pre>
+
+<pre>
+FORENSICS BEFORE ISOLATION — snapshot, then quarantine, and never terminate:
+$ VOL=$(aws ec2 describe-instances --instance-ids i-0compromised \
+    --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text)
+$ aws ec2 create-snapshot --volume-id $VOL \
+    --description "forensic i-0compromised 2026-08-20" \
+    --tag-specifications 'ResourceType=snapshot,Tags=[{Key=Incident,Value=INC-4821}]'
+
+$ aws ec2 modify-instance-attribute --instance-id i-0compromised --groups sg-0quarantine
+   (sg-0quarantine: no ingress, egress only to the forensics collector)
+$ aws ec2 modify-instance-metadata-options --instance-id i-0compromised --http-endpoint disabled
+   → cuts the instance off from new credentials while leaving it running for analysis.
+</pre>
+
+    <div class="note">🔑 <strong>A leaked access key posted publicly triggers an AWS response of its own.</strong>
+       AWS scans public sources and, on detecting an exposed key, attaches a quarantine policy
+       (<code>AWSCompromisedKeyQuarantine…</code>) that denies the operations most used for abuse, and opens a
+       support case. That is a safety net, not a plan — it fires after exposure, covers only some actions, and
+       finding it attached to one of your users means the key was public. Treat its appearance as a confirmed
+       incident.</div>
+
+    <h2>Part 6 — The Day-One Account Baseline</h2>
+
+<pre>
+EVERY ACCOUNT, FROM CREATION — delivered as StackSets with auto-deployment
+so new accounts inherit it (see the IaC lesson):
+
+  IDENTITY
+    ✅ root: MFA on, no access keys, contact details set
+    ✅ IAM Identity Center for humans; no IAM users
+    ✅ SCPs: deny root usage, deny leaving the Organization, deny disabling logging
+
+  LOGGING (all to a separate, restricted account)
+    ✅ Organization CloudTrail, multi-Region, log-file validation on
+    ✅ data events on sensitive buckets (see Observability)
+    ✅ Config recorder + delivery channel
+    ✅ VPC Flow Logs
+
+  DETECTIVE
+    ✅ GuardDuty, org-wide, auto-enrol new accounts
+    ✅ Security Hub with AWS FSBP, findings aggregated to one Region
+    ✅ IAM Access Analyzer: external AND unused access
+
+  DATA PROTECTION
+    ✅ S3 Block Public Access at the ACCOUNT level
+    ✅ EBS encryption by default, per Region
+    ✅ KMS keys with rotation enabled
+
+  COST + LIMITS
+    ✅ budget + Cost Anomaly Detection (see Cost)
+</pre>
+
+<pre>
+VERIFY IT RATHER THAN ASSUMING IT — a baseline check that can fail:
+$ cat &gt; baseline.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+fail=0
+chk() { printf '%-42s %s\n' "$1" "$2"; [ "$2" = OK ] || fail=1; }
+
+[ "$(aws s3control get-public-access-block --account-id "$ACC" \
+   --query 'PublicAccessBlockConfiguration.BlockPublicPolicy' --output text)" = True ] \
+   && chk "S3 Block Public Access (account)" OK || chk "S3 Block Public Access (account)" FAIL
+
+[ "$(aws ec2 get-ebs-encryption-by-default --query EbsEncryptionByDefault --output text)" = True ] \
+   && chk "EBS encryption by default" OK || chk "EBS encryption by default" FAIL
+
+[ "$(aws guardduty list-detectors --query 'length(DetectorIds)')" -ge 1 ] \
+   && chk "GuardDuty enabled" OK || chk "GuardDuty enabled" FAIL
+
+[ "$(aws iam get-account-summary --query 'SummaryMap.AccountAccessKeysPresent' --output text)" = 0 ] \
+   && chk "No root access keys" OK || chk "No root access keys" FAIL
+
+exit $fail
+SH
+$ bash baseline.sh
+S3 Block Public Access (account)           OK
+EBS encryption by default                  FAIL
+GuardDuty enabled                          OK
+No root access keys                        OK
+$ echo $?
+1                                                  ← a check that can fail is a control
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>An IAM policy granting <code>kms:Decrypt</code> against a key whose policy never delegated to
+         IAM, databases created unencrypted "to fix later", secrets in Lambda environment variables and
+         Terraform state, rotation configured without the application reloading, GuardDuty enabled and never
+         read, and an incident response that starts by terminating the instance.</strong> The identity policy is
+         obviously correct and access is still denied, because the key policy is authoritative and nobody looks
+         there. The databases were created without encryption because it was quicker, and retrofitting now means
+         snapshot, copy, restore and a cutover window nobody has scheduled for eighteen months. Secrets sit in
+         Lambda environment variables where anyone with <code>ReadOnlyAccess</code> can read them, and in a
+         Terraform state file that half the engineering team can download. Rotation runs every thirty days and
+         breaks the service every thirty days, because the application read the password once at startup.
+         GuardDuty produces four hundred findings into a dashboard someone opened during onboarding, so the
+         crypto-mining finding from Tuesday is still unread. And when a role is compromised, the first action is
+         to terminate the instance, destroying the disk and memory that would have explained how, while the
+         attacker's temporary credentials keep working from somewhere else entirely.</p>
+      <p>✅ <strong>Read the key policy first, encrypt at creation, keep secrets in a secrets store and reload
+         them, route findings to humans and automation, and preserve before you contain.</strong> When a KMS
+         denial makes no sense, check whether the key policy delegates to IAM at all — and scope keys with
+         <code>kms:ViaService</code> and encryption context so a stolen credential cannot decrypt arbitrary
+         ciphertext. Turn on account-level EBS default encryption and create every database encrypted, because
+         RDS and EBS cannot be encrypted in place and the retrofit is a migration with a cutover. Put
+         credentials in Secrets Manager, fetch them in the INIT phase, cache with a TTL, and retry once on an
+         authentication failure so rotation is invisible rather than an outage — and never let a secret reach
+         git, an image layer, an AMI, a CloudFormation parameter or a state file. Route high-severity findings
+         to a pager, medium to a ticket queue, and a narrow set of unambiguous ones to automatic remediation,
+         because a dashboard is not a control. Use Access Analyzer's unused-access findings to drive
+         least-privilege from evidence. And run incidents in the order preserve, contain, investigate,
+         eradicate, recover: snapshot the volume, swap to a quarantine security group, disable IMDS, deny
+         sessions by <code>aws:TokenIssueTime</code> — and keep that policy document in the runbook, because
+         improvising it during an incident wastes the minutes that matter.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Expecting an IAM policy to grant KMS access</td><td><strong>The key policy is authoritative</strong> — if it does not delegate to IAM, the identity policy grants nothing</td><td>Read the key policy first on every KMS denial</td></tr>
+      <tr><td>Forgetting the KMS grant on cross-account S3</td><td>Both bucket and identity policies look right and access is denied</td><td>SSE-KMS needs a <strong>third</strong> grant — the key policy</td></tr>
+      <tr><td>Assuming key rotation re-encrypts data</td><td>It adds new backing material and <strong>retains the old</strong>; nothing is re-encrypted</td><td>Re-encrypt explicitly if you need it</td></tr>
+      <tr><td>Scheduling key deletion casually</td><td><strong>Every ciphertext under that key becomes unrecoverable</strong></td><td>Use the 7–30 day window; alarm on <code>ScheduleKeyDeletion</code></td></tr>
+      <tr><td>Unscoped key policies</td><td>A stolen credential can decrypt arbitrary ciphertext directly</td><td><code>kms:ViaService</code> + encryption-context conditions</td></tr>
+      <tr><td>"We will encrypt the database later"</td><td><strong>RDS and EBS cannot be encrypted in place</strong> — it is snapshot, copy, restore, cut over</td><td>Encrypt at creation; set the EBS Region default</td></tr>
+      <tr><td>Setting EBS default encryption once</td><td>It is <strong>per Region</strong> — a new Region starts unencrypted</td><td>Apply it via StackSets to every Region</td></tr>
+      <tr><td>Secrets in Lambda environment variables</td><td>Returned in plaintext by <code>GetFunctionConfiguration</code>, which <strong><code>ReadOnlyAccess</code> grants</strong></td><td>Fetch from Secrets Manager at INIT; cache with a TTL</td></tr>
+      <tr><td>Secrets in git, images, AMIs or state</td><td>Permanent, searchable, and survive "removal"</td><td>A secrets store; scan for leaks in CI</td></tr>
+      <tr><td>Rotation without application reload</td><td><strong>The service breaks on every rotation</strong></td><td>TTL cache + retry once on auth failure</td></tr>
+      <tr><td>Enabling GuardDuty and not routing it</td><td>400 findings in a dashboard nobody opens</td><td>EventBridge → pager / tickets / narrow auto-remediation</td></tr>
+      <tr><td>Auto-remediating ambiguous findings</td><td>Automation fights legitimate change and erodes trust</td><td>Automate only where the correct action is never in doubt</td></tr>
+      <tr><td>Terminating a compromised instance first</td><td><strong>Destroys the evidence</strong>, and the attacker's credentials still work elsewhere</td><td>Snapshot → quarantine SG → disable IMDS → revoke sessions</td></tr>
+      <tr><td>Deleting a leaked temporary credential</td><td><strong>Impossible</strong> — they cannot be deleted</td><td>Deny on <code>aws:TokenIssueTime</code>; keep it in the runbook</td></tr>
+      <tr><td>Fixing a trust policy without revoking sessions</td><td>Existing sessions keep working until they expire</td><td>Revoke first, then tighten trust</td></tr>
+      <tr><td>Treating the AWS key-quarantine policy as the fix</td><td>It fires <em>after</em> public exposure and covers only some actions</td><td>Treat its appearance as a confirmed incident</td></tr>
+      <tr><td>A baseline that is a wiki page</td><td>Drifts immediately; new accounts never get it</td><td><strong>StackSets with auto-deployment</strong> + a check that can fail</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is envelope encryption and why does KMS use it?</summary>
+      <p><strong>KMS encrypts a key, and that key encrypts your data.</strong> The service calls
+         <code>GenerateDataKey</code>, which returns a plaintext data key and an encrypted copy of it. Your data
+         is encrypted locally with the plaintext key, the plaintext key is discarded, and the encrypted key is
+         stored alongside the ciphertext. To read, you send the encrypted key back to KMS,
+         get the plaintext key, and decrypt locally.</p>
+      <table class="tbl">
+        <tr><th>Reason</th><th>Detail</th></tr>
+        <tr><td><strong>Size</strong></td><td>KMS's <code>Encrypt</code> API caps at 4 KB — a 5 GB file could never go through it</td></tr>
+        <tr><td><strong>Performance</strong></td><td>Only 32 bytes cross the network; bulk encryption happens locally at line rate</td></tr>
+        <tr><td><strong>Blast radius</strong></td><td>A data key protects one object; the KMS key never leaves the service</td></tr>
+        <tr><td><strong>Auditability</strong></td><td>Every use of the KMS key is a CloudTrail event</td></tr>
+      </table>
+      <p>The practical consequence worth adding is <strong>S3 Bucket Keys</strong>: without them, every object
+         operation is a KMS request, which the <a href="s3.html">S3 lesson</a> measured at $577 a month —
+         Bucket Keys derive per-object keys from a short-lived bucket-level key and cut that by 99%.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Secrets Manager or Parameter Store?</summary>
+      <table class="tbl">
+        <tr><th></th><th>Secrets Manager</th><th>Parameter Store</th></tr>
+        <tr><td>Cost</td><td>$0.40/secret/month</td><td><strong>Standard tier is free</strong></td></tr>
+        <tr><td>Rotation</td><td><strong>Built in, with Lambda</strong></td><td>None</td></tr>
+        <tr><td>Cross-account</td><td>✅ resource policy</td><td>Advanced tier only</td></tr>
+        <tr><td>Size</td><td>64 KB</td><td>4 KB / 8 KB</td></tr>
+      </table>
+      <p><strong>The deciding question is rotation.</strong> If the value is a credential that should rotate —
+         a database password, an API key — Secrets Manager, because rotation with staging labels
+         (<code>AWSPENDING</code> → <code>AWSCURRENT</code>) is the whole feature you are paying for. For
+         configuration, feature flags, ARNs and endpoints, Parameter Store's standard tier is free and
+         perfectly good, and <code>SecureString</code> parameters are KMS-encrypted too.</p>
+      <p>Most real systems use both: Parameter Store for configuration, Secrets Manager for the handful of
+         things that rotate. And the point that matters more than either: <strong>fetch at runtime and cache
+         with a TTL</strong>, so a rotation is invisible rather than an outage.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> An IAM policy grants <code>kms:Decrypt</code> on the key, and the call is still denied. Why?</summary>
+      <p><strong>Because KMS key policies are authoritative in a way other resource policies are not.</strong>
+         For most services, an identity policy <em>or</em> a resource policy suffices within one account. For
+         KMS, the key policy must either name the principal directly, or explicitly delegate to IAM — which the
+         <em>default</em> key policy does with a <code>kms:CallerAccount</code> condition. If someone replaced
+         that default with a narrow policy, no identity policy in the account can grant access.</p>
+<pre>
+$ aws kms get-key-policy --key-id 9f2a-4b2c --policy-name default \
+    --query Policy --output text | jq '.Statement[].Principal'
+{ "AWS": "arn:aws:iam::111122223333:role/DataTeam" }
+   → only DataTeam. No delegation to IAM. Every other identity policy is inert.
+</pre>
+      <table class="tbl">
+        <tr><th>Also check</th><th>Symptom</th></tr>
+        <tr><td>A <code>kms:ViaService</code> condition</td><td>Works through S3, denied when called directly</td></tr>
+        <tr><td>An encryption-context condition</td><td>Denied unless the context matches exactly</td></tr>
+        <tr><td>Cross-account use</td><td>Needs the key policy <em>and</em> the caller's identity policy</td></tr>
+        <tr><td>Grants</td><td>Access can come from a grant rather than a policy — check <code>list-grants</code></td></tr>
+      </table>
+      <p><strong>The habit worth forming:</strong> on any KMS denial, read the key policy before touching the
+         identity policy. It is also the explanation for the classic cross-account SSE-KMS failure, where the
+         bucket policy and the role policy are both correct and the missing grant is on the key.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Secrets rotation is enabled and the application breaks every 30 days. Explain.</summary>
+      <p><strong>The application reads the secret once at startup and caches it for the process lifetime.</strong>
+         Rotation's final step moves the <code>AWSCURRENT</code> label to the new version and the old password
+         stops working — so every long-lived process is holding a credential that has just been invalidated.</p>
+      <p>Rotation is two halves, and teams implement only the first:</p>
+<pre>
+  createSecret → setSecret → testSecret → finishSecret     ← Secrets Manager's half
+  the application must NOTICE                              ← the half that is missing
+</pre>
+      <table class="tbl">
+        <tr><th>Fix</th><th>Effect</th></tr>
+        <tr><td><strong>TTL cache</strong> (5 minutes)</td><td>Picks up the new value within the TTL</td></tr>
+        <tr><td><strong>Retry once on auth failure</strong></td><td>Invalidate the cache and refetch — closes the window entirely</td></tr>
+        <tr><td>Parameters and Secrets Lambda extension</td><td>Caching handled outside your code</td></tr>
+        <tr><td><strong>RDS Proxy with IAM auth</strong></td><td>The application never holds a password at all</td></tr>
+      </table>
+      <p><strong>The strongest answer is the last row:</strong> with RDS Proxy holding the credentials and IAM
+         authentication from the application, rotation stops being an application concern — there is no cached
+         password to invalidate. Failing that, the TTL-plus-retry pattern is a few lines and makes rotation a
+         non-event. And a rotation that has never been tested is not a control: rotate on demand in staging and
+         confirm the service does not blink.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> An access key has been leaked publicly. Walk through your response.</summary>
+      <p><strong>Order matters: preserve, contain, investigate, eradicate, recover.</strong> The instinct to
+         delete everything immediately destroys the evidence needed to answer the only question that matters —
+         what did they do.</p>
+      <p><strong>1. Contain, reversibly.</strong> Deactivate the key rather than deleting it, so the identifier
+         remains resolvable in CloudTrail. If the compromised identity is a role, add the
+         <code>aws:TokenIssueTime</code> deny policy as well, because any temporary credentials already issued
+         <strong>cannot be deleted</strong> and would otherwise keep working:</p>
+<pre>
+$ aws iam update-access-key --user-name ci-user --access-key-id AKIA… --status Inactive
+$ aws iam put-role-policy --role-name AssumedByCI --policy-name AWSRevokeOlderSessions \
+    --policy-document file://revoke.json      # Deny * where aws:TokenIssueTime < now
+</pre>
+      <p><strong>2. Determine the blast radius.</strong> What could the key do, and what did it do? Access
+         Analyzer or the attached policies answer the first; CloudTrail answers the second — every call, from
+         which IP, at what time. Look specifically for persistence: new users, new keys, new roles, changed
+         trust policies, and anything in Regions you do not normally use, which is where crypto-mining
+         appears.</p>
+      <p><strong>3. Eradicate.</strong> Delete the key, remove anything the attacker created, and rotate every
+         secret the identity could read — assume anything reachable was read.</p>
+      <p><strong>4. Fix the cause, which is never "someone leaked a key".</strong> It is that a long-lived key
+         existed at all. Replace it with OIDC federation for CI (see
+         <a href="iam-deep-dive.html">IAM Advanced</a>), so there is no credential to leak; add secret scanning
+         in CI and on the repository; and use permission boundaries so the next leaked identity cannot escalate.</p>
+      <p><strong>Two things worth raising unprompted.</strong> If AWS attached a
+         <code>AWSCompromisedKeyQuarantine…</code> policy, the key was <em>publicly indexed</em> — treat that
+         as confirmation, not as the remediation, since it covers only some actions and fires after exposure.
+         And check GuardDuty for the finding types that accompany this (<code>UnauthorizedAccess:IAMUser/…</code>,
+         <code>CryptoCurrency:EC2/…</code>) — if it was enabled and nobody read it, the detection gap is a
+         second, separate finding for the postmortem.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the security baseline for a new AWS Organization.</summary>
+      <p><strong>Structure first, because the account boundary is the only control that cannot be edited
+         away.</strong> Separate accounts per environment and per domain, an OU hierarchy that matches how you
+         will apply policy, and dedicated accounts for logging, security tooling and shared services — with the
+         log archive account restricted so that even administrators of the workload accounts cannot alter its
+         contents.</p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Control</th><th>Property</th></tr>
+        <tr><td><strong>Preventive</strong></td><td>SCPs: no root use, no leaving the Organization, no disabling CloudTrail/GuardDuty/Config, no unencrypted resource creation, no IGWs in data accounts</td><td><strong>Cannot be bypassed locally</strong></td></tr>
+        <tr><td><strong>Detective</strong></td><td>Org CloudTrail (+ data events on sensitive buckets), Config, GuardDuty, Security Hub, Access Analyzer</td><td>Complete and centralised</td></tr>
+        <tr><td><strong>Responsive</strong></td><td>EventBridge → pager / tickets / narrow auto-remediation</td><td><strong>Findings reach humans</strong></td></tr>
+        <tr><td><strong>Identity</strong></td><td>IAM Identity Center, no IAM users, OIDC for CI, permission boundaries for delegated role creation</td><td>No long-lived keys to leak</td></tr>
+        <tr><td><strong>Data</strong></td><td>Account-level Block Public Access, EBS default encryption, CMKs with rotation and <code>ViaService</code> scoping</td><td>Secure by default</td></tr>
+      </table>
+      <p><strong>Delivery matters as much as content.</strong> Ship the baseline as StackSets with
+         auto-deployment so accounts created next year inherit it automatically — a baseline applied by hand
+         drifts within a quarter and never reaches new accounts. Then verify it with a scheduled check that can
+         <em>fail</em>, because a control nobody tests is an assumption.</p>
+      <p><strong>The distinction I would emphasise to a regulator or an auditor</strong> is between controls a
+         team <em>could</em> disable and controls they <em>cannot</em>. Anything that matters belongs in an SCP
+         at the Organization level, not in an account-level setting a workload team owns. That single
+         distinction is what makes the baseline an architecture rather than a checklist.</p>
+      <p><strong>What I would deliberately not do:</strong> enable every detective service at maximum
+         verbosity on day one. Four hundred unread findings train people to ignore the console, and the cost is
+         real. Start with GuardDuty and AWS Foundational Security Best Practices, route them properly, and add
+         Macie and Inspector once there is a workflow that acts on what they produce.</p>
+    </details>
+
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove the KMS key policy is authoritative — grant every IAM
+       permission possible and still be denied.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ KEY=$(aws kms create-key --description "policy demo" --query KeyMetadata.KeyId --output text)
+$ aws kms create-alias --alias-name alias/demo --target-key-id $KEY
+
+REPLACE THE DEFAULT KEY POLICY WITH A NARROW ONE:
+$ cat &gt; keypolicy.json &lt;&lt;'EOF'
+{ "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "AdminOnly",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/KeyAdmin" },
+      "Action": "kms:*", "Resource": "*" } ] }
+EOF
+$ aws kms put-key-policy --key-id $KEY --policy-name default --policy file://keypolicy.json
+   ⚠️ note what is MISSING: the default policy's delegation to IAM,
+     "Principal": {"AWS": "arn:aws:iam::111122223333:root"} with kms:CallerAccount.
+</pre>
+<pre>
+NOW GRANT AN APPLICATION ROLE EVERYTHING IAM CAN GRANT:
+$ aws iam put-role-policy --role-name AppRole --policy-name kms-full --policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{"Effect":"Allow","Action":"kms:*","Resource":"*"}]}'
+$ aws iam attach-role-policy --role-name AppRole \
+    --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+
+$ # assume AppRole and try:
+$ aws kms generate-data-key --key-id alias/demo --key-spec AES_256
+An error occurred (AccessDeniedException) when calling the GenerateDataKey operation:
+User: arn:aws:sts::111122223333:assumed-role/AppRole/session is not authorized to perform:
+kms:GenerateDataKey on this resource because no resource-based policy allows the
+kms:GenerateDataKey action
+                        ────────────────────────────────
+   ⚠️ AdministratorAccess. kms:* on *. STILL DENIED.
+     Read the error text: "no RESOURCE-BASED policy allows".
+</pre>
+<pre>
+CONFIRM WITH THE SIMULATOR — which agrees, and points at the key policy:
+$ aws iam simulate-principal-policy \
+    --policy-source-arn arn:aws:iam::111122223333:role/AppRole \
+    --action-names kms:GenerateDataKey \
+    --resource-arns arn:aws:kms:us-east-1:111122223333:key/$KEY \
+    --query 'EvaluationResults[0].[EvalDecision,EvalDecisionDetails]' --output json
+[ "implicitDeny", { "arn:aws:iam::111122223333:role/AppRole": "implicitDeny" } ]
+</pre>
+<pre>
+✅ FIX — the key policy must grant, or delegate to IAM:
+$ cat &gt; keypolicy2.json &lt;&lt;'EOF'
+{ "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "AdminOnly", "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/KeyAdmin" },
+      "Action": "kms:*", "Resource": "*" },
+    { "Sid": "AllowAppRoleViaS3Only", "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/AppRole" },
+      "Action": ["kms:Decrypt","kms:GenerateDataKey"], "Resource": "*",
+      "Condition": {
+        "StringEquals": { "kms:ViaService": "s3.us-east-1.amazonaws.com" } } } ] }
+EOF
+$ aws kms put-key-policy --key-id $KEY --policy-name default --policy file://keypolicy2.json
+</pre>
+<pre>
+VERIFY BOTH HALVES OF THE CONDITION:
+$ # through S3 — allowed:
+$ aws s3 cp /tmp/file s3://acme-data/x --sse aws:kms --sse-kms-key-id alias/demo
+upload: /tmp/file to s3://acme-data/x               ✅
+
+$ # directly — still denied, because of kms:ViaService:
+$ aws kms generate-data-key --key-id alias/demo --key-spec AES_256
+An error occurred (AccessDeniedException): ... explicit deny in a resource-based policy
+   ✅ a stolen credential cannot decrypt arbitrary ciphertext — only S3 can, on its behalf.
+</pre>
+<table class="tbl">
+  <tr><th>Configuration</th><th>Identity policy</th><th>Key policy</th><th>Result</th></tr>
+  <tr><td>Default key policy</td><td>Grants <code>kms:Decrypt</code></td><td>Delegates to IAM</td><td>✅ allowed</td></tr>
+  <tr><td>Narrow key policy</td><td><strong><code>AdministratorAccess</code></strong></td><td>Does not name the role</td><td><strong>❌ denied</strong></td></tr>
+  <tr><td>Key policy names the role</td><td>Grants nothing extra</td><td>Names the role</td><td>✅ allowed</td></tr>
+  <tr><td>With <code>kms:ViaService</code></td><td>Grants <code>kms:*</code></td><td>Names the role, scoped</td><td>✅ via S3, ❌ directly</td></tr>
+</table>
+<div class="note">🔑 <strong>This is the one place in AWS where "the IAM policy is obviously correct" is not a
+   useful sentence.</strong> The error message says so explicitly — <em>"no resource-based policy allows"</em>
+   — which distinguishes it from the ordinary implicit-deny message. Make reading
+   <code>get-key-policy</code> the first step of any KMS denial, and note the same mechanism explains
+   cross-account SSE-KMS failures where both S3 policies are correct and the key policy is the missing
+   grant.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Encrypt an existing unencrypted RDS instance, and measure
+       what that actually costs you.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws rds describe-db-instances --db-instance-identifier prod-orders \
+    --query 'DBInstances[0].[StorageEncrypted,Endpoint.Address,AllocatedStorage,MultiAZ]' --output text
+False   prod-orders.abc123.us-east-1.rds.amazonaws.com   500   True
+
+❌ TRY THE OBVIOUS THING FIRST:
+$ aws rds modify-db-instance --db-instance-identifier prod-orders \
+    --storage-encrypted --apply-immediately
+An error occurred (InvalidParameterCombination): You can't modify the StorageEncrypted
+setting for an existing DB instance.
+   → encryption is fixed AT CREATION. There is no in-place path.
+</pre>
+<pre>
+✅ THE ONLY PATH — snapshot, copy WITH a key, restore, cut over:
+
+STEP 1 — snapshot (no downtime on Multi-AZ; taken from the standby):
+$ aws rds create-db-snapshot --db-instance-identifier prod-orders \
+    --db-snapshot-identifier prod-orders-preenc
+$ time aws rds wait db-snapshot-completed --db-snapshot-identifier prod-orders-preenc
+real    18m42s
+
+STEP 2 — the copy is where encryption is applied:
+$ aws rds copy-db-snapshot --source-db-snapshot-identifier prod-orders-preenc \
+    --target-db-snapshot-identifier prod-orders-enc \
+    --kms-key-id alias/acme-rds
+$ time aws rds wait db-snapshot-completed --db-snapshot-identifier prod-orders-enc
+real    24m11s
+$ aws rds describe-db-snapshots --db-snapshot-identifier prod-orders-enc \
+    --query 'DBSnapshots[0].[Encrypted,KmsKeyId]' --output text
+True    arn:aws:kms:us-east-1:111122223333:key/9f2a-4b2c
+
+STEP 3 — restore into a NEW instance (a new endpoint, as always):
+$ aws rds restore-db-snapshot-to-db-instance \
+    --db-snapshot-identifier prod-orders-enc \
+    --db-instance-identifier prod-orders-encrypted \
+    --db-instance-class db.r6g.2xlarge --multi-az \
+    --db-subnet-group-name orders-subnets --vpc-security-group-ids sg-0orders
+$ time aws rds wait db-instance-available --db-instance-identifier prod-orders-encrypted
+real    31m08s
+</pre>
+<pre>
+STEP 4 — REAPPLY EVERYTHING THE RESTORE DROPPED (see the RDS lesson):
+$ aws rds describe-db-instances --db-instance-identifier prod-orders-encrypted \
+    --query 'DBInstances[0].{pg:DBParameterGroups[0].DBParameterGroupName,
+             backup:BackupRetentionPeriod,pi:PerformanceInsightsEnabled}' --output json
+{ "pg": "default.postgres15", "backup": 0, "pi": false }     ⚠️ all defaults
+$ aws rds modify-db-instance --db-instance-identifier prod-orders-encrypted \
+    --db-parameter-group-name orders-pg15 --backup-retention-period 14 \
+    --enable-performance-insights --apply-immediately
+$ aws rds reboot-db-instance --db-instance-identifier prod-orders-encrypted   # static params
+</pre>
+<pre>
+STEP 5 — CUT OVER, and this is why the DNS indirection matters:
+$ # the snapshot was taken at T0; writes since then must be replayed or the
+$ # application must be paused. THIS is the real downtime.
+$ aws route53 change-resource-record-sets --hosted-zone-id Z123 --change-batch '{"Changes":[
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"orders-db.internal.acme.com",
+      "Type":"CNAME","TTL":30,
+      "ResourceRecords":[{"Value":"prod-orders-encrypted.abc123.us-east-1.rds.amazonaws.com"}]}}]}'
+$ aws rds describe-db-instances --db-instance-identifier prod-orders-encrypted \
+    --query 'DBInstances[0].StorageEncrypted' --output text
+True                                               ✅
+</pre>
+<table class="tbl">
+  <tr><th>Step</th><th>Time</th><th>Downtime?</th></tr>
+  <tr><td>Snapshot</td><td>18 m</td><td>No (Multi-AZ)</td></tr>
+  <tr><td>Copy with KMS key</td><td>24 m</td><td>No</td></tr>
+  <tr><td>Restore</td><td>31 m</td><td>No</td></tr>
+  <tr><td>Reapply configuration + reboot</td><td>6 m</td><td>No</td></tr>
+  <tr><td><strong>Write pause + cutover</strong></td><td><strong>Minutes to hours</strong></td><td><strong>YES</strong></td></tr>
+  <tr><td>Total elapsed</td><td><strong>~80 minutes + the cutover</strong></td><td>—</td></tr>
+</table>
+<pre>
+✅ AND MAKE IT NEVER HAPPEN AGAIN — deny unencrypted creation outright:
+  { "Effect": "Deny",
+    "Action": ["rds:CreateDBInstance", "rds:CreateDBCluster"],
+    "Resource": "*",
+    "Condition": { "Bool": { "rds:StorageEncrypted": "false" } } }
+$ aws rds create-db-instance --db-instance-identifier test --engine postgres ...
+An error occurred (AccessDenied): ... explicit deny in a service control policy
+</pre>
+<div class="note">⚠️ <strong>"We will encrypt it later" is a promise to schedule an 80-minute migration and a
+   cutover window.</strong> Multi-AZ makes most of it non-disruptive, but the moment the application must switch
+   endpoints is real downtime unless you have replication or a write pause — and the restored instance comes
+   back with default parameter groups, no backups and no Performance Insights, all of which must be reapplied.
+   The SCP at the end costs nothing and removes the decision entirely.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Make secret rotation break an application, then make it
+       invisible.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws secretsmanager create-secret --name prod/db \
+    --secret-string '{"username":"app","password":"initial-Pw-1"}' \
+    --query ARN --output text
+arn:aws:secretsmanager:us-east-1:111122223333:secret:prod/db-AbCdEf
+
+❌ THE APPLICATION EVERYONE WRITES FIRST — read once, hold forever:
+$ cat &gt; app_bad.py &lt;&lt;'PY'
+import boto3, json, time, psycopg2
+sm = boto3.client("secretsmanager")
+SECRET = json.loads(sm.get_secret_value(SecretId="prod/db")["SecretString"])   # ONCE
+conn = psycopg2.connect(host=HOST, user=SECRET["username"], password=SECRET["password"])
+while True:
+    try:
+        conn.cursor().execute("SELECT 1"); print("ok", flush=True)
+    except Exception as e:
+        print("FAIL:", str(e)[:60], flush=True)
+    time.sleep(10)
+PY
+$ python3 app_bad.py &amp;
+ok
+ok
+</pre>
+<pre>
+ROTATE:
+$ aws secretsmanager rotate-secret --secret-id prod/db \
+    --rotation-lambda-arn arn:aws:lambda:us-east-1:1111:function:SecretsManagerRDSRotation \
+    --rotation-rules AutomaticallyAfterDays=30
+$ aws secretsmanager describe-secret --secret-id prod/db \
+    --query '[RotationEnabled,VersionIdsToStages]' --output json
+[ true, { "a3f91c2b": ["AWSCURRENT"], "7d2e4f81": ["AWSPREVIOUS"] } ]
+
+$ # the running application:
+ok
+FAIL: FATAL:  password authentication failed for user "app"
+FAIL: FATAL:  password authentication failed for user "app"
+   ⚠️ every long-lived process is now holding an invalidated credential.
+     It will keep failing until someone restarts it.
+</pre>
+<pre>
+✅ THE FIX — TTL cache plus one retry on an authentication failure:
+$ cat &gt; app_good.py &lt;&lt;'PY'
+import boto3, json, time, psycopg2
+sm = boto3.client("secretsmanager")
+_c = {"v": None, "at": 0.0}
+
+def secret(ttl=300, force=False):
+    now = time.time()
+    if force or _c["v"] is None or now - _c["at"] > ttl:
+        _c["v"] = json.loads(sm.get_secret_value(SecretId="prod/db")["SecretString"])
+        _c["at"] = now
+    return _c["v"]
+
+def connect(force=False):
+    s = secret(force=force)
+    return psycopg2.connect(host=HOST, user=s["username"], password=s["password"])
+
+conn = connect()
+while True:
+    try:
+        conn.cursor().execute("SELECT 1"); print("ok", flush=True)
+    except psycopg2.OperationalError as e:
+        if "authentication failed" in str(e):
+            print("auth failed - refreshing secret", flush=True)
+            conn = connect(force=True)                 # ← the important line
+        else:
+            conn = connect()
+    time.sleep(10)
+PY
+$ python3 app_good.py &amp;
+$ aws secretsmanager rotate-secret --secret-id prod/db --rotate-immediately
+ok
+auth failed - refreshing secret
+ok                                                 ✅ ONE failed check, then recovered
+ok
+</pre>
+<pre>
+VERIFY THE ROTATION LAMBDA'S FOUR STEPS ACTUALLY RAN:
+$ aws logs tail /aws/lambda/SecretsManagerRDSRotation --since 5m --format short \
+  | grep -oE 'Step: (createSecret|setSecret|testSecret|finishSecret)'
+Step: createSecret                                 ← new password as AWSPENDING
+Step: setSecret                                    ← applied to the database
+Step: testSecret                                   ← connected with AWSPENDING
+Step: finishSecret                                 ← AWSCURRENT moved
+   ⚠️ if testSecret fails, rotation ABORTS and AWSCURRENT is unchanged —
+     which is the safety property. A rotation that silently half-completed
+     would be far worse.
+</pre>
+<pre>
+✅ THE STRONGEST VERSION — no password in the application at all:
+$ aws rds modify-db-instance --db-instance-identifier prod-orders \
+    --manage-master-user-password --apply-immediately
+   → RDS creates and rotates the master password in Secrets Manager; nobody
+     ever sees it.
+$ # and the application authenticates with IAM through RDS Proxy:
+  token = rds.generate_db_auth_token(DBHostname=PROXY, Port=5432, DBUsername="app")
+  conn  = psycopg2.connect(host=PROXY, user="app", password=token, sslmode="require")
+   → the credential is a 15-minute IAM token. Rotation is not an application concern.
+</pre>
+<table class="tbl">
+  <tr><th>Approach</th><th>Failed requests per rotation</th><th>Application change</th></tr>
+  <tr><td>Read once at startup</td><td><strong>All, until restarted</strong></td><td>—</td></tr>
+  <tr><td>TTL cache (5 min)</td><td>Up to 5 minutes' worth</td><td>~8 lines</td></tr>
+  <tr><td><strong>TTL + retry on auth failure</strong></td><td><strong>1</strong></td><td>~12 lines</td></tr>
+  <tr><td>Parameters &amp; Secrets extension</td><td>Up to the cache TTL</td><td>Config only</td></tr>
+  <tr><td><strong>RDS Proxy + IAM auth</strong></td><td><strong>0</strong></td><td>No password handling at all</td></tr>
+</table>
+<div class="note">🔑 <strong>Rotation is two halves and teams ship only the first.</strong> Secrets Manager
+   rotating the credential is worthless — actively harmful — if the application cannot notice. Test it the only
+   way that counts: <code>rotate-secret --rotate-immediately</code> in staging, with load running, and confirm
+   the error count. A rotation schedule that has never been exercised is a scheduled outage.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Turn a GuardDuty finding into an automated containment
+       action, and prove it fires.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws guardduty list-detectors --query DetectorIds --output text
+d-9f2a4b2c
+$ aws guardduty get-findings-statistics --detector-id d-9f2a4b2c \
+    --finding-statistic-types COUNT_BY_SEVERITY \
+    --query 'FindingStatistics.CountBySeverity' --output json
+{ "2": 284, "5": 102, "8": 3 }
+   ⚠️ 3 HIGH-severity findings. Nobody has looked at this dashboard in six weeks.
+</pre>
+<pre>
+$ aws guardduty list-findings --detector-id d-9f2a4b2c \
+    --finding-criteria '{"Criterion":{"severity":{"Gte":7}}}' --query FindingIds --output text \
+  | tr '\t' '\n' | while read f; do
+      aws guardduty get-findings --detector-id d-9f2a4b2c --finding-ids "$f" \
+        --query 'Findings[0].[Type,Resource.InstanceDetails.InstanceId,UpdatedAt]' --output text
+    done
+CryptoCurrency:EC2/BitcoinTool.B!DNS          i-0a1b2c3d   2026-08-14T02:41:19Z
+UnauthorizedAccess:EC2/SSHBruteForce          i-0f9e8d7c   2026-08-18T11:02:44Z
+Backdoor:EC2/C&amp;CActivity.B!DNS                i-0a1b2c3d   2026-08-19T22:14:08Z
+   → six days of crypto-mining, undetected because detection is not response.
+</pre>
+<pre>
+✅ ROUTE IT — EventBridge, with a pager AND an automated action:
+$ aws events put-rule --name guardduty-high --event-pattern '{
+    "source": ["aws.guardduty"],
+    "detail-type": ["GuardDuty Finding"],
+    "detail": { "severity": [{"numeric": [">=", 7]}] }}'
+
+$ aws events put-targets --rule guardduty-high --targets '[
+    {"Id":"pager","Arn":"arn:aws:sns:us-east-1:1111:security-pager"},
+    {"Id":"contain","Arn":"arn:aws:lambda:us-east-1:1111:function:auto-contain",
+     "RetryPolicy":{"MaximumRetryAttempts":2},
+     "DeadLetterConfig":{"Arn":"arn:aws:sqs:us-east-1:1111:sec-dlq"}}]'
+</pre>
+<pre>
+THE CONTAINMENT FUNCTION — preserve BEFORE isolating:
+$ cat &gt; auto_contain.py &lt;&lt;'PY'
+import boto3, os
+ec2 = boto3.client("ec2")
+QUARANTINE_SG = os.environ["QUARANTINE_SG"]
+CONTAIN_TYPES = ("CryptoCurrency:EC2/", "Backdoor:EC2/", "UnauthorizedAccess:EC2/")
+
+def handler(event, context):
+    d = event["detail"]
+    if not d["type"].startswith(CONTAIN_TYPES):
+        return {"action": "notified_only", "type": d["type"]}
+    iid = d["resource"]["instanceDetails"]["instanceId"]
+
+    # 1. PRESERVE — snapshot every volume before touching anything
+    inst = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+    for bdm in inst["BlockDeviceMappings"]:
+        ec2.create_snapshot(VolumeId=bdm["Ebs"]["VolumeId"],
+            Description=f"forensic {iid} {d['id']}",
+            TagSpecifications=[{"ResourceType":"snapshot",
+                "Tags":[{"Key":"Incident","Value":d["id"]},
+                        {"Key":"Instance","Value":iid}]}])
+
+    # 2. CONTAIN — isolate, and cut off new credentials
+    ec2.modify_instance_attribute(InstanceId=iid, Groups=[QUARANTINE_SG])
+    ec2.modify_instance_metadata_options(InstanceId=iid, HttpEndpoint="disabled")
+
+    # 3. MARK — do NOT terminate; the evidence is in memory
+    ec2.create_tags(Resources=[iid],
+        Tags=[{"Key":"Quarantined","Value":d["id"]},{"Key":"DoNotTerminate","Value":"true"}])
+    return {"action": "contained", "instance": iid}
+PY
+</pre>
+<pre>
+TEST IT WITH A SAMPLE FINDING — never wait for a real one to find out:
+$ aws guardduty create-sample-findings --detector-id d-9f2a4b2c \
+    --finding-types "CryptoCurrency:EC2/BitcoinTool.B!DNS"
+$ sleep 60
+$ aws logs tail /aws/lambda/auto-contain --since 2m --format short | tail -3
+{"action": "contained", "instance": "i-99999999"}
+
+$ aws ec2 describe-instances --instance-ids i-0a1b2c3d \
+    --query 'Reservations[0].Instances[0].[SecurityGroups[].GroupId,
+             MetadataOptions.HttpEndpoint,State.Name]' --output text
+sg-0quarantine   disabled   running                ✅ isolated, IMDS off, STILL RUNNING
+$ aws ec2 describe-snapshots --filters Name=tag:Instance,Values=i-0a1b2c3d \
+    --query 'Snapshots[].[SnapshotId,State]' --output text
+snap-0f3c9a1e   pending                            ✅ evidence preserved first
+</pre>
+<table class="tbl">
+  <tr><th>Finding type</th><th>Automate?</th><th>Why</th></tr>
+  <tr><td><code>CryptoCurrency:EC2/*</code></td><td><strong>✅ contain</strong></td><td>Never a false positive worth leaving running</td></tr>
+  <tr><td><code>Backdoor:EC2/C&amp;CActivity*</code></td><td><strong>✅ contain</strong></td><td>Same</td></tr>
+  <tr><td><code>UnauthorizedAccess:IAMUser/*</code></td><td>⚠️ page, revoke sessions</td><td>Disabling the wrong identity is its own outage</td></tr>
+  <tr><td><code>Recon:EC2/PortProbeUnprotectedPort</code></td><td>❌ ticket</td><td>Extremely common; automating it is noise</td></tr>
+  <tr><td><code>Policy:S3/BucketPublicAccessGranted</code></td><td>✅ via Config remediation</td><td>The correct action is never ambiguous</td></tr>
+</table>
+<div class="note">🔑 <strong>Automate only where the right action is never in doubt, and always preserve before
+   containing.</strong> The most common mistake in an auto-remediation function is calling
+   <code>terminate-instances</code> — it looks decisive and destroys the disk and memory that would explain the
+   breach. Snapshot, swap to a quarantine security group, disable IMDS so no fresh credentials are issued, tag
+   it <code>DoNotTerminate</code>, and let a human decide. And test with
+   <code>create-sample-findings</code>: an untested response function fails for the first time during a real
+   incident.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Run a complete incident response for a leaked access key —
+       contain, investigate, eradicate, and fix the cause.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE TRIGGER:
+$ aws guardduty list-findings --detector-id d-9f2a4b2c \
+    --finding-criteria '{"Criterion":{"type":{"Eq":["UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom"]}}}' \
+    --query FindingIds --output text | head -1 | xargs -I{} \
+  aws guardduty get-findings --detector-id d-9f2a4b2c --finding-ids {} \
+    --query 'Findings[0].[Type,Resource.AccessKeyDetails.[UserName,AccessKeyId],Service.Action]' --output json
+[ "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom",
+  [ "ci-deployer", "AKIA5EXAMPLE9F21C0E4" ], { "ActionType": "AWS_API_CALL" } ]
+
+$ aws iam list-attached-user-policies --user-name ci-deployer \
+    --query 'AttachedPolicies[].PolicyArn' --output text
+arn:aws:iam::aws:policy/AdministratorAccess         ⚠️ full admin
+</pre>
+<pre>
+STEP 1 — CONTAIN, REVERSIBLY. Deactivate; do not delete yet:
+$ aws iam update-access-key --user-name ci-deployer \
+    --access-key-id AKIA5EXAMPLE9F21C0E4 --status Inactive
+   → the key stops working immediately, and the ID remains resolvable in CloudTrail.
+
+$ # if the key was used to assume roles, those SESSIONS are still alive:
+$ aws cloudtrail lookup-events --lookup-attributes \
+      AttributeKey=EventName,AttributeValue=AssumeRole \
+    --start-time 2026-08-14T00:00:00Z \
+    --query 'Events[?contains(CloudTrailEvent, `ci-deployer`)].CloudTrailEvent' --output text \
+  | jq -r '.requestParameters.roleArn' | sort -u
+arn:aws:iam::111122223333:role/DeployRole
+$ cat &gt; revoke.json &lt;&lt;'EOF'
+{ "Version":"2012-10-17",
+  "Statement":[{"Effect":"Deny","Action":"*","Resource":"*",
+    "Condition":{"DateLessThan":{"aws:TokenIssueTime":"2026-08-20T14:06:00Z"}}}] }
+EOF
+$ aws iam put-role-policy --role-name DeployRole \
+    --policy-name AWSRevokeOlderSessions --policy-document file://revoke.json
+   ⚠️ temporary credentials CANNOT be deleted. This is the only way to kill them.
+</pre>
+<pre>
+STEP 2 — SCOPE IT. What did they actually do?
+$ aws athena start-query-execution --query-string "
+  SELECT eventtime, eventname, sourceipaddress, awsregion, errorcode
+  FROM cloudtrail_logs
+  WHERE useridentity.accesskeyid = 'AKIA5EXAMPLE9F21C0E4'
+    AND eventtime >= '2026-08-14T00:00:00Z'
+  ORDER BY eventtime" ...
+
+  2026-08-14T02:41:19Z  GetCallerIdentity   203.0.113.77   us-east-1   -
+  2026-08-14T02:41:44Z  ListBuckets         203.0.113.77   us-east-1   -
+  2026-08-14T02:43:02Z  RunInstances        203.0.113.77   ap-south-1  -     ⚠️
+  2026-08-14T02:51:18Z  CreateUser          203.0.113.77   us-east-1   -     ⚠️
+  2026-08-14T02:51:22Z  CreateAccessKey     203.0.113.77   us-east-1   -     ⚠️
+  2026-08-14T02:52:40Z  AttachUserPolicy    203.0.113.77   us-east-1   -     ⚠️
+  2026-08-18T09:12:00Z  GetObject           203.0.113.77   us-east-1   -     ⚠️
+</pre>
+<pre>
+FOUR THINGS TO CHASE, and the third is the one people miss:
+$ # (a) PERSISTENCE — what did they create?
+$ aws iam list-users --query 'Users[?CreateDate>=`2026-08-14`].[UserName,CreateDate]' --output text
+svc-backup-helper   2026-08-14T02:51:18Z            ⚠️ not ours
+
+$ # (b) COMPUTE — in Regions we never use:
+$ for r in $(aws ec2 describe-regions --query 'Regions[].RegionName' --output text); do
+    n=$(aws ec2 describe-instances --region $r \
+        --filters Name=instance-state-name,Values=running \
+        --query 'length(Reservations[].Instances[])' --output text)
+    [ "$n" != "0" ] &amp;&amp; echo "$r: $n"
+  done
+us-east-1: 24
+ap-south-1: 8                                       ⚠️ crypto-mining
+
+$ # (c) DATA — what was READ? Only answerable if data events were on:
+$ aws cloudtrail get-event-selectors --trail-name org-trail \
+    --query 'AdvancedEventSelectors[?Name==`sensitive-s3`]' --output text
+sensitive-s3 ...                                    ✅ they were. (See Observability.)
+
+$ # (d) SECRETS the identity could read — assume all were read:
+$ aws cloudtrail lookup-events --lookup-attributes \
+      AttributeKey=EventName,AttributeValue=GetSecretValue \
+    --start-time 2026-08-14T00:00:00Z --query 'length(Events)'
+7
+</pre>
+<pre>
+STEP 3 — ERADICATE:
+$ aws iam delete-user --user-name svc-backup-helper          # after removing keys/policies
+$ aws ec2 terminate-instances --region ap-south-1 --instance-ids $(...)
+$ aws iam delete-access-key --user-name ci-deployer --access-key-id AKIA5EXAMPLE9F21C0E4
+$ for s in $(aws secretsmanager list-secrets --query 'SecretList[].Name' --output text); do
+    aws secretsmanager rotate-secret --secret-id "$s" --rotate-immediately
+  done
+$ # and remove the revoke policy once every pre-incident session has expired (>12h)
+</pre>
+<pre>
+STEP 4 — FIX THE CAUSE, which is never "someone leaked a key":
+   the cause is that a LONG-LIVED KEY WITH ADMIN EXISTED AT ALL.
+
+$ # (a) remove the credential entirely — OIDC federation for CI:
+$ aws iam create-role --role-name GitHubDeploy --assume-role-policy-document '{
+    "Version":"2012-10-17","Statement":[{"Effect":"Allow",
+      "Principal":{"Federated":"arn:aws:iam::1111:oidc-provider/token.actions.githubusercontent.com"},
+      "Action":"sts:AssumeRoleWithWebIdentity",
+      "Condition":{"StringEquals":{
+        "token.actions.githubusercontent.com:aud":"sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub":"repo:acme/infra:environment:production"}}}]}'
+$ aws iam delete-user --user-name ci-deployer
+
+$ # (b) make the next leak far less useful — a permission boundary:
+$ aws iam put-user-permissions-boundary --user-name any-remaining \
+    --permissions-boundary arn:aws:iam::1111:policy/DeveloperBoundary
+
+$ # (c) detect it earlier — alarm on the root causes, not just the symptom:
+$ aws cloudwatch put-metric-alarm --alarm-name iam-createuser \
+    --namespace CloudTrailMetrics --metric-name CreateUserCount \
+    --statistic Sum --period 300 --evaluation-periods 1 --threshold 0 \
+    --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching \
+    --alarm-actions arn:aws:sns:us-east-1:1111:security-pager
+</pre>
+<table class="tbl">
+  <tr><th>Phase</th><th>Action</th><th>Why in this order</th></tr>
+  <tr><td>Contain</td><td>Deactivate key; deny by <code>TokenIssueTime</code></td><td>Reversible; temporary credentials cannot be deleted</td></tr>
+  <tr><td>Scope</td><td>CloudTrail via Athena</td><td>Deleting first destroys the audit trail's subject</td></tr>
+  <tr><td>Hunt persistence</td><td>New users, keys, roles, trust policies, <strong>unused Regions</strong></td><td>Containment without eradication is temporary</td></tr>
+  <tr><td>Eradicate</td><td>Delete artefacts; rotate every reachable secret</td><td>Assume anything readable was read</td></tr>
+  <tr><td><strong>Fix the cause</strong></td><td><strong>OIDC — no key to leak</strong></td><td>Rotating the key recreates the same risk</td></tr>
+</table>
+<div class="note">⚠️ <strong>Six days elapsed between the first malicious call and the response</strong>, and
+   GuardDuty had flagged it on day one. The technical response above is straightforward; the finding that
+   belongs in the postmortem is that <em>detection existed and routing did not</em>. Note also the ordering
+   discipline: deactivate rather than delete (reversible, and keeps the key ID resolvable in CloudTrail), scope
+   before eradicating, and treat the presence of an <code>AWSCompromisedKeyQuarantine…</code> policy as proof
+   the key was publicly indexed rather than as the remediation.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build the account baseline as code, then write the check
+       that proves it — and watch the check fail.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE BASELINE AS A STACKSET, so accounts created LATER inherit it:
+$ cat &gt; baseline.yaml &lt;&lt;'YAML'
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  AccountPublicAccessBlock:
+    Type: AWS::S3::AccountPublicAccessBlock          # note: account-wide, not per bucket
+    Properties:
+      AccountId: !Ref AWS::AccountId
+      BlockPublicAcls: true
+      IgnorePublicAcls: true
+      BlockPublicPolicy: true
+      RestrictPublicBuckets: true
+  Detector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      RoleARN: !GetAtt ConfigRole.Arn
+      RecordingGroup: { AllSupported: true, IncludeGlobalResourceTypes: true }
+  AccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties: { Type: ACCOUNT }
+YAML
+
+$ aws cloudformation create-stack-set --stack-set-name account-baseline \
+    --template-body file://baseline.yaml --permission-model SERVICE_MANAGED \
+    --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+    --capabilities CAPABILITY_NAMED_IAM
+$ aws cloudformation create-stack-instances --stack-set-name account-baseline \
+    --deployment-targets OrganizationalUnitIds=ou-abc1-workloads \
+    --regions us-east-1 eu-west-1 \
+    --operation-preferences FailureTolerancePercentage=10,MaxConcurrentPercentage=25
+</pre>
+<pre>
+THE PREVENTIVE HALF — SCPs, which the workload team CANNOT undo:
+$ aws organizations create-policy --type SERVICE_CONTROL_POLICY --name baseline-guardrails \
+    --content '{
+  "Version":"2012-10-17",
+  "Statement":[
+    {"Sid":"NoDisablingLogging","Effect":"Deny",
+     "Action":["cloudtrail:StopLogging","cloudtrail:DeleteTrail",
+               "guardduty:DeleteDetector","guardduty:DisassociateFromMasterAccount",
+               "config:DeleteConfigurationRecorder","config:StopConfigurationRecorder"],
+     "Resource":"*"},
+    {"Sid":"NoUnencryptedRDS","Effect":"Deny",
+     "Action":["rds:CreateDBInstance","rds:CreateDBCluster"],"Resource":"*",
+     "Condition":{"Bool":{"rds:StorageEncrypted":"false"}}},
+    {"Sid":"NoUnencryptedTransit","Effect":"Deny",
+     "Action":"s3:*","Resource":"*",
+     "Condition":{"Bool":{"aws:SecureTransport":"false"}}},
+    {"Sid":"NoRootUse","Effect":"Deny","Action":"*","Resource":"*",
+     "Condition":{"StringLike":{"aws:PrincipalArn":"arn:aws:iam::*:root"}}}]}'
+</pre>
+<pre>
+✅ NOW THE PART THAT MAKES IT A CONTROL — a check that can FAIL:
+$ cat &gt; baseline_check.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+ACC=$(aws sts get-caller-identity --query Account --output text)
+fail=0
+chk() { printf '%-44s %s\n' "$1" "$2"; [ "$2" = OK ] || fail=1; }
+t()   { [ "$1" = "$2" ] && echo OK || echo FAIL; }
+
+chk "S3 Block Public Access (account)" \
+  "$(t True "$(aws s3control get-public-access-block --account-id $ACC \
+      --query 'PublicAccessBlockConfiguration.BlockPublicPolicy' --output text 2>/dev/null)")"
+chk "EBS encryption by default" \
+  "$(t True "$(aws ec2 get-ebs-encryption-by-default --query EbsEncryptionByDefault --output text)")"
+chk "GuardDuty enabled" \
+  "$(t 1 "$(aws guardduty list-detectors --query 'length(DetectorIds)' --output text)")"
+chk "Config recorder recording" \
+  "$(t True "$(aws configservice describe-configuration-recorder-status \
+      --query 'ConfigurationRecordersStatus[0].recording' --output text 2>/dev/null)")"
+chk "No root access keys" \
+  "$(t 0 "$(aws iam get-account-summary --query 'SummaryMap.AccountAccessKeysPresent' --output text)")"
+chk "Access Analyzer present" \
+  "$(t 1 "$(aws accessanalyzer list-analyzers --query 'length(analyzers)' --output text)")"
+chk "CloudTrail multi-region logging" \
+  "$(t True "$(aws cloudtrail describe-trails \
+      --query 'trailList[?IsMultiRegionTrail==`true`] | [0].IsMultiRegionTrail' --output text)")"
+
+exit $fail
+SH
+$ bash baseline_check.sh
+S3 Block Public Access (account)             OK
+EBS encryption by default                    FAIL
+GuardDuty enabled                            OK
+Config recorder recording                    OK
+No root access keys                          OK
+Access Analyzer present                      OK
+CloudTrail multi-region logging              OK
+$ echo $?
+1                                                  ← EBS default is PER REGION
+</pre>
+<pre>
+FIX THE GAP THE CHECK FOUND, in every Region:
+$ for r in $(aws ec2 describe-regions --query 'Regions[].RegionName' --output text); do
+    aws ec2 enable-ebs-encryption-by-default --region $r &gt;/dev/null
+    printf '%-16s %s\n' "$r" "$(aws ec2 get-ebs-encryption-by-default --region $r \
+      --query EbsEncryptionByDefault --output text)"
+  done
+us-east-1        True
+eu-west-1        True
+ap-south-1       True
+...
+$ bash baseline_check.sh; echo "exit=$?"
+...
+EBS encryption by default                    OK
+exit=0                                             ✅
+</pre>
+<pre>
+PROVE THE CHECK ACTUALLY DETECTS REGRESSION — an assertion you have never
+seen fail is not a control:
+$ aws ec2 disable-ebs-encryption-by-default &gt;/dev/null
+$ bash baseline_check.sh; echo "exit=$?"
+EBS encryption by default                    FAIL
+exit=1                                             ✅ it fails when it should
+$ aws ec2 enable-ebs-encryption-by-default &gt;/dev/null
+
+AND RUN IT CONTINUOUSLY, per account:
+$ aws events put-rule --name daily-baseline --schedule-expression 'rate(1 day)'
+$ aws events put-targets --rule daily-baseline --targets \
+    '[{"Id":"1","Arn":"arn:aws:lambda:us-east-1:1111:function:baseline-check"}]'
+</pre>
+<pre>
+AND PROVE THE PREVENTIVE HALF IS REAL:
+$ aws cloudtrail stop-logging --name org-trail
+An error occurred (AccessDenied): ... explicit deny in a service control policy
+$ aws rds create-db-instance --db-instance-identifier x --engine postgres \
+    --db-instance-class db.t3.micro --allocated-storage 20 --master-username a \
+    --master-user-password Passw0rd123
+An error occurred (AccessDenied): ... explicit deny in a service control policy
+   ✅ the guardrails are not settings a team can turn off — they are denials
+     from a layer the team does not control.
+</pre>
+<table class="tbl">
+  <tr><th>Control type</th><th>Example</th><th>Can the account team undo it?</th></tr>
+  <tr><td>Setting</td><td>EBS encryption by default</td><td><strong>Yes</strong> — hence the daily check</td></tr>
+  <tr><td>StackSet resource</td><td>GuardDuty detector</td><td>Yes, but it is re-deployed and drift is visible</td></tr>
+  <tr><td><strong>SCP</strong></td><td><strong>Deny <code>cloudtrail:StopLogging</code></strong></td><td><strong>No</strong></td></tr>
+  <tr><td>Detective check</td><td><code>baseline_check.sh</code> daily</td><td>Catches everything in rows 1–2</td></tr>
+</table>
+<div class="note">🔑 <strong>The distinction in that last table is the whole point of a baseline.</strong>
+   Auditors and regulators care about controls a team <em>cannot</em> disable — so anything that genuinely
+   matters belongs in an SCP, not in an account setting. Everything else needs a check that runs daily and can
+   fail, tested by breaking it deliberately at least once. A baseline that is a wiki page drifts within a
+   quarter and never reaches accounts created next year; StackSets with auto-deployment plus SCPs plus a
+   failing check is the version that holds.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>KMS encrypts a key, not your data</strong> — envelope encryption exists because the <code>Encrypt</code> API caps at 4 KB and because only 32 bytes should cross the network.</li>
+        <li><strong>The KMS key policy is authoritative.</strong> Proven: <code>AdministratorAccess</code> plus <code>kms:*</code> was still denied, with the error explicitly saying <em>"no resource-based policy allows"</em>.</li>
+        <li>Scope keys with <code>kms:ViaService</code> and encryption-context conditions so a stolen credential cannot decrypt arbitrary ciphertext directly.</li>
+        <li>The encryption context is authenticated data recorded in CloudTrail — it makes the audit log show <em>what</em> was decrypted, not just that a key was used.</li>
+        <li>Key rotation adds new material and <strong>retains the old</strong>; it re-encrypts nothing. Key <em>deletion</em> has a mandatory 7–30 day window because it destroys every ciphertext permanently.</li>
+        <li><strong>RDS and EBS cannot be encrypted in place.</strong> The measured path was snapshot → copy with a key → restore → cut over: <strong>~80 minutes plus a real cutover window</strong>, with default parameter groups and no backups on the restored instance.</li>
+        <li>Set account-level EBS default encryption <strong>per Region</strong>, and deny unencrypted creation with an SCP so the decision never arises.</li>
+        <li><strong>Lambda environment variables are readable by anyone with <code>ReadOnlyAccess</code></strong> via <code>GetFunctionConfiguration</code> — encrypted at rest is not the same as private.</li>
+        <li>Never let secrets reach git, an image layer, an AMI, a CloudFormation parameter, or Terraform state (plaintext regardless of <code>sensitive</code>).</li>
+        <li><strong>Rotation is two halves and teams ship one.</strong> Read-once-at-startup fails on every rotation; a TTL cache plus one retry on auth failure reduced it to <strong>a single failed request</strong>.</li>
+        <li>The strongest version removes the password entirely: <code>ManageMasterUserPassword</code> plus RDS Proxy with IAM auth means <strong>zero failures per rotation</strong>.</li>
+        <li>Test rotation with <code>--rotate-immediately</code> under load — an unexercised rotation schedule is a scheduled outage.</li>
+        <li><strong>Detective services are not controls until findings reach someone.</strong> Three high-severity GuardDuty findings sat unread for six days while crypto-mining ran.</li>
+        <li>Route by severity: page, ticket, or narrow auto-remediation — and <strong>automate only where the correct action is never ambiguous</strong>.</li>
+        <li><strong>Preserve before you contain.</strong> Snapshot volumes, swap to a quarantine SG, disable IMDS, tag <code>DoNotTerminate</code> — terminating destroys the evidence and does not stop the attacker's other credentials.</li>
+        <li><strong>Leaked temporary credentials cannot be deleted</strong> — deny by <code>aws:TokenIssueTime</code>, and keep that policy document in the runbook.</li>
+        <li>Deactivate a leaked key rather than deleting it: reversible, and the key ID stays resolvable in CloudTrail while you scope the incident.</li>
+        <li>Hunt persistence after containment: new users, new keys, changed trust policies, and <strong>running instances in Regions you never use</strong>.</li>
+        <li><strong>The cause of a leaked key is never "someone leaked a key"</strong> — it is that a long-lived credential existed. Replace CI keys with OIDC federation so there is nothing to leak.</li>
+        <li>An <code>AWSCompromisedKeyQuarantine…</code> policy appearing means the key was <strong>publicly indexed</strong>; treat it as confirmation of an incident, never as the fix.</li>
+        <li>Ship the account baseline as <strong>StackSets with auto-deployment</strong> so future accounts inherit it, and put anything that genuinely matters in an <strong>SCP</strong> — the only layer a workload team cannot disable.</li>
+        <li>Write a baseline check that can <strong>fail</strong>, run it daily, and break it deliberately once: an assertion you have never seen fail is not a control.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="iac.html">← Infrastructure as Code</a>
+      <a href="well-architected.html">The Well-Architected Trade-offs →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
