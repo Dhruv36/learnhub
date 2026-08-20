@@ -1,0 +1,1143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RDS &amp; Aurora — AWS — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../kubernetes/index.html">Kubernetes</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>RDS &amp; Aurora <span class="level-badge level-adv">Data</span></h1>
+
+    <p><strong>What you'll master:</strong> the misconception that costs the most — <strong>Multi-AZ is
+       availability, not scale</strong>, and the standby you are paying for <em>cannot serve a single
+       read</em>; the two entirely different products both called "Multi-AZ", and their <strong>120-second
+       versus 35-second</strong> failovers; read replicas, their asynchronous lag, and the stale-read bug that
+       appears only under load; Aurora's genuinely different architecture — <strong>a distributed storage layer
+       that ships redo log records instead of pages</strong>, six copies across three AZs with a 4-of-6 write
+       quorum, replicas that read the <em>same volume</em> so adding one copies <strong>nothing</strong>, and
+       lag measured in <strong>milliseconds rather than seconds</strong>; backups, where a retention of
+       <strong>0 silently disables point-in-time recovery</strong> and deleting an instance takes its automated
+       backups with it; the restore that <strong>creates a new endpoint your application has never heard
+       of</strong>; and Performance Insights, which answers "why is the database slow" faster than any other
+       tool AWS ships. Prerequisites: <a href="s3.html">S3</a>,
+       <a href="ec2-compute.html">EC2, EBS &amp; Auto Scaling</a> and
+       <a href="lambda-serverless.html">Lambda &amp; API Gateway</a> (for the connection-pooling story).</p>
+
+    <h2>Part 1 — What RDS Manages, and What It Does Not</h2>
+
+    <table class="tbl">
+      <tr><th>AWS handles</th><th>You still own</th></tr>
+      <tr><td>OS and engine patching</td><td><strong>Schema, indexes and queries</strong></td></tr>
+      <tr><td>Automated backups and PITR</td><td>Deciding the retention — and it defaults badly</td></tr>
+      <tr><td>Failover orchestration</td><td><strong>Clients reconnecting</strong> after a failover</td></tr>
+      <tr><td>Replication plumbing</td><td>Whether stale reads are acceptable</td></tr>
+      <tr><td>Storage provisioning and autoscaling</td><td><strong>Connection management</strong></td></tr>
+      <tr><td>Monitoring hooks</td><td>Actually reading them</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Every RDS incident that is not a hardware failure lives in the right-hand
+       column.</strong> RDS removes the operational work of running a database and none of the work of using one
+       well — a missing index is still a missing index, and a connection storm is still a connection storm (see
+       <a href="lambda-serverless.html">Lambda</a>). The managed service moves the failure modes; it does not
+       remove them.</div>
+
+<pre>
+STORAGE — the same shapes as EBS, with the same trap:
+
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].[StorageType,AllocatedStorage,Iops,MaxAllocatedStorage]' --output text
+gp2   100   None   None
+   ⚠️ gp2 on RDS ties IOPS to size exactly as it does on EC2: 3 IOPS/GB = 300 IOPS,
+     with a burst bucket that drains. And MaxAllocatedStorage None = NO AUTOSCALING:
+     the database stops accepting writes when the disk fills.
+
+$ aws rds modify-db-instance --db-instance-identifier orders-db \
+    --storage-type gp3 --max-allocated-storage 1000 --apply-immediately
+   → gp3 gives 3,000 IOPS and 125 MB/s baseline regardless of size, and storage
+     autoscaling now grows the volume to 1 TB before anything fills up.
+</pre>
+
+    <h2>Part 2 — Multi-AZ Is Availability, Not Scale</h2>
+
+    <p>This is the most consequential misconception in the whole service, and it costs real money: teams pay to
+       double their database and believe they have doubled read capacity.</p>
+
+<pre>
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].[MultiAZ,SecondaryAvailabilityZone,Endpoint.Address]' --output text
+True   us-east-1b   orders-db.cluster-abc.us-east-1.rds.amazonaws.com
+
+$ # try to reach the standby:
+$ dig +short orders-db.cluster-abc.us-east-1.rds.amazonaws.com
+10.0.1.44                                          ← ONE address. The primary.
+   → there is no standby endpoint. There is no way to connect to it.
+     It exists solely to be promoted.
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th><strong>Multi-AZ instance</strong></th><th><strong>Multi-AZ DB cluster</strong></th><th>Read replica</th></tr>
+      <tr><td>Standby readable</td><td><strong>❌ Never</strong></td><td><strong>✅ 2 readable standbys</strong></td><td>✅</td></tr>
+      <tr><td>Replication</td><td>Synchronous</td><td>Semi-synchronous (2 of 2)</td><td><strong>Asynchronous</strong></td></tr>
+      <tr><td>Data loss on failover</td><td>None</td><td>None</td><td><strong>Possible — it lags</strong></td></tr>
+      <tr><td>Failover</td><td>~60–120 s</td><td><strong>~35 s</strong></td><td>Manual promotion, minutes</td></tr>
+      <tr><td>Adds read capacity</td><td><strong>❌</strong></td><td>✅</td><td>✅</td></tr>
+      <tr><td>Cost</td><td>2× instance</td><td>3× instance</td><td>+1× per replica</td></tr>
+      <tr><td>Buys you</td><td><strong>Availability only</strong></td><td>Availability <em>and</em> reads</td><td>Reads only</td></tr>
+    </table>
+
+<pre>
+FAILOVER IS A DNS CHANGE — which means the client is half the story:
+
+  1. AWS detects the primary has failed                     ~30 s
+  2. the standby is promoted                                ~10 s
+  3. the endpoint's DNS record is repointed                 ~5 s   (TTL 5 s)
+  4. YOUR CLIENT NOTICES                                    ???
+
+$ aws rds failover-db-instance --db-instance-identifier orders-db
+$ # measured from the application side:
+  connection errors begin        t+0 s
+  DNS record updated             t+47 s
+  Java app recovers              NEVER                      ← networkaddress.cache.ttl=-1
+  Node app recovers              t+49 s
+</pre>
+
+    <div class="note">⚠️ <strong>The failover completed in 47 seconds and the JVM never noticed.</strong> This is
+       the same client-side DNS caching problem as <a href="edge-dns.html">Route 53 failover</a>: a JVM with the
+       default security policy caches successful lookups for the life of the process. Set
+       <code>networkaddress.cache.ttl=30</code>, use a connection pool that validates connections before
+       handing them out, and — best of all — put <strong>RDS Proxy</strong> in front, which holds client
+       connections open across the failover and cuts observed downtime to a few seconds.</div>
+
+    <h2>Part 3 — Read Replicas and the Lag You Must Design For</h2>
+
+<pre>
+$ aws rds create-db-instance-read-replica --db-instance-identifier orders-ro-1 \
+    --source-db-instance-identifier orders-db --db-instance-class db.r6g.large
+
+$ aws rds describe-db-instances --db-instance-identifier orders-ro-1 \
+    --query 'DBInstances[0].[StatusInfos[0].Status,ReadReplicaSourceDBInstanceIdentifier]' --output text
+replicating   orders-db
+</pre>
+
+<pre>
+REPLICATION IS ASYNCHRONOUS, so there are two distinct failure modes:
+
+  (1) STALE READS — always present, usually small, occasionally catastrophic:
+        POST /orders   → writes to the primary
+        GET  /orders/42 → reads from a replica, 240 ms behind
+        → "your order does not exist", immediately after creating it.
+
+  (2) LAG GROWTH UNDER WRITE LOAD — replicas apply changes SINGLE-THREADED
+      on many engines, so a write-heavy primary outruns them:
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name ReplicaLag \
+    --dimensions Name=DBInstanceIdentifier,Value=orders-ro-1 --period 300 --statistics Maximum \
+    --start-time $(date -u -d '2 hours ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --query 'sort_by(Datapoints,&amp;Timestamp)[::4].[Timestamp,Maximum]' --output text
+2026-08-20T11:00:00Z      0.0
+2026-08-20T12:00:00Z    182.0                      ← a bulk import started
+2026-08-20T13:00:00Z   1841.0                      ← 30 minutes behind
+</pre>
+
+    <table class="tbl">
+      <tr><th>Pattern</th><th>Route to</th><th>Why</th></tr>
+      <tr><td>Read-after-write for the same user</td><td><strong>Primary</strong></td><td>Lag is visible as a bug</td></tr>
+      <tr><td>Dashboards, reports, analytics</td><td>Replica</td><td>Seconds of staleness are irrelevant</td></tr>
+      <tr><td>Search, browse, catalogue</td><td>Replica</td><td>Same</td></tr>
+      <tr><td>Anything inside a transaction</td><td>Primary</td><td>Correctness</td></tr>
+      <tr><td>Bulk export / ETL</td><td><strong>A dedicated replica</strong></td><td>Isolates the load from user traffic</td></tr>
+    </table>
+
+    <div class="note">💡 <strong>Promoting a read replica is permanent and one-way.</strong>
+       <code>promote-read-replica</code> makes it a standalone primary; it can never rejoin the original as a
+       replica, and any writes to the old primary after that moment are lost to it. That makes promotion a
+       genuine disaster-recovery action rather than a routine one — which is why cross-Region DR usually uses a
+       cross-Region replica that you promote once, deliberately, and never fail back automatically.</div>
+
+    <h2>Part 4 — Aurora: A Different Machine Underneath</h2>
+
+    <p>Aurora is not "RDS with better numbers". It replaces the storage engine with a distributed service, and
+       almost every operational difference follows from one design decision.</p>
+
+<pre>
+THE DESIGN DECISION: Aurora ships REDO LOG RECORDS, not data pages.
+
+  a traditional database on failover/replication must ship:
+      the changed 8 KB or 16 KB PAGE, plus the log, plus double-write buffers
+
+  Aurora writes ONLY the log record to storage; the storage layer applies it.
+      → dramatically less write amplification
+      → replicas read the SAME volume, so there is no "replication" to fall behind
+      → adding a replica copies NOTHING
+</pre>
+
+<pre>
+THE STORAGE LAYER:
+
+     6 copies of every 10 GB segment, spread across 3 Availability Zones
+     write quorum  4 of 6      → survives losing an entire AZ + one more copy
+     read  quorum  3 of 6      → survives losing an AZ
+     auto-grows in 10 GB increments to 128 TiB, with no downtime and no planning
+
+$ aws rds describe-db-clusters --db-cluster-identifier orders-aurora \
+    --query 'DBClusters[0].[AllocatedStorage,Engine,EngineVersion,MultiAZ]' --output text
+1   aurora-postgresql   15.4   True
+   ← "1" GB allocated: Aurora does not preallocate. It grows as you write.
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>RDS (PostgreSQL/MySQL)</th><th><strong>Aurora</strong></th></tr>
+      <tr><td>Storage</td><td>An EBS volume per instance</td><td><strong>Shared distributed volume, 6 copies / 3 AZs</strong></td></tr>
+      <tr><td>Replica lag</td><td>Seconds, grows under write load</td><td><strong>Typically 10–100 <em>milli</em>seconds</strong></td></tr>
+      <tr><td>Adding a replica</td><td>Copies the whole dataset — hours</td><td><strong>Minutes; copies nothing</strong></td></tr>
+      <tr><td>Max replicas</td><td>5 (engine-dependent)</td><td>15</td></tr>
+      <tr><td>Failover</td><td>60–120 s</td><td><strong>~30 s or less</strong></td></tr>
+      <tr><td>Storage growth</td><td>Provisioned; autoscaling optional</td><td>Automatic, to 128 TiB</td></tr>
+      <tr><td>Backtrack</td><td>❌</td><td>✅ (MySQL) — rewind in place, up to 72 h</td></tr>
+      <tr><td>Cost</td><td>Lower per instance-hour</td><td>~20% more, <strong>plus I/O charges unless I/O-Optimized</strong></td></tr>
+    </table>
+
+<pre>
+CLUSTER ENDPOINTS — three of them, and using the wrong one is a common bug:
+
+  orders.cluster-abc123.us-east-1.rds.amazonaws.com          → the WRITER, always
+  orders.cluster-ro-abc123.us-east-1.rds.amazonaws.com       → round-robins READERS
+  orders-instance-1.abc123.us-east-1.rds.amazonaws.com       → ONE specific instance
+
+  ❌ pointing writes at the reader endpoint:
+     ERROR: cannot execute INSERT in a read-only transaction
+  ❌ pointing everything at an INSTANCE endpoint:
+     survives nothing — that instance is replaced on failover and the name changes role
+</pre>
+
+<pre>
+AURORA SERVERLESS v2 — capacity in 0.5-ACU steps, scaling in seconds:
+$ aws rds modify-db-cluster --db-cluster-identifier orders-aurora \
+    --serverless-v2-scaling-configuration MinCapacity=0.5,MaxCapacity=16
+   1 ACU ≈ 2 GiB RAM with proportional CPU. Scales up in SECONDS, in place,
+   without dropping connections — unlike v1, which paused and resumed disruptively.
+
+  ⚠️ MinCapacity is a floor you PAY for continuously. 0.5 ACU ≈ $43/month
+    even at zero traffic, per instance in the cluster.
+</pre>
+
+    <div class="note">💡 <strong>Aurora I/O-Optimized is a pricing mode worth checking rather than assuming.</strong>
+       Standard Aurora bills storage I/O per request, which for a busy OLTP database can be a third of the total
+       bill; I/O-Optimized charges roughly 30% more for instances and storage and then charges <strong>nothing
+       for I/O</strong>. The rule of thumb: if I/O is more than ~25% of your Aurora spend, switch. Check the
+       <code>VolumeReadIOPs</code>/<code>VolumeWriteIOPs</code> metrics and the <code>Aurora:StorageIOUsage</code>
+       line in Cost Explorer, then switch — it takes effect without downtime and can be changed once a month.</div>
+
+    <h2>Part 5 — Backups You Have Not Tested Are Not Backups</h2>
+
+<pre>
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].[BackupRetentionPeriod,PreferredBackupWindow,DeletionProtection]' --output text
+0   03:00-04:00   False
+   ⚠️⚠️ RETENTION 0 MEANS AUTOMATED BACKUPS ARE DISABLED.
+        No point-in-time recovery. None. And it is a valid, accepted setting
+        that some Terraform modules and console flows leave as the default.
+
+$ aws rds modify-db-instance --db-instance-identifier orders-db \
+    --backup-retention-period 14 --deletion-protection --apply-immediately
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>Automated backups</th><th>Manual snapshots</th></tr>
+      <tr><td>Taken</td><td>Daily + continuous transaction logs</td><td>When you ask</td></tr>
+      <tr><td>Retention</td><td><strong>0–35 days</strong> (0 = off)</td><td><strong>Until you delete them</strong></td></tr>
+      <tr><td>Enables PITR</td><td>✅ to any second in the window</td><td>❌ that point in time only</td></tr>
+      <tr><td>Deleted with the instance</td><td><strong>✅ — they go too</strong></td><td>❌ they survive</td></tr>
+      <tr><td>Cross-Region / cross-account</td><td>Via copy</td><td>Via copy (re-encrypt with a shared KMS key)</td></tr>
+    </table>
+
+<pre>
+DELETING AN INSTANCE — the flag that decides whether the data still exists tomorrow:
+$ aws rds delete-db-instance --db-instance-identifier orders-db --skip-final-snapshot
+   → the instance AND all automated backups are gone. Immediately. Unrecoverable.
+
+$ aws rds delete-db-instance --db-instance-identifier orders-db \
+    --final-db-snapshot-identifier orders-db-final-2026-08-20
+   → one manual snapshot survives. This should be the only form you ever type.
+</pre>
+
+<pre>
+AND THE PART THAT BREAKS RUNBOOKS — A RESTORE IS A NEW INSTANCE:
+
+$ aws rds restore-db-instance-to-point-in-time \
+    --source-db-instance-identifier orders-db \
+    --target-db-instance-identifier orders-db-restored \
+    --restore-time 2026-08-20T12:45:00Z
+$ aws rds describe-db-instances --db-instance-identifier orders-db-restored \
+    --query 'DBInstances[0].Endpoint.Address' --output text
+orders-db-restored.abc123.us-east-1.rds.amazonaws.com
+                    ↑ A DIFFERENT HOSTNAME. Your application has never heard of it.
+
+  the restore also comes back with:
+    - the DEFAULT parameter group, not yours
+    - the DEFAULT security group, not yours
+    - no read replicas
+    - Multi-AZ OFF
+</pre>
+
+    <div class="note">⚠️ <strong>"Restore completed" and "service restored" are different events, and DR
+       rehearsals routinely measure the first.</strong> After the restore you must reapply the parameter group,
+       reattach security groups, re-enable Multi-AZ, recreate replicas, and repoint the application — which
+       means either a deploy or a DNS change, both of which have their own delay. The fix is to have the
+       application connect through a name <em>you</em> control (a Route 53 CNAME or RDS Proxy endpoint) so a
+       restore is a repoint rather than a redeploy, and to rehearse against the clock with a load generator
+       running.</div>
+
+    <h2>Part 6 — Why Is It Slow? Performance Insights First</h2>
+
+<pre>
+$ aws rds modify-db-instance --db-instance-identifier orders-db \
+    --enable-performance-insights --performance-insights-retention-period 7 \
+    --apply-immediately
+   (7 days is the FREE tier; longer retention is billed)
+
+$ aws pi get-resource-metrics --service-type RDS \
+    --identifier db-ABCDEFGH12345678 \
+    --metric-queries '[{"Metric":"db.load.avg","GroupBy":{"Group":"db.wait_event"}}]' \
+    --start-time $(date -u -d '1 hour ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --period-in-seconds 300 --query 'MetricList[].Key.Dimensions' --output json
+</pre>
+
+    <table class="tbl">
+      <tr><th>Top wait event</th><th>What it means</th><th>Where to look</th></tr>
+      <tr><td><code>CPU</code></td><td>Genuinely compute-bound</td><td>Query plans, missing indexes, or a bigger instance</td></tr>
+      <tr><td><code>IO:DataFileRead</code></td><td>Reading from storage — <strong>the working set does not fit in RAM</strong></td><td>More memory, or an index that avoids the scan</td></tr>
+      <tr><td><code>Lock:transactionid</code></td><td>Row-level lock contention</td><td>Long transactions, hot rows, missing <code>FOR UPDATE SKIP LOCKED</code></td></tr>
+      <tr><td><code>LWLock:BufferContent</code></td><td>Internal contention, often index hot spots</td><td>Sequential primary keys, index design</td></tr>
+      <tr><td><code>Client:ClientRead</code></td><td><strong>The database is waiting for your application</strong></td><td>Not a database problem — chatty client or network</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Performance Insights answers "what is the database waiting on", which is a
+       different and better question than "what is the CPU doing".</strong> The <code>Client:ClientRead</code>
+       row is the one that reframes investigations: a database whose top wait is waiting for the client is not
+       slow at all, and adding capacity will change nothing. Read the wait events before resizing anything.</div>
+
+<pre>
+PARAMETER GROUPS — and the reason a change appears to do nothing:
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].DBParameterGroups[0]' --output json
+{ "DBParameterGroupName": "orders-pg15", "ParameterApplyStatus": "pending-reboot" }
+                                                              ↑ NOT applied yet
+
+$ aws rds describe-engine-default-parameters --db-parameter-group-family postgres15 \
+    --query 'EngineDefaults.Parameters[?ParameterName==`shared_buffers`].ApplyType' --output text
+static                                             ← static parameters need a REBOOT
+                                                     dynamic ones apply immediately
+$ aws rds reboot-db-instance --db-instance-identifier orders-db
+</pre>
+
+<pre>
+BLUE/GREEN DEPLOYMENTS — for engine upgrades without a long outage:
+$ aws rds create-blue-green-deployment --blue-green-deployment-name orders-pg16 \
+    --source arn:aws:rds:us-east-1:111122223333:db:orders-db \
+    --target-engine-version 16.2 --target-db-parameter-group-name orders-pg16
+   → AWS builds a full green environment, keeps it replicating from blue, and
+     SWITCHES OVER in about a minute, renaming endpoints so no client changes.
+     Blue is retained, so rollback is possible.
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Multi-AZ bought for read capacity, all reads pointed at the writer, backup retention left at
+         0, an instance deleted with <code>--skip-final-snapshot</code>, a DR runbook that measures restore
+         completion, gp2 storage with no autoscaling, and a "slow database" diagnosed by resizing it.</strong>
+         The team pays double for a standby that cannot serve a single query and believes read capacity is
+         handled. Every report and dashboard hits the primary, so an analytics query at month end slows
+         checkout. Backup retention is zero because a Terraform module left the default, so there is no
+         point-in-time recovery at all and nobody has checked. Someone deleted a decommissioned instance with
+         <code>--skip-final-snapshot</code> and took its automated backups with it. The DR rehearsal records
+         "restored in eleven minutes" and never notices that the restored instance came back with the default
+         parameter group, no Multi-AZ, no replicas and a hostname the application has never heard of. Storage
+         is gp2 at 100 GB, so it delivers 300 IOPS with a burst bucket that drains, and
+         <code>MaxAllocatedStorage</code> is unset, so the database will stop accepting writes when the disk
+         fills. And when latency rises, the instance class is doubled — which does nothing, because the top
+         wait event was <code>Client:ClientRead</code>.</p>
+      <p>✅ <strong>Separate availability from scale, route reads deliberately, set retention and deletion
+         protection on day one, rehearse restores against the clock, use gp3 with autoscaling, and read the wait
+         events before spending money.</strong> Multi-AZ is availability; read capacity comes from read
+         replicas, a Multi-AZ DB cluster, or Aurora — decide which problem you are solving before paying for
+         either. Route read-after-write and transactional reads to the writer and everything tolerant of
+         staleness to a replica, with a dedicated replica for ETL so analytics cannot slow checkout. Set backup
+         retention (14–35 days), enable deletion protection, and make
+         <code>--final-db-snapshot-identifier</code> the only deletion form anyone types. Rehearse recovery by
+         measuring <em>service restored under load</em>, and have the application connect through a name you
+         control — a Route 53 record or an RDS Proxy endpoint — so a restore is a repoint, not a redeploy.
+         Use gp3 for size-independent IOPS and set <code>MaxAllocatedStorage</code> so a full disk is never an
+         outage. Put RDS Proxy in front so failover costs seconds instead of a JVM restart, and set
+         <code>networkaddress.cache.ttl</code> so clients notice the DNS change at all. And when it is slow,
+         open Performance Insights first: <code>IO:DataFileRead</code>, <code>Lock:transactionid</code> and
+         <code>Client:ClientRead</code> lead to three completely different fixes, only one of which is a bigger
+         instance.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Buying Multi-AZ for read capacity</td><td><strong>The standby is not readable and has no endpoint</strong> — you pay 2× for availability only</td><td>Read replicas, a Multi-AZ DB <em>cluster</em>, or Aurora</td></tr>
+      <tr><td>Confusing the two "Multi-AZ" products</td><td>Instance deployment: 1 unreadable standby, ~120 s failover. DB cluster: <strong>2 readable standbys, ~35 s</strong></td><td>Name which one you mean</td></tr>
+      <tr><td>Assuming failover is transparent</td><td>It is a DNS change — <strong>a default-configured JVM never notices</strong></td><td>RDS Proxy, connection validation, <code>networkaddress.cache.ttl=30</code></td></tr>
+      <tr><td>Reading from replicas indiscriminately</td><td>Asynchronous lag: "your order does not exist" right after creating it</td><td>Read-after-write and transactions go to the writer</td></tr>
+      <tr><td>Ignoring <code>ReplicaLag</code></td><td>A bulk import pushed a replica <strong>30 minutes behind</strong>; single-threaded apply cannot catch up</td><td>Alarm on it; dedicate a replica to ETL</td></tr>
+      <tr><td>Promoting a replica casually</td><td><strong>Permanent and one-way</strong> — it can never rejoin</td><td>Treat promotion as a DR action</td></tr>
+      <tr><td>Writing to the Aurora reader endpoint</td><td><code>cannot execute INSERT in a read-only transaction</code></td><td>Cluster endpoint writes, reader endpoint reads</td></tr>
+      <tr><td>Hard-coding an Aurora <em>instance</em> endpoint</td><td>That instance changes role on failover; the name survives nothing</td><td>Always the cluster endpoints</td></tr>
+      <tr><td><strong>Backup retention left at 0</strong></td><td><strong>Automated backups and PITR are disabled entirely</strong> — a valid setting some modules default to</td><td>14–35 days, plus deletion protection</td></tr>
+      <tr><td><code>--skip-final-snapshot</code></td><td>The instance <strong>and every automated backup</strong> vanish immediately</td><td><code>--final-db-snapshot-identifier</code>, always</td></tr>
+      <tr><td>Assuming snapshots outlive the instance</td><td>Automated ones do not; <strong>manual ones do</strong></td><td>Take a manual snapshot before any deletion</td></tr>
+      <tr><td>Measuring a DR test by restore completion</td><td>The restore returns a <strong>new endpoint, default parameter group, no Multi-AZ, no replicas</strong></td><td>Measure service restored under load; connect via a name you control</td></tr>
+      <tr><td>gp2 storage on RDS</td><td>3 IOPS/GB with a draining burst bucket — the EC2 trap, again</td><td>gp3: 3,000 IOPS baseline regardless of size</td></tr>
+      <tr><td>No <code>MaxAllocatedStorage</code></td><td>A full disk stops accepting writes</td><td>Enable storage autoscaling with a ceiling</td></tr>
+      <tr><td>Changing a parameter and seeing no effect</td><td><strong>Static parameters need a reboot</strong>; status stays <code>pending-reboot</code></td><td>Check <code>ParameterApplyStatus</code> and <code>ApplyType</code></td></tr>
+      <tr><td>Resizing to fix "slow"</td><td>The top wait may be <code>Client:ClientRead</code> — <strong>the database waiting for your app</strong></td><td><strong>Performance Insights first</strong>; wait events name the fix</td></tr>
+      <tr><td>Ignoring Aurora I/O charges</td><td>I/O can be a third of the Aurora bill on busy OLTP</td><td>Switch to <strong>I/O-Optimized above ~25%</strong> I/O spend</td></tr>
+      <tr><td>Aurora Serverless v2 <code>MinCapacity</code> too high</td><td>The floor is billed continuously — 0.5 ACU ≈ $43/month at zero traffic</td><td>Set the floor to the real idle requirement</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does Multi-AZ give you, and what does it not?</summary>
+      <p><strong>It gives you availability and durability. It gives you no read capacity whatsoever.</strong> In
+         a Multi-AZ <em>instance deployment</em>, the standby is a synchronously-replicated copy in another
+         Availability Zone that exists only to be promoted — it has no endpoint, cannot be connected to, and
+         serves no queries. You pay for two instances and can use one.</p>
+      <p>What it protects against: AZ failure, host failure, storage failure, and it moves patching to the
+         standby so maintenance is a failover rather than an outage. Failover takes roughly 60–120 seconds and
+         loses no committed data, because replication is synchronous.</p>
+      <p><strong>For read capacity you need something else:</strong> read replicas (asynchronous, so they can
+         serve stale data), a Multi-AZ <em>DB cluster</em> (two <em>readable</em> standbys and ~35-second
+         failover), or Aurora. The distinction between the two things both called "Multi-AZ" is the part worth
+         stating explicitly — they are different products with different capabilities and different prices.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between an automated backup and a manual snapshot?</summary>
+      <table class="tbl">
+        <tr><th></th><th>Automated backup</th><th>Manual snapshot</th></tr>
+        <tr><td>Schedule</td><td>Daily, plus continuous transaction logs</td><td>On demand</td></tr>
+        <tr><td>Retention</td><td>0–35 days — <strong>0 disables it</strong></td><td>Until explicitly deleted</td></tr>
+        <tr><td>Point-in-time recovery</td><td><strong>✅ any second in the window</strong></td><td>❌ that instant only</td></tr>
+        <tr><td>Survives instance deletion</td><td><strong>❌</strong></td><td>✅</td></tr>
+      </table>
+      <p><strong>The two things that bite:</strong> first, a retention period of <strong>0 is legal and means
+         no backups at all</strong> — no warning, no point-in-time recovery, and some infrastructure modules
+         leave it as the default. Second, automated backups are <strong>deleted with the instance</strong>, so
+         <code>delete-db-instance --skip-final-snapshot</code> destroys the data and every recovery point in one
+         command.</p>
+      <p>The practical rule: set retention to 14–35 days, enable deletion protection, and make
+         <code>--final-db-snapshot-identifier</code> the only deletion form anyone ever types.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Explain how Aurora's storage differs from RDS, and what that buys you.</summary>
+      <p><strong>Aurora replaces the storage engine with a distributed service, and ships redo log records
+         instead of data pages.</strong> A traditional engine writes changed pages, plus the log, plus
+         double-write buffers, to its own volume; Aurora writes only the log record, and the storage layer
+         materialises pages itself.</p>
+<pre>
+  6 copies of every 10 GB segment, across 3 AZs
+  write quorum 4/6   → survives an entire AZ plus one more copy
+  read  quorum 3/6   → survives an entire AZ
+  grows automatically in 10 GB steps to 128 TiB
+</pre>
+      <table class="tbl">
+        <tr><th>Consequence</th><th>Why it follows</th></tr>
+        <tr><td><strong>Replica lag in milliseconds</strong></td><td>Replicas read the <em>same volume</em> — there is no replication stream to fall behind</td></tr>
+        <tr><td><strong>Adding a replica copies nothing</strong></td><td>Minutes instead of hours; no impact on the writer</td></tr>
+        <tr><td>Failover in ~30 s</td><td>A replica is already attached to the same storage</td></tr>
+        <tr><td>Less write amplification</td><td>Only log records cross the network</td></tr>
+        <tr><td>No storage planning</td><td>The volume grows itself</td></tr>
+      </table>
+      <p><strong>The costs</strong>, since a complete answer names them: roughly 20% more per instance-hour,
+         plus per-request I/O charges unless you choose I/O-Optimized (worth it above ~25% I/O spend), and
+         engine-version compatibility that trails upstream PostgreSQL and MySQL. Aurora is the right default for
+         a serious relational workload on AWS; plain RDS is right when cost dominates or you need an engine or
+         version Aurora does not offer.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Users report that an order they just created "does not exist". Diagnose.</summary>
+      <p><strong>A read-after-write served by an asynchronous read replica.</strong> The <code>POST</code> writes
+         to the primary; the subsequent <code>GET</code> is routed to a replica that has not yet applied the
+         change, so the row genuinely is not there yet.</p>
+<pre>
+$ aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name ReplicaLag \
+    --dimensions Name=DBInstanceIdentifier,Value=orders-ro-1 --period 60 --statistics Maximum \
+    ... --query 'max(Datapoints[].Maximum)' --output text
+1841.0                                             ← 30 minutes behind
+</pre>
+      <p><strong>Why it is intermittent</strong> is the part that makes it hard to reproduce: lag is near zero
+         when the primary is idle and grows under write load, because replicas on many engines apply changes
+         single-threaded. So it works perfectly in testing and fails during the busiest hour — and a bulk import
+         can push it to half an hour.</p>
+      <table class="tbl">
+        <tr><th>Fix</th><th>Trade-off</th></tr>
+        <tr><td><strong>Route read-after-write to the writer</strong></td><td>The correct fix; costs writer capacity</td></tr>
+        <tr><td>Read your own writes from a session cache</td><td>More application complexity</td></tr>
+        <tr><td>Aurora instead of RDS replicas</td><td>Lag drops to 10–100 ms — mitigates, does not eliminate</td></tr>
+        <tr><td>Dedicated ETL replica</td><td>Stops bulk jobs from lagging the user-facing replica</td></tr>
+        <tr><td>Alarm on <code>ReplicaLag</code></td><td>Makes it visible before users report it</td></tr>
+      </table>
+      <p>The design principle to state: <strong>replica routing is a correctness decision, not a load-balancing
+         one.</strong> Classify each query by whether staleness is acceptable, and route on that — never by
+         round-robin across all endpoints.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the data tier for a system needing 99.99% availability, a 5-minute RPO and a 15-minute RTO, across two Regions.</summary>
+      <p><strong>Start by separating the three numbers, because they are satisfied by different mechanisms</strong>
+         — availability by redundancy in-Region, RPO by replication, RTO by how fast you can repoint.</p>
+      <p><strong>In-Region (availability):</strong> Aurora with a writer and at least two readers across three
+         AZs. The storage layer already holds six copies with a 4-of-6 write quorum, so an AZ loss is survivable
+         without a failover; instance failover is ~30 seconds. That is the 99.99% tier. A Multi-AZ instance
+         deployment would give ~120-second failovers and no read capacity, which is a worse answer at the same
+         or higher price.</p>
+      <p><strong>Cross-Region (RPO):</strong> an Aurora <strong>Global Database</strong>, which replicates at the
+         storage layer with typical lag under a second — comfortably inside a 5-minute RPO, and far better than
+         a cross-Region read replica. Managed failover promotes the secondary Region in about a minute.</p>
+      <p><strong>RTO is the part people get wrong.</strong> Fifteen minutes is not a database number, it is an
+         end-to-end number: promotion, application configuration, connection re-establishment, cache warming and
+         DNS. So the application must connect through a name <em>you</em> control — Route 53 with a low TTL, or
+         RDS Proxy endpoints — and the secondary Region must already be running application capacity. A database
+         that promotes in 60 seconds behind an application that needs a redeploy to notice has a 40-minute
+         RTO.</p>
+      <table class="tbl">
+        <tr><th>Requirement</th><th>Mechanism</th><th>Measured against</th></tr>
+        <tr><td>99.99% availability</td><td>Aurora, 3 AZs, 2+ readers</td><td>~30 s failover</td></tr>
+        <tr><td>5-minute RPO</td><td>Aurora Global Database</td><td>Sub-second replication lag</td></tr>
+        <tr><td>15-minute RTO</td><td>Warm standby app + controlled DNS</td><td><strong>Rehearsed end to end, under load</strong></td></tr>
+        <tr><td>Human error</td><td>35-day PITR + Backtrack (MySQL)</td><td>Tested restore</td></tr>
+      </table>
+      <p><strong>What I would insist on:</strong> a quarterly rehearsal that fails over for real and measures
+         time-to-service-restored with a load generator running, not time-to-promotion. And an explicit decision
+         about write behaviour in the secondary Region — a Global Database has one writer, so either the
+         secondary is read-only until promoted, or you are designing a multi-writer system and that is a
+         different, much harder conversation to have before the incident rather than during it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A production database is "slow" and the team wants to double the instance size. How do you decide?</summary>
+      <p><strong>Refuse to decide without wait events.</strong> "Slow" is a symptom with at least five distinct
+         causes, and resizing fixes exactly one of them. Performance Insights answers <em>what the database is
+         waiting on</em>, which is the question that discriminates between them.</p>
+      <table class="tbl">
+        <tr><th>Top wait</th><th>Cause</th><th>Does a bigger instance help?</th></tr>
+        <tr><td><code>CPU</code></td><td>Genuinely compute-bound</td><td><strong>Yes</strong> — or fix the query plan first</td></tr>
+        <tr><td><code>IO:DataFileRead</code></td><td>Working set exceeds RAM</td><td>Yes, <em>if</em> you scale memory — or add an index</td></tr>
+        <tr><td><code>Lock:transactionid</code></td><td>Lock contention</td><td><strong>No</strong> — it makes contention worse</td></tr>
+        <tr><td><code>LWLock:*</code></td><td>Internal hot spots (often index design)</td><td>No</td></tr>
+        <tr><td><code>Client:ClientRead</code></td><td><strong>The database is waiting for the application</strong></td><td><strong>No — this is not a database problem</strong></td></tr>
+      </table>
+      <p><strong>The order I would work in:</strong> wait events first; then the top SQL by database load, since
+         a single unindexed query is the most common cause and an index is free compared with an instance class;
+         then check whether reads that tolerate staleness are hitting the writer, because moving them is cheaper
+         than scaling; then connection behaviour, since an exhausted pool presents as latency and is fixed by
+         RDS Proxy rather than by capacity. Only after that is "the instance is too small" a supported
+         conclusion.</p>
+      <p><strong>The argument that usually lands:</strong> doubling the instance doubles the bill permanently
+         and buys at most a 2× headroom that the same growth will consume in a quarter, whereas an index or a
+         routing change is often 10–100× and free. Resizing is a legitimate answer — it is just the
+         <em>last</em> one, and it should be a measured decision rather than the reflex. If the team is under
+         acute pressure, resize as a deliberate temporary mitigation with a dated ticket to find the real cause,
+         and say out loud that that is what you are doing.</p>
+    </details>
+
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Prove that a Multi-AZ standby cannot serve reads, and price
+       what that means.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].[MultiAZ,AvailabilityZone,SecondaryAvailabilityZone,DBInstanceClass]' --output text
+True   us-east-1a   us-east-1b   db.r6g.2xlarge
+   → two instances are running. You are billed for two.
+</pre>
+<pre>
+TRY TO FIND THE STANDBY:
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].Endpoint' --output json
+{ "Address": "orders-db.abc123.us-east-1.rds.amazonaws.com", "Port": 5432 }
+   ← ONE endpoint.
+
+$ dig +short orders-db.abc123.us-east-1.rds.amazonaws.com
+10.0.1.44                                          ← one address, in us-east-1a
+
+$ aws rds describe-db-instances --query 'DBInstances[].DBInstanceIdentifier' --output text
+orders-db                                          ← the standby is not even LISTED
+</pre>
+<pre>
+CONFIRM THE ADDRESS IS THE PRIMARY, AND ONLY THE PRIMARY:
+$ psql -h 10.0.1.44 -U app -d orders -c 'SELECT pg_is_in_recovery(), inet_server_addr();'
+ pg_is_in_recovery | inet_server_addr
+-------------------+------------------
+ f                 | 10.0.1.44        ← f = NOT a standby. This is the writer.
+
+$ # is there anything else listening in us-east-1b?
+$ for ip in 10.0.2.{40..60}; do timeout 1 bash -c "&lt;/dev/tcp/$ip/5432" 2&gt;/dev/null \
+    &amp;&amp; echo "$ip open"; done
+                                                   ← nothing. No route, no endpoint.
+</pre>
+<pre>
+NOW ADD A READ REPLICA AND SEE THE DIFFERENCE:
+$ aws rds create-db-instance-read-replica --db-instance-identifier orders-ro-1 \
+    --source-db-instance-identifier orders-db --db-instance-class db.r6g.2xlarge
+$ aws rds describe-db-instances --db-instance-identifier orders-ro-1 \
+    --query 'DBInstances[0].Endpoint.Address' --output text
+orders-ro-1.abc123.us-east-1.rds.amazonaws.com     ← its OWN endpoint
+
+$ psql -h orders-ro-1.abc123.us-east-1.rds.amazonaws.com -U app -d orders \
+    -c 'SELECT pg_is_in_recovery(); SELECT count(*) FROM orders;'
+ pg_is_in_recovery
+-------------------
+ t                                                 ← t = a standby, AND it answered
+  count
+--------
+ 4821004
+</pre>
+<table class="tbl">
+  <tr><th>Configuration</th><th>Instances billed</th><th>Usable for reads</th><th>Monthly (db.r6g.2xlarge)</th></tr>
+  <tr><td>Single-AZ</td><td>1</td><td>1</td><td>$672</td></tr>
+  <tr><td><strong>Multi-AZ instance</strong></td><td><strong>2</strong></td><td><strong>1</strong></td><td>$1,344</td></tr>
+  <tr><td>Single-AZ + 1 replica</td><td>2</td><td><strong>2</strong></td><td>$1,344</td></tr>
+  <tr><td>Multi-AZ + 1 replica</td><td>3</td><td>2</td><td>$2,016</td></tr>
+  <tr><td><strong>Multi-AZ DB cluster</strong></td><td>3</td><td><strong>3</strong></td><td>$2,016</td></tr>
+</table>
+<div class="note">🔑 Rows 2 and 3 cost <strong>exactly the same</strong> and buy completely different things: one
+   buys automatic failover with no extra read capacity, the other buys read capacity with no automatic failover.
+   Neither is wrong — but paying for row 2 while believing you bought row 3 is extremely common, and it surfaces
+   as "we have two database servers, why is it slow?" Decide which problem you are solving, then pay for
+   it.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Trigger a failover, measure how long it takes, and measure
+       how long each client takes to notice.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat &gt; probe.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+H=orders-db.abc123.us-east-1.rds.amazonaws.com
+START=$(date +%s)
+while true; do
+  T=$(( $(date +%s) - START ))
+  IP=$(dig +short $H | head -1)
+  if OUT=$(psql -h $H -U app -d orders -tAc 'SELECT inet_server_addr()' 2>&1); then
+    printf '%4ds  dns=%-10s  db=%s\n' "$T" "$IP" "$OUT"
+  else
+    printf '%4ds  dns=%-10s  ERROR: %s\n' "$T" "$IP" "$(echo "$OUT" | head -1 | cut -c1-48)"
+  fi
+  sleep 1
+done
+SH
+$ bash probe.sh &amp;
+$ aws rds failover-db-instance --db-instance-identifier orders-db
+</pre>
+<pre>
+   0s  dns=10.0.1.44  db=10.0.1.44
+   6s  dns=10.0.1.44  ERROR: server closed the connection unexpectedly
+  12s  dns=10.0.1.44  ERROR: could not connect to server: Connection refu
+  31s  dns=10.0.1.44  ERROR: could not connect to server: Connection refu
+  44s  dns=10.0.2.91  ERROR: could not connect to server: Connection refu   ← DNS moved
+  47s  dns=10.0.2.91  db=10.0.2.91                                          ← RECOVERED
+</pre>
+<pre>
+CONFIRM THE ROLES SWAPPED:
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].[AvailabilityZone,SecondaryAvailabilityZone]' --output text
+us-east-1b   us-east-1a                            ← they traded places
+
+$ aws rds describe-events --source-identifier orders-db --source-type db-instance \
+    --duration 10 --query 'Events[].[Date,Message]' --output text
+2026-08-20T14:02:11Z   Multi-AZ instance failover started
+2026-08-20T14:02:49Z   Multi-AZ instance failover completed
+</pre>
+<pre>
+NOW THE PART THAT MATTERS — how long did each CLIENT take?
+
+$ # Node.js (pg pool, default settings)
+  reconnected at t+49s                             ✅ tracks DNS
+
+$ # Java (Spring Boot + HikariCP, JVM defaults)
+  still failing at t+600s
+$ jcmd 4821 VM.system_properties | grep networkaddress.cache.ttl
+networkaddress.cache.ttl=-1                        ← cached FOREVER
+   → the JVM resolved 10.0.1.44 at startup and will use it until the process dies.
+
+$ # after setting it:
+$ java -Dnetworkaddress.cache.ttl=30 -jar app.jar
+  reconnected at t+62s                             ✅
+</pre>
+<pre>
+✅ THE BEST ANSWER — RDS Proxy holds client connections across the failover:
+$ aws rds create-db-proxy --db-proxy-name orders-proxy --engine-family POSTGRESQL \
+    --auth '[{"AuthScheme":"SECRETS","SecretArn":"arn:...:secret:orders-creds","IAMAuth":"REQUIRED"}]' \
+    --role-arn arn:aws:iam::111122223333:role/rds-proxy-role \
+    --vpc-subnet-ids subnet-0a subnet-0b subnet-0c
+$ aws rds register-db-proxy-targets --db-proxy-name orders-proxy --db-instance-identifiers orders-db
+
+$ # repoint the app at the proxy, then fail over again:
+   0s  db=ok
+   4s  ERROR: server closed the connection unexpectedly
+   9s  db=ok                                       ← 9 SECONDS, and the JVM was fine
+</pre>
+<table class="tbl">
+  <tr><th>Client</th><th>Time to recover</th><th>Why</th></tr>
+  <tr><td>AWS failover itself</td><td><strong>38 s</strong></td><td>Detect, promote, repoint DNS</td></tr>
+  <tr><td>Node.js (pg)</td><td>49 s</td><td>Re-resolves on reconnect</td></tr>
+  <tr><td>JVM, defaults</td><td><strong>Never</strong></td><td><code>networkaddress.cache.ttl=-1</code></td></tr>
+  <tr><td>JVM, ttl=30</td><td>62 s</td><td>Re-resolves after the cache expires</td></tr>
+  <tr><td><strong>Via RDS Proxy</strong></td><td><strong>9 s</strong></td><td>The proxy holds client connections and repoints behind them</td></tr>
+</table>
+<div class="note">⚠️ <strong>"Failover takes 60 seconds" is a statement about AWS, not about your
+   application.</strong> The number that matters to users is the last column, and it ranges from nine seconds to
+   never depending on client configuration you own. Measure it before an incident does — and note the JVM case
+   fails <em>silently forever</em>, which means a Multi-AZ deployment can give you an outage that Multi-AZ was
+   bought to prevent.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce the read-after-write bug, measure the lag that
+       causes it, and fix the routing.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat &gt; raw_test.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+W=orders-db.abc123.us-east-1.rds.amazonaws.com
+R=orders-ro-1.abc123.us-east-1.rds.amazonaws.com
+MISS=0
+for i in $(seq 1 200); do
+  ID=$(psql -h $W -U app -d orders -tAc \
+      "INSERT INTO orders(sku,qty) VALUES('sku-$i',1) RETURNING id")
+  N=$(psql -h $R -U app -d orders -tAc "SELECT count(*) FROM orders WHERE id=$ID")
+  [ "$N" -eq 0 ] && MISS=$((MISS+1))
+done
+echo "missing on replica immediately after write: $MISS / 200"
+SH
+</pre>
+<pre>
+IDLE DATABASE — the test passes, which is why this ships:
+$ bash raw_test.sh
+missing on replica immediately after write: 0 / 200      ✅ looks fine
+$ aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name ReplicaLag \
+    --dimensions Name=DBInstanceIdentifier,Value=orders-ro-1 --period 60 --statistics Maximum \
+    --start-time $(date -u -d '5 min ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --query 'max(Datapoints[].Maximum)' --output text
+0.0
+</pre>
+<pre>
+NOW ADD WRITE LOAD — a bulk import, exactly like month-end:
+$ pgbench -h $W -U app -c 30 -j 4 -T 600 orders &gt;/dev/null &amp;
+$ sleep 120
+$ bash raw_test.sh
+missing on replica immediately after write: 187 / 200    ❌ 93.5% failure
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name ReplicaLag \
+    --dimensions Name=DBInstanceIdentifier,Value=orders-ro-1 --period 60 --statistics Maximum \
+    ... --query 'sort_by(Datapoints,&amp;Timestamp)[].[Timestamp,Maximum]' --output text
+14:00:00      0.0
+14:02:00     41.0
+14:04:00    308.0
+14:06:00    912.0
+14:08:00   1841.0                                  ← 30 minutes behind, still climbing
+</pre>
+<pre>
+WHY IT CLIMBS — the replica applies changes SINGLE-THREADED:
+$ psql -h $R -U app -d orders -c "SELECT wait_event_type, wait_event, state
+    FROM pg_stat_activity WHERE backend_type = 'startup';"
+ wait_event_type | wait_event  | state
+-----------------+-------------+--------
+ IO              | WALRead     | active           ← one process, replaying serially
+   → 30 concurrent writers on the primary vs one applier on the replica.
+     The gap can never close while the write load continues.
+</pre>
+<pre>
+✅ FIX 1 — ROUTE BY CORRECTNESS, not by load:
+  class Router:
+      def route(self, query_kind):
+          return WRITER if query_kind in {
+              "write", "read_after_write", "in_transaction"} else READER
+
+  # concretely, in the order service:
+  create_order()   → WRITER
+  get_order(id)    → WRITER   if it may follow a create in this session
+  list_catalogue() → READER
+  monthly_report() → READER (dedicated ETL replica)
+
+$ bash raw_test.sh                                 # with read-after-write on the writer
+missing on replica immediately after write: 0 / 200      ✅ under full load
+</pre>
+<pre>
+✅ FIX 2 — ISOLATE THE BULK LOAD so it stops lagging the user-facing replica:
+$ aws rds create-db-instance-read-replica --db-instance-identifier orders-ro-etl \
+    --source-db-instance-identifier orders-db --db-instance-class db.r6g.xlarge
+   → point reporting and ETL here; orders-ro-1 serves only user traffic.
+
+✅ FIX 3 — MAKE IT VISIBLE:
+$ aws cloudwatch put-metric-alarm --alarm-name replica-lag-high \
+    --namespace AWS/RDS --metric-name ReplicaLag \
+    --dimensions Name=DBInstanceIdentifier,Value=orders-ro-1 \
+    --statistic Maximum --period 60 --evaluation-periods 3 --threshold 30 \
+    --comparison-operator GreaterThanThreshold \
+    --alarm-actions arn:aws:sns:us-east-1:111122223333:ops
+</pre>
+<table class="tbl">
+  <tr><th>Query</th><th>Route</th><th>Reason</th></tr>
+  <tr><td>Any write</td><td>Writer</td><td>Only the writer accepts them</td></tr>
+  <tr><td><strong>Read after write, same session</strong></td><td><strong>Writer</strong></td><td>Lag is a visible bug</td></tr>
+  <tr><td>Read inside a transaction</td><td>Writer</td><td>Correctness</td></tr>
+  <tr><td>Catalogue, search, browse</td><td>Reader</td><td>Staleness is invisible</td></tr>
+  <tr><td>Reports, ETL</td><td><strong>Dedicated reader</strong></td><td>Isolates the load</td></tr>
+</table>
+<div class="note">🔑 <strong>The test passed on an idle database, which is exactly why this reaches
+   production.</strong> Replica lag is near zero without write load and grows without bound with it, so
+   correctness depends on a condition that no test environment reproduces. Any load test that exercises replica
+   routing must run <em>concurrent writes</em>, or it is testing a system that does not exist.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Compare Aurora and RDS on the two things Aurora's
+       architecture is supposed to change: replica lag, and the cost of adding a replica.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+SAME DATASET, SAME LOAD, ON BOTH:
+$ pgbench -h $RDS_WRITER   -U app -c 30 -j 4 -T 600 orders &gt;/dev/null &amp;
+$ pgbench -h $AURORA_WRITER -U app -c 30 -j 4 -T 600 orders &gt;/dev/null &amp;
+$ sleep 180
+</pre>
+<pre>
+LAG — RDS uses ReplicaLag (seconds); Aurora uses AuroraReplicaLag (milliseconds):
+$ aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name ReplicaLag \
+    --dimensions Name=DBInstanceIdentifier,Value=orders-ro-1 --period 60 --statistics Maximum \
+    ... --query 'max(Datapoints[].Maximum)' --output text
+1841.0                                             ← 1,841 SECONDS
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name AuroraReplicaLag \
+    --dimensions Name=DBInstanceIdentifier,Value=aurora-reader-1 --period 60 --statistics Maximum \
+    ... --query 'max(Datapoints[].Maximum)' --output text
+21.4                                               ← 21 MILLISECONDS
+
+    difference: 86,000×
+</pre>
+<pre>
+WHY — ask each replica what it is doing:
+$ psql -h $RDS_REPLICA -tAc "SELECT wait_event FROM pg_stat_activity WHERE backend_type='startup'"
+WALRead                                            ← replaying a log stream, serially
+
+$ psql -h $AURORA_READER -tAc "SELECT count(*) FROM pg_stat_replication"
+0                                                  ← there IS no replication stream.
+   → the Aurora reader is attached to the SAME storage volume. Nothing is being
+     shipped, so there is nothing to fall behind. The "lag" is only the time to
+     invalidate cached pages.
+</pre>
+<pre>
+ADDING A REPLICA — time it on both:
+$ time aws rds create-db-instance-read-replica --db-instance-identifier rds-ro-2 \
+    --source-db-instance-identifier orders-db --db-instance-class db.r6g.2xlarge
+$ aws rds wait db-instance-available --db-instance-identifier rds-ro-2
+real    47m12s                                     ← copies the entire 800 GB dataset
+
+$ time aws rds create-db-instance --db-instance-identifier aurora-reader-2 \
+    --db-cluster-identifier orders-aurora --engine aurora-postgresql \
+    --db-instance-class db.r6g.2xlarge
+$ aws rds wait db-instance-available --db-instance-identifier aurora-reader-2
+real     4m38s                                     ← copies NOTHING; attaches to the volume
+</pre>
+<pre>
+AND THE IMPACT ON THE WRITER WHILE THAT HAPPENED:
+$ # RDS, during the 47-minute replica build:
+  writer CPUUtilization      41% → 78%
+  writer WriteLatency        1.2 ms → 8.9 ms       ← users felt this
+$ # Aurora, during the 4-minute build:
+  writer CPUUtilization      41% → 42%
+  writer WriteLatency        1.2 ms → 1.2 ms       ← nothing happened
+</pre>
+<table class="tbl">
+  <tr><th></th><th>RDS PostgreSQL</th><th><strong>Aurora PostgreSQL</strong></th></tr>
+  <tr><td>Replica lag under load</td><td>1,841 s and climbing</td><td><strong>21 ms</strong></td></tr>
+  <tr><td>Time to add a replica (800 GB)</td><td>47 minutes</td><td><strong>4.6 minutes</strong></td></tr>
+  <tr><td>Writer impact while adding</td><td>WriteLatency 1.2 → 8.9 ms</td><td><strong>None</strong></td></tr>
+  <tr><td>Max replicas</td><td>5</td><td>15</td></tr>
+  <tr><td>Failover</td><td>60–120 s</td><td>~30 s</td></tr>
+  <tr><td>Instance cost</td><td>Baseline</td><td>~+20%</td></tr>
+  <tr><td>I/O cost</td><td>Included in provisioned storage</td><td><strong>Per request, unless I/O-Optimized</strong></td></tr>
+</table>
+<pre>
+CHECK WHETHER I/O-OPTIMIZED IS THE RIGHT MODE — measure, do not assume:
+$ aws ce get-cost-and-usage --time-period Start=2026-07-01,End=2026-08-01 \
+    --granularity MONTHLY --metrics UnblendedCost \
+    --filter '{"Dimensions":{"Key":"USAGE_TYPE","Values":["USE1-Aurora:StorageIOUsage"]}}' \
+    --query 'ResultsByTime[0].Total.UnblendedCost.Amount' --output text
+1204.88
+$ # total Aurora spend the same month:
+3980.12
+    I/O share = 1204.88 / 3980.12 = 30.3%          ← above the ~25% threshold
+
+$ aws rds modify-db-cluster --db-cluster-identifier orders-aurora \
+    --storage-type aurora-iopt1 --apply-immediately
+    new cost ≈ (3980.12 − 1204.88) × 1.30 = $3,608  → saves ~$372/month
+</pre>
+<div class="note">🔑 <strong>Every Aurora advantage in that table traces to one design choice</strong> — shipping
+   redo log records to a shared distributed volume instead of shipping pages to per-instance disks. Replicas do
+   not lag because there is no stream to lag behind; adding one is fast and free of writer impact because there
+   is nothing to copy; failover is quick because the new writer is already attached to the same storage. Knowing
+   the mechanism means you can predict the behaviour rather than memorising the numbers.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Rehearse a point-in-time restore properly — and discover
+       everything the runbook forgot.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE SCENARIO: at 12:45 someone ran `DELETE FROM orders WHERE created_at < now()`
+without a transaction. It is now 13:10.
+
+$ psql -h $WRITER -tAc 'SELECT count(*) FROM orders'
+41                                                 ← was 4,821,004
+
+FIRST — CAN you even restore? Check before you need to:
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].[BackupRetentionPeriod,LatestRestorableTime]' --output text
+14   2026-08-20T13:05:00Z
+   ✅ 14-day retention, restorable to 13:05. (If this had said 0, the exercise ends here
+      and the data is gone — see Part 5.)
+</pre>
+<pre>
+RESTORE TO ONE MINUTE BEFORE THE MISTAKE:
+$ START=$(date +%s)
+$ aws rds restore-db-instance-to-point-in-time \
+    --source-db-instance-identifier orders-db \
+    --target-db-instance-identifier orders-db-restored \
+    --restore-time 2026-08-20T12:44:00Z \
+    --db-subnet-group-name orders-subnets
+$ aws rds wait db-instance-available --db-instance-identifier orders-db-restored
+$ echo "restore completed in $(( $(date +%s) - START ))s"
+restore completed in 668s                          ← 11 minutes. The runbook says "11 min". ✅?
+</pre>
+<pre>
+NOW INSPECT WHAT CAME BACK — this is the actual exercise:
+$ aws rds describe-db-instances --db-instance-identifier orders-db-restored \
+    --query 'DBInstances[0].{endpoint:Endpoint.Address, multiaz:MultiAZ,
+             pg:DBParameterGroups[0].DBParameterGroupName,
+             sg:VpcSecurityGroups[].VpcSecurityGroupId, class:DBInstanceClass,
+             backup:BackupRetentionPeriod, pi:PerformanceInsightsEnabled}' --output json
+{
+  "endpoint": "orders-db-restored.abc123.us-east-1.rds.amazonaws.com",   ⚠️ NEW HOSTNAME
+  "multiaz": false,                                                      ⚠️ LOST
+  "pg": "default.postgres15",                                            ⚠️ DEFAULTS
+  "sg": [ "sg-0default" ],                                               ⚠️ WRONG SG
+  "class": "db.r6g.2xlarge",
+  "backup": 0,                                                           ⚠️ NO BACKUPS
+  "pi": false                                                            ⚠️ NO INSIGHTS
+}
+$ aws rds describe-db-instances --query \
+    'DBInstances[?ReadReplicaSourceDBInstanceIdentifier==`orders-db-restored`]' --output text
+                                                   ⚠️ NO REPLICAS
+</pre>
+<pre>
+AND THE ONE THAT ACTUALLY STOPS YOU:
+$ psql -h orders-db-restored.abc123.us-east-1.rds.amazonaws.com -U app -d orders -c 'SELECT 1'
+psql: error: connection to server ... failed: timeout expired
+   → it came back in the DEFAULT security group. The application cannot reach it.
+</pre>
+<pre>
+THE FULL RECOVERY, timed honestly:
+$ aws rds modify-db-instance --db-instance-identifier orders-db-restored \
+    --vpc-security-group-ids sg-0orders \
+    --db-parameter-group-name orders-pg15 \
+    --backup-retention-period 14 --multi-az \
+    --enable-performance-insights --apply-immediately
+$ aws rds wait db-instance-available --db-instance-identifier orders-db-restored
+   +14 min (Multi-AZ conversion)
+$ aws rds reboot-db-instance --db-instance-identifier orders-db-restored    # static params
+   +4 min
+$ psql -h orders-db-restored... -tAc 'SELECT count(*) FROM orders'
+4821004                                            ✅ the data is back
+
+$ # and now: how does the APPLICATION find it?
+</pre>
+<pre>
+❌ THE RUNBOOK'S ANSWER: "update the connection string and redeploy."
+   +18 min for a deploy pipeline, on a good day.
+
+✅ THE FIX — connect through a name YOU control, decided BEFORE the incident:
+$ aws route53 change-resource-record-sets --hosted-zone-id Z123 --change-batch '{"Changes":[
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"orders-db.internal.acme.com",
+      "Type":"CNAME","TTL":30,
+      "ResourceRecords":[{"Value":"orders-db-restored.abc123.us-east-1.rds.amazonaws.com"}]}}]}'
+   → the application always used orders-db.internal.acme.com. Recovery is one
+     DNS change with a 30-second TTL, not a redeploy.
+</pre>
+<table class="tbl">
+  <tr><th>Step</th><th>Time</th><th>In the old runbook?</th></tr>
+  <tr><td>PITR restore completes</td><td>11:08</td><td>✅ — <em>and it stopped here</em></td></tr>
+  <tr><td>Reattach security group</td><td>+2:10</td><td>❌</td></tr>
+  <tr><td>Reapply parameter group</td><td>+0:30</td><td>❌</td></tr>
+  <tr><td>Re-enable Multi-AZ</td><td>+14:20</td><td>❌</td></tr>
+  <tr><td>Reboot for static parameters</td><td>+4:05</td><td>❌</td></tr>
+  <tr><td>Recreate read replicas</td><td>+47:00</td><td>❌</td></tr>
+  <tr><td>Repoint the application</td><td>+0:35 (CNAME) or +18:00 (deploy)</td><td>❌</td></tr>
+  <tr><td><strong>Real RTO</strong></td><td><strong>~32 min without replicas, ~79 with</strong></td><td><strong>Runbook claimed 11</strong></td></tr>
+</table>
+<div class="note">⚠️ <strong>The runbook was not wrong about the restore; it measured the wrong event.</strong>
+   "Restore completed" is an infrastructure milestone, and every DR test that stops there under-reports RTO by
+   3–7×. Rehearse with a load generator running and record <em>time to service restored at normal
+   throughput</em>. Two changes remove most of the gap for free: connect through a DNS name you control, and
+   script the post-restore reconfiguration instead of performing it by hand at 2am. If the honest number still
+   misses the RTO, the architecture must change — a warm standby or Aurora Backtrack (which rewinds
+   <em>in place</em>, in minutes, with no new endpoint at all).</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> A database is "slow". Diagnose it with Performance Insights
+       instead of resizing it, and fix the real cause.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE REQUEST: "p99 went from 80 ms to 2.4 s. Please double the instance to db.r6g.4xlarge."
+
+FIRST — WHAT IS THE DATABASE WAITING ON?
+$ aws pi get-resource-metrics --service-type RDS --identifier db-ABCDEFGH12345678 \
+    --metric-queries '[{"Metric":"db.load.avg","GroupBy":{"Group":"db.wait_event","Limit":5}}]' \
+    --start-time $(date -u -d '2 hours ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --period-in-seconds 300 \
+    --query 'MetricList[].{event:Key.Dimensions."db.wait_event.name",
+             load:DataPoints[-1].Value}' --output table
+|  CPU                    |   0.82  |
+|  IO:DataFileRead        |  11.40  |   ← DOMINANT
+|  Lock:transactionid     |   0.31  |
+|  Client:ClientRead      |   0.44  |
+|  LWLock:BufferMapping   |   0.12  |
+
+$ aws rds describe-db-instances --db-instance-identifier orders-db \
+    --query 'DBInstances[0].DBInstanceClass' --output text
+db.r6g.2xlarge                                     ← 8 vCPU. CPU load is 0.82 of 8.
+   ⇒ the instance is 90% IDLE on CPU. Doubling it would change nothing.
+</pre>
+<pre>
+IO:DataFileRead MEANS READING FROM STORAGE. Which query?
+$ aws pi get-resource-metrics --service-type RDS --identifier db-ABCDEFGH12345678 \
+    --metric-queries '[{"Metric":"db.load.avg","GroupBy":{"Group":"db.sql","Limit":3}}]' \
+    --start-time $(date -u -d '2 hours ago' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --period-in-seconds 300 \
+    --query 'MetricList[].{sql:Key.Dimensions."db.sql.statement",load:DataPoints[-1].Value}' \
+    --output json
+[ { "sql": "SELECT * FROM orders WHERE customer_id = ? AND status = ? ORDER BY created_at DESC LIMIT 50",
+    "load": 9.81 },
+  { "sql": "INSERT INTO order_events ...", "load": 0.94 },
+  { "sql": "SELECT * FROM customers WHERE id = ?", "load": 0.31 } ]
+   → ONE query is 86% of database load.
+</pre>
+<pre>
+$ psql -h $WRITER -U app -d orders -c "EXPLAIN (ANALYZE, BUFFERS)
+   SELECT * FROM orders WHERE customer_id = 90210 AND status = 'shipped'
+   ORDER BY created_at DESC LIMIT 50;"
+
+ Limit  (cost=1904821.44..1904821.56 rows=50) (actual time=2318.401..2318.412 rows=50)
+   ->  Sort  (cost=1904821.44..1906032.19 rows=484300)
+         Sort Method: top-N heapsort  Memory: 41kB
+         ->  Seq Scan on orders  (cost=0.00..1888702.00 rows=484300 width=284)
+               Filter: ((customer_id = 90210) AND (status = 'shipped'::text))
+               Rows Removed by Filter: 4820504
+               Buffers: shared read=1204882                ← 1.2 M blocks READ FROM DISK
+ Execution Time: 2318.556 ms
+</pre>
+<pre>
+✅ THE FIX — one index, matching the filter AND the sort:
+$ psql -h $WRITER -U app -d orders -c \
+  "CREATE INDEX CONCURRENTLY idx_orders_cust_status_created
+   ON orders (customer_id, status, created_at DESC);"
+CREATE INDEX
+   (CONCURRENTLY: no write lock, so it can be built in production)
+
+$ psql -h $WRITER -U app -d orders -c "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders
+   WHERE customer_id = 90210 AND status = 'shipped' ORDER BY created_at DESC LIMIT 50;"
+ Limit  (cost=0.56..104.22 rows=50) (actual time=0.038..0.211 rows=50)
+   ->  Index Scan using idx_orders_cust_status_created on orders
+         Index Cond: ((customer_id = 90210) AND (status = 'shipped'::text))
+         Buffers: shared hit=54                            ← 1,204,882 → 54
+ Execution Time: 0.247 ms
+</pre>
+<pre>
+MEASURE THE SYSTEM, not just the query:
+$ sleep 900
+$ aws pi get-resource-metrics --service-type RDS --identifier db-ABCDEFGH12345678 \
+    --metric-queries '[{"Metric":"db.load.avg","GroupBy":{"Group":"db.wait_event","Limit":5}}]' \
+    ... --output table
+|  CPU                    |   0.61  |
+|  IO:DataFileRead        |   0.19  |   ← 11.40 → 0.19
+|  Client:ClientRead      |   0.41  |
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name ReadIOPS \
+    --dimensions Name=DBInstanceIdentifier,Value=orders-db --period 300 --statistics Average \
+    ... --query 'Datapoints[-1].Average' --output text
+412.0                                              ← was 18,904
+</pre>
+<table class="tbl">
+  <tr><th>Metric</th><th>Before</th><th>After</th><th>Change</th></tr>
+  <tr><td>p99 latency</td><td>2,400 ms</td><td><strong>74 ms</strong></td><td>32× better</td></tr>
+  <tr><td>Query execution time</td><td>2,318 ms</td><td><strong>0.25 ms</strong></td><td>9,270×</td></tr>
+  <tr><td>Blocks read per query</td><td>1,204,882</td><td><strong>54</strong></td><td>22,300×</td></tr>
+  <tr><td><code>IO:DataFileRead</code> load</td><td>11.40</td><td>0.19</td><td>60×</td></tr>
+  <tr><td>ReadIOPS</td><td>18,904</td><td>412</td><td>46×</td></tr>
+  <tr><td><strong>Monthly cost</strong></td><td>$672</td><td><strong>$672</strong></td><td><strong>unchanged</strong></td></tr>
+  <tr><td>(Had we resized instead)</td><td>$672</td><td>$1,344</td><td>+$672/mo, ~1.3× faster</td></tr>
+</table>
+<div class="note">🔑 <strong>The proposed fix would have cost $8,064 a year and delivered about 1.3×; the actual
+   fix cost nothing and delivered 32×.</strong> The discriminator was one command: the top wait event was
+   <code>IO:DataFileRead</code> on an instance 90% idle on CPU, which rules out "too small" immediately. Work
+   the order every time — wait events, then top SQL by load, then the plan, then routing, then connections —
+   and treat "resize it" as the conclusion you reach last, with evidence. If pressure demands a resize now, do
+   it as an explicitly temporary mitigation with a dated ticket, and say so.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Multi-AZ is availability, not scale.</strong> The standby has no endpoint, is not listed, and cannot serve one read — you pay 2× for failover alone.</li>
+        <li>Two different products share the name: a Multi-AZ <em>instance deployment</em> (1 unreadable standby, ~120 s) and a Multi-AZ <em>DB cluster</em> (<strong>2 readable standbys, ~35 s</strong>).</li>
+        <li>Multi-AZ and "single-AZ plus a replica" cost the same and buy opposite things — decide which problem you are solving.</li>
+        <li><strong>Failover is a DNS change, so the client is half the story</strong>: AWS took 38 s, Node recovered at 49 s, and a default JVM (<code>networkaddress.cache.ttl=-1</code>) <strong>never recovered at all</strong>.</li>
+        <li><strong>RDS Proxy cut observed failover downtime to 9 seconds</strong> by holding client connections across it — and removes credentials from the application.</li>
+        <li>Read replicas are <strong>asynchronous</strong>: read-after-write, transactional reads and anything correctness-sensitive must go to the writer.</li>
+        <li><strong>Replica lag is ~0 when idle and unbounded under write load</strong> — 0/200 failures on an idle database, <strong>187/200 under load</strong>, because replicas apply changes single-threaded. Load tests without concurrent writes test a system that does not exist.</li>
+        <li>Give ETL and reporting a <strong>dedicated replica</strong>, and alarm on <code>ReplicaLag</code>.</li>
+        <li><strong>Promoting a replica is permanent and one-way</strong> — a DR action, never a routine one.</li>
+        <li><strong>Aurora ships redo log records, not pages</strong>, to a shared volume with 6 copies across 3 AZs (write quorum 4/6, read 3/6). Every other difference follows from that.</li>
+        <li>Measured: replica lag <strong>1,841 s versus 21 ms</strong>; adding a replica to 800 GB took <strong>47 minutes versus 4.6</strong>, with writer latency 1.2 → 8.9 ms on RDS and <strong>no impact</strong> on Aurora.</li>
+        <li>Use the <strong>cluster endpoint</strong> to write and the <strong>reader endpoint</strong> to read; a hard-coded <em>instance</em> endpoint survives nothing.</li>
+        <li><strong>Aurora I/O-Optimized</strong> is worth it above ~25% I/O spend — measured 30.3%, saving ~$372/month, switchable without downtime.</li>
+        <li>Aurora Serverless v2's <code>MinCapacity</code> is a floor you pay for continuously — 0.5 ACU ≈ $43/month at zero traffic.</li>
+        <li><strong>A backup retention period of 0 is legal and disables PITR entirely</strong> — set 14–35 days, plus deletion protection.</li>
+        <li><strong>Automated backups are deleted with the instance; manual snapshots survive.</strong> Make <code>--final-db-snapshot-identifier</code> the only deletion form anyone types.</li>
+        <li><strong>A restore creates a new instance with a new hostname</strong>, the default parameter group, the default security group, no Multi-AZ and no replicas — the real RTO was <strong>32 minutes against a runbook claiming 11</strong>.</li>
+        <li>Connect through a DNS name <em>you</em> control so recovery is a repoint, not a redeploy — and rehearse against <em>service restored under load</em>, never "restore completed".</li>
+        <li>Use gp3 on RDS (size-independent IOPS) and set <code>MaxAllocatedStorage</code>, or a full disk stops accepting writes.</li>
+        <li>A parameter change that appears to do nothing is usually <strong>static and pending a reboot</strong> — check <code>ParameterApplyStatus</code>.</li>
+        <li><strong>Performance Insights asks what the database is <em>waiting on</em></strong>, which is the question that discriminates: <code>IO:DataFileRead</code>, <code>Lock:transactionid</code> and <code>Client:ClientRead</code> lead to three different fixes, and only one is a bigger instance.</li>
+        <li>Measured: one index took a query from <strong>2,318 ms to 0.25 ms</strong> and p99 from 2,400 ms to 74 ms — at <strong>no cost</strong>, where the proposed resize was $8,064/year for ~1.3×.</li>
+        <li>Work the order every time: wait events → top SQL → query plan → read routing → connections → and only then instance size.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="s3.html">← S3: Storage Classes, Access &amp; Cost</a>
+      <a href="dynamodb.html">DynamoDB →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
