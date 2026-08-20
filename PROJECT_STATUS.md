@@ -60,8 +60,8 @@ Also: the five v3 files orphaned by the nav split (`pods-deployments`, `services
 `← CSS Track` link AND mojibake (`Â·`, `â†’` — double-encoded UTF-8) before committing.
 
 **🚧 IN PROGRESS: AWS v4 (track 17)** — `tutorials/aws/`, rebuilding 12 v3 lessons (~12KB) into
-**20 lessons at v4 depth** (56–60KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
-**2 of 20 done:**
+**20 lessons at v4 depth** (56–75KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
+**5 of 20 done — §1 Foundations COMPLETE:**
 
 *§1 Foundations ×4* — ✅ `index.html` (**the shared-responsibility line moves per service**; AZ *names*
 are randomised per account so cross-account placement must use **Zone IDs**; the `us-east-1` control-plane
@@ -74,11 +74,35 @@ inline Deny; **cross-account needs BOTH sides**, and SSE-KMS needs a third grant
 demonstrated creating a backdoor user from a role explicitly denied `iam:CreateUser`; confused deputy via
 `aws:SourceArn`/`sts:ExternalId`; ABAC + **permission boundaries**, with an SCP enforcing the tag at
 creation; Access Analyzer found **243 services granted and never used**)
-**⏳ NEXT: `iam-deep-dive.html` (v3 rewrite — STS, trust policies, IMDSv2, OIDC federation)**, then
-`billing-cost.html` (NEW) to finish §1.
+✅ `iam-deep-dive.html` (**AssumeRole returns a new principal**, two policies per role; the **silent 1-hour
+role-chaining cap** that killed a 4-hour nightly job — `--duration-seconds 14400` returned a 1-hour expiry;
+**IMDSv1 SSRF credential theft** demonstrated end to end, blocked by `--http-tokens required` +
+`--http-put-response-hop-limit 1`; **an audience-only GitHub OIDC trust policy is assumable by every repo on
+GitHub** — pin `sub` to `repo:acme/shop:environment:production`; session policies as break-glass ceilings;
+revoking un-deletable temporary credentials via **`aws:TokenIssueTime`** while the workload recovers on its
+next refresh; the credential resolution chain and `aws configure list`) ·
+✅ `billing-cost.html` (four billing shapes; **group by USAGE TYPE, not service** — a 4× S3 bill was PUTs,
+storage barely moved; **Savings Plans commit to spend** and break even only at utilisation ≥ (1 − discount),
+so sizing on the average instead of the floor cost **$3,066/month more than no plan**; transfer priced **per
+direction** — a **free** S3 gateway endpoint replaced **$181/month** of NAT processing, and 196 TB of cross-AZ
+traffic was one API returning **412 KB to answer a boolean**; colder S3 tiers charge per object, impose a
+**128 KB minimum billable size** and minimum durations → a measured **93-month payback**, fixed by aggregating
+to Parquet not by tiering; the **U-shaped Lambda memory curve** where 1024 MB is cheapest AND 10× faster than
+128 MB; CloudWatch Logs ingestion at $0.50/GB exceeding the compute; **cost allocation tags are NOT
+retroactive**; billing lags 24h so quotas bound a runaway, budgets only describe one)
 
-*Remaining sections:* §2 Networking ×3 (`vpc-networking` v3 rewrite, `connectivity` NEW, `edge-dns` NEW) ·
-§3 Compute ×3 (`ec2-compute`, `containers`, `lambda-serverless` — all v3 rewrites) · §4 Data ×4
+*§2 Networking ×3* — ✅ `vpc-networking.html` (**a VPC is a routing domain, not a device**; CIDRs immutable and
+overlap makes peering permanently impossible; **5 reserved IPs per subnet** so a /28 gives 11; **"public" is a
+route to an IGW *plus* a public IP**, and an unassociated subnet silently inherits the **main** route table;
+SGs stateful/allow-only/unioned and **referencing other SGs** so rules survive scaling — plus **tracked flows
+survive rule revocation** and the untracked-flow inversion; NACLs stateless and the **ephemeral-port trap**
+diagnosed from an ACCEPT/REJECT pair in flow logs; **EKS caps at 29 pods/m5.large** and `FailedCreatePodSandBox`
+is a *scheduling success* — **prefix delegation → 110 pods**, no renumbering; five faults, one identical
+timeout, and a fixed read-only debugging order)
+**⏳ NEXT: `connectivity.html` (NEW — peering vs TGW, PrivateLink, VPN/Direct Connect)**, then
+`edge-dns.html` (NEW) to finish §2.
+
+*Remaining sections:* §3 Compute ×3 (`ec2-compute`, `containers`, `lambda-serverless` — all v3 rewrites) · §4 Data ×4
 (`s3` NEW, `rds-aurora` NEW, `dynamodb` NEW, `messaging` v3 rewrite) · §5 Operations ×3
 (`observability`, `iac` v3 rewrites, `security-ops` NEW) · §6 Architecture ×3 (`well-architected` v3
 rewrite, `resilience-dr` NEW, `scaling-patterns` NEW).
