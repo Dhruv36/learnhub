@@ -6,9 +6,33 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-20)
+## ▶️ RESUME HERE (last updated 2026-08-21)
 
-**Last completed:** ✅ **Kubernetes v4 (track 16) — COMPLETE.** All **22 lessons** rebuilt from 12 v3
+**Last completed:** ✅ **AWS v4 (track 17) — COMPLETE.** All **20 lessons** at v4 depth (54–90KB, every
+one `det=12 ex=6`) across 6 sections, both end-of-track chores done, and the **quiz bank rewritten to the
+v4 curriculum** (200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed 65/66/69). Whole track
+passes `python validate.py tutorials/aws` with **0 errors and 0 warnings** (23 files); pushed & live.
+The two closing lessons: `resilience-dr.html` (**HA survives a component dying, DR restores destroyed
+state** — Multi-AZ covered 2 of 14 real incidents and replicated an accidental DELETE in 11 ms; RTO/RPO
+derived from downtime cost and tiered; a designed 4h RTO measured **9h47m** then **52 min** after ~3
+engineer-days; **"available" ≠ usable** — a 2 TB restore served 18× latency for 40 more minutes; restores
+lose the endpoint, alarms, Multi-AZ and TTL settings; Vault Lock compliance + Object Lock in a separate
+account; **RPO is lag at failure** — Aurora Global p50 310 ms but 21.7 s in the batch window; DynamoDB
+global tables' silent last-writer-wins; S3 CRR has no ordering; **static stability** and the four
+control-plane defects that blocked drill 1; failover = health check + TTL + JVM cache + pool =
+**7m12s vs a 90 s claim**, fixed to 1m35s; ARC at ~$2,190/mo; cells/shuffle sharding 3.6%; failback and
+the 52 → 71 min announced-vs-unannounced delta) · `scaling-patterns.html` (**USL: throughput peaks then
+DECLINES** — 8,760 req/s at 16 instances, 7,900 at 24, from a shared sequence row; **the constraint always
+moves**; Little's Law for pool sizing; the five statelessness pins and idempotency as the enabling
+property; **the ASG control loop measured 4m40s → 1m25s tuned** and still cannot serve a 30 s spike;
+CPU is the wrong metric for I/O-bound work (34% CPU, p99 4.2 s, zero scaling activities);
+`default_instance_warmup` ends flapping; **a queue adds patience, not capacity** — a 400/min deficit
+became a **4.1M backlog** that aged out of retention; backlog-per-instance = target ÷ processing time;
+**retry storms** turning 4% errors into 3× load; **load shedding: 6.1% rejected in 2 ms held p99 at
+310 ms and goodput at 94%** vs 14.2 s and 61%; connections, replica lag, TTL jitter and single-flight,
+the 1,000 WCU per-partition ceiling at 6% utilisation; quotas, cells, and the known-spike playbook).
+
+**Previously:** ✅ **Kubernetes v4 (track 16) — COMPLETE.** All **22 lessons** rebuilt from 12 v3
 lessons (~10KB) to v4 depth (49–57KB, every one `det=12 ex=6`) across 6 sections, + **quiz bank
 rewritten to the v4 curriculum** (200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed
 69/78/53). Whole track passes `python validate.py tutorials/kubernetes` with **0 errors** (28 files);
@@ -59,9 +83,8 @@ Also: the five v3 files orphaned by the nav split (`pods-deployments`, `services
 ⚠️ **Scaffolding reminder:** any newly-copied `quiz.html` must be checked for BOTH the stale
 `← CSS Track` link AND mojibake (`·`, `→` — double-encoded UTF-8) before committing.
 
-**🚧 IN PROGRESS: AWS v4 (track 17)** — `tutorials/aws/`, rebuilding 12 v3 lessons (~12KB) into
-**20 lessons at v4 depth** (56–75KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
-**18 of 20 done — §1 Foundations, §2 Networking, §3 Compute, §4 Data and §5 Operations COMPLETE:**
+**✅ AWS v4 (track 17) — COMPLETE** — `tutorials/aws/`, 12 v3 lessons (~12KB) rebuilt into
+**20 lessons at v4 depth** (54–90KB, `det=12 ex=6`) across 6 sections. Per-lesson findings:
 
 *§1 Foundations ×4* — ✅ `index.html` (**the shared-responsibility line moves per service**; AZ *names*
 are randomised per account so cross-account placement must use **Zone IDs**; the `us-east-1` control-plane
@@ -207,14 +230,13 @@ between 48% and 81%**), so the answer was **14 instances where the proposal said
 bypass is worse than none** → preventive and invisible, plus audited break-glass; an ADR ending the
 multi-Region argument on incident history — **all 5 outages in 3 years were self-inflicted and would have
 replicated**; **3.25 engineer-days closed a contractual SLA breach**)
-**⏳ NEXT: `resilience-dr.html` (NEW — RTO/RPO, the 4 DR strategies, immutable backups, static stability,
-retry storms, FIS game days)**, then `scaling-patterns.html` (NEW) to finish the track.
+✅ `resilience-dr.html` and ✅ `scaling-patterns.html` — summarised in the RESUME block at the top.
 
-*Remaining sections:* §6 Architecture ×2 (`resilience-dr` NEW, `scaling-patterns` NEW).
+**BOTH END-OF-TRACK CHORES DONE:** `s3-cloudfront.html` and `rds-dynamodb.html` are now redirect stubs
+(→ `s3`/`edge-dns` and `rds-aurora`/`dynamodb`), and the quiz bank was rewritten to the v4 curriculum
+(`10 200 0`, 0 duplicate stems, de-skewed with `node tools/quizshuffle.js`).
 
-**TWO END-OF-TRACK CHORES:** (1) `s3-cloudfront.html` and `rds-dynamodb.html` are **orphaned** by the
-nav split (s3-cloudfront → `s3` + `edge-dns`; rds-dynamodb → `rds-aurora` + `dynamodb`) — convert both
-to redirect stubs. (2) Retune the AWS quiz bank to the v4 curriculum, then `node tools/quizshuffle.js`.
+**⏳ NEXT: CI/CD v4 (track 18)** — `tutorials/cicd/`, 12 v3 lessons (~10KB) → ~20 at v4. Then MongoDB.
 
 **Then the remaining infra two:** CI/CD → MongoDB, each 12 v3 → ~20 at v4.
 
@@ -231,8 +253,8 @@ node tools/quizshuffle.js tutorials/<track>                   # de-skew (idempot
 |-------|-----|-----|--------|
 | Docker | `tutorials/docker/` | ✅ **21 at v4** | done |
 | Kubernetes | `tutorials/kubernetes/` | ✅ **22 at v4** | done |
-| AWS | `tutorials/aws/` | 🚧 **18 of 20 at v4** | ~20 |
-| CI/CD | `tutorials/cicd/` | 12 | ~20 |
+| AWS | `tutorials/aws/` | ✅ **20 at v4 + bank** | done |
+| CI/CD | `tutorials/cicd/` | 🚧 **12 — NEXT** | ~20 |
 | MongoDB | `tutorials/mongodb/` | 12 | ~20 |
 
 Each track: write `nav.js` first, then lessons (commit every 1–2), then retune the quiz bank to
