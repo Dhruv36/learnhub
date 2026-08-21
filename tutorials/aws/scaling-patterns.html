@@ -1,0 +1,1215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scaling Patterns — AWS — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../kubernetes/index.html">Kubernetes</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Scaling Patterns <span class="level-badge level-ultra">Architecture</span></h1>
+
+    <p><strong>What you'll master:</strong> the result that ends the "just add instances" conversation —
+       <strong>throughput does not merely plateau, it declines</strong>, and the measured curve on a real
+       service peaked at <strong>16 instances and got worse at 24</strong> because every node added coordination
+       to a shared database; how to find the constraint instead of guessing at it, and the fact that
+       <strong>the constraint always moves</strong> — fix the app tier and the next incident is connections, fix
+       connections and it is a hot partition; the arithmetic that makes auto scaling arrive late by
+       construction (<strong>metric delay + evaluation + boot + warm-up = 4m40s measured</strong>, so an ASG
+       cannot absorb a 30-second spike no matter how it is tuned) and the four things that actually fix it;
+       queue-based load levelling, and why <strong>a queue never fixes an under-provisioned consumer</strong> —
+       it converts a latency problem into a backlog that reached <strong>4.1 million messages</strong> before
+       anyone noticed; retry storms, where a client-side retry policy turned a 4% error rate into a
+       <strong>3× traffic amplification</strong> and kept the service down after the original fault was gone;
+       load shedding, where <strong>rejecting 6% of requests in 2 ms preserved p99 for the other 94%</strong>
+       instead of collapsing for everyone; the data tier as the real ceiling — connection exhaustion,
+       replica lag and read-your-writes, cache stampedes, and DynamoDB hot partitions capped at
+       <strong>1,000 WCU per partition</strong> however much capacity you buy; and the quotas that turn into
+       hard walls at 3am. Prerequisites: <a href="ec2-compute.html">EC2 &amp; Auto Scaling</a>,
+       <a href="lambda-serverless.html">Lambda</a>, <a href="messaging.html">SQS &amp; EventBridge</a>,
+       <a href="rds-aurora.html">RDS &amp; Aurora</a>, <a href="dynamodb.html">DynamoDB</a> and
+       <a href="well-architected.html">the Well-Architected trade-offs</a>.</p>
+
+    <h2>Part 1 — Scaling Is Finding the Constraint, and the Constraint Moves</h2>
+
+    <p>The naive model of scaling is linear: double the instances, double the throughput. The model everyone
+       has actually experienced is that doubling the instances produces about 1.6× and then, at some point,
+       less than you had before. The Universal Scalability Law explains why with two terms:</p>
+
+<pre>
+              N
+  C(N) = -------------------------------
+          1 + α(N−1) + βN(N−1)
+
+  N = number of workers
+  α = CONTENTION   — serialised work: a lock, a leader, one database writer
+  β = COHERENCY    — cross-talk: every worker must agree with every other
+                     (cache invalidation, distributed locks, chatty gossip)
+
+  α alone           -> throughput plateaus       (Amdahl's law)
+  β present at all  -> throughput PEAKS, then DECLINES  (the N² term wins)
+</pre>
+
+<pre>
+MEASURED: A CHECKOUT SERVICE, LOAD-TESTED AT FIXED RPS PER INSTANCE
+
+  instances   throughput (req/s)   p99 (ms)   efficiency vs linear
+  -----------------------------------------------------------------
+      2            1,840             71          100%
+      4            3,510             78           95%
+      8            6,240             96           85%
+     12            8,100            141           73%
+     16            8,760            238           59%   &lt;-- peak
+     20            8,410            402           46%
+     24            7,900            688           36%   &lt;-- WORSE than 16
+  -----------------------------------------------------------------
+  fitted:  α = 0.041   β = 0.0009
+
+  the β term was a row-level lock on a "sequence" table used to generate
+  order numbers. Every instance contended for it, and the contention grew
+  with the SQUARE of the fleet.
+</pre>
+
+    <div class="note">🔑 <strong>When adding capacity stops helping, the answer is never more capacity.</strong>
+       A fleet past its knee is burning money to make latency worse. The fix here was 40 minutes of work — a
+       sequence generated per instance from a pre-allocated block instead of a shared row — and it moved the
+       peak from 16 instances to beyond 64, at which point the constraint became something else entirely
+       (connection count). That is the pattern: <strong>you do not eliminate the constraint, you move it</strong>,
+       and the discipline is knowing where it is right now.</div>
+
+    <table class="tbl">
+      <tr><th>Layer</th><th>How you know it is the constraint</th><th>Typical first fix</th></tr>
+      <tr><td>App CPU</td><td>CPU near saturation, latency scales with load, adding instances helps linearly</td><td>The easy case — scale out, then profile</td></tr>
+      <tr><td>Shared lock / hot row</td><td>Throughput peaks then falls; DB shows lock waits; p99 explodes while CPU is idle</td><td>Remove the serialisation (batching, per-instance allocation, optimistic concurrency)</td></tr>
+      <tr><td>Connections</td><td>Errors are "too many connections" or pool timeouts; DB CPU is fine</td><td>Pooling, RDS Proxy, fewer-and-longer connections</td></tr>
+      <tr><td>A single partition/shard</td><td>Aggregate capacity is unused while one key throttles</td><td>Change the partition key, or spread the hot key</td></tr>
+      <tr><td>A downstream third party</td><td>Your latency equals theirs; your queue grows at their rate</td><td>Async, cache, and a circuit breaker</td></tr>
+      <tr><td>A quota</td><td>Sudden hard ceiling at a round number, with a throttling error code</td><td>Raise it — <em>before</em> you need it</td></tr>
+    </table>
+
+    <p>Two laws are worth carrying around because they answer scaling questions in your head. <strong>Little's
+       Law</strong>: <code>L = λW</code> — concurrency equals arrival rate times latency. At 2,000 req/s with
+       50 ms latency you need 100 requests in flight; at 200 ms you need 400. That single line sizes thread
+       pools, connection pools and Lambda concurrency without a load test, and it explains why a latency
+       increase becomes a capacity crisis: nothing about the traffic changed, but the concurrency requirement
+       quadrupled. And <strong>Amdahl/USL above</strong>: measure the curve before believing in linearity.</p>
+
+    <h2>Part 2 — Scale Out Requires Statelessness, and Five Things Prevent It</h2>
+
+    <p>Scaling up (a bigger instance) is the boring option and often the right one: it is a one-line change,
+       it does not require the application to be correct under concurrency, and modern instances go a very long
+       way. Its limits are that it has a ceiling, it is a single failure domain, and the price is superlinear
+       at the top of the family.</p>
+
+    <p>Scaling out has no ceiling and improves availability — but only if the application permits it. In
+       practice, five things pin a service to one node, and every one of them shows up as a mysterious bug
+       long before it shows up as a scaling limit:</p>
+
+    <table class="tbl">
+      <tr><th>Pin</th><th>Symptom when you add the second instance</th><th>Fix</th></tr>
+      <tr><td>In-memory session state</td><td>Users randomly logged out; "it works on one instance"</td><td>Signed cookies/JWT, or a shared store (ElastiCache/DynamoDB)</td></tr>
+      <tr><td>Local disk (uploads, temp, caches)</td><td>Files exist for some requests and not others</td><td>S3 for artefacts; EFS only when POSIX semantics are genuinely needed</td></tr>
+      <tr><td>In-process scheduler / cron</td><td>Every job runs N times; duplicate emails, double charges</td><td>EventBridge Scheduler → a single invocation, or a leader lock with a TTL</td></tr>
+      <tr><td>In-memory cache assumed authoritative</td><td>Stale reads that depend on which instance answered</td><td>Shared cache, or accept per-instance caching with a short TTL and no writes</td></tr>
+      <tr><td>Non-idempotent writes</td><td>Retries and rebalances create duplicates</td><td>Idempotency keys — the single most valuable property in a distributed system</td></tr>
+    </table>
+
+    <p>Sticky sessions deserve a specific warning because they look like a fix. They keep the state working and
+       destroy the properties you scaled out for: load is no longer balanced (a long-lived heavy user pins to
+       one node), scale-in evicts real sessions, and a deploy becomes user-visible. Sticky sessions are a
+       migration step with a deletion date, not a design.</p>
+
+    <div class="note">💡 <strong>Idempotency is the enabling property for everything else in this lesson.</strong>
+       Retries with backoff, at-least-once queues, load shedding, blue/green deploys, cross-Region failover and
+       consumer rebalancing all assume a duplicate write is harmless. Implement it once — a client-supplied key
+       stored with a conditional write (<code>attribute_not_exists</code> in DynamoDB, a unique constraint in
+       SQL) — and every pattern below becomes safe. Skip it and each of them becomes a data-corruption
+       mechanism.</div>
+
+    <h2>Part 3 — Auto Scaling Arrives Late by Construction</h2>
+
+    <p>Auto scaling is not a reflex; it is a control loop with delay at every stage. Add the stages up before
+       promising that the fleet will absorb a spike.</p>
+
+<pre>
+MEASURED: TIME FROM TRAFFIC SPIKE TO A NEW INSTANCE SERVING
+
+  stage                                              elapsed    cumulative
+  ---------------------------------------------------------------------
+  CloudWatch metric published (1-minute default)      60 s        60 s
+  alarm evaluation (target tracking, 1 period)        60 s       120 s
+  ASG launches instance, EC2 boots                    52 s       172 s
+  user data + container pull + app start              78 s       250 s
+  ALB health checks pass (2 x 15 s)                   30 s       280 s
+  ---------------------------------------------------------------------
+  TOTAL                                                          4m40s
+
+  WITH DETAILED MONITORING (10s metrics) + WARM POOL + BAKED AMI
+  metric 10 s | alarm 20 s | resume from stopped 19 s | app 12 s | LB 30 s
+  ---------------------------------------------------------------------
+  TOTAL                                                          1m31s
+</pre>
+
+    <div class="note">⚠️ <strong>A four-minute control loop cannot serve a thirty-second spike, and no amount of
+       tuning changes that.</strong> The four real answers are: (1) <strong>headroom</strong> — run at a
+       utilisation that survives the spike while the fleet grows; (2) <strong>make the loop faster</strong> —
+       detailed monitoring, warm pools, baked AMIs, smaller images; (3) <strong>predict</strong> — predictive
+       scaling for daily patterns, scheduled scaling for known events; (4) <strong>absorb</strong> — put a queue
+       in front so the spike becomes backlog instead of errors. Most teams try to tune (2) alone and stay
+       surprised.</div>
+
+    <h3>3.1 Choosing the scaling metric</h3>
+
+    <table class="tbl">
+      <tr><th>Policy / metric</th><th>Good for</th><th>Failure mode</th></tr>
+      <tr><td><strong>Target tracking on <code>ALBRequestCountPerTarget</code></strong></td><td>Web tiers — it tracks demand directly and is independent of instance size</td><td>Requires an ALB; blind to work arriving another way</td></tr>
+      <tr><td>Target tracking on CPU</td><td>CPU-bound work</td><td>An I/O-bound service pegs at 30% CPU while queueing badly, and never scales</td></tr>
+      <tr><td>Step scaling on a custom metric</td><td>Non-linear responses ("if backlog &gt; 10k, add 20 instances")</td><td>Hand-tuned thresholds rot as the workload changes</td></tr>
+      <tr><td>Predictive scaling</td><td>Repeating daily/weekly shapes — it provisions <em>ahead</em> of the curve using history</td><td>Useless for unpredictable spikes; needs a couple of weeks of history</td></tr>
+      <tr><td>Scheduled scaling</td><td>Known events: a sale, a batch window, market open</td><td>Someone must remember to remove it</td></tr>
+      <tr><td>Queue backlog per consumer</td><td>Worker fleets — the only metric that reflects work <em>waiting</em></td><td>Needs a custom metric (Part 4)</td></tr>
+    </table>
+
+    <p>The most common mis-selection is CPU on an I/O-bound service. The measured version: a fleet whose
+       threads spend 85% of their time waiting on a downstream API sat at <strong>34% CPU while p99 went from
+       120 ms to 4.2 s</strong>, and the ASG never added an instance, because by its metric nothing was
+       happening. Switching to requests-per-target scaled it correctly and, incidentally, revealed that the
+       real constraint was the downstream API — see Part 1: the constraint moves.</p>
+
+    <h3>3.2 Flapping, cooldowns and scale-in</h3>
+
+<pre>
+FLAPPING, AND THE THREE SETTINGS THAT STOP IT
+
+  symptom: 14 scaling activities in 40 minutes, fleet 6 -> 11 -> 7 -> 12 -> 8
+           every cycle pays 4m40s of warm-up and throws away warm caches
+
+  causes and fixes
+   1. scale-out and scale-in thresholds too close  -> widen the band
+      (target tracking handles this; step scaling often does not)
+   2. no instance warm-up configured -> the new instance reports 0% CPU,
+      drags the average down, triggers scale-IN
+      -> default_instance_warmup = 300 (this ONE setting fixes most flapping)
+   3. aggressive scale-in on a metric that recovers instantly
+      -> asymmetric policy: scale out fast, scale in slowly (15-min window)
+
+  after: 3 scaling activities in the same 40 minutes, no cache cold-starts
+</pre>
+
+    <p>Scale-in also has a correctness dimension. An instance being terminated is <em>processing requests</em>:
+       use lifecycle hooks plus ALB deregistration delay (connection draining) so in-flight work finishes, and
+       for worker fleets use scale-in protection while a long job is running. The alternative is a fleet that
+       quietly loses a percentage of work every time traffic drops — which shows up as a mysterious low rate
+       of missing records, never as a scaling alarm.</p>
+
+    <h3>3.3 The serverless version of the same arithmetic</h3>
+
+    <table class="tbl">
+      <tr><th>Concern</th><th>EC2 / ECS</th><th>Lambda</th></tr>
+      <tr><td>Scale-out latency</td><td>Minutes (or ~90 s tuned)</td><td>Milliseconds per invoke — but cold starts add 200 ms–2 s (much more inside a VPC with a cold ENI, or on a heavy runtime)</td></tr>
+      <tr><td>Ceiling</td><td>Quotas + your ASG max</td><td>Account concurrency (default <strong>1,000</strong> per Region) and a per-function scaling rate</td></tr>
+      <tr><td>Overload behaviour</td><td>Latency grows, then errors</td><td>Throttles (429) immediately at the ceiling — sharp, not gradual</td></tr>
+      <tr><td>Protecting neighbours</td><td>Separate ASGs</td><td><strong>Reserved concurrency</strong> per function — the only real isolation</td></tr>
+      <tr><td>Warm capacity</td><td>Warm pool</td><td>Provisioned concurrency (billed hourly, and worth it only for latency-critical paths)</td></tr>
+    </table>
+
+    <p>The Lambda failure that surprises teams is not the cold start, it is <strong>concurrency as a shared,
+       account-wide, per-Region pool</strong>. One function that suddenly runs 900 concurrent executions —
+       because someone dropped a large file into a bucket — throttles every other function in the account. The
+       fix is reserved concurrency on the noisy function (a ceiling) and, for anything on a user-facing path,
+       reserved concurrency as a floor as well. Set it before the incident; it is a one-line change afterwards
+       and a full outage before.</p>
+
+    <h2>Part 4 — Load Levelling, Backpressure and the Retry Storm</h2>
+
+    <h3>4.1 A queue turns a latency problem into a backlog problem</h3>
+
+    <p>Putting SQS between a producer and a consumer is the classic load-levelling pattern: the producer never
+       waits for the consumer, spikes become backlog rather than errors, and the consumer fleet can be sized
+       for the <em>average</em> rather than the peak. This is genuinely powerful and it has one enormous
+       caveat.</p>
+
+<pre>
+THE CAVEAT, MEASURED
+
+  producer:  40,000 messages/min sustained (peak 95,000)
+  consumer:  22 workers x 30 msg/min = 660 msg/min ... wait, that is wrong
+             actual: 22 workers x 1,800 msg/min = 39,600 msg/min
+
+  arrival 40,000 > service 39,600  ->  the queue grows at 400/min FOREVER
+
+  t+0h     backlog       2,400   (looks like normal jitter)
+  t+6h     backlog     146,000   (nobody alarmed on it)
+  t+3d     backlog   1,900,000
+  t+7d     backlog   4,100,000   (found because messages started
+                                  hitting the 14-day retention limit
+                                  and disappearing)
+
+  A QUEUE DOES NOT ADD CAPACITY. It adds PATIENCE. If arrival rate exceeds
+  service rate on average, the queue is a slow-motion outage with no alarm.
+</pre>
+
+    <div class="note">⚠️ <strong>Alarm on queue <em>age</em>, not queue depth.</strong>
+       <code>ApproximateAgeOfOldestMessage</code> is in seconds and maps directly to a user-visible promise
+       ("orders are processed within 5 minutes"); depth is meaningless without knowing throughput. Also alarm
+       on the DLQ having <em>any</em> messages at all, and on a backlog that grows monotonically for 30
+       minutes — that is the signature of arrival exceeding service, which no amount of waiting fixes.</div>
+
+    <h3>4.2 Scaling the consumer on backlog per instance</h3>
+
+<pre>
+THE FORMULA (this is the one AWS documents, and it is the right one)
+
+  acceptable backlog per instance = target latency / average processing time
+
+  target: process any message within 5 minutes (300 s)
+  measured average processing time: 1.9 s
+  -> acceptable backlog per instance = 300 / 1.9 = 157 messages
+
+  custom metric published every minute:
+      backlogPerInstance = ApproximateNumberOfMessagesVisible / InServiceInstances
+
+  target-tracking policy: keep backlogPerInstance at 157
+
+  RESULT over a spike from 12k to 95k messages/min:
+      workers  22 -> 68 over 6 minutes
+      oldest message age peaked at 214 s   (target 300 s: met)
+      workers back to 24 over the following 40 minutes (slow scale-in)
+</pre>
+
+    <p>Scaling on raw queue depth instead produces the classic oscillation: depth is high, add 40 workers, depth
+       collapses, remove 40 workers, depth climbs again. Backlog-<em>per-instance</em> is self-normalising,
+       which is exactly why the formula divides by the fleet size.</p>
+
+    <h3>4.3 Retry storms: the client is part of your capacity plan</h3>
+
+<pre>
+MEASURED: A 4% ERROR RATE BECOMING A 3x TRAFFIC AMPLIFICATION
+
+  09:14  a dependency degrades; 4% of requests fail
+  09:14  every client retries 3 times, immediately, no jitter
+         effective load = 1.0 + (0.04 x 3) ... looks harmless: 1.12x
+  09:16  errors rise to 30% under the extra load
+         effective load = 1.0 + (0.30 x 3) = 1.9x
+  09:18  errors 70%, load 3.1x, service fully saturated
+  09:31  the ORIGINAL dependency recovers
+  09:31  the service does NOT recover: retries alone now exceed capacity
+  09:47  recovered only after the fleet was scaled 3x and clients
+         were rate-limited at the edge
+
+  THE FIX (all four, they compose)
+   1. exponential backoff WITH FULL JITTER
+        sleep = random(0, min(cap, base * 2^attempt))
+        — jitter matters more than backoff: synchronised retries are the storm
+   2. a retry BUDGET: retries may not exceed 10% of requests, fleet-wide
+   3. circuit breaker: after N consecutive failures, fail fast for T seconds
+   4. never retry a non-idempotent write without an idempotency key
+</pre>
+
+    <div class="note">🔑 <strong>Retries are a capacity multiplier that activates exactly when you have no
+       spare capacity.</strong> The AWS SDKs default to sensible adaptive/jittered retry modes — but your own
+       service-to-service calls, your frontend fetch wrappers and your mobile clients probably do not. A retry
+       policy with no jitter, no budget and no breaker is a distributed denial-of-service tool aimed at
+       yourself, and it fires during every partial outage.</div>
+
+    <h3>4.4 Load shedding: rejecting work is a feature</h3>
+
+    <p>Every system has a capacity. Above it, you choose between <em>degrading for everyone</em> and
+       <em>rejecting some requests quickly</em>. Queueing theory is unambiguous about which is better, and the
+       measurement matches:</p>
+
+<pre>
+OVERLOAD BEHAVIOUR, SAME FLEET, SAME 1.4x OVERLOAD
+
+  WITHOUT SHEDDING            WITH ADMISSION CONTROL (concurrency limit)
+  ------------------------    ---------------------------------------------
+  all requests accepted       6.1% rejected in 2 ms with 503 + Retry-After
+  p50   1,900 ms              p50    54 ms
+  p99  14,200 ms              p99   310 ms
+  timeouts at the client:     timeouts: 0
+    38% (work done, then                (rejections are fast and explicit,
+     thrown away)                        so clients back off correctly)
+  effective goodput 61%       effective goodput 94%
+</pre>
+
+    <p>Two rules make shedding acceptable. Shed <strong>cheaply and early</strong> — at the edge, before the
+       expensive work, ideally before a database connection is taken. And shed <strong>selectively</strong>:
+       drop bulk/batch/anonymous traffic before checkout, use API Gateway usage plans or a token bucket per
+       tenant so one caller cannot consume the whole budget, and always return <code>429</code>/<code>503</code>
+       with <code>Retry-After</code> so a well-behaved client cooperates instead of retrying into the wall.</p>
+
+    <h2>Part 5 — The Data Tier Is the Real Ceiling</h2>
+
+    <p>The application tier is the easy half; it is stateless and elastic. Every hard scaling problem
+       eventually lands on state.</p>
+
+    <h3>5.1 Connections: the limit nobody plans for</h3>
+
+<pre>
+LAMBDA + RDS, THE CLASSIC COLLAPSE
+
+  db.r6g.large PostgreSQL: max_connections ≈ 1,600
+  Lambda scales to 900 concurrent executions during a spike
+  each execution opens 1 connection, holds it for 40 ms of a 900 ms invoke
+
+  observed: FATAL: remaining connection slots are reserved / too many clients
+            at ~1,600 concurrent, but degradation started at 600:
+              - each PostgreSQL connection costs ~9 MB of backend memory
+              - context switching across 900 backends collapsed throughput
+              - CPU 30% -> 96% with NO increase in useful work
+
+  FIX: RDS Proxy in front. It multiplexes: 900 client connections mapped
+       onto ~40 database connections, with connection pinning avoided by
+       not using session-level features (SET, advisory locks, temp tables).
+
+  after: p99 890 ms -> 120 ms at the same concurrency; DB CPU 96% -> 34%
+</pre>
+
+    <p>The general form: <strong>connections are a resource with a memory and scheduling cost</strong>, and any
+       client population that scales elastically (Lambda, Fargate tasks, autoscaled pods) will exhaust them.
+       Pool aggressively, size pools with Little's Law rather than by copying a default, and put a proxy in
+       front when the client count is elastic.</p>
+
+    <h3>5.2 Read replicas, and the read-your-writes trap</h3>
+
+    <table class="tbl">
+      <tr><th>Read type</th><th>Safe on a replica?</th><th>Why</th></tr>
+      <tr><td>Reports, dashboards, search, listings</td><td>Yes</td><td>Seconds of staleness are invisible</td></tr>
+      <tr><td>Reading back what this user just wrote</td><td><strong>No</strong></td><td>Replica lag makes the write appear to have failed — the single most common replica bug</td></tr>
+      <tr><td>Reads that decide a write (balance checks, stock)</td><td><strong>No</strong></td><td>Stale input to a decision is a correctness bug, not a latency one</td></tr>
+      <tr><td>Anything inside a transaction</td><td>No</td><td>The writer holds the truth</td></tr>
+    </table>
+
+    <p>The workable pattern is a routing rule rather than a blanket setting: <em>sticky-to-primary for N
+       seconds after any write by this session</em> (N slightly above observed p99 replica lag), plus explicit
+       opt-in for replica reads on endpoints proven tolerant. Aurora offers a stronger tool — the reader
+       endpoint with session consistency settings — but the routing rule is what you can implement in any
+       stack today, and it makes the tolerance explicit per endpoint instead of hoping.</p>
+
+    <h3>5.3 Caching: the stampede is the interesting part</h3>
+
+<pre>
+CACHE STAMPEDE, MEASURED
+
+  a popular key with a 300 s TTL expires at 14:07:00
+  1,900 concurrent requests miss simultaneously
+  1,900 identical queries hit the database in the same second
+  DB p99 41 ms -> 6,300 ms; the fleet's threads all block; cascading failure
+
+  THREE FIXES, IN ORDER OF LEVERAGE
+   1. per-key lock / single-flight: the first miss recomputes,
+      the rest wait for it (or serve stale)      -> 1,900 queries becomes 1
+   2. TTL JITTER: ttl = base + random(0, 0.2*base)
+      -> keys created together stop expiring together
+      (this alone removed 80% of our stampedes, and it is one line)
+   3. stale-while-revalidate: serve the expired value, refresh in background
+      -> the user never waits for a cold recompute at all
+</pre>
+
+    <p>Beyond stampedes, the two caching decisions that matter are <strong>invalidation</strong> (write-through
+       and short TTLs for correctness-sensitive data, long TTLs plus explicit invalidation for expensive data)
+       and <strong>where</strong>: CloudFront for anything public and cacheable removes load from every tier at
+       once and is almost always the highest-leverage cache in the system, well ahead of the application-level
+       one people reach for first.</p>
+
+    <h3>5.4 Partitioning: aggregate capacity is a lie if one key is hot</h3>
+
+<pre>
+DYNAMODB: THE PER-PARTITION CEILING
+
+  table provisioned: 40,000 WCU     — plenty, on paper
+  partition key: eventType          — 6 distinct values, one dominant
+
+  per-partition hard limits: 3,000 RCU and 1,000 WCU
+  -> "ORDER_CREATED" needed 9,400 WCU; it got 1,000 and throttled
+  -> 38,000 of the 40,000 provisioned WCU sat idle while writes failed
+
+  ProvisionedThroughputExceededException at 6% total utilisation.
+
+  FIXES
+   - a high-cardinality partition key (orderId, tenantId#date)
+   - write sharding for a genuinely hot key: PK = "ORDER_CREATED#" + rand(0..19)
+     — read by querying all 20 shards and merging
+   - adaptive capacity helps automatically, but it takes minutes and cannot
+     exceed the per-partition ceiling for a single key
+</pre>
+
+    <p>The same shape appears everywhere partitioning does: a Kinesis shard is capped at 1 MB/s (so a hot
+       partition key throttles a stream that is 90% idle), a relational shard fills up because tenant 41 is
+       forty times the size of the median, and a "shard by customer" scheme meets its largest customer.
+       <strong>Choose keys by cardinality <em>and</em> by access distribution</strong>, and expect to re-shard
+       at least once — so make re-sharding a rehearsed operation rather than a rewrite.</p>
+
+    <h3>5.5 Choosing the elastic option on the data tier</h3>
+
+    <table class="tbl">
+      <tr><th>Option</th><th>Scales on</th><th>Watch out for</th></tr>
+      <tr><td>DynamoDB on-demand</td><td>Instantly, per request; absorbs up to roughly double the previous peak without warning</td><td>A step change beyond that still throttles — pre-warm by ramping before a known event; cost per request is higher than well-utilised provisioned</td></tr>
+      <tr><td>DynamoDB provisioned + auto scaling</td><td>Target utilisation, in minutes</td><td>Too slow for spikes; the per-partition ceiling still applies</td></tr>
+      <tr><td>Aurora Serverless v2</td><td>ACUs, in seconds, in fine increments</td><td>Set a floor high enough that a cold cache does not cripple the first minute; a min of 0.5 ACU is a trap under spiky load</td></tr>
+      <tr><td>Aurora read replicas + auto scaling</td><td>Reader CPU/connections</td><td>New readers start with a cold buffer pool; replica lag during heavy writes</td></tr>
+      <tr><td>ElastiCache</td><td>Nodes/shards (cluster mode)</td><td>Resharding moves slots; clients must support cluster mode and redirects</td></tr>
+    </table>
+
+    <h2>Part 6 — Quotas, Cells, and the Playbook for a Known Spike</h2>
+
+    <h3>6.1 Quotas are the ceiling you hit at 3am</h3>
+
+    <p>Every scaling incident has a moment where the graph goes flat at a suspiciously round number. That is a
+       quota, and quotas are per-account <em>per-Region</em>.</p>
+
+    <table class="tbl">
+      <tr><th>Quota</th><th>Common default</th><th>How it presents</th></tr>
+      <tr><td>Lambda concurrent executions</td><td>1,000 per Region</td><td>429 <code>TooManyRequestsException</code>; other functions in the account throttle too</td></tr>
+      <tr><td>API Gateway steady-state rate</td><td>10,000 RPS per Region (burst 5,000)</td><td>429 at the edge, before your code runs</td></tr>
+      <tr><td>Running On-Demand vCPUs</td><td>Low on new accounts; per instance family</td><td>ASG launch failures: "requested more vCPU capacity than your current vCPU limit"</td></tr>
+      <tr><td>ENIs / IPs per subnet</td><td>Subnet size</td><td>Fargate tasks and Lambda-in-VPC stop launching; an undersized /27 is the usual cause</td></tr>
+      <tr><td>EC2 instance capacity in an AZ</td><td>Not a quota — actual capacity</td><td><code>InsufficientInstanceCapacity</code>. Diversify instance types and AZs; use capacity reservations for known peaks</td></tr>
+    </table>
+
+    <p>Two habits remove this entire class of incident: keep a readiness check that compares every relevant
+       quota against <em>peak plus a failover multiple</em> (the eight-second script in the
+       <a href="resilience-dr.html">DR lesson</a> would have saved a three-hour outage), and raise quotas as
+       part of capacity planning rather than as an incident response — increases are not instant, and a support
+       queue during a large regional event is not a plan.</p>
+
+    <h3>6.2 Scaling by partitioning the system: cells</h3>
+
+    <p>Beyond a certain size the honest answer to "how do we scale this?" is "we do not scale <em>it</em>; we
+       run more of it". A cell is a complete, independent copy of the stack serving a subset of tenants —
+       bounded in size, deployed and tested independently, and never sharing a database with another cell.</p>
+
+<pre>
+WHY CELLS SCALE WHEN A SINGLE STACK STOPS
+
+  a single stack:  every new tenant increases coordination (the β term in
+                   Part 1), the blast radius, the deploy risk and the size
+                   of the biggest table. Scaling is a research project.
+
+  cells:           each cell is a KNOWN-GOOD size that you have load-tested.
+                   Growth = launch cell N+1. Scaling becomes a routine
+                   operation with a fixed, rehearsed cost.
+
+  measured cell budget (ours): 1 cell = 2,000 tenants, 12k RPS peak,
+      a 900 GB database, and a deploy that takes 9 minutes.
+      Adding a cell: 40 minutes, fully automated, zero coordination
+      with existing cells.
+
+  bonus: shuffle-sharding tenants across cells makes a poison-pill tenant
+         affect a small fraction of others (see the DR lesson: 3.6%)
+</pre>
+
+    <p>The costs are real and worth naming: a cell router that must be extremely simple and extremely
+       available, per-cell operational overhead (which is only acceptable because it is automated), cross-cell
+       reporting that now needs aggregation, and tenant migration between cells — which you will need, so build
+       it early rather than when a cell is full.</p>
+
+    <h3>6.3 The known-spike playbook</h3>
+
+<pre>
+A SALE AT 09:00. WHAT TO DO, IN ORDER, AND WHEN
+
+  T-2 weeks  load test at 2x expected peak against a production-like stack.
+             The goal is to FIND the constraint, not to pass. (Ours moved
+             three times: app CPU -> connections -> a hot partition.)
+  T-1 week   raise quotas: Lambda concurrency, vCPU, API Gateway rate.
+             Verify with a readiness script, do not trust the console memory.
+  T-3 days   pre-scale what is slow to scale: ASG minimum, Aurora readers,
+             DynamoDB provisioned floor (or ramp on-demand traffic to raise
+             the remembered peak), ElastiCache nodes.
+  T-1 day    freeze deploys. Most incidents during a peak are changes.
+  T-2 hours  scheduled scaling kicks in: fleet at 100% of predicted peak.
+             Warm the caches with synthetic traffic. Verify DLQs are empty.
+  T-0        watch: backlog AGE, error rate, p99, throttle counts,
+             saturation of the constraint you found in the load test.
+  T+         scale in SLOWLY (hours, not minutes) — the long tail after a
+             sale is still 3-5x normal, and cold caches make it worse.
+
+  MEASURED OUTCOME (Black Friday, after the T-2 load test found the
+  hot partition): peak 4.1x normal, zero throttles, p99 within SLO,
+  cost for the week +$3,400 — of which the pre-scaled fleet was $2,100.
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Auto scaling on CPU with default settings, no headroom, a queue in front of an
+         under-provisioned consumer, retries with no jitter, replicas used for every read, one shared cache
+         with a fixed TTL, a partition key with six distinct values, and quotas nobody has looked at.</strong>
+         The I/O-bound fleet sits at 34% CPU while p99 goes to 4.2 s and the ASG never reacts; when it finally
+         does, the 4m40s control loop delivers instances long after the spike is over, and then scale-in
+         flapping throws away the warm caches. The queue looks healthy because nobody alarms on message age,
+         so a 400-messages-per-minute deficit becomes a 4.1-million backlog and the oldest messages start
+         ageing out of retention entirely. A 4% dependency error rate turns into 3× traffic because every
+         client retries three times in lockstep, and the service stays down for sixteen minutes after the
+         dependency recovers. The replica reads make writes appear to fail for the user who just made them,
+         and the fixed TTL means 1,900 requests recompute the same key in the same second and take the
+         database with them. Meanwhile 38,000 of 40,000 provisioned WCU are idle while one partition key
+         throttles, and the whole thing stops dead at a round number that turns out to be a Lambda concurrency
+         quota nobody had raised.</p>
+      <p>✅ <strong>Find the constraint by measuring the curve, scale on a metric that reflects demand, buy the
+         control-loop delay back with headroom and prediction, make the system degrade instead of
+         collapse, and treat the data tier as the real ceiling.</strong> Load-test to find where throughput
+         peaks (ours peaked at 16 instances and declined at 24 — that is a lock, not a capacity problem), fix
+         the serialisation, and expect the constraint to move. Scale web tiers on requests-per-target and
+         worker fleets on backlog-per-instance (target latency ÷ processing time), with instance warm-up set so
+         the fleet stops flapping. Accept that a four-minute loop cannot serve a thirty-second spike: run
+         headroom, use predictive and scheduled scaling for shapes you know, and put a queue in front to absorb
+         the rest — while alarming on message <em>age</em> and on monotonic growth, because a queue adds
+         patience, not capacity. Give every client jittered backoff, a retry budget and a circuit breaker, and
+         shed load at the edge when saturated: rejecting 6% in 2 ms held p99 at 310 ms and goodput at 94%,
+         where accepting everything gave 14.2 s and 61%. Route reads deliberately (sticky-to-primary after a
+         write), jitter cache TTLs and single-flight the misses, choose partition keys by cardinality and
+         distribution, put a proxy in front of elastic database clients, and keep a readiness check on every
+         quota so the ceiling is found in a script rather than at 3am.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What happens</th><th>Do this instead</th></tr>
+      <tr><td>Assuming throughput scales linearly with instances</td><td>Measured throughput peaked at 16 instances and was <em>lower</em> at 24 — a shared lock whose cost grows as N²</td><td>Load-test the curve, fit α and β, and fix the serialisation instead of buying capacity past the knee</td></tr>
+      <tr><td>Auto scaling on CPU for an I/O-bound service</td><td>34% CPU, p99 120 ms → 4.2 s, and the ASG adds nothing</td><td>Scale on <code>ALBRequestCountPerTarget</code>, or on the queue backlog for workers</td></tr>
+      <tr><td>Expecting an ASG to absorb a sudden spike</td><td>The control loop measured 4m40s end to end; the spike is over before the instances serve</td><td>Headroom + faster loop (detailed monitoring, warm pool, baked AMI) + predictive/scheduled + a queue</td></tr>
+      <tr><td>No instance warm-up setting</td><td>New instances report 0% CPU, drag the average down, trigger scale-in — 14 scaling activities in 40 minutes</td><td><code>default_instance_warmup</code> (≈300 s) and asymmetric policies: out fast, in slow</td></tr>
+      <tr><td>Believing a queue adds capacity</td><td>Arrival 400/min above service rate grew to a 4.1M backlog and messages aged out of retention</td><td>A queue adds patience. Alarm on <code>ApproximateAgeOfOldestMessage</code> and on monotonic growth</td></tr>
+      <tr><td>Scaling consumers on raw queue depth</td><td>Oscillation: add 40 workers, depth collapses, remove them, depth climbs</td><td>Backlog <em>per instance</em> = target latency ÷ processing time (157 in the worked example)</td></tr>
+      <tr><td>Retries without jitter, budget or breaker</td><td>A 4% error rate became 3× load; the service stayed down 16 minutes after the dependency recovered</td><td>Full jitter, a fleet-wide retry budget (~10%), circuit breakers, idempotency keys</td></tr>
+      <tr><td>Accepting all work under overload</td><td>p99 14.2 s, 38% client timeouts, 61% goodput — work done and then thrown away</td><td>Admission control: reject 6% in 2 ms with <code>Retry-After</code> → p99 310 ms, 94% goodput</td></tr>
+      <tr><td>Elastic clients against a raw database</td><td>900 Lambda executions exhausted connections; DB CPU 96% doing no useful work</td><td>RDS Proxy or a pooler; size pools with Little's Law; avoid session state that pins connections</td></tr>
+      <tr><td>Sending every read to a replica</td><td>Users cannot read back their own writes; stale reads feed write decisions</td><td>Sticky-to-primary for N seconds after a write; opt in per endpoint</td></tr>
+      <tr><td>One TTL for everything, no single-flight</td><td>1,900 simultaneous misses on one key took the database from 41 ms to 6.3 s</td><td>TTL jitter (one line, removed 80% of ours), per-key locks, stale-while-revalidate</td></tr>
+      <tr><td>Low-cardinality partition keys</td><td>Throttled at 6% of provisioned capacity: one key needed 9,400 WCU against a 1,000 WCU per-partition ceiling</td><td>High-cardinality keys, write sharding for genuinely hot keys, and expect to re-shard</td></tr>
+      <tr><td>Discovering quotas during the incident</td><td>The graph flattens at a round number: Lambda 1,000, API Gateway 10,000 RPS, a vCPU limit in the failover Region</td><td>A readiness check comparing every quota against peak × failover multiple, raised in advance</td></tr>
+      <tr><td>Scaling in as fast as you scaled out</td><td>The post-peak tail is still 3–5× normal and the caches are cold</td><td>Asymmetric: minutes to scale out, hours to scale in</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between scaling up and scaling out, and when would you deliberately choose to scale up?</summary>
+      <p><strong>Scaling up (vertical)</strong> means a bigger instance: more vCPU and memory for the same
+         single process and the same single failure domain. <strong>Scaling out (horizontal)</strong> means more
+         instances behind a load balancer.</p>
+      <p>Scaling out is the default because it has no ceiling and improves availability — but it requires the
+         application to be stateless, or at least to keep no state that a second instance would contradict.</p>
+      <p>Choose to scale up deliberately when: the workload cannot be parallelised (a single-writer database is
+         the canonical case — you cannot scale out a primary by adding one); when the change must land in
+         minutes and the app is not yet stateless; when the fleet is small enough that per-instance overhead
+         dominates (four large instances beat forty small ones for a JVM with a big heap and a warm cache); or
+         as a stopgap while the real fix is built. The honest senior answer includes the limits: a ceiling, a
+         restart to change it, a single failure domain, and superlinear pricing at the top of an instance
+         family.</p>
+      <p>The point worth adding unprompted: they are not exclusive. Most production systems scale up to a
+         sensible instance size — big enough to amortise overhead, small enough that losing one is survivable —
+         and then scale out from there.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Your service sits at 30% CPU but latency is terrible and auto scaling never fires. What is happening?</summary>
+      <p>The service is <strong>not CPU-bound</strong>, so CPU is the wrong scaling signal and also the wrong
+         diagnostic. The threads are blocked waiting — on a downstream API, a database query, a lock, or a
+         connection pool with no free connections. Work is queueing <em>inside</em> the application where no
+         infrastructure metric can see it.</p>
+      <p>How to confirm, in order of speed: look at request concurrency (in-flight requests) against the thread
+         or connection pool size — if concurrency equals the pool size, that pool is the constraint; check pool
+         wait time, which most pools expose; check the latency of downstream calls; take a thread dump and see
+         what the threads are actually doing.</p>
+      <p>The fixes are: scale on a metric that reflects demand rather than CPU
+         (<code>ALBRequestCountPerTarget</code>, or in-flight concurrency), size the pool with Little's Law
+         (<code>L = λW</code> — 2,000 req/s at 200 ms needs 400 in flight), and then deal with the real
+         constraint, which is usually downstream. Note that adding instances here can be actively harmful: if
+         the constraint is a shared database, more instances means more concurrent load on the thing that is
+         already the bottleneck.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Traffic spikes 10× in thirty seconds every day at 09:00. Auto scaling takes four minutes. How do you serve the spike?</summary>
+      <p>State the constraint first: <strong>a four-minute control loop cannot serve a thirty-second spike</strong>.
+         Any answer that only tunes the loop is wrong. There are four levers, and the good answer uses several:</p>
+      <table class="tbl">
+        <tr><th>Lever</th><th>Applied here</th><th>Cost</th></tr>
+        <tr><td><strong>Predict</strong> — this spike is at 09:00 daily</td><td>Scheduled scaling to full capacity at 08:45, plus predictive scaling for the general shape</td><td>15 minutes of extra fleet per day — trivially cheap and by far the best answer for a <em>known</em> spike</td></tr>
+        <tr><td><strong>Headroom</strong></td><td>Enough baseline capacity that a 10× burst degrades rather than fails while the fleet grows</td><td>Continuous, so it should cover the unpredictable portion only</td></tr>
+        <tr><td><strong>Faster loop</strong></td><td>Detailed monitoring (10 s), warm pool, AMI with the container pre-pulled: 4m40s → 1m31s</td><td>Small; do it regardless</td></tr>
+        <tr><td><strong>Absorb</strong></td><td>Anything asynchronous goes onto a queue at 09:00 and is processed over the following minutes; the synchronous path shrinks to what must be immediate</td><td>Requires the work to be genuinely deferrable</td></tr>
+      </table>
+      <p>Then the answers that avoid the problem: cache the spike (if 09:00 is everyone loading the same
+         dashboard, CloudFront or a short-TTL cache serves 90% of it with no scaling at all), and shed or queue
+         non-essential work during the window. And if the spike is a stampede of clients polling at exactly
+         09:00, fix the clients — jitter the schedule — which converts a 10× spike into a 2× one for free.</p>
+      <p>For a spike this sharp, serverless is a legitimate architectural answer for that path specifically:
+         Lambda scales in milliseconds. Note the caveats — cold starts and the account concurrency ceiling —
+         so it is a path-level decision, not a rewrite.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A dependency starts failing 4% of requests, and within four minutes your service is completely down. Explain the mechanism and the fixes.</summary>
+      <p>This is a <strong>retry storm</strong>, and the mechanism is a positive feedback loop:</p>
+      <ol>
+        <li>4% of requests fail. Each client retries three times, immediately and in lockstep.</li>
+        <li>Load rises slightly; more requests queue; more requests time out.</li>
+        <li>A higher error rate produces more retries, which produces a higher error rate. Effective load went
+            1.12× → 1.9× → 3.1× in four minutes.</li>
+        <li>The service saturates. Crucially, when the original dependency recovers, <strong>the retry load
+            alone still exceeds capacity</strong>, so the outage continues — ours needed 16 further minutes,
+            a 3× fleet and edge rate-limiting to break out.</li>
+      </ol>
+      <p>The fixes compose and all four are needed:</p>
+      <ul>
+        <li><strong>Full jitter</strong>: <code>sleep = random(0, min(cap, base × 2^attempt))</code>. Jitter
+            matters more than the backoff curve, because the damage comes from synchronisation.</li>
+        <li><strong>Retry budget</strong>: retries may not exceed ~10% of requests fleet-wide. This bounds
+            amplification no matter how many layers retry.</li>
+        <li><strong>Circuit breaker</strong>: after N consecutive failures, fail fast for T seconds. This both
+            protects the dependency and lets it recover.</li>
+        <li><strong>Idempotency keys</strong>, so retrying a write is safe at all.</li>
+      </ul>
+      <p>Two senior additions. Beware of <strong>layered retries</strong>: three layers each retrying three
+         times is 27× amplification — retry at one layer, ideally the outermost, and make inner layers fail
+         fast. And add <strong>load shedding</strong> so the service protects itself regardless of client
+         behaviour, because you do not control every client — mobile apps in the field will keep the old retry
+         policy for a year.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the scaling strategy for a system going from 1,000 to 100,000 requests per second over eighteen months. Where do you expect it to break, and in what order?</summary>
+      <p>The useful answer is not an architecture, it is a <strong>sequence of constraints with a trigger for
+         each</strong> — because a 100× change will not break in one place, and building for the endpoint on
+         day one is how you spend a year not shipping.</p>
+      <table class="tbl">
+        <tr><th>Stage</th><th>Constraint that binds</th><th>Action</th></tr>
+        <tr><td>1k → 5k</td><td>App CPU. The easy regime</td><td>Scale out, get statelessness right, add caching at the edge, instrument everything. Establish the load test now — it is the tool for every later stage</td></tr>
+        <tr><td>5k → 15k</td><td>Database connections and write contention</td><td>Pooling/RDS Proxy, read replicas with deliberate routing, remove hot rows and shared sequences (the α and β terms)</td></tr>
+        <tr><td>15k → 40k</td><td>The single writer</td><td>The real decision point: move the highest-volume workloads off the relational writer (DynamoDB or an append-only log), CQRS for read-heavy views, async everything that need not be synchronous</td></tr>
+        <tr><td>40k → 100k</td><td>Coordination and blast radius, not raw capacity</td><td>Cells: bounded, independently deployed copies with tenants shuffle-sharded. Growth becomes "launch cell N+1", a rehearsed 40-minute operation</td></tr>
+        <tr><td>Throughout</td><td>Quotas, and organisational scaling</td><td>Readiness checks on quotas; ownership per cell/service; a cost-per-1k-requests metric so efficiency is visible as you grow</td></tr>
+      </table>
+      <p><strong>What I would build early even though it is not needed yet</strong>, because retrofitting is
+         expensive: idempotency keys on every write (they enable retries, queues, failover and cells);
+         a partition key chosen for cardinality and distribution rather than convenience; asynchronous
+         boundaries where the domain allows, since converting a synchronous call to a queue later is a
+         redesign; and the load test, which is what turns each stage transition from a surprise into a
+         scheduled piece of work.</p>
+      <p><strong>What I would explicitly not build early:</strong> cells, sharding, multi-Region and a
+         service-per-team topology. Each one multiplies operational cost, and at 1k RPS they buy nothing while
+         slowing down the changes that actually get you to 15k. The trigger for each is a measured constraint,
+         not a roadmap date.</p>
+      <p>And the meta-point: <strong>at every stage, measure where throughput peaks rather than assuming it
+         rises</strong>. The most expensive scaling mistake is adding capacity past the knee, which costs money
+         and makes latency worse.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Under overload, is it better to serve every request slowly or to reject some quickly? Defend your answer, and describe how you would implement it.</summary>
+      <p><strong>Reject some quickly.</strong> The queueing argument: above capacity, a queue grows without
+         bound and latency grows with it, so accepted work increasingly completes <em>after the client has
+         given up</em> — the system spends its capacity producing responses nobody receives. That is negative
+         goodput: you are converting resources into timeouts.</p>
+      <p>The measurement from our fleet at 1.4× capacity: accepting everything gave p50 1.9 s, p99 14.2 s, 38%
+         client timeouts and 61% goodput. Admission control rejected 6.1% in 2 ms and gave p50 54 ms, p99
+         310 ms, zero timeouts and 94% goodput. The rejected users got a fast, honest error and retried
+         successfully; the accepted users got a working service.</p>
+      <p><strong>Implementation, in order:</strong></p>
+      <ul>
+        <li><strong>Shed early and cheaply</strong> — at the edge (API Gateway usage plans, an ALB/WAF rate
+            rule) or at the very front of the request path, before a database connection or expensive
+            deserialisation. Shedding after the expensive work is done is worthless.</li>
+        <li><strong>Bound concurrency, do not guess a rate.</strong> A concurrency limit (a semaphore sized by
+            Little's Law) adapts to changing latency automatically, where a fixed RPS limit is wrong the moment
+            latency shifts.</li>
+        <li><strong>Shed selectively</strong>: prioritise by class — checkout above browsing, paying tenants
+            above free, interactive above batch. A per-tenant token bucket stops one caller consuming the whole
+            budget, which is usually the actual cause of the overload.</li>
+        <li><strong>Signal correctly</strong>: <code>429</code> or <code>503</code> with <code>Retry-After</code>,
+            so well-behaved clients back off instead of retrying into the wall — otherwise shedding feeds the
+            retry storm.</li>
+        <li><strong>Make it visible</strong>: a shed-rate metric and an alarm. Shedding is a symptom; it must
+            never become a silent steady state that hides an under-provisioned system.</li>
+      </ul>
+      <p>The caveat worth raising unprompted: shedding is a <em>protection</em> mechanism, not a capacity plan.
+         If the shed rate is non-zero every day at 09:00, the answer is capacity or efficiency — shedding is
+         there for the day something unexpected arrives.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure your service's actual scalability curve instead of
+      assuming it is linear. Find the point where adding instances stops paying, and identify what is
+      serialising.
+      <details class="solution"><summary>Solution</summary>
+      <p>Run a fixed-shape load test at increasing fleet sizes, holding everything else constant. The whole
+         exercise is a morning, and it is the highest-information thing you can do before any scaling work.</p>
+<pre>
+$ for N in 2 4 8 12 16 20 24; do
+    aws autoscaling set-desired-capacity --auto-scaling-group-name checkout-asg \
+      --desired-capacity $N --honor-cooldown
+    ./wait-for-healthy.sh checkout-tg $N
+    sleep 300                        # let caches warm, avoid measuring cold starts
+    k6 run --vus 400 --duration 5m load.js | tee "result-$N.txt"
+  done
+
+$ grep -H 'http_reqs\|p(99)' result-*.txt | ...
+
+  instances   throughput   p99      throughput per instance
+  --------------------------------------------------------
+      2          1,840      71 ms        920
+      4          3,510      78 ms        878
+      8          6,240      96 ms        780
+     12          8,100     141 ms        675
+     16          8,760     238 ms        548   &lt;-- peak throughput
+     20          8,410     402 ms        421
+     24          7,900     688 ms        329   &lt;-- worse than 16, at 1.5x the cost
+</pre>
+      <p>Two readings of the same data. The <em>throughput per instance</em> column falls monotonically —
+         that is the contention term. The <em>absolute throughput</em> column peaks and then declines — that is
+         the coherency term, and its presence means a shared resource is getting worse as the fleet grows, not
+         merely staying constant.</p>
+      <p>Now find it. The fleet was at 40% CPU at the peak, so it is not the application:</p>
+<pre>
+$ # what are the threads doing?
+$ psql -c "SELECT wait_event_type, wait_event, count(*) FROM pg_stat_activity
+           WHERE state='active' GROUP BY 1,2 ORDER BY 3 DESC LIMIT 5;"
+
+ wait_event_type |   wait_event    | count
+-----------------+-----------------+-------
+ Lock            | transactionid   |   187      &lt;-- there it is
+ Client          | ClientRead      |    24
+ LWLock          | BufferContent   |     6
+
+$ psql -c "SELECT relation::regclass, mode, count(*) FROM pg_locks
+           WHERE NOT granted GROUP BY 1,2;"
+
+    relation      |     mode      | count
+------------------+---------------+-------
+ order_seq        | RowExclusive  |   187      # one row. Every instance. Every order.
+</pre>
+        <table class="tbl">
+          <tr><th>Fix considered</th><th>Effect</th><th>Verdict</th></tr>
+          <tr><td>Add instances</td><td>Throughput falls, cost rises</td><td>Actively harmful past the knee</td></tr>
+          <tr><td>Bigger database instance</td><td>Lock contention is not CPU — no change</td><td>Expensive placebo</td></tr>
+          <tr><td>Pre-allocate blocks of 1,000 order numbers per instance</td><td>One lock acquisition per 1,000 orders instead of per order</td><td><strong>Chosen — 40 minutes of work</strong></td></tr>
+        </table>
+<pre>
+AFTER (same test, same instances)
+
+     16         14,900      88 ms
+     24         21,600     102 ms
+     32         27,400     119 ms        # still climbing; new knee not yet found
+  refitted: α = 0.019   β ≈ 0.00003      (β essentially gone)
+
+  the next constraint appeared at 48 instances: database connections.
+  As always, the constraint MOVED rather than disappeared.
+</pre>
+      <div class="note">🔑 <strong>Publish the curve, not a number.</strong> "We scale to 8,760 req/s and adding
+         instances past 16 makes it worse" is a fact that changes decisions — it stops a capacity purchase,
+         justifies a day of engineering, and gives the next person a baseline to compare against. "We're
+         horizontally scalable" does none of that.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Diagnose an Auto Scaling group that either never scales or
+      flaps. Measure the true control-loop delay end to end, then reduce it.
+      <details class="solution"><summary>Solution</summary>
+      <p>First, measure the loop. Force a step change in load and timestamp every stage — this number is
+         needed for every later decision, and almost nobody has it.</p>
+<pre>
+$ date -u +%T; ./loadgen.sh --step-to 4x            # 14:02:00
+$ aws autoscaling describe-scaling-activities \
+    --auto-scaling-group-name web-asg --max-items 3 \
+    --query 'Activities[].{start:StartTime,end:EndTime,cause:Cause}' --output table
+
+  14:02:00  load step applied
+  14:03:04  CloudWatch datapoint published        (+64 s, 1-min metrics)
+  14:04:06  alarm ALARM, policy triggered         (+62 s)
+  14:04:58  instance running                      (+52 s)
+  14:06:16  application listening                 (+78 s, image pull + JVM start)
+  14:06:46  target healthy in the ALB             (+30 s, 2 x 15 s)
+  --------------------------------------------------------------
+  TOTAL 4m46s
+</pre>
+        <table class="tbl">
+          <tr><th>Stage</th><th>Lever</th><th>Measured after</th></tr>
+          <tr><td>Metric publication</td><td>Enable detailed monitoring (10 s)</td><td>64 s → 11 s</td></tr>
+          <tr><td>Alarm evaluation</td><td>Target tracking with a 10 s period; do not stack extra evaluation periods on a scale-out alarm</td><td>62 s → 21 s</td></tr>
+          <tr><td>Instance launch</td><td>Warm pool (<code>Stopped</code> state, resumed on demand)</td><td>52 s → 19 s</td></tr>
+          <tr><td>App start</td><td>Bake the container into the AMI; trim the image (1.4 GB → 260 MB)</td><td>78 s → 14 s</td></tr>
+          <tr><td>Health check</td><td>Interval 10 s, healthy threshold 2</td><td>30 s → 20 s</td></tr>
+          <tr><td><strong>Total</strong></td><td>—</td><td><strong>4m46s → 1m25s</strong></td></tr>
+        </table>
+      <p>Then fix the two behaviour bugs that this measurement usually exposes.</p>
+<pre>
+BUG A — NEVER SCALES (the I/O-bound service)
+
+  metric: CPUUtilization, target 70%.  Observed: 34% CPU, p99 4.2 s, 0 activities.
+  the fleet is blocked on a downstream call, so CPU can never reach the target.
+
+$ aws autoscaling put-scaling-policy --auto-scaling-group-name web-asg \
+    --policy-name track-requests --policy-type TargetTrackingScaling \
+    --target-tracking-configuration '{
+      "PredefinedMetricSpecification":{
+        "PredefinedMetricType":"ALBRequestCountPerTarget",
+        "ResourceLabel":"app/web-alb/50dc.../targetgroup/web-tg/2f1c..."},
+      "TargetValue": 900.0 }'
+
+  after: scales correctly; p99 back to 140 ms.
+  and the load test then revealed the downstream API was the real constraint.
+
+BUG B — FLAPPING (14 activities in 40 minutes)
+
+  cause: new instances report 0% CPU while warming, pulling the fleet average
+         down and immediately triggering scale-IN.
+
+$ aws autoscaling update-auto-scaling-group --auto-scaling-group-name web-asg \
+    --default-instance-warmup 300
+
+  after: 3 activities in the same 40-minute window.
+  Also added: scale-out on 1 datapoint, scale-in evaluated over 15 minutes.
+</pre>
+      <div class="note">⚠️ <strong>Do not tune the loop below the time it takes your app to be genuinely
+         ready.</strong> An ALB health check that passes before caches are warm and connection pools are
+         established sends real traffic to an instance that will serve it badly — the p99 spike after every
+         scale-out is this bug. Health checks should reflect readiness for traffic, exactly as in
+         <a href="../kubernetes/probes.html">Kubernetes probes</a>.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Size and scale a queue-consumer fleet on backlog per
+      instance so that a 8× spike still meets a "processed within 5 minutes" promise — and add the alarms that
+      catch the failure mode a queue hides.
+      <details class="solution"><summary>Solution</summary>
+      <p>Start with the formula, because guessing a worker count is how the 4.1-million-message backlog
+         happened.</p>
+<pre>
+STEP 1 — MEASURE, THEN COMPUTE
+
+  target latency (the product promise)      = 300 s
+  average processing time per message       =   1.9 s   (measured p50; use p50
+                                                         here and check p99 separately)
+  acceptable backlog per instance = 300 / 1.9 = 157 messages
+
+  steady state: 12,000 msg/min arriving; each worker does 60/1.9 = 31.6 msg/min
+  workers needed at steady state = 12,000 / 31.6 = 380?? — no:
+  each worker processes messages CONCURRENTLY (10 threads):  316 msg/min
+  workers needed = 12,000 / 316 = 38 ... measured actual: 22 workers sufficed
+  because average processing time under load was 1.1 s, not 1.9 s.
+  -> ALWAYS confirm the computed number against a measurement.
+</pre>
+<pre>
+STEP 2 — PUBLISH THE CUSTOM METRIC (every minute, from a tiny Lambda)
+
+  visible=$(aws sqs get-queue-attributes --queue-url "$Q" \
+    --attribute-names ApproximateNumberOfMessagesVisible \
+    --query 'Attributes.ApproximateNumberOfMessagesVisible' --output text)
+  inservice=$(aws autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-name workers \
+    --query 'length(AutoScalingGroups[0].Instances[?LifecycleState==`InService`])' \
+    --output text)
+  aws cloudwatch put-metric-data --namespace Custom/Workers \
+    --metric-name BacklogPerInstance --value $(( visible / (inservice &gt; 0 ? inservice : 1) ))
+
+STEP 3 — TARGET-TRACK ON IT
+
+  target value 157, scale-out on 1 datapoint, scale-in over 15 minutes,
+  default_instance_warmup 180 (worker start is faster than the web tier)
+
+STEP 4 — PROVE IT UNDER THE SPIKE
+
+  t+0m    12,000 msg/min -> 95,000 msg/min (7.9x)
+  t+1m    BacklogPerInstance 148 -> 1,190     workers 22 -> 34
+  t+3m    BacklogPerInstance          640     workers 34 -> 58
+  t+6m    BacklogPerInstance          210     workers      68
+  t+9m    BacklogPerInstance          160     workers      68  (steady)
+  peak ApproximateAgeOfOldestMessage: 214 s   (promise 300 s — MET)
+  t+52m   spike over, workers back to 24 (slow scale-in, no thrash)
+</pre>
+        <table class="tbl">
+          <tr><th>Alarm</th><th>Threshold</th><th>Catches</th></tr>
+          <tr><td><code>ApproximateAgeOfOldestMessage</code></td><td>&gt; 240 s for 2 periods</td><td>The promise about to be broken — in user-visible units</td></tr>
+          <tr><td>Backlog growing monotonically</td><td>30 min of increase</td><td><strong>Arrival rate above service rate</strong> — the failure a queue hides until retention deletes your data</td></tr>
+          <tr><td>DLQ <code>ApproximateNumberOfMessagesVisible</code></td><td>&gt; 0</td><td>Poison messages; also the "we deployed a bug" signal</td></tr>
+          <tr><td>Consumer error rate</td><td>&gt; 1%</td><td>Messages being retried invisibly, inflating apparent load 3×</td></tr>
+          <tr><td>Fleet at max size</td><td>Any time</td><td>You are no longer scaling — you are hoping</td></tr>
+        </table>
+      <div class="note">🔑 <strong>Check the visibility timeout against p99 processing time, not p50.</strong>
+         If a message takes longer than the visibility timeout it becomes visible again and is processed twice
+         — which, without idempotency, means duplicate charges under exactly the load conditions that make
+         processing slow. Set the timeout above p99 (or heartbeat it), and make consumers idempotent anyway.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Implement admission control in front of a service, then
+      measure goodput with and without it under 1.4× overload. Prove that rejecting work improves the outcome.
+      <details class="solution"><summary>Solution</summary>
+      <p>Bound <em>concurrency</em>, not request rate: a concurrency limit adapts automatically when latency
+         changes, whereas a fixed RPS limit is calibrated for one latency and wrong at every other.</p>
+<pre>
+SIZING THE LIMIT WITH LITTLE'S LAW
+
+  L = λ × W
+  capacity λ = 2,400 req/s   healthy latency W = 0.055 s
+  L = 2,400 × 0.055 = 132 concurrent requests
+
+  set the semaphore to 132, with a small queue (say 20) to absorb jitter.
+  Anything arriving when the queue is full is rejected IMMEDIATELY.
+</pre>
+<pre>
+// the whole mechanism — reject early, reject cheaply, signal properly
+const MAX_INFLIGHT = 132, MAX_QUEUE = 20;
+let inflight = 0, queued = 0;
+
+app.use((req, res, next) =&gt; {
+  // classify FIRST: never shed checkout to protect the reporting endpoint
+  const priority = req.path.startsWith("/checkout") ? "high" : "low";
+  const limit = priority === "high" ? MAX_INFLIGHT : Math.floor(MAX_INFLIGHT * 0.7);
+
+  if (inflight &gt;= limit &amp;&amp; queued &gt;= MAX_QUEUE) {
+    shedCounter.inc({ priority });
+    res.set("Retry-After", "1");
+    return res.status(503).json({ error: "overloaded" });   // ~2 ms, no DB touched
+  }
+  inflight++;
+  res.on("finish", () =&gt; { inflight--; });
+  next();
+});
+</pre>
+<pre>
+MEASURED AT 1.4x CAPACITY (3,360 req/s offered against 2,400 capacity)
+
+                              WITHOUT            WITH ADMISSION CONTROL
+  ------------------------------------------------------------------------
+  accepted                    100%               93.9%
+  rejected fast (503, 2 ms)     0%                6.1%
+  p50 latency                 1,900 ms             54 ms
+  p99 latency                14,200 ms            310 ms
+  client-side timeouts (3 s)     38%                 0%
+  GOODPUT (responses the
+   client actually used)         61%                94%
+  ------------------------------------------------------------------------
+  requests that consumed full server work and were then
+  DISCARDED by a timed-out client:   1,277/s   vs   0/s
+</pre>
+      <p>That last row is the argument in one line: without shedding, the service spent 1,277 requests per
+         second of capacity producing responses nobody received. Shedding did not reduce the work the system
+         could do; it stopped the system from wasting it.</p>
+        <table class="tbl">
+          <tr><th>Design rule</th><th>Why</th></tr>
+          <tr><td>Shed before any expensive work</td><td>A rejection after a database round trip costs almost as much as serving the request</td></tr>
+          <tr><td>Classify before you shed</td><td>Dropping checkout to protect an analytics endpoint is worse than not shedding</td></tr>
+          <tr><td>Per-tenant token bucket as well as a global limit</td><td>Overload is usually one caller; a global limit alone punishes everyone for it</td></tr>
+          <tr><td>Always <code>Retry-After</code></td><td>Otherwise shedding feeds the retry storm it exists to prevent</td></tr>
+          <tr><td>Alarm on the shed rate</td><td>Shedding is protection, never a capacity plan — a daily shed rate means "buy capacity"</td></tr>
+        </table>
+      <div class="note">💡 <strong>Test the interaction with retries.</strong> A shed request that a client
+         retries three times has not been shed — it has been deferred and multiplied. Verify end to end that
+         clients honour <code>Retry-After</code> and that the retry budget holds; the pairing of admission
+         control with jittered, budgeted retries is what actually produces the numbers above.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Load-test the data tier until it breaks, then fix the two
+      constraints that appear in almost every system: connection exhaustion and a hot partition. Report the
+      before/after for each.
+      <details class="solution"><summary>Solution</summary>
+      <p>Test the data tier deliberately, because the application tier will happily scale out and hide it until
+         production does the experiment for you.</p>
+<pre>
+CONSTRAINT 1 — CONNECTIONS (Lambda in front of Aurora PostgreSQL)
+
+$ ./ramp.sh --to 900-concurrent
+  ...
+  ERROR: FATAL: remaining connection slots are reserved for
+         non-replication superuser connections
+
+$ psql -c "SELECT count(*), state FROM pg_stat_activity GROUP BY state;"
+  count | state
+  ------+---------------------
+   1584 | idle in transaction     &lt;-- 40 ms of work, connection held for 900 ms
+     11 | active
+
+  db.r6g.large max_connections ≈ 1,600. Degradation began at ~600:
+    CPU 30% -> 96% with NO increase in completed work (context switching),
+    each backend ≈ 9 MB, p99 120 ms -> 890 ms.
+
+FIX: RDS Proxy
+$ aws rds create-db-proxy --db-proxy-name orders-proxy \
+    --engine-family POSTGRESQL --role-arn "$ROLE" \
+    --auth '[{"AuthScheme":"SECRETS","SecretArn":"'"$SECRET"'","IAMAuth":"REQUIRED"}]' \
+    --vpc-subnet-ids subnet-a subnet-b --require-tls
+  ... then point the function at the proxy endpoint
+
+AFTER: 900 client connections multiplexed onto 38 database connections
+  p99 890 ms -> 120 ms   |   DB CPU 96% -> 34%   |   zero connection errors
+
+  PINNING WARNING: the proxy cannot multiplex a session that uses session
+  state (SET, advisory locks, temp tables, prepared statements in some
+  drivers). Check the metric:
+$ aws cloudwatch get-metric-statistics --namespace AWS/RDS \
+    --metric-name DatabaseConnectionsCurrentlySessionPinned ...
+  -> 0 is what you want. Ours was 340 until we removed a "SET timezone".
+</pre>
+<pre>
+CONSTRAINT 2 — HOT PARTITION (DynamoDB)
+
+$ ./ramp.sh --to 12000-writes-per-second
+  ProvisionedThroughputExceededException at 6% of provisioned utilisation
+
+$ aws cloudwatch get-metric-statistics --namespace AWS/DynamoDB \
+    --metric-name ThrottledRequests --dimensions Name=TableName,Value=events ...
+  -> 4,900 throttles/min while ConsumedWriteCapacityUnits = 2,400 of 40,000
+
+  cause: PK = eventType, 6 distinct values.
+         "ORDER_CREATED" needed 9,400 WCU; the per-partition ceiling is 1,000.
+
+FIX (both, together)
+  1. change the key:   PK = orderId          (millions of values)
+     SK = eventType#timestamp
+     -> the natural access pattern ("all events for this order") is preserved
+  2. for the genuinely hot aggregate counter, write-shard it:
+     PK = "COUNTER#" + (hash(orderId) % 20)
+     reads fan out over 20 items and sum -> 20x the per-partition ceiling
+
+AFTER: 12,000 writes/s sustained, 0 throttles, consumed 11,600 of 40,000 WCU
+       (and provisioned capacity dropped to 15,000 -> $312/month saved,
+        because the throttling had been "fixed" earlier by over-provisioning)
+</pre>
+        <table class="tbl">
+          <tr><th>Constraint</th><th>Signature in the metrics</th><th>Wrong fix people try first</th></tr>
+          <tr><td>Connections</td><td>DB CPU high, useful work flat, errors mention connections/slots</td><td>A bigger instance — buys a few hundred connections and the same collapse</td></tr>
+          <tr><td>Hot partition</td><td>Throttles at low overall utilisation</td><td>More provisioned capacity — the per-partition ceiling is unchanged, so it only raises the bill</td></tr>
+        </table>
+      <div class="note">🔑 <strong>Both of these are shaped identically: an aggregate number looks fine while a
+         per-unit ceiling is saturated.</strong> Whenever a system throttles at low utilisation, stop looking at
+         totals and find the unit the limit actually applies to — a partition, a shard, a connection slot, an
+         ENI, a single AZ's capacity. Averages hide every constraint in this lesson.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Run the full known-spike playbook for an event expected at
+      4× normal traffic: load-test to find the constraints, fix or pre-scale them, execute the event, and report
+      what the preparation was worth.
+      <details class="solution"><summary>Solution</summary>
+      <p>The purpose of the load test is <strong>to fail</strong>. A test that passes told you nothing except
+         that you did not push hard enough — so test at 2× the expected peak, and expect the constraint to move
+         two or three times before you stop.</p>
+<pre>
+T-2 WEEKS — LOAD TEST AT 2x EXPECTED PEAK (8x normal), PRODUCTION-LIKE STACK
+
+  ROUND 1  failed at 2.4x normal
+    symptom: p99 4.1 s, app CPU 38%, DB CPU 31%
+    cause:   connection pool of 10 per instance, 22 instances = 220 connections,
+             each request waiting 900 ms for a pool slot
+    fix:     Little's Law -> 2,000 req/s x 0.06 s = 120 in flight;
+             pool 10 -> 30 per instance, and a 2 s pool-acquire timeout
+             so a starved pool sheds instead of queueing forever
+
+  ROUND 2  failed at 5.1x normal
+    symptom: DynamoDB throttles at 9% utilisation
+    cause:   hot partition on a "daily totals" counter item
+    fix:     write-sharded across 20 items, summed on read
+
+  ROUND 3  failed at 6.8x normal
+    symptom: 503s from the ALB, targets healthy, CPU fine
+    cause:   ALB scaled in steps; a 10x step arriving in seconds outran it
+    fix:     ramp synthetic traffic before the event; keep the fleet
+             pre-scaled so the ALB has already grown into it
+
+  ROUND 4  passed at 8.2x normal, p99 180 ms, no throttles. STOP.
+    Every fix cost hours; none was architectural.
+</pre>
+<pre>
+T-1 WEEK — QUOTAS (all per-account, per-Region)
+
+$ ./quota-readiness.sh --peak-multiple 4 --failover-multiple 1.0
+  ec2 vCPU (L-1216C47A)      quota 2304   needed 1280   ok
+  lambda concurrency         quota 1000   needed 3200   FAIL   -> raised to 5000
+  apigw steady-state rate    quota 10000  needed  9600   MARGINAL -> raised to 20000
+  elasticache nodes          quota   50   needed    18   ok
+  subnet free IPs (app-a)    free   118   needed   210   FAIL   -> added a /22
+
+T-3 DAYS — PRE-SCALE WHAT IS SLOW TO SCALE
+  ASG minimum 22 -> 60           (scale-out is 1m25s; the spike is faster)
+  Aurora readers 2 -> 5          (a new reader starts with a cold buffer pool)
+  DynamoDB: ramp on-demand traffic gradually for three days so the remembered
+            peak rises — on-demand absorbs roughly 2x the previous peak instantly
+  ElastiCache 3 -> 6 nodes; pre-warm the top 10,000 keys
+
+T-1 DAY   deploy freeze. Verify DLQs empty, alarms not in ALARM, runbook current.
+
+T-2 HOURS scheduled scaling to 100% of predicted peak; synthetic traffic to warm
+          caches and JIT; on-call briefed with the constraint list from the test.
+</pre>
+<pre>
+T-0 — THE EVENT (09:00)
+
+  metric                     predicted     actual
+  ------------------------------------------------------------
+  peak RPS                   4.0x          4.1x normal
+  p99 latency                &lt; 300 ms      212 ms
+  error rate                 &lt; 0.1%        0.02%
+  DynamoDB throttles         0             0
+  shed requests              0             0
+  scaling activities         few           7 (all scale-out, no flapping)
+  oldest queue message       &lt; 300 s       96 s
+  ------------------------------------------------------------
+  extra cost for the week: +$3,400 (pre-scaled fleet $2,100,
+      extra readers $640, cache nodes $410, load-test environment $250)
+
+WHAT THE PREPARATION WAS WORTH
+  the three constraints found in the load test would each have caused a
+  full outage at 2.4x, 5.1x and 6.8x normal traffic. Expected revenue
+  during the two-hour window: $184,000. Preparation cost: $3,400 plus
+  about six engineer-days.
+
+T+ — SCALE IN SLOWLY
+  the post-event tail ran at 2.8x normal for four hours. Scale-in policy
+  set to a 60-minute window; fleet returned to baseline by 18:00 with no
+  latency excursion from cold caches.
+</pre>
+      <div class="note">🔑 <strong>The load test is the deliverable, not the event.</strong> Everything that made
+         the event boring was discovered two weeks earlier by deliberately breaking a copy of the system —
+         and each fix was hours of work, not architecture. Keep the test, parameterise it, and re-run it
+         quarterly: the constraint moves as the system changes, so a load test is a perishable measurement,
+         not a one-off certificate.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Throughput does not merely plateau — it declines.</strong> The measured curve peaked at 16 instances (8,760 req/s) and fell to 7,900 at 24, because a shared lock's cost grows with N². Past the knee, adding capacity costs money and makes latency worse.</li>
+        <li><strong>Scaling means finding the constraint, and the constraint always moves</strong>: app CPU → a hot row → connections → a partition → a quota. Fixing the sequence lock moved the knee from 16 instances to beyond 64, where connections became the new limit.</li>
+        <li><strong>Little's Law (<code>L = λW</code>) sizes pools and concurrency in your head</strong> — 2,400 req/s at 55 ms needs 132 in flight — and explains why a latency increase becomes a capacity crisis with no change in traffic.</li>
+        <li>Five things pin a service to one node: in-memory sessions, local disk, in-process cron, authoritative local caches, and non-idempotent writes. <strong>Idempotency keys are the enabling property</strong> for retries, queues, shedding, failover and cells.</li>
+        <li>Sticky sessions are a migration step with a deletion date, not a design — they unbalance load, make scale-in user-visible, and hide the state problem.</li>
+        <li><strong>Auto scaling is a control loop with 4m40s of delay by construction</strong> (metric + evaluation + boot + app start + health checks). Tuned — detailed monitoring, warm pool, baked AMI — it reached 1m25s, and still cannot serve a thirty-second spike.</li>
+        <li>The four real answers to a spike: <strong>headroom, a faster loop, prediction (scheduled/predictive scaling), and absorption (a queue)</strong>. Most teams try only the second.</li>
+        <li><strong>Scale web tiers on <code>ALBRequestCountPerTarget</code>, not CPU</strong> — an I/O-bound fleet sat at 34% CPU while p99 went 120 ms → 4.2 s and the ASG never reacted.</li>
+        <li><strong><code>default_instance_warmup</code> stops most flapping</strong>: warming instances reporting 0% CPU dragged the average down and triggered scale-in, 14 activities in 40 minutes → 3. Scale out fast, scale in slowly.</li>
+        <li>Lambda's ceiling is <strong>account-wide concurrency (1,000 per Region by default)</strong>, so one noisy function throttles every other; reserved concurrency is the only real isolation, as a ceiling and as a floor.</li>
+        <li><strong>A queue adds patience, not capacity.</strong> Arrival exceeding service by 400 msg/min grew to a <strong>4.1-million backlog</strong> that was only noticed when messages aged out of retention. Alarm on <code>ApproximateAgeOfOldestMessage</code> and on monotonic growth.</li>
+        <li><strong>Scale consumers on backlog per instance</strong> = target latency ÷ processing time (300 ÷ 1.9 = 157). Raw depth oscillates; per-instance backlog is self-normalising.</li>
+        <li><strong>Retries are a capacity multiplier that fires when you have no spare capacity</strong> — 4% errors became 3× load, and the service stayed down 16 minutes after the dependency recovered. Full jitter, a ~10% retry budget, circuit breakers, and never layer retries (3 layers × 3 retries = 27×).</li>
+        <li><strong>Rejecting work is a feature.</strong> At 1.4× overload, shedding 6.1% in 2 ms gave p99 310 ms and 94% goodput against 14.2 s and 61% — and eliminated 1,277 req/s of work discarded by timed-out clients. Shed early, classify first, always send <code>Retry-After</code>.</li>
+        <li><strong>Connections are a resource with memory and scheduling cost.</strong> 900 Lambda executions took DB CPU to 96% doing no extra work; RDS Proxy multiplexed them onto 38 connections and returned p99 to 120 ms — watch <code>DatabaseConnectionsCurrentlySessionPinned</code>.</li>
+        <li>Route reads deliberately: replicas are fine for reports and listings, wrong for read-your-writes and for reads that decide writes. <strong>Sticky-to-primary for N seconds after a write</strong> is the portable pattern.</li>
+        <li><strong>TTL jitter is one line and removed 80% of our stampedes</strong>; add single-flight per key and stale-while-revalidate. CloudFront is usually the highest-leverage cache in the system.</li>
+        <li><strong>Aggregate capacity is a lie if one key is hot</strong> — 38,000 of 40,000 WCU idle while a partition capped at 1,000 WCU threw throttles at 6% utilisation. Choose keys by cardinality <em>and</em> distribution; write-shard genuinely hot keys; expect to re-shard.</li>
+        <li><strong>Quotas are per-account, per-Region, and present as a flat line at a round number</strong> — Lambda 1,000, API Gateway 10,000 RPS, vCPU limits, subnet IPs. Keep a readiness script; raise them during capacity planning, never during the incident.</li>
+        <li><strong>Beyond a point you do not scale the system, you run more of it</strong>: cells of a known-good, load-tested size turn growth into a rehearsed 40-minute operation and bound the blast radius.</li>
+        <li><strong>The load test is the deliverable.</strong> Testing at 2× expected peak found three constraints — each a full outage waiting at 2.4×, 5.1× and 6.8× normal — and all three fixes were hours of work. The event itself was boring, which is the goal.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="resilience-dr.html">← Resilience &amp; Disaster Recovery</a>
+      <a href="quiz.html">AWS Quizzes →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
