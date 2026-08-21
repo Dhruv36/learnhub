@@ -231,7 +231,7 @@ node tools/quizshuffle.js tutorials/<track>                   # de-skew (idempot
 |-------|-----|-----|--------|
 | Docker | `tutorials/docker/` | ✅ **21 at v4** | done |
 | Kubernetes | `tutorials/kubernetes/` | ✅ **22 at v4** | done |
-| AWS | `tutorials/aws/` | 🚧 2 of 20 at v4 | ~20 |
+| AWS | `tutorials/aws/` | 🚧 **18 of 20 at v4** | ~20 |
 | CI/CD | `tutorials/cicd/` | 12 | ~20 |
 | MongoDB | `tutorials/mongodb/` | 12 | ~20 |
 
@@ -245,6 +245,23 @@ Key Takeaways → pager. Heavy cross-linking between pattern lessons.
 
 Forward links to unwritten lessons show as "broken link" in validate.py; that is expected and clears as
 each file lands. Re-run the whole-track validate at the end.
+
+**Authoring notes for a 70–80KB v4 lesson (learned across the AWS track — applies to any track):**
+- These files are too big for one comfortable `Write`. Write **part A** (intro → Parts 1–6 → mistake-pair
+  → Common Mistakes → 6 interview `<details>`) and **part B** (6 exercise `<details>` → Takeaways → pager
+  → closing `</main></div><script>…</body></html>`) to the scratchpad, then `cat A B > tutorials/<track>/<file>.html`.
+  The scratchpad is only a staging area — the committed HTML is always the artifact.
+- **`validate.py` catches two silent-corruption bugs**; always run it before committing:
+  1. **Unescaped `<` inside `<pre>`** — e.g. `PK = TENANT#<id>#<shard>` or `<timestamp>`. Browsers swallow
+     everything to the next `>`. Use `&lt;`/`&gt;`. (`<=` and `<0` are safe — a letter or `/` after `<` is
+     what triggers it.) Hit twice on this track.
+  2. **A stray `</p>` closing a `<div class="note">`** that never opened one. Hit twice; fixed with `sed`
+     after assembly.
+- **Mojibake check** (double-encoded UTF-8 from earlier sessions): `grep -c 'â€\|Â·\|â†’\|Ã' <file>` must
+  print `0`. Write the arrows/bullets as real UTF-8 characters, never as escapes.
+- Structural counts to confirm: `grep -c '<details class="solution">'` = **12**, `grep -c 'class="exercise"'` = **6**.
+- Pager: `prev` = the previous lesson in `nav.js` order, `next` = the following one. The forward link
+  errors until that file lands — expected.
 
 **How to work:** write each lesson at v4 depth, then
 ```
