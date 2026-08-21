@@ -61,7 +61,7 @@ Also: the five v3 files orphaned by the nav split (`pods-deployments`, `services
 
 **🚧 IN PROGRESS: AWS v4 (track 17)** — `tutorials/aws/`, rebuilding 12 v3 lessons (~12KB) into
 **20 lessons at v4 depth** (56–75KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
-**14 of 20 done — §1 Foundations, §2 Networking, §3 Compute and §4 Data COMPLETE:**
+**18 of 20 done — §1 Foundations, §2 Networking, §3 Compute, §4 Data and §5 Operations COMPLETE:**
 
 *§1 Foundations ×4* — ✅ `index.html` (**the shared-responsibility line moves per service**; AZ *names*
 are randomised per account so cross-account placement must use **Zone IDs**; the `us-east-1` control-plane
@@ -173,12 +173,44 @@ in 90 s**, capped by `maxReceiveCount` + rate-limited redrive; **the FIFO messag
 parallelism** — **304 msg/s on one group with 20 idle workers, 18,420 on sixty**; **EventBridge archive is NOT
 retroactive** — a `FilterArns`-scoped replay recovered **3,632 events** without touching 3 healthy consumers;
 **everything is at-least-once → key idempotency on BUSINESS ids, not message ids**)
-**⏳ NEXT: §5 Operations — `observability.html` (v3 rewrite)**, then `iac.html` (v3 rewrite) and
-`security-ops.html` (NEW).
+*§5 Operations ×3* — ✅ `observability.html` (four tools, four questions, and the defaults answering none:
+**CloudTrail data events OFF** so "who downloaded the export?" is unanswerable — scoped to one bucket
+**$0.04 vs $200/mo**; **Average hides outages** — 3 broken hosts of 20 read **1,243 ms while p99 was
+8,103 ms**, and **p50 alongside p99** separates "all slow" from "a subset failing"; **`INSUFFICIENT_DATA` is
+not an alarm** so a *partial* failure fires and a *total* failure silences — fix with
+`--treat-missing-data breaching`, a traffic alarm, and a canary; **metric-dimension cardinality computed at
+$37M/mo**, replaced by **EMF at $32.40** with per-customer latency still queryable; **ingestion $0.50/GB
+dwarfs retention $0.03/GB**; **X-Ray sampled 0.20% of traffic**, and **annotations are indexed, metadata is
+not** — `deployVersion` turns "when did this start?" into a filter) ·
+✅ `iac.html` (**IaC is for review and reproducibility, not automation**, and **state is the hard part**;
+**a one-line diff produced `Replacement: True`** on a production DB — review the *plan*, and fail CI on it;
+**`DeletionPolicy` does NOT cover replacements** — `Retain` was set and the database was destroyed anyway;
+two concurrent applies **orphaned a real resource**, and state holds **passwords in plaintext despite
+`sensitive`**; **CDK logical IDs derive from the construct path** so a cosmetic rename destroys the bucket;
+drift **triaged as revert-it or adopt-it** via CloudTrail, then made *impossible* with an SCP; import as an
+iterate-until-**"0 to change"** loop) ·
+✅ `security-ops.html` (envelope encryption, and **the KMS key policy is authoritative** — `AdministratorAccess`
++ `kms:*` **still denied**, the error naming the resource-based policy; **RDS encryption is a migration, not a
+setting** — snapshot→copy→restore→cut over, **~80 min + a real window**, restore returns defaults; **Lambda env
+vars are readable by `ReadOnlyAccess`**; **rotation is two halves and teams ship one** — TTL cache + one retry
+cut failures to **1**, RDS Proxy + IAM auth to **0**; 3 high-severity GuardDuty findings **unread for 6 days**
+while mining ran → route to a containment fn that **snapshots before isolating and never terminates**;
+**leaked temporary creds cannot be deleted** → deny on `aws:TokenIssueTime`; baseline as StackSets + SCPs +
+**a check tested to fail**)
 
-*Remaining sections:* §5 Operations ×3
-(`observability`, `iac` v3 rewrites, `security-ops` NEW) · §6 Architecture ×3 (`well-architected` v3
-rewrite, `resilience-dr` NEW, `scaling-patterns` NEW).
+*§6 Architecture ×3* — ✅ `well-architected.html` (**the pillars conflict** — architecture is choosing which to
+sacrifice, in writing; **serial dependencies multiply** to **99.32% / 293 min per month** while every
+component's own SLA looks fine, and **one homegrown auth service contributed 215 of those minutes**; each nine
+priced against downtime cost — **99.99%→99.999% saves $3.6k and costs $960k** — with the **break-even
+$/hour as a dated revisit trigger**; **queueing delay = ρ/(1−ρ)** measured on a real fleet (**p99 118 → 402 ms
+between 48% and 81%**), so the answer was **14 instances where the proposal said 12**; **a control people
+bypass is worse than none** → preventive and invisible, plus audited break-glass; an ADR ending the
+multi-Region argument on incident history — **all 5 outages in 3 years were self-inflicted and would have
+replicated**; **3.25 engineer-days closed a contractual SLA breach**)
+**⏳ NEXT: `resilience-dr.html` (NEW — RTO/RPO, the 4 DR strategies, immutable backups, static stability,
+retry storms, FIS game days)**, then `scaling-patterns.html` (NEW) to finish the track.
+
+*Remaining sections:* §6 Architecture ×2 (`resilience-dr` NEW, `scaling-patterns` NEW).
 
 **TWO END-OF-TRACK CHORES:** (1) `s3-cloudfront.html` and `rds-dynamodb.html` are **orphaned** by the
 nav split (s3-cloudfront → `s3` + `edge-dns`; rds-dynamodb → `rds-aurora` + `dynamodb`) — convert both
