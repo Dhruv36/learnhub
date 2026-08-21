@@ -1,0 +1,1227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Resilience &amp; Disaster Recovery — AWS — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../kubernetes/index.html">Kubernetes</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Resilience &amp; Disaster Recovery <span class="level-badge level-ultra">Architecture</span></h1>
+
+    <p><strong>What you'll master:</strong> the distinction that decides every DR design —
+       <strong>high availability survives a component dying; disaster recovery restores state after something
+       destroys it</strong>, and Multi-AZ buys you the first while doing nothing whatsoever about the second,
+       because it replicates a <code>DELETE FROM orders</code> in eleven milliseconds; how to derive a DR
+       strategy from written RTO and RPO numbers instead of picking a tier and reverse-engineering the
+       justification; why <strong>the only RTO that exists is the one you have measured</strong> — a designed
+       "four hours" that had never been rehearsed took <strong>9h47m</strong> on the first real attempt, and
+       <strong>52 minutes</strong> after the four defects that drill exposed were fixed; the restore mechanics
+       nobody reads about until the outage (EBS lazy loading, a 2 TB snapshot restore that came up "available"
+       in 21 minutes and then served queries at <strong>18× normal latency for 40 minutes</strong>); the real
+       RPO of every replication option, including the <strong>last-writer-wins silent overwrite</strong> in
+       DynamoDB global tables; <strong>static stability</strong> — the principle that recovery must never
+       depend on the control plane of the thing that is broken; why <strong>failover time is health check +
+       DNS TTL + JVM cache + connection pool</strong>, which measured <strong>7m12s</strong> where the runbook
+       claimed 90 seconds; and how to run a Region-evacuation game day that finds the quota, certificate and
+       IAM dependencies before an incident does. Prerequisites:
+       <a href="vpc-networking.html">VPCs</a>, <a href="edge-dns.html">Route 53 &amp; load balancers</a>,
+       <a href="rds-aurora.html">RDS &amp; Aurora</a>, <a href="dynamodb.html">DynamoDB</a>,
+       <a href="s3.html">S3</a>, <a href="observability.html">Observability</a> and
+       <a href="well-architected.html">the Well-Architected trade-offs</a>.</p>
+
+    <h2>Part 1 — RTO and RPO Are Contracts, Not Adjectives</h2>
+
+    <p>Every DR conversation that goes badly starts the same way: someone says the system must be "highly
+       available" or "disaster-proof", and the team picks an architecture. Every DR conversation that goes well
+       starts with two numbers written down and signed by someone who owns the revenue.</p>
+
+    <table class="tbl">
+      <tr><th>Term</th><th>Question it answers</th><th>Units</th><th>What it buys</th></tr>
+      <tr><td><strong>RTO</strong> — Recovery Time Objective</td><td>How long may we be down?</td><td>Time from failure to service restored</td><td>Standby capacity, automation, rehearsal</td></tr>
+      <tr><td><strong>RPO</strong> — Recovery Point Objective</td><td>How much data may we lose?</td><td>Time between last durable copy and failure</td><td>Replication frequency and synchronicity</td></tr>
+      <tr><td><strong>RTA / RPA</strong> — the <em>actual</em> figures</td><td>What did the last drill measure?</td><td>Same units, different truth</td><td>Nothing — it is the audit of the above</td></tr>
+    </table>
+
+    <p>RTO and RPO are independent. A nightly backup gives you an RPO of up to 24 hours and, if you have
+       rehearsed the restore, an RTO of 40 minutes. Synchronous replication gives you an RPO of zero and, if
+       nobody has automated the promotion, an RTO of "whenever the on-call engineer wakes up and finds the
+       runbook". Systems fail on <em>one</em> of the two numbers far more often than both.</p>
+
+<pre>
+THE FOUR STRATEGIES (AWS DR whitepaper), WITH THE COST THAT COMES WITH THEM
+
+  strategy            RPO           RTO            what is running in the DR Region
+  ----------------------------------------------------------------------------------
+  Backup &amp; Restore    hours         hours          nothing. Backups exist, that is all.
+  Pilot Light         minutes       tens of mins   data replicated + AMIs/IaC ready;
+                                                   NO application servers running
+  Warm Standby        seconds       minutes        a scaled-down but WORKING copy,
+                                                   serving synthetic traffic
+  Multi-site active   near zero     near zero      full capacity, taking real traffic
+  ----------------------------------------------------------------------------------
+  cost of the DR copy (as % of primary spend, measured on our
+  $41,300/month production estate):
+
+  Backup &amp; Restore    $   380/mo    0.9%   (S3 + AWS Backup storage, cross-Region copy)
+  Pilot Light         $ 4,910/mo   11.9%   (Aurora Global secondary, S3 CRR, NAT, ECR)
+  Warm Standby        $12,740/mo   30.9%   (the above + 2 tasks/service + ALB + 20% RDS)
+  Multi-site active   $46,200/mo  111.9%   (full second copy + cross-Region data transfer)
+</pre>
+
+    <p>Note the shape of that cost curve: the jump from "nothing" to Pilot Light is <strong>13×</strong>, and
+       almost all of it is the replicated database and the cross-Region data transfer at $0.02/GB — not the
+       compute, because in Pilot Light there is no compute. The jump from Warm Standby to active/active is
+       relatively small in dollars and enormous in engineering: every write path now needs a conflict story.</p>
+
+    <div class="note">🔑 <strong>Derive the strategy from the numbers; never the reverse.</strong> The honest
+       sequence is: (1) what does an hour of downtime cost, (2) therefore what RTO can we justify, (3) which
+       strategy achieves it, (4) what does that strategy cost, (5) does step 4 exceed step 1 — if so, relax the
+       RTO in writing. A team that starts at step 3 ends up paying for Warm Standby and, because it was never
+       rehearsed, achieving Backup &amp; Restore.</div>
+
+    <table class="tbl">
+      <tr><th>Symptom in a design review</th><th>What it really means</th></tr>
+      <tr><td>"We need five nines"</td><td>Nobody has priced downtime. See <a href="well-architected.html">the availability arithmetic</a>.</td></tr>
+      <tr><td>"We're multi-AZ, so we're covered"</td><td>HA and DR have been conflated. Part 2.</td></tr>
+      <tr><td>"RTO is 4 hours" with no drill date</td><td>The RTO is unknown. It is not 4 hours; it is unmeasured.</td></tr>
+      <tr><td>"RPO is zero"</td><td>Only true for synchronous replication, and then only for infrastructure failure — not for a bad migration, which is replicated instantly.</td></tr>
+      <tr><td>One RTO for the whole company</td><td>Tier the workloads. Checkout and the internal reporting dashboard do not deserve the same money.</td></tr>
+    </table>
+
+    <p>Tiering is the single highest-leverage move in this entire lesson. On the estate above, applying one
+       strategy to everything cost $12,740/month. Tiering it — active/active for the payment API, Warm Standby
+       for the customer-facing app, Pilot Light for internal tooling, Backup &amp; Restore for analytics —
+       produced a <em>better</em> RTO on the tier that mattered for <strong>$9,180/month</strong>, because the
+       money moved to where downtime was expensive.</p>
+
+    <h2>Part 2 — High Availability Is Not Disaster Recovery</h2>
+
+    <p>This is the most consequential confusion in the field, and it survives because both words sound like
+       "the system stays up".</p>
+
+    <table class="tbl">
+      <tr><th></th><th>High Availability</th><th>Disaster Recovery</th></tr>
+      <tr><td>Protects against</td><td>A component failing: an instance, an AZ, a disk</td><td>State being destroyed or a Region being lost</td></tr>
+      <tr><td>Mechanism</td><td>Redundancy + health checks + automatic failover</td><td>An independent, older, immutable copy of the data</td></tr>
+      <tr><td>Scope</td><td>Usually inside one Region</td><td>Usually across Regions and <em>accounts</em></td></tr>
+      <tr><td>Typical RTO</td><td>Seconds to a couple of minutes</td><td>Minutes to hours</td></tr>
+      <tr><td>Useless against</td><td>Logical corruption, bad deploys, deletion</td><td>Nothing — but you pay in RPO</td></tr>
+      <tr><td>AWS examples</td><td>Multi-AZ RDS, ASG across 3 AZs, ALB, DynamoDB (inherently multi-AZ)</td><td>Snapshots, PITR, versioning, cross-account copies, Aurora Backtrack</td></tr>
+    </table>
+
+    <p>The distinction becomes concrete the moment you look at what actually causes outages. Here is the
+       incident record from the estate above — every Sev1/Sev2 over three years, classified by whether a second
+       AZ or a second Region would have helped:</p>
+
+<pre>
+INCIDENT CLASSIFICATION, 3 YEARS, 14 INCIDENTS
+
+  cause                                    count   Multi-AZ helps?   Multi-Region helps?
+  ---------------------------------------------------------------------------------------
+  bad deploy / bad config change             6          no                 no
+  dependency saturation (pool, quota)        3          no                 no
+  expired certificate / credential           2          no                 no
+  logical data damage (migration, DELETE)    1          no                 no  (replicated)
+  single EC2 instance failure                1          YES                yes
+  AZ-level impairment (EBS in one AZ)        1          YES                yes
+  full Region impairment                     0          n/a                n/a
+  ---------------------------------------------------------------------------------------
+  covered by Multi-AZ .......... 2 of 14 (14%)
+  needed DR (restore state) .... 1 of 14  (7%)
+  needed neither, only better
+  change safety and limits ..... 11 of 14 (79%)
+</pre>
+
+    <div class="note">⚠️ <strong>Replication is not a backup, because replication is <em>fast and faithful</em>.</strong>
+       In the logical-damage incident, an accidental <code>DELETE</code> against the writer was present on the
+       Multi-AZ standby in <strong>11 ms</strong>, on the cross-Region Aurora secondary in <strong>[0.9 s]</strong>,
+       and in the S3 replica bucket within the minute. Every copy was perfect. The recovery came from
+       Backtrack — an <em>older</em> copy, which is the entire point. The property you need from a backup is not
+       "another copy" but "a copy that has not yet seen the damage".</div>
+
+    <p>The corollary matters more than the rule: the four properties that make a copy a real backup are
+       <strong>older</strong> (a point in time before the damage), <strong>immutable</strong> (nothing with
+       production credentials can delete it), <strong>isolated</strong> (a different account, ideally a
+       different Region), and <strong>proven</strong> (a restore has been performed from it recently). A copy
+       missing any of the four is storage, not a backup — most notably the very common case of nightly
+       snapshots that live in the same account as the thing they protect, which a compromised or mistaken
+       admin credential removes along with everything else.</p>
+
+    <h2>Part 3 — Backups That Actually Restore</h2>
+
+    <p>Everyone has backups. The interesting question is what happens in the 40 minutes after you start the
+       restore, and AWS storage has two behaviours that surprise people at exactly that moment.</p>
+
+    <h3>3.1 EBS and RDS restores are lazy</h3>
+
+    <p>An EBS snapshot lives in S3. When you restore a volume from it, the volume is available immediately —
+       but blocks are fetched from S3 <em>on first access</em>. The volume reports "available", the database
+       reports "available", and then the first queries touch cold blocks and pay an S3 round trip each.</p>
+
+<pre>
+MEASURED: RESTORE OF A 2 TB RDS (gp3, PostgreSQL) FROM SNAPSHOT
+
+  t+0m00s   restore-db-instance-from-db-snapshot issued
+  t+21m14s  status = available          &lt;-- the runbook declared victory here
+  t+21m30s  first application query      p50 = 412 ms   (normal p50 = 23 ms)
+  t+30m00s  sustained traffic            p50 = 288 ms   p99 = 3,900 ms
+  t+61m00s  most working set touched     p50 =  31 ms   p99 =   210 ms
+  t+95m00s  fully warm                   p50 =  23 ms   p99 =   180 ms
+
+  "available" to "actually usable"  = 40 minutes of 18x latency
+  the RTO the drill claimed          = 21 minutes
+  the RTO the customer experienced   = 61 minutes
+</pre>
+
+    <div class="note">🔑 <strong>Define RTO as "meets the latency SLO", not as "status = available".</strong>
+       Options for the gap: <strong>Fast Snapshot Restore</strong> (FSR) pre-hydrates a snapshot in a chosen AZ
+       so restored volumes get full performance immediately — it is billed per hour per snapshot per AZ (about
+       <strong>$0.75/hour</strong>, roughly <strong>$540/month</strong> per snapshot per AZ, so enable it on
+       the DR snapshot only when a drill is scheduled or the RTO genuinely demands it); or restore early and
+       run a warming pass (<code>pg_prewarm</code>, a full table scan) before shifting traffic; or accept the
+       warm-up and write it into the RTO.</div>
+
+    <h3>3.2 Restore does not restore everything</h3>
+
+    <p>Restores produce a <em>new resource</em>, and new resources do not inherit the operational furniture of
+       the old one. This is where drills lose their first twenty minutes.</p>
+
+    <table class="tbl">
+      <tr><th>Restore type</th><th>What you get</th><th>What is NOT restored — you must reapply</th></tr>
+      <tr><td>RDS snapshot restore</td><td>A new instance with a new endpoint</td><td>Parameter group choices if not specified, security groups (defaults applied), Multi-AZ setting, tags, CloudWatch alarms, IAM auth config, the <em>endpoint name</em> every client is configured with</td></tr>
+      <tr><td>DynamoDB PITR / backup restore</td><td>A new table</td><td>Auto scaling policies, IAM resource policies, CloudWatch alarms, tags, TTL settings, stream settings — and the table name</td></tr>
+      <tr><td>EBS snapshot</td><td>A new volume in one AZ</td><td>Attachment, mount, fstab entries, and any encryption key grant if the KMS key differs</td></tr>
+      <tr><td>S3 versioning</td><td>Previous object versions in place</td><td>Nothing to restore — but deletes leave a <em>delete marker</em>; recovery means removing markers, at scale, in order</td></tr>
+    </table>
+
+    <p>The endpoint problem is the one that bites hardest: your application connects to
+       <code>orders.cluster-abc123.eu-west-1.rds.amazonaws.com</code>, and the restore produced
+       <code>orders-restore-2026-08-21.cluster-xyz789...</code>. If the connection string is baked into a task
+       definition, recovery now includes a deploy. The fix is a layer of indirection created <em>before</em>
+       the incident: a Route 53 CNAME (<code>db.internal.example.com</code>) or a Secrets Manager /
+       Parameter Store lookup at connection time, so recovery is a one-record change rather than a release.</p>
+
+    <h3>3.3 Immutability and isolation</h3>
+
+<pre>
+THE BACKUP TOPOLOGY THAT SURVIVES A COMPROMISED ADMIN CREDENTIAL
+
+  ACCOUNT: prod (blast radius)          ACCOUNT: backup-vault (isolated)
+  ----------------------------          ---------------------------------
+  RDS / Aurora ---- AWS Backup ------->  Vault with VAULT LOCK (compliance)
+  DynamoDB     ----   plan       ----->  min retention 35d, max 400d
+  EBS          ----             ----->  cross-Region copy to us-west-2
+  S3 bucket    ---- replication ----->  bucket with OBJECT LOCK + versioning
+
+  properties enforced by the platform, not by policy:
+   - Vault Lock in COMPLIANCE mode cannot be disabled or shortened by ANYONE,
+     including the account root, once the 3-day cooling-off window elapses
+   - S3 Object Lock in COMPLIANCE mode: no version can be deleted or
+     overwritten until its retain-until date, root included
+   - the prod account has NO permission to delete in the vault account;
+     only to create
+</pre>
+
+    <div class="note">⚠️ <strong>The 3-day cooling-off window on Vault Lock compliance mode is the setting
+       people skip.</strong> Until it elapses, the lock is reversible — which is a feature (you can fix a
+       mistake) and a trap (a team that enabled it on Friday and was breached on Saturday had a reversible
+       lock). Governance mode, by contrast, is reversible forever by anyone holding
+       <code>backup:DisableVaultLock</code> — useful for testing, worth nothing against a compromised admin.</div>
+
+    <h2>Part 4 — Replication: The RPO You Get, Not the One on the Slide</h2>
+
+    <p>Every replication option is asynchronous unless it explicitly is not, and asynchronous means your RPO is
+       the replication lag <em>at the moment of failure</em> — which is the worst moment, because failures
+       correlate with load, and lag correlates with load.</p>
+
+    <table class="tbl">
+      <tr><th>Mechanism</th><th>Sync?</th><th>Typical lag</th><th>Realistic RPO</th><th>The catch</th></tr>
+      <tr><td>RDS Multi-AZ (single standby)</td><td><strong>Synchronous</strong></td><td>—</td><td>Zero (infrastructure failure only)</td><td>Standby is not readable; failover typically 60–120 s</td></tr>
+      <tr><td>RDS Multi-AZ DB cluster (2 readable standbys)</td><td>Semi-sync to one</td><td>ms</td><td>Near zero</td><td>Failover typically under 35 s; more expensive</td></tr>
+      <tr><td>RDS cross-Region read replica</td><td>Async</td><td>Seconds–minutes</td><td>= lag; promotion is manual</td><td>Lag grows under write bursts and long transactions</td></tr>
+      <tr><td>Aurora Global Database</td><td>Async, storage-level</td><td>Typically under 1 s</td><td>Seconds (unplanned); zero for managed <em>planned</em> failover</td><td>Replication is done by the storage layer, so it barely loads the writer — but unplanned promotion still loses the in-flight tail</td></tr>
+      <tr><td>DynamoDB global tables</td><td>Async, multi-active</td><td>Typically under 1 s</td><td>Seconds</td><td><strong>Last writer wins</strong> — concurrent writes in two Regions silently discard one</td></tr>
+      <tr><td>S3 Cross-Region Replication</td><td>Async</td><td>Seconds–minutes</td><td>Minutes; <strong>no ordering guarantee</strong></td><td>Add <strong>RTC</strong> for a 15-minute SLA; existing objects need Batch Replication</td></tr>
+      <tr><td>EBS snapshot copy / AWS Backup copy</td><td>Scheduled</td><td>= schedule</td><td>Hours</td><td>Copy time itself counts against RPO</td></tr>
+    </table>
+
+    <h3>4.1 Measuring your own lag instead of quoting the docs</h3>
+
+<pre>
+MEASURED: AURORA GLOBAL DATABASE, eu-west-1 -> us-east-1, ONE WEEK
+
+  metric: AuroraGlobalDBReplicationLag  (milliseconds)
+
+  quiet period (03:00-06:00)      p50 =   142 ms   p99 =    380 ms
+  business hours                  p50 =   310 ms   p99 =  1,240 ms
+  nightly batch write (23:00)     p50 = 4,900 ms   p99 = 21,700 ms   &lt;-- !!
+  during the Black Friday peak    p50 = 2,100 ms   p99 =  8,400 ms
+
+  the RPO on the design document:  "under 1 second"
+  the RPO if we lose the Region at 23:14: up to 21.7 SECONDS of writes
+</pre>
+
+    <p>Twenty-one seconds of writes at that hour is roughly 4,000 orders. The design document was not lying —
+       sub-second is the typical figure — it was quoting a median as if it were a guarantee. Alarm on the
+       <em>p99 of replication lag</em>, not the average, and state RPO as "under N seconds at p99, measured
+       weekly", with the batch-window exception written down.</p>
+
+    <h3>4.2 The last-writer-wins trap in global tables</h3>
+
+    <p>DynamoDB global tables are <em>multi-active</em>: every replica accepts writes. Conflicts are resolved
+       by last writer wins, using the timestamp assigned by the receiving Region. There is no application-level
+       conflict callback, no vector clock, and no error.</p>
+
+<pre>
+TWO REGIONS, ONE ITEM, 300 ms APART
+
+  t+0ms    eu-west-1: UpdateItem cart#914  ADD items :socks     -> {shoes, socks}
+  t+300ms  us-east-1: UpdateItem cart#914  ADD items :hat       -> {shoes, hat}
+                      (us-east-1 has not yet seen the socks write)
+  t+1.1s   replication settles
+
+  RESULT: {shoes, hat}.  The socks write is gone. No error was returned,
+          no metric incremented, no log line written. The customer sees a
+          cart that "lost" an item and blames the app.
+</pre>
+
+    <div class="note">🔑 <strong>Multi-active is a routing decision, not a database feature you switch on.</strong>
+       Either pin each entity to a home Region (route by tenant, user or cart ID so a given item is only written
+       in one place — an active/active <em>fleet</em> with single-writer <em>data</em>), or design the item so
+       conflicting writes cannot collide: per-write records instead of mutated sets, distinct attributes per
+       Region, or CRDT-shaped structures you fold at read time. "Just turn on global tables and go
+       active/active" is how you get silent, unattributable data loss.</div>
+
+    <h3>4.3 S3 replication has no ordering guarantee</h3>
+
+    <p>CRR replicates objects independently. If your process writes <code>data.parquet</code> and then
+       <code>_SUCCESS</code>, the destination bucket can receive <code>_SUCCESS</code> first — and a consumer in
+       the DR Region will read a manifest that promises data which has not arrived. Replication Time Control
+       gives you a 15-minute SLA and per-object metrics, but not ordering. Design the DR consumer to verify,
+       not to trust the marker: compare object counts, sizes or a checksum manifest before acting.</p>
+
+    <h2>Part 5 — Failover Mechanics: Static Stability and the Control Plane</h2>
+
+    <p>Two ideas do most of the work here. The first is that every AWS service has a <strong>control
+       plane</strong> (create, modify, delete — the APIs) and a <strong>data plane</strong> (the thing actually
+       serving: running instances, an ALB forwarding packets, S3 GETs). Data planes are engineered for higher
+       availability than control planes and stay up in situations where control planes are impaired.</p>
+
+    <p>The second idea follows from the first, and it is the single most useful principle in DR design:</p>
+
+    <div class="note">🔑 <strong>Static stability: a system should keep working, and recovery should complete,
+       without making any control-plane call to the impaired thing.</strong> If your Region failover requires
+       <code>RunInstances</code> in the failover Region, an ACM certificate to be issued, a quota increase to
+       be approved, or an IAM role to be created, then your DR plan has a dependency on exactly the kind of
+       API that is least likely to work under a large correlated event — and on a support queue that will be
+       very busy. Pre-provision, and let the recovery action be a <em>data-plane</em> action: shift weight,
+       flip a routing control, scale an already-warm ASG.</div>
+
+<pre>
+THE SAME FAILOVER, TWO DESIGNS
+
+  DYNAMIC (what most runbooks say)          STATIC (what survives)
+  --------------------------------          ------------------------------------
+  1. terraform apply in us-west-2           1. capacity already running at 30%
+  2. wait for ASG to launch 40 instances    2. ALB + target groups already exist
+  3. request quota increase (vCPU limit)    3. quotas already raised, verified
+  4. create/validate ACM cert               4. cert issued and attached months ago
+  5. update Route 53                        5. flip the ARC routing control
+  6. hope RunInstances succeeds in a        6. ASG desired count 30% -> 100%
+     Region every other customer is            (a data-plane-ish scaling action
+     also failing into                          against pre-warmed capacity)
+
+  drill result, dynamic design:  FAILED at step 3 (quota), 4h11m elapsed
+  drill result, static design:   52 minutes end to end, no support ticket
+</pre>
+
+    <h3>5.1 Failover time is a sum, and DNS is only the first term</h3>
+
+    <p>"Route 53 fails over in 90 seconds" is true and irrelevant, because clients do not obey it. The real
+       client-observed recovery is the sum of every cache between the health check and the socket.</p>
+
+<pre>
+MEASURED: CLIENT-OBSERVED FAILOVER, BEFORE AND AFTER
+
+  term                                          before        after
+  --------------------------------------------------------------------
+  health check detection                        90 s          30 s
+    (3 failures x 30 s interval)                              (fast: 3 x 10 s)
+  Route 53 record TTL                           300 s         60 s
+  resolver / OS cache beyond TTL                ~20 s         ~20 s
+  JVM DNS cache (networkaddress.cache.ttl)      infinite!     30 s
+    - a SecurityManager was installed, so the
+      JVM cached the successful lookup FOREVER
+  connection pool holding sockets to dead IPs   until app     15 s
+    - pools do not re-resolve on their own;       restart     (maxLifetime
+      an open TCP connection never checks DNS                  + validation)
+  --------------------------------------------------------------------
+  TOTAL client-observed recovery                7m12s*        1m35s
+  runbook claim                                 90 s          90 s
+  * and only because someone restarted the fleet at 7m12s
+</pre>
+
+    <div class="note">⚠️ <strong>Every cache in that list is a client-side setting, so DR work is application
+       work.</strong> Set <code>networkaddress.cache.ttl</code> explicitly (do not inherit it), bound connection
+       lifetime in every pool (<code>maxLifetime</code> in HikariCP, <code>maxIdleTime</code> in most others),
+       enable connection validation, and use a short TTL on the failover record — 60 s costs a rounding error
+       in Route 53 queries and removes 240 s from your RTO. Then measure it from a real client, because the
+       one term you did not think of is the one that dominates.</div>
+
+    <h3>5.2 Health checks that check the right thing</h3>
+
+    <table class="tbl">
+      <tr><th>Health check target</th><th>Fails over when…</th><th>Problem</th></tr>
+      <tr><td><code>/</code> or TCP port open</td><td>The process is dead</td><td>Misses a healthy process serving 100% errors because its database is unreachable</td></tr>
+      <tr><td>Deep check that queries the DB</td><td>Any dependency is degraded</td><td>A shared dependency blip fails over <em>every</em> Region at once, or flaps — the classic self-inflicted outage</td></tr>
+      <tr><td>Composite: shallow liveness + a separate readiness signal</td><td>This Region specifically cannot serve</td><td>The right answer, and the most work</td></tr>
+    </table>
+
+    <p>The rule from <a href="../kubernetes/probes.html">probes</a> transfers exactly: <strong>a check may only
+       test what its remedy can fix</strong>. Regional failover is the remedy, so the check must test something
+       regional. If the payment provider is down globally, failing over to us-east-1 achieves nothing except
+       moving a broken service and adding cross-Region latency to the incident.</p>
+
+    <h3>5.3 Route 53 ARC, and when it is worth $2,190 a month</h3>
+
+    <p>Route 53 Application Recovery Controller gives you <strong>routing controls</strong> — on/off switches for
+       traffic to a cell or Region — whose data plane is distributed across five Regions, so you can flip them
+       during an event in which the Route 53 control plane (us-east-1) is impaired. It also provides
+       <strong>readiness checks</strong> (is the standby actually configured to take traffic: capacity, quotas,
+       replicas) and <strong>safety rules</strong> (never let an operator turn off the last healthy cell, or
+       turn on a cell that is not ready).</p>
+
+    <p>An ARC cluster is billed at about <strong>$3.00/hour — roughly $2,190/month</strong>, which makes it the
+       most expensive line item in many DR budgets and one that is entirely correct for a payment system and
+       entirely wrong for an internal tool. The cheap approximation for smaller workloads: Route 53 failover
+       records with health checks pointed at an S3 object you can toggle, giving a manual "big red switch"
+       whose control path is S3, not your application.</p>
+
+    <h2>Part 6 — Proving It: Game Days, Blast Radius, and Failing Back</h2>
+
+    <h3>6.1 The drill is the design review</h3>
+
+    <p>A DR plan that has never been executed is a hypothesis. The first drill on this estate was scheduled for
+       two hours and took nine hours and forty-seven minutes; none of the four blocking defects were on
+       anyone's risk list, and none of them were exotic.</p>
+
+<pre>
+DRILL 1 — "EVACUATE eu-west-1", FINDINGS IN ORDER OF DISCOVERY
+
+  t+00:12  FAIL  ACM certificate for the failover ALB did not exist in us-east-1
+                 (certs are REGIONAL; CloudFront additionally requires us-east-1)
+                 -> issued + DNS validation: 34 minutes
+  t+01:05  FAIL  vCPU quota in us-east-1 was the account default; the ASG
+                 launched 9 of 40 instances and then InsufficientInstanceCapacity
+                 -> quota increase via support: 3h20m (this dominated the drill)
+  t+04:40  FAIL  Secrets Manager secrets were not replicated; the app started,
+                 could not read DB credentials, crash-looped
+                 -> enabled multi-Region secret replication: 18 minutes
+  t+05:20  FAIL  ECR images were only in eu-west-1; ECS could not pull
+                 -> cross-Region replication rule + re-push: 41 minutes
+  t+06:50  OK    application serving; Aurora secondary promoted (RPO 1.4 s)
+  t+09:47  OK    all synthetic checks green, drill declared complete
+
+  DRILL 2 (same scenario, 6 weeks later, after fixes):  52 minutes
+  DRILL 3 (unannounced, on-call engineer only):         71 minutes
+</pre>
+
+    <div class="note">🔑 <strong>Every one of those four defects is a static-stability failure</strong> — each
+       required a control-plane action (issue, request, replicate, push) at the worst possible time. And note
+       what drill 3 measured that drill 2 could not: the difference between the team that built it running the
+       plan, and one on-call engineer at 03:00 following it. That 19-minute delta is your real RTO.</div>
+
+    <h3>6.2 Fault injection, safely</h3>
+
+    <table class="tbl">
+      <tr><th>Experiment</th><th>Tool</th><th>What it proves</th></tr>
+      <tr><td>Kill 30% of instances</td><td>FIS <code>aws:ec2:terminate-instances</code></td><td>ASG replacement + connection draining actually work</td></tr>
+      <tr><td>Isolate one AZ</td><td>FIS <code>aws:network:disrupt-connectivity</code> (AZ scope)</td><td>The system survives AZ loss <em>without</em> a human; also finds the resource pinned to one AZ</td></tr>
+      <tr><td>Add 200 ms latency to a dependency</td><td>FIS SSM latency action</td><td>Timeouts and circuit breakers are configured, not defaults</td></tr>
+      <tr><td>Fail Aurora over</td><td><code>failover-db-cluster</code></td><td>Client reconnect logic, and the true failover window</td></tr>
+      <tr><td>Revoke a permission</td><td>Scoped deny in a test account</td><td>Degradation is graceful, not a crash loop</td></tr>
+    </table>
+
+    <p>Two rules make this safe: every experiment declares a <strong>stop condition</strong> (a CloudWatch alarm
+       that aborts it automatically — FIS supports this natively), and the first run of anything happens in a
+       pre-production account. The value is not in breaking things; it is in the moment somebody says "that
+       shouldn't have affected checkout" and is wrong.</p>
+
+    <h3>6.3 Blast radius: cells and shuffle sharding</h3>
+
+    <p>DR reduces the cost of a disaster. Cell-based architecture reduces the <em>probability</em> that any one
+       customer sees it, by making failures partial instead of total.</p>
+
+<pre>
+SHUFFLE SHARDING, WHY THE ARITHMETIC IS SO GOOD
+
+  8 cells, each tenant assigned to 2 of them  ->  C(8,2) = 28 distinct pairs
+
+  one poisoned tenant takes down BOTH of its cells:
+    - tenants sharing BOTH cells (fully down):  1 in 28  = 3.6%
+    - tenants sharing ONE cell (degraded, other cell absorbs): 12 in 28 = 43%
+    - tenants sharing NEITHER (unaffected):     15 in 28  = 54%
+
+  compare: one shared fleet -> 100% of tenants down
+           8 plain (non-shuffled) shards -> 12.5% of tenants fully down
+
+  measured during a real poison-pill incident (a tenant's 400 MB
+  request body exhausting worker threads):
+    before cells: 100% of tenants saw errors for 22 minutes
+    after cells:  3.6% of tenants saw errors for 22 minutes,
+                  43% saw elevated latency for 90 seconds
+</pre>
+
+    <h3>6.4 Failing back is harder than failing over</h3>
+
+    <p>Failover is a rehearsed emergency. Failback is an unrehearsed reversal in which the two sides have
+       diverged, and it is where drills usually stop and real incidents do not.</p>
+
+    <table class="tbl">
+      <tr><th>Failback question</th><th>Why it is hard</th><th>Design answer</th></tr>
+      <tr><td>Where is the authoritative data now?</td><td>The DR Region took writes; the original has an older, partially-replicated copy</td><td>Declare the DR Region primary and reverse replication — do not "sync back"</td></tr>
+      <tr><td>Did the original Region lose writes?</td><td>Unpromoted replicas may hold writes the new primary never saw</td><td>Snapshot the old primary <em>before</em> anything reconnects; reconcile offline</td></tr>
+      <tr><td>When do we go back?</td><td>Pressure to return "to normal" while the Region is still recovering</td><td>Never during the incident. Schedule failback as a planned change, with its own runbook</td></tr>
+      <tr><td>Do we need to go back at all?</td><td>Symmetric design means "primary" is just a label</td><td>Build symmetric, then failback is the next scheduled failover — the best possible answer</td></tr>
+    </table>
+
+    <div class="note">💡 <strong>The strongest DR posture is one where failover is boring because it happens on
+       purpose.</strong> Teams that fail over between Regions on a schedule — monthly, in business hours,
+       announced — never discover a certificate, quota or credential problem during an actual outage, because
+       the plan is exercised more often than it is needed. It also removes the worst failure mode of all:
+       hesitation, because nobody is sure the failover will work.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A DR plan consisting of Multi-AZ everywhere, nightly snapshots in the production account,
+         a Route 53 record with a 300-second TTL, an untested four-hour RTO on a wiki page last edited
+         eighteen months ago, and cross-Region replication described as a backup.</strong> Multi-AZ covers 14%
+         of the incidents this system has actually had, and none of the top three causes. The snapshots share
+         an account with the workload, so the credential that deletes production deletes them too. The
+         300-second TTL is the smallest term in a failover budget dominated by a JVM that caches DNS forever
+         and a connection pool that never re-resolves, so the true recovery is seven minutes and only after a
+         fleet restart. The four-hour RTO is a wish: the first real attempt will spend three hours and twenty
+         minutes in a support queue for a vCPU quota nobody raised in the failover Region, and will then fail
+         again on an ACM certificate that does not exist there, on secrets that were never replicated, and on
+         container images that live in one Region's registry. And the replica is not a backup — when a
+         migration deletes 40,000 rows, the replica deletes them too, perfectly, in under a second.</p>
+      <p>✅ <strong>Written RTO/RPO per workload tier, signed by someone who owns the revenue; backups that are
+         older, immutable, isolated and proven; static stability everywhere in the recovery path; failover
+         time measured from a real client; and a drill on the calendar.</strong> Tier the estate so the payment
+         API gets active/active and analytics gets Backup &amp; Restore — the same money buys a better RTO
+         where it matters. Push backups into a separate account behind Vault Lock in compliance mode, past its
+         three-day cooling-off window, with S3 Object Lock on the object copies. Pre-provision the failover
+         Region completely: quotas raised and verified by a readiness check, certificates issued, secrets
+         replicated, images replicated, capacity already running at 30% — so recovery is "scale up and flip a
+         routing control", not "create things during an event". Set the DNS TTL to 60 s <em>and</em> pin
+         <code>networkaddress.cache.ttl</code>, bound pool connection lifetime, and measure the total from a
+         client rather than from Route 53. Alarm on the p99 of replication lag, not the mean, and state the RPO
+         as a measured number with its batch-window exception. Then drill it: announced first, unannounced
+         second, with the on-call engineer driving — and treat the delta between those two numbers as the RTO
+         you actually have.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What happens</th><th>Do this instead</th></tr>
+      <tr><td>Treating Multi-AZ as disaster recovery</td><td>Every logical error is replicated synchronously; 79% of real incidents are unaffected by it</td><td>HA for component failure, DR for state destruction — budget for both, separately</td></tr>
+      <tr><td>Backups in the same account as the workload</td><td>The compromised or mistaken credential that destroys production destroys the backups</td><td>Separate backup account, Vault Lock (compliance), cross-Region copy, no delete permission from prod</td></tr>
+      <tr><td>Declaring RTO met at "status = available"</td><td>A 2 TB restore served 18× latency for 40 more minutes because EBS hydrates lazily</td><td>Define RTO as "meets the latency SLO"; pre-warm, or use Fast Snapshot Restore for the drill</td></tr>
+      <tr><td>Quoting median replication lag as RPO</td><td>The p99 during the nightly batch was 21.7 s — roughly 4,000 orders, not "under a second"</td><td>Alarm on p99 lag; state RPO as a measured p99 with named exceptions</td></tr>
+      <tr><td>Turning on DynamoDB global tables and calling it active/active</td><td>Last-writer-wins silently discards concurrent writes — no error, no metric, no log</td><td>Pin entities to a home Region, or model data so writes cannot conflict</td></tr>
+      <tr><td>Trusting <code>_SUCCESS</code> markers across S3 CRR</td><td>Replication has no ordering guarantee; the marker can arrive before the data</td><td>Verify counts/checksums in the destination; use RTC for a 15-minute SLA</td></tr>
+      <tr><td>A recovery plan that creates resources in the failover Region</td><td>Control-plane calls, quota requests and certificate issuance during the event — 3h20m of a 4h11m drill was a support ticket</td><td>Static stability: pre-provision everything; recovery is scale-up plus a routing flip</td></tr>
+      <tr><td>Budgeting failover as "the Route 53 TTL"</td><td>JVM DNS cache and connection pools dominated: 7m12s observed against a 90 s claim</td><td>Pin <code>networkaddress.cache.ttl</code>, bound pool <code>maxLifetime</code>, measure from a client</td></tr>
+      <tr><td>Deep health checks on shared dependencies</td><td>One dependency blip fails over every Region at once, or flaps between them</td><td>Regional signal for a regional remedy; separate liveness from readiness</td></tr>
+      <tr><td>Hardcoded database endpoints</td><td>Restore produces a new endpoint, so recovery now requires a deploy</td><td>Indirection created in advance: internal CNAME or a secret resolved at connect time</td></tr>
+      <tr><td>One RTO for the whole company</td><td>Uniform spend, wrong distribution — the checkout path and the reporting dashboard get the same protection</td><td>Tier workloads; the tiered estate cost less <em>and</em> recovered the important tier faster</td></tr>
+      <tr><td>Never rehearsing, or only rehearsing with the authors</td><td>The plan works for the people who wrote it; the on-call engineer took 19 minutes longer</td><td>Announced drill, then unannounced, with on-call driving; schedule failovers so they are routine</td></tr>
+      <tr><td>No failback plan</td><td>Divergent data, pressure to return during an unstable window, and a "sync back" that overwrites real writes</td><td>Reverse the replication direction; snapshot the old primary before reconnecting; fail back as a planned change</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between RTO and RPO, and can you give an example where one is small and the other is large?</summary>
+      <p><strong>RTO</strong> is how long the service may be unavailable — measured from the failure to service
+         restored. <strong>RPO</strong> is how much data you may lose — measured from the last durable copy back
+         to the failure. They are independent axes and are bought with different things: RTO with standby
+         capacity, automation and rehearsal; RPO with replication frequency and synchronicity.</p>
+      <p><strong>Small RTO, large RPO:</strong> a stateless marketing site restored from a nightly S3 sync — up
+         in 3 minutes, but any content published since last night is gone (RPO 24 h).
+         <strong>Large RTO, small RPO:</strong> an Aurora Global Database with no automation — the secondary is
+         within a second of the writer (RPO ~1 s), but promotion is manual and the runbook has never been used,
+         so the RTO is however long it takes to page someone and have them work it out.</p>
+      <p>The senior addition: quote both as <em>measured</em> figures with a drill date. An RTO that has never
+         been executed is not a number, it is an intention — the first drill on our estate turned a claimed
+         4 hours into a measured 9h47m.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Name the four DR strategies and what is running in the DR Region for each.</summary>
+      <table class="tbl">
+        <tr><th>Strategy</th><th>Running in DR</th><th>RPO / RTO</th><th>Good fit</th></tr>
+        <tr><td>Backup &amp; Restore</td><td>Nothing — just backups (ideally cross-Region, cross-account)</td><td>Hours / hours</td><td>Analytics, internal tools, anything where a day of downtime is survivable</td></tr>
+        <tr><td>Pilot Light</td><td>Data replicated; no application compute. AMIs/images and IaC ready</td><td>Minutes / tens of minutes</td><td>The common sweet spot — you pay mostly for the database copy</td></tr>
+        <tr><td>Warm Standby</td><td>A scaled-down but functional copy, serving synthetic traffic</td><td>Seconds / minutes</td><td>Customer-facing apps with a real revenue cost per hour</td></tr>
+        <tr><td>Multi-site active/active</td><td>Full capacity, taking real traffic</td><td>Near zero / near zero</td><td>Payments, auth — and only where the write path has a conflict story</td></tr>
+      </table>
+      <p>The one thing to add unprompted: Warm Standby's real advantage over Pilot Light is not the compute, it
+         is that a warm copy is <em>continuously proven</em>. Something that serves synthetic traffic every
+         minute cannot silently rot, whereas a pilot light discovers its missing certificate during the
+         incident.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Your production database is Multi-AZ with cross-Region read replicas and hourly snapshots. An engineer runs a migration that drops a column with three years of data. Walk through the recovery.</summary>
+      <p>First, state the thing the question is testing: <strong>none of the three mechanisms listed protects
+         against this</strong>. Multi-AZ applied the DDL synchronously. The cross-Region replica applied it
+         within seconds. Both copies are perfect and both are wrong. Only the snapshot — an <em>older</em> copy
+         — has the data.</p>
+      <p>The recovery, in order:</p>
+      <ol>
+        <li><strong>Stop the bleeding:</strong> block writes to the affected tables or take the service into a
+            degraded read-only mode. Every minute of new writes is a minute you must reconcile later.</li>
+        <li><strong>Fix the time.</strong> Get the exact timestamp of the migration from the audit trail
+            (CloudTrail, the database log, the deploy record). This is the restore target.</li>
+        <li><strong>Choose the mechanism by cost of downtime.</strong> Aurora MySQL with Backtrack enabled:
+            rewind the cluster to seconds before the migration, in minutes, without a restore — but it rewinds
+            <em>everything</em>, so you lose legitimate writes made since. RDS/Aurora PITR: restore to a new
+            cluster at T-1s; the production cluster keeps running, and you then extract and merge the missing
+            column. Snapshot restore: same shape but coarser (up to an hour of data missing from the copy).</li>
+        <li><strong>Prefer restore-beside over restore-in-place</strong> when the damage is scoped to a table or
+            column. Restore to a parallel cluster, extract the lost data, backfill into production. Downtime
+            stays near zero and no legitimate write is lost. Restore-in-place is for damage so broad that
+            reconciliation is not feasible.</li>
+        <li><strong>Reconcile and verify:</strong> row counts, checksums against the restored copy, and a
+            business-level check (yesterday's revenue total) before resuming writes.</li>
+      </ol>
+      <p>Then the prevention, which is what the interviewer actually wants: migrations that drop data should be
+         two-phase (stop using the column, deploy, wait a retention period, then drop), destructive DDL should
+         require a snapshot immediately prior as part of the pipeline, and production credentials for
+         schema changes should be gated. And the general rule: <strong>replication faithfully replicates
+         mistakes; only an older copy is a backup.</strong></p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> The runbook says failover takes 90 seconds. In a drill, customers saw errors for over seven minutes. Where did the time go, and how do you fix it?</summary>
+      <p>Ninety seconds is the Route 53 term — health check detection plus the record change. The client-observed
+         recovery is a sum of every cache between that record and the socket:</p>
+      <table class="tbl">
+        <tr><th>Term</th><th>Typical default</th><th>Fix</th></tr>
+        <tr><td>Health check detection</td><td>3 failures × 30 s = 90 s</td><td>Fast health checks (3 × 10 s = 30 s), accepting more sensitivity</td></tr>
+        <tr><td>Record TTL</td><td>300 s</td><td>60 s on failover records; the extra query cost is negligible</td></tr>
+        <tr><td>Downstream resolver caches</td><td>Honours TTL, roughly</td><td>Nothing you control — budget ~20 s</td></tr>
+        <tr><td>JVM DNS cache</td><td>30 s normally; <strong>forever</strong> when a SecurityManager is installed</td><td>Set <code>networkaddress.cache.ttl</code> explicitly; never inherit it</td></tr>
+        <tr><td>Connection pools</td><td>Never re-resolve; an established TCP connection has no DNS to check</td><td>Bound <code>maxLifetime</code> (e.g. 15 s during an incident, 30 min normally), enable validation, and make the app react to connection errors by rebuilding the pool</td></tr>
+      </table>
+      <p>In our measurement the JVM cache and the pool were the entire problem — the fleet only recovered when
+         someone restarted it at 7m12s. After pinning the DNS TTL, bounding pool lifetime and switching to fast
+         health checks, the same drill measured 1m35s.</p>
+      <p>The generalisation worth saying out loud: <strong>DNS failover is an application-configuration problem
+         wearing an infrastructure costume.</strong> And you cannot know your failover time from the AWS side —
+         it must be measured from a client that behaves like your clients.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design DR for a payments platform: 12,000 transactions/minute at peak, $180k/hour of downtime, a regulator requiring seven-year immutable retention. Justify every choice.</summary>
+      <p><strong>Start with the numbers, not the architecture.</strong> $180k/hour means one hour of downtime
+         pays for roughly two years of a full second Region. So the usual "active/active is too expensive"
+         argument is inverted here — but only for the payment path. Tier ruthlessly: the authorisation path
+         gets active/active, the merchant dashboard gets Warm Standby, reporting and analytics get Backup &amp;
+         Restore. Uniform protection would waste money on the dashboard and under-protect the path that earns.</p>
+      <p><strong>Targets:</strong> authorisation path RTO under 60 s, RPO zero for committed transactions —
+         and note that in payments, RPO zero is not negotiable in the way RTO is: a lost authorisation is a
+         reconciliation dispute, a regulatory issue and a customer charged twice.</p>
+      <p><strong>Data, with the conflict story stated:</strong> RPO zero rules out async-only replication for
+         the authoritative ledger. Two workable shapes:</p>
+      <ul>
+        <li><strong>Regionally partitioned writes (preferred):</strong> route each merchant to a home Region by
+            merchant ID. Each Region is authoritative for its own merchants, replicated to the other for
+            read/standby. There is no cross-Region write conflict by construction, and evacuation means moving
+            a merchant set, which is a routing change. Cost: an evacuated merchant's in-flight tail is bounded
+            by replication lag, so pair it with (b).</li>
+        <li><strong>Durable intake ahead of the ledger:</strong> accept authorisations into a Region-local,
+            replicated, append-only log before they touch the ledger, with an idempotency key per transaction.
+            A Region loss then loses at most what has not been acknowledged, and replaying is safe because
+            every write is idempotent. This is what actually delivers "RPO zero" in practice — not a database
+            setting, but an idempotent write path plus a durable intake.</li>
+      </ul>
+      <p><strong>Failover mechanism:</strong> Route 53 ARC routing controls (the $2,190/month is 44 seconds of
+         downtime — trivially justified here), with readiness checks proving the standby's quotas, capacity and
+         replica health <em>continuously</em>, and safety rules preventing an operator from disabling the last
+         healthy cell. Both Regions run real traffic, so failover is a weight change against a proven path,
+         not an activation.</p>
+      <p><strong>Static stability:</strong> each Region runs enough capacity to take 100% of peak alone. That
+         means ~50% average utilisation, which the cost review will attack — the answer is the queueing
+         argument from <a href="well-architected.html">Well-Architected</a> plus the $180k/hour. No recovery
+         step may issue a certificate, request a quota or create a role.</p>
+      <p><strong>Regulatory retention:</strong> seven years, immutable — S3 with Object Lock in compliance mode
+         and a seven-year retain-until date, in a separate account, replicated to a second Region, with
+         Glacier Deep Archive transitions for cost. Compliance mode specifically, because governance mode is
+         reversible by anyone with the permission, which is not what a regulator means by immutable. Note the
+         Vault Lock cooling-off period for AWS Backup vaults and confirm it has elapsed.</p>
+      <p><strong>Blast radius:</strong> cells with shuffle sharding by merchant, so a poison-pill merchant takes
+         out 1 in 28 rather than everyone. This buys more real availability than the second Region does,
+         because poison pills happen and Region losses mostly do not.</p>
+      <p><strong>Proof:</strong> scheduled monthly failover in business hours (which makes failover boring),
+         quarterly unannounced drills driven by on-call, continuous restore testing of the immutable copies —
+         a backup nobody has restored is not evidence for a regulator either.</p>
+      <p><strong>What I would deliberately not do:</strong> synchronous cross-Region database replication. The
+         inter-Region round trip is added to every commit, and it makes the remote Region a hard dependency of
+         the local write path — you have converted two independent failure domains into one, which is the
+         opposite of the goal.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> You inherit a system whose DR plan has never been tested and whose owner insists it works. You have one week. What do you do, and in what order?</summary>
+      <p><strong>Do not argue about the plan; measure it.</strong> An untested plan is a hypothesis, and the
+         cheapest way to end the disagreement is evidence. The order matters, because each step is cheaper than
+         the next and any of them can end the exercise.</p>
+      <table class="tbl">
+        <tr><th>Day</th><th>Action</th><th>Why this order</th></tr>
+        <tr><td>1</td><td><strong>Inventory the state.</strong> Every stateful store, its backup mechanism, retention, account and Region. One page.</td><td>Costs hours, needs no permission, and typically finds one store with no backup at all — which ends the debate immediately</td></tr>
+        <tr><td>1</td><td><strong>Restore one thing.</strong> Take the most important database, restore it into a sandbox, run a real query, record the wall-clock time.</td><td>The single highest-information action available. It is non-disruptive and produces the first true number</td></tr>
+        <tr><td>2</td><td><strong>Readiness audit of the failover Region:</strong> quotas, certificates, secrets, images, IAM roles, capacity. Compare against what the plan assumes exists.</td><td>These are the four defects that dominated our first drill; all are checkable from a laptop with read-only access</td></tr>
+        <tr><td>3</td><td><strong>Measure replication lag p99</strong> over a full day including the batch window, and compare with the stated RPO.</td><td>Observational; usually shows the stated RPO is a median quoted as a guarantee</td></tr>
+        <tr><td>4</td><td><strong>Trace one failover path end to end</strong> on paper: health check → TTL → client DNS cache → connection pool. Note every default.</td><td>Finds the JVM/pool terms that dominate real recovery, without touching production</td></tr>
+        <tr><td>5</td><td><strong>Tabletop with on-call</strong>, not with the authors. Read the runbook aloud and stop at every step that names a person, a console click or a resource that must be created.</td><td>Surfaces the difference between the plan working and the plan being executable at 03:00</td></tr>
+        <tr><td>End of week</td><td><strong>One page: measured RTO/RPO versus stated, ranked by gap ÷ effort</strong>, with a date for the first real drill.</td><td>Turns "it works" / "it doesn't" into a prioritised list — and the ranking almost always puts one-hour fixes at the top</td></tr>
+      </table>
+      <p>Two things about how to run this politically: never present it as an audit of the owner — present the
+         restore timing and the readiness gaps as facts, and let them draw the conclusion. And expect the
+         top-ranked fixes to be tiny: raise a quota, replicate a secret, pin a DNS TTL, create a CNAME. On our
+         estate the difference between a failed 4h11m drill and a clean 52-minute one was about three
+         engineer-days of work, none of it architectural.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Take a real system and produce the DR requirements table:
+      RTO and RPO per workload tier, derived from the cost of downtime rather than from a strategy name. Then
+      price the gap between the requirement and what the current architecture actually delivers.
+      <details class="solution"><summary>Solution</summary>
+      <p>Start from revenue, not from architecture. For each workload, ask what one hour of unavailability
+         costs — in lost revenue, in SLA credits, in recovery labour, and in the disputes that follow.</p>
+<pre>
+STEP 1 — COST OF DOWNTIME PER WORKLOAD (one hour, peak)
+
+  workload            lost revenue   SLA credits   labour   total/hour
+  ---------------------------------------------------------------------
+  checkout API          $ 38,000      $ 4,200       $ 900    $ 43,100
+  customer web app      $  6,400      $     0       $ 900    $  7,300
+  merchant dashboard    $      0      $ 1,100       $ 600    $  1,700
+  internal reporting    $      0      $     0       $ 300    $    300
+  nightly analytics     $      0      $     0       $ 150    $    150
+
+STEP 2 — DERIVE THE TARGET (what RTO can each justify?)
+
+  tier    workloads              cost/hr    RTO target   RPO target
+  ---------------------------------------------------------------------
+  T1      checkout API           $43,100    &lt; 5 min      0 (idempotent intake)
+  T2      customer web app       $ 7,300    &lt; 30 min     &lt; 1 min
+  T3      merchant dashboard     $ 1,700    &lt; 4 h        &lt; 15 min
+  T4      reporting, analytics   $   450    &lt; 24 h       &lt; 24 h
+
+STEP 3 — WHAT WE ACTUALLY HAVE (measured, not designed)
+
+  tier   mechanism today                 measured RTO   measured RPO   gap
+  ---------------------------------------------------------------------------
+  T1     Multi-AZ + manual promotion     ~45 min*       1.4 s          40 min
+  T2     Multi-AZ + manual promotion     ~45 min*       1.4 s          15 min
+  T3     nightly snapshot, same account  ~3 h           up to 24 h     RPO 23h
+  T4     nightly snapshot, same account  ~3 h           up to 24 h     none
+  * estimated - never drilled. This estimate is the first thing to replace.
+
+STEP 4 — PRICE THE GAP
+
+  T1: Warm Standby -> active/active for the auth path
+        + $9,900/mo   closes 40 min of RTO on a $43,100/hr workload
+        break-even: 13.4 minutes of avoided downtime PER YEAR
+  T2: automate promotion + pre-provision (no new infra)
+        + ~4 engineer-days, one-off; closes 15 min
+  T3: move backups to the backup account + 6-hourly copies
+        + $60/mo       closes RPO 24h -> 6h ... still short of 15 min
+        -> either accept in writing, or add a read replica (+$310/mo)
+  T4: no change. Requirement already met.
+</pre>
+      <p>Three things this table does that a strategy name cannot. It makes T1's $9,900/month obviously correct
+         (thirteen minutes of avoided downtime a year pays for it) and T3's read replica genuinely arguable —
+         which is the conversation you want. It exposes that T1 and T2 currently share a mechanism despite
+         differing 6× in cost of downtime, which is the actual defect. And it converts "our RTO is 45 minutes"
+         into "our RTO is an estimate nobody has tested", which is the finding that matters most.</p>
+      <div class="note">🔑 <strong>The row that changes behaviour is "measured", not "designed".</strong> Leave
+         the estimate in the table with an asterisk and a drill date — a starred number is uncomfortable in a
+         way that a designed number never is, and that discomfort is what gets the drill scheduled.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Perform a real restore of a production-sized database into
+      a sandbox and measure the true RTO — including the period after the status says "available". Then
+      identify what the restore did not restore.
+      <details class="solution"><summary>Solution</summary>
+      <p>The point of this exercise is that it is safe: a restore into a sandbox touches nothing in production
+         and produces the only RTO number that is real.</p>
+<pre>
+$ SNAP=$(aws rds describe-db-snapshots --db-instance-identifier orders-prod \
+    --snapshot-type automated --query \
+    'reverse(sort_by(DBSnapshots,&amp;SnapshotCreateTime))[0].DBSnapshotIdentifier' \
+    --output text)
+$ echo $SNAP
+rds:orders-prod-2026-08-21-03-07
+
+$ date -u +%T; aws rds restore-db-instance-from-db-snapshot \
+    --db-instance-identifier orders-drill-21aug \
+    --db-snapshot-identifier "$SNAP" \
+    --db-instance-class db.r6g.2xlarge \
+    --no-multi-az --db-subnet-group-name sandbox-subnets \
+    --vpc-security-group-ids sg-0drill --no-publicly-accessible
+09:14:02
+
+$ while [ "$(aws rds describe-db-instances --db-instance-identifier \
+      orders-drill-21aug --query 'DBInstances[0].DBInstanceStatus' \
+      --output text)" != "available" ]; do sleep 30; done; date -u +%T
+09:35:16                                   # 21m14s to "available"
+
+$ # the number everyone stops at. Keep going.
+$ psql -h orders-drill-21aug... -c '\timing on' \
+    -c "SELECT count(*) FROM orders WHERE created_at &gt; now() - interval '1 day';"
+ count
+-------
+ 41,882
+Time: 412.338 ms          # normal production p50 for this query: 23 ms
+
+$ pgbench -h orders-drill-21aug... -T 60 -c 8 -S           # read-only load
+latency average = 288.4 ms       # 12.5x normal
+...repeat at t+30m: latency average = 31.2 ms
+...repeat at t+75m: latency average = 23.4 ms
+</pre>
+        <table class="tbl">
+          <tr><th>Milestone</th><th>Elapsed</th><th>Is the RTO met?</th></tr>
+          <tr><td>API call accepted</td><td>0s</td><td>No</td></tr>
+          <tr><td>Status <code>available</code></td><td>21m14s</td><td>The runbook says yes</td></tr>
+          <tr><td>First query returns</td><td>21m30s</td><td>18× the latency SLO — no</td></tr>
+          <tr><td>Within latency SLO</td><td>61m</td><td><strong>Yes. This is the RTO.</strong></td></tr>
+        </table>
+      <p><strong>What the restore did not bring with it</strong> — found by diffing the restored instance
+         against production:</p>
+<pre>
+$ diff &lt;(aws rds describe-db-instances --db-instance-identifier orders-prod \
+      --query 'DBInstances[0].{sg:VpcSecurityGroups,pg:DBParameterGroups,
+      maz:MultiAZ,br:BackupRetentionPeriod,pi:PerformanceInsightsEnabled}') \
+    &lt;(aws rds describe-db-instances --db-instance-identifier orders-drill-21aug \
+      --query 'DBInstances[0].{sg:VpcSecurityGroups,pg:DBParameterGroups,
+      maz:MultiAZ,br:BackupRetentionPeriod,pi:PerformanceInsightsEnabled}')
+
+  MultiAZ                    true  -> false          (would need enabling: +8 min)
+  BackupRetentionPeriod      35    -> 7              (a restored DR primary with
+                                                      7-day retention is a second
+                                                      incident waiting)
+  PerformanceInsights        true  -> false          (blind during the incident)
+  CloudWatch alarms          9     -> 0              (no paging on the new instance)
+  endpoint                   orders.cluster-abc123   -> orders-drill-21aug.xyz789
+</pre>
+      <p>The endpoint line is the expensive one. If applications hold that hostname in configuration, recovery
+         now includes a deployment — add 15–40 minutes and a change-approval step to the RTO. Fix it before the
+         incident with indirection: an internal CNAME (<code>db.internal.example.com</code>) that recovery
+         re-points, or a Secrets Manager entry resolved at connection time.</p>
+      <div class="note">⚠️ <strong>Run this quarterly and record the number.</strong> Restore time grows with
+         the database, so an RTO measured when the table was 400 GB is wrong at 2 TB. AWS Backup's restore
+         testing can automate exactly this — scheduled restores with a validation hook — which turns "we think
+         it's an hour" into a dated metric with a trend line.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure the real RPO of your replication — Aurora Global
+      Database, DynamoDB global tables and S3 CRR — under production load rather than at rest, and turn the
+      result into an alarm and a written statement.
+      <details class="solution"><summary>Solution</summary>
+      <p>Every one of these is asynchronous, so RPO equals lag at the moment of failure. Measure the
+         distribution, not the average, and measure across a full day including the batch window.</p>
+<pre>
+$ aws cloudwatch get-metric-statistics \
+    --namespace AWS/RDS --metric-name AuroraGlobalDBReplicationLag \
+    --dimensions Name=DBClusterIdentifier,Value=orders-global-eu \
+    --start-time 2026-08-20T00:00:00Z --end-time 2026-08-21T00:00:00Z \
+    --period 300 --statistics Average Maximum --output table | tail -20
+
+  window        Average(ms)   Maximum(ms)
+  03:00-06:00       142           380
+  09:00-12:00       298         1,190
+  14:00-17:00       331         1,240
+  22:45-23:30     4,900        21,700       &lt;-- nightly batch
+</pre>
+<pre>
+$ # DynamoDB global tables: use the per-replica lag metric
+$ aws cloudwatch get-metric-statistics --namespace AWS/DynamoDB \
+    --metric-name ReplicationLatency \
+    --dimensions Name=TableName,Value=carts \
+                 Name=ReceivingRegion,Value=us-east-1 \
+    --start-time 2026-08-20T00:00:00Z --end-time 2026-08-21T00:00:00Z \
+    --period 300 --statistics Average Maximum --output text | sort -k3 -n | tail -3
+
+  ...  Average 412 ms   Maximum 2,840 ms   (during a bulk import)
+
+$ # S3 CRR: replication metrics must be ENABLED on the rule first
+$ aws cloudwatch get-metric-statistics --namespace AWS/S3 \
+    --metric-name ReplicationLatency \
+    --dimensions Name=SourceBucket,Value=orders-docs \
+                 Name=DestinationBucket,Value=orders-docs-dr \
+                 Name=RuleId,Value=to-us-east-1 \
+    --start-time 2026-08-20T00:00:00Z --end-time 2026-08-21T00:00:00Z \
+    --period 3600 --statistics Maximum --output text | sort -k2 -n | tail -3
+
+  ...  Maximum 1,180 s      (19.7 minutes, during the 40k-object nightly export)
+</pre>
+        <table class="tbl">
+          <tr><th>Mechanism</th><th>Documented</th><th>Measured p50</th><th>Measured worst</th><th>Honest RPO statement</th></tr>
+          <tr><td>Aurora Global</td><td>"typically under 1 s"</td><td>310 ms</td><td>21.7 s</td><td>"Under 1.3 s at p99 in business hours; up to 22 s during the 22:45–23:30 batch"</td></tr>
+          <tr><td>DynamoDB global tables</td><td>"typically under 1 s"</td><td>412 ms</td><td>2.8 s</td><td>"Under 3 s; bulk imports are the only excursion"</td></tr>
+          <tr><td>S3 CRR (no RTC)</td><td>"most objects within 15 min"</td><td>48 s</td><td>19.7 min</td><td>"Up to 20 min without RTC; enable RTC for a 15-minute SLA on the DR bucket"</td></tr>
+        </table>
+      <p>Now convert measurement into control. Two alarms per mechanism: one on the p99 breaching the stated
+         RPO (this is an SLO alarm — page during business hours), and one on lag <em>increasing steadily</em>
+         for 30 minutes, which is the early signal of a replica that will never catch up.</p>
+<pre>
+$ aws cloudwatch put-metric-alarm --alarm-name aurora-global-rpo-breach \
+    --namespace AWS/RDS --metric-name AuroraGlobalDBReplicationLag \
+    --dimensions Name=DBClusterIdentifier,Value=orders-global-eu \
+    --extended-statistic p99 --period 300 --evaluation-periods 2 \
+    --threshold 5000 --comparison-operator GreaterThanThreshold \
+    --alarm-actions arn:aws:sns:eu-west-1:111122223333:oncall
+</pre>
+      <p>Two findings usually come out of this exercise and both are worth more than the alarms. First, the
+         batch window is nearly always the excursion — so either the RPO statement carries an exception, or the
+         batch is rewritten to write in smaller committed chunks, which typically flattens the peak by an
+         order of magnitude. Second, S3 replication metrics are <em>off by default</em> on a rule; a team that
+         has never enabled them has no replication data at all, which is itself the finding.</p>
+      <div class="note">🔑 <strong>An RPO is only meaningful with a percentile and a time window attached.</strong>
+         "Under a second" is a median dressed as a guarantee. "Under 1.3 s at p99 outside 22:45–23:30, measured
+         weekly" is a number you can be held to and can defend.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Build a Route 53 failover for a two-Region service and
+      measure the <em>client-observed</em> recovery time, not the DNS record change. Then reduce it.
+      <details class="solution"><summary>Solution</summary>
+      <p>Set up the failover pair, then measure from a client that behaves like your real clients — a JVM with
+         a connection pool, not <code>curl</code>, because <code>curl</code> re-resolves on every invocation
+         and will tell you a flattering lie.</p>
+<pre>
+$ # health check on the primary, FAST interval
+$ aws route53 create-health-check --caller-reference hc-eu-1 \
+    --health-check-config 'Type=HTTPS,FullyQualifiedDomainName=eu.api.example.com,\
+ResourcePath=/health/regional,RequestInterval=10,FailureThreshold=3'
+  -> HealthCheckId: 9f2c...
+
+$ # failover records; note TTL 60, not the default 300
+$ aws route53 change-resource-record-sets --hosted-zone-id Z123 --change-batch '{
+  "Changes":[
+   {"Action":"UPSERT","ResourceRecordSet":{"Name":"api.example.com","Type":"A",
+     "SetIdentifier":"eu-primary","Failover":"PRIMARY","TTL":60,
+     "HealthCheckId":"9f2c...","ResourceRecords":[{"Value":"52.x.x.x"}]}},
+   {"Action":"UPSERT","ResourceRecordSet":{"Name":"api.example.com","Type":"A",
+     "SetIdentifier":"us-secondary","Failover":"SECONDARY","TTL":60,
+     "ResourceRecords":[{"Value":"3.y.y.y"}]}}]}'
+</pre>
+<pre>
+MEASUREMENT — kill the primary target group, watch a real client
+
+  java -Dtest.rps=20 -jar loadclient.jar https://api.example.com/order
+
+  RUN 1 (defaults everywhere)
+  t+0s      primary made to fail (target group drained)
+  t+00:31   health check reports Unhealthy  (3 x 10s)
+  t+00:38   Route 53 answers with the secondary IP
+  t+00:38 - t+07:12   client STILL erroring
+              -> jcmd &lt;pid&gt; VM.system_properties | grep networkaddress
+                 networkaddress.cache.ttl = -1     (SecurityManager present:
+                                                    successful lookups cached
+                                                    FOREVER)
+              -> HikariCP maxLifetime = 1800000 (30 min), and the pooled
+                 sockets pointed at the dead IP; an ESTABLISHED TCP
+                 connection never consults DNS again
+  t+07:12   engineer restarts the fleet -> recovery
+  CLIENT-OBSERVED RECOVERY: 7m12s   (runbook claim: 90s)
+
+  CHANGES MADE
+    -Dnetworkaddress.cache.ttl=30          (explicit, never inherited)
+    -Dnetworkaddress.cache.negative.ttl=0
+    HikariCP: maxLifetime=30000 during incident mode, keepaliveTime=15000,
+              connectionTestQuery enabled, and a failure-count trigger that
+              calls softEvictConnections() after 10 consecutive failures
+
+  RUN 2 (same failure, same client)
+  t+00:30   health check Unhealthy
+  t+00:37   Route 53 answers secondary
+  t+01:05   JVM cache expires, new resolution
+  t+01:35   pool fully rebuilt against the new IP, errors stop
+  CLIENT-OBSERVED RECOVERY: 1m35s
+</pre>
+        <table class="tbl">
+          <tr><th>Term</th><th>Run 1</th><th>Run 2</th><th>Lever</th></tr>
+          <tr><td>Detection</td><td>31 s</td><td>30 s</td><td>Fast health check (10 s × 3)</td></tr>
+          <tr><td>DNS answer + TTL</td><td>7 s</td><td>7 s</td><td>TTL 60 on failover records</td></tr>
+          <tr><td>Client DNS cache</td><td>∞</td><td>28 s</td><td><code>networkaddress.cache.ttl</code></td></tr>
+          <tr><td>Connection pool</td><td>∞ (needed a restart)</td><td>30 s</td><td><code>maxLifetime</code> + eviction on failure</td></tr>
+          <tr><td><strong>Total</strong></td><td><strong>7m12s</strong></td><td><strong>1m35s</strong></td><td>—</td></tr>
+        </table>
+      <p>Notice that the two AWS-side terms barely moved — 38 s in run 1, 37 s in run 2. The entire improvement
+         came from two client-side settings and one line of pool configuration. This is why DR reviews that
+         only inspect infrastructure produce optimistic numbers.</p>
+      <div class="note">⚠️ <strong>Also test the failure mode where the primary is <em>slow</em> rather than
+         dead.</strong> A health check on <code>/health/regional</code> with a 5-second timeout will keep
+         reporting healthy while the service serves 8-second responses, so no failover occurs at all. Give the
+         health endpoint a latency budget of its own, or drive failover from an error-rate alarm rather than
+         from liveness.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Run a Region-evacuation game day. Find every dependency the
+      recovery has on the control plane of the failing Region — or on a support queue — and convert the plan to
+      a statically stable one. Report the before and after.
+      <details class="solution"><summary>Solution</summary>
+      <p>Scope it honestly: announce the window, take an unimportant-but-real workload first, and define the
+         success criterion as "synthetic checks green in the failover Region", with an abort condition and a
+         named person who can call it.</p>
+<pre>
+DRILL 1 — ANNOUNCED, TEAM DRIVING. Planned 2h. Actual 4h11m, FAILED.
+
+  t+00:00  routing control flipped; ASG desired 2 -> 40 in us-east-1
+  t+00:04  BLOCK 1: ALB has no certificate.
+           $ aws acm list-certificates --region us-east-1
+           (empty)                                    # certs are REGIONAL
+           -> request + DNS validation                        34 min
+  t+00:47  BLOCK 2: capacity.
+           $ aws autoscaling describe-scaling-activities --max-items 3
+           "Launching a new EC2 instance. Status Reason: You have requested
+            more vCPU capacity than your current vCPU limit of 64 allows"
+           9 of 40 instances launched.
+           $ aws service-quotas get-service-quota --service-code ec2 \
+               --quota-code L-1216C47A --region us-east-1
+           Value: 64.0        # eu-west-1 is 2,304. Quotas are PER REGION.
+           -> support ticket                                3h20m  &lt;-- dominated
+  t+04:11  ABORTED (window exhausted). Two further defects found on paper:
+           - Secrets Manager secrets not replicated (app would crash-loop)
+           - ECR images only in eu-west-1 (ECS could not pull)
+
+THE FIXES — all four are the same fix: DO IT BEFORE THE EVENT
+
+  1. certificate      request in us-east-1 now, attach to the standby ALB
+                      (also: CloudFront needs its cert in us-east-1 specifically)
+  2. quota            raise to 2,304 in us-east-1 AND add a readiness check
+                      that alarms if headroom drops below 100% of peak
+  3. secrets          replicate-secret-to-regions on every prod secret;
+                      the app resolves the LOCAL replica endpoint
+  4. images           ECR cross-Region replication rule at the registry level
+  5. capacity         run 30% of peak continuously in us-east-1 so the ASG is
+                      SCALING, not launching from zero into a busy Region
+</pre>
+<pre>
+$ # readiness check that would have caught block 2 months earlier
+$ cat check-quota-headroom.sh
+#!/usr/bin/env bash
+set -euo pipefail
+PEAK_VCPU=1280
+for R in eu-west-1 us-east-1; do
+  Q=$(aws service-quotas get-service-quota --region "$R" \
+        --service-code ec2 --quota-code L-1216C47A \
+        --query 'Quota.Value' --output text)
+  printf '%-12s quota=%-8s peak=%s  ' "$R" "${Q%.*}" "$PEAK_VCPU"
+  if [ "${Q%.*}" -lt "$PEAK_VCPU" ]; then echo "FAIL"; else echo "ok"; fi
+done
+
+$ ./check-quota-headroom.sh
+eu-west-1    quota=2304     peak=1280  ok
+us-east-1    quota=64       peak=1280  FAIL       # 8 seconds to find. 3h20m to fix.
+</pre>
+<pre>
+DRILL 2 — SAME SCENARIO, 6 WEEKS LATER, TEAM DRIVING
+
+  t+00:00  routing control flipped
+  t+00:02  ASG 12 -> 40 (already warm), first new instances InService
+  t+00:09  all targets healthy, synthetic checks green in us-east-1
+  t+00:31  Aurora global secondary promoted; RPO measured 1.4 s
+  t+00:52  full traffic, error budget consumed: 0.6 min
+  TOTAL: 52 minutes.
+
+DRILL 3 — UNANNOUNCED, ON-CALL ENGINEER ALONE, 03:10 LOCAL
+
+  TOTAL: 71 minutes.  Extra time spent on:
+    +9 min  finding which runbook was current (two existed; one was stale)
+    +6 min  the routing-control safety rule refused the flip until the
+            readiness check was acknowledged — correct behaviour, undocumented
+    +4 min  hesitation before promoting the database (no explicit
+            "you are authorised to do this without approval" line)
+  ALL THREE fixed with documentation, not engineering.
+</pre>
+        <table class="tbl">
+          <tr><th>Metric</th><th>Drill 1</th><th>Drill 2</th><th>Drill 3</th></tr>
+          <tr><td>Outcome</td><td>Aborted</td><td>Success</td><td>Success</td></tr>
+          <tr><td>Elapsed</td><td>4h11m</td><td>52 min</td><td>71 min</td></tr>
+          <tr><td>Support tickets raised</td><td>1 (3h20m)</td><td>0</td><td>0</td></tr>
+          <tr><td>Control-plane creates in the recovery path</td><td>4</td><td>0</td><td>0</td></tr>
+          <tr><td>Engineering effort to get from 1 → 2</td><td colspan="3">≈ 3 engineer-days, plus $1,180/month for the warm 30% capacity</td></tr>
+        </table>
+      <div class="note">🔑 <strong>Drill 3 is the number to publish.</strong> Drill 2 measures the plan; drill 3
+         measures the organisation. The 19-minute delta was entirely documentation and permission-to-act —
+         the cheapest RTO reduction available anywhere in this lesson, and the one teams skip because it
+         produces no architecture diagram.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Recover from logical corruption that every replica faithfully
+      copied: a migration deleted 40,000 rows across two tables at a known time, and it is now 90 minutes later
+      with production still taking writes. Produce the recovery, the timeline, and the prevention.
+      <details class="solution"><summary>Solution</summary>
+      <p>This is the incident where Multi-AZ, cross-Region replicas and global tables all contribute nothing —
+         they replicated the damage in milliseconds. Only an older copy helps, and the design question is which
+         older copy costs the least to use.</p>
+<pre>
+STEP 0 — STOP THE BLEEDING (first 4 minutes, before any restore)
+
+  - put the affected service into read-only mode (feature flag), so the
+    reconciliation set stops growing
+  - DO NOT roll back the deploy blindly: the migration is applied; a rollback
+    that re-runs DDL can make the damage worse
+  - capture the exact time from CloudTrail / the DB log / the deploy record:
+      2026-08-21T09:41:07Z   ALTER TABLE ... / DELETE FROM ...
+  - snapshot the CURRENT state before touching anything. You are about to
+    change things; you want a way back to "damaged but known".
+</pre>
+        <table class="tbl">
+          <tr><th>Option</th><th>Applies to</th><th>Time to recover</th><th>Collateral</th><th>Verdict here</th></tr>
+          <tr><td><strong>Aurora Backtrack</strong></td><td>Aurora MySQL only, if enabled in advance</td><td>Minutes, in place</td><td>Rewinds the <em>whole cluster</em> — 90 min of legitimate writes lost</td><td>Only if the 90 minutes of writes are worthless or replayable</td></tr>
+          <tr><td><strong>PITR restore beside</strong></td><td>Aurora / RDS with PITR</td><td>25–60 min for the copy</td><td>None to production — it keeps serving</td><td><strong>Chosen.</strong> Extract and backfill</td></tr>
+          <tr><td><strong>PITR restore in place</strong></td><td>Same</td><td>Restore + cutover</td><td>Loses 90 min of writes; needs a maintenance window</td><td>Only if damage is too broad to reconcile</td></tr>
+          <tr><td><strong>Snapshot restore</strong></td><td>Any</td><td>Restore time</td><td>Coarser point in time (up to the snapshot interval)</td><td>Fallback if PITR is not enabled</td></tr>
+          <tr><td><strong>S3 versioning</strong></td><td>Object data / exports</td><td>Minutes</td><td>Delete markers must be removed in order</td><td>Used for the derived exports afterwards</td></tr>
+        </table>
+<pre>
+STEP 1 — RESTORE BESIDE, TO ONE SECOND BEFORE THE DAMAGE
+
+$ aws rds restore-db-cluster-to-point-in-time \
+    --source-db-cluster-identifier orders-prod \
+    --db-cluster-identifier orders-rescue \
+    --restore-to-time 2026-08-21T09:41:06Z \
+    --restore-type copy-on-write            # Aurora: fast, shares storage
+$ aws rds create-db-instance --db-instance-identifier orders-rescue-1 \
+    --db-cluster-identifier orders-rescue --engine aurora-postgresql \
+    --db-instance-class db.r6g.2xlarge
+  ... available at t+26m
+
+STEP 2 — QUANTIFY BEFORE YOU COPY ANYTHING
+
+rescue=&gt; SELECT count(*) FROM order_lines;        -- 8,412,006
+prod=&gt;   SELECT count(*) FROM order_lines;        -- 8,374,331
+                                                    difference: 37,675
+
+rescue=&gt; SELECT count(*) FROM shipment_events;    -- 2,110,884
+prod=&gt;   SELECT count(*) FROM shipment_events;    -- 2,108,559
+                                                    difference:  2,325
+                                             total missing: 40,000  ✓ matches
+
+  -- and the writes that happened AFTER the damage, which the rescue
+  -- copy does NOT have and which must NOT be overwritten:
+prod=&gt;   SELECT count(*) FROM order_lines WHERE created_at &gt; '09:41:07';
+                                                       -- 6,204  KEEP THESE
+
+STEP 3 — BACKFILL ONLY THE MISSING ROWS (never a table swap)
+
+$ psql -h orders-rescue... -c "\copy (SELECT * FROM order_lines
+    WHERE id NOT IN (SELECT id FROM dblink_prod_ids)) TO 'missing.csv' CSV"
+  -- in practice: export by primary key range, import into a staging table,
+  --              then INSERT ... SELECT ... ON CONFLICT (id) DO NOTHING
+
+prod=&gt; INSERT INTO order_lines SELECT * FROM staging_order_lines
+       ON CONFLICT (id) DO NOTHING;
+INSERT 0 37675
+prod=&gt; INSERT INTO shipment_events SELECT * FROM staging_shipment_events
+       ON CONFLICT (id) DO NOTHING;
+INSERT 0 2325
+
+  ON CONFLICT DO NOTHING is the whole safety story: the 6,204 post-damage
+  writes cannot be clobbered, and the backfill is idempotent, so a partial
+  run can simply be re-run.
+
+STEP 4 — VERIFY AT THE BUSINESS LEVEL, NOT THE ROW LEVEL
+
+prod=&gt; SELECT date_trunc('day',created_at) d, count(*), sum(amount)
+       FROM order_lines WHERE created_at &gt; now() - interval '7 days'
+       GROUP BY 1 ORDER BY 1;
+  -- compare against yesterday's finance report: revenue totals match to the cent
+  -- compare row counts against the rescue copy + known post-damage inserts
+
+STEP 5 — RE-ENABLE WRITES, THEN DROP THE RESCUE CLUSTER (after 7 days, not now)
+
+TIMELINE
+  09:41  damage
+  11:11  detected (90 min - the real defect: no alarm on row-count deltas)
+  11:15  read-only mode, timestamp fixed, current-state snapshot taken
+  11:19  PITR restore issued
+  11:45  rescue cluster available
+  11:58  counts quantified, backfill plan reviewed by a second engineer
+  12:24  backfill complete
+  12:39  business-level verification passed
+  12:44  writes re-enabled
+  RTO (full function) 3h03m | data loss: ZERO | production downtime: 89 min read-only
+</pre>
+      <p><strong>Prevention, ranked by cost.</strong> The recovery above was competent; the 90 minutes before
+         detection were not.</p>
+        <table class="tbl">
+          <tr><th>Control</th><th>Cost</th><th>What it would have changed</th></tr>
+          <tr><td>Alarm on row-count deltas / anomalous DELETE volume</td><td>Hours</td><td>Detection at 09:43 instead of 11:11 — the single biggest win, and it removes most of the reconciliation set</td></tr>
+          <tr><td>Two-phase destructive migrations (stop using → wait → drop)</td><td>Process</td><td>The drop happens weeks later, deliberately, with the data already proven unused</td></tr>
+          <tr><td>Pipeline takes a snapshot immediately before destructive DDL</td><td>Cents</td><td>A guaranteed, known-good restore point at exactly the right second</td></tr>
+          <tr><td>PITR enabled everywhere (RDS/Aurora and DynamoDB)</td><td>~$0.20/GB-month</td><td>Makes restore-beside possible at all; without it this is a snapshot restore and coarser</td></tr>
+          <tr><td>Aurora Backtrack (MySQL) where the workload allows</td><td>~$0.012/million change records</td><td>A minutes-long in-place rewind option for the cases where losing recent writes is acceptable</td></tr>
+          <tr><td>Rehearse this exact scenario, not only Region loss</td><td>One afternoon a quarter</td><td>Logical damage is far more common than Region loss — and it is the drill almost nobody runs</td></tr>
+        </table>
+      <div class="note">🔑 <strong>Restore beside, backfill idempotently, verify at the business level.</strong>
+         The instinct under pressure is to restore in place and swap tables, which loses every write since the
+         damage and turns a data-loss incident into two. <code>ON CONFLICT DO NOTHING</code> (or its equivalent
+         — conditional writes in DynamoDB, <code>INSERT IGNORE</code> in MySQL) makes the repair safe to re-run
+         and impossible to make worse, which is exactly what you want at 12:20 with a director watching.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>HA survives a component dying; DR restores state after something destroys it.</strong> They are separate budgets — Multi-AZ covered <strong>2 of 14 real incidents (14%)</strong>, and 79% needed neither AZ nor Region redundancy, only better change safety and limits.</li>
+        <li><strong>Replication is not backup, because it is fast and faithful</strong> — an accidental <code>DELETE</code> reached the standby in 11 ms and the cross-Region secondary in 0.9 s. A backup must be <strong>older, immutable, isolated and proven</strong>; a copy missing any of the four is storage.</li>
+        <li>Derive the strategy from written RTO/RPO and the cost of downtime, never the reverse — and <strong>tier the estate</strong>: the tiered design recovered the important tier faster for <strong>less money</strong> than one uniform strategy.</li>
+        <li><strong>The only RTO that exists is the measured one.</strong> A designed "4 hours" took <strong>9h47m</strong> on the first attempt and <strong>52 minutes</strong> after roughly three engineer-days of fixes — none of them architectural.</li>
+        <li><strong>Define RTO as "meets the latency SLO", not "status = available".</strong> A 2 TB restore reported available at 21m14s and then served <strong>18× latency for 40 minutes</strong> while EBS hydrated blocks lazily from S3; Fast Snapshot Restore (~$0.75/hour per snapshot per AZ) or a warming pass buys that back.</li>
+        <li><strong>Restores do not restore the furniture</strong> — Multi-AZ, retention, alarms, auto scaling policies, TTL and stream settings, and above all <strong>the endpoint</strong>. Add indirection (internal CNAME or a secret resolved at connect time) <em>before</em> the incident, or recovery includes a deploy.</li>
+        <li>Backups belong in a <strong>separate account behind Vault Lock in compliance mode</strong> (past its three-day cooling-off window) with S3 Object Lock — governance mode is reversible by anyone holding the permission, which is worth nothing against a compromised admin.</li>
+        <li><strong>Your RPO is replication lag at the moment of failure, and failures correlate with load.</strong> Aurora Global measured p50 310 ms in business hours but <strong>21.7 s during the nightly batch</strong> — roughly 4,000 orders. State RPO as a p99 with named exceptions; alarm on p99, not the mean.</li>
+        <li><strong>DynamoDB global tables resolve conflicts by last writer wins, silently</strong> — no error, no metric, no log. Multi-active is a routing decision: pin entities to a home Region, or model data so writes cannot collide.</li>
+        <li><strong>S3 CRR has no ordering guarantee</strong>, so a <code>_SUCCESS</code> marker can arrive before its data. Verify counts or checksums in the destination; RTC gives a 15-minute SLA, not ordering; replication metrics are off by default.</li>
+        <li><strong>Static stability: recovery must not call the control plane of the broken thing.</strong> Every one of the four drill-blocking defects — missing certificate, unraised quota, unreplicated secrets, single-Region images — was a control-plane action attempted at the worst moment; one of them cost <strong>3h20m in a support queue</strong>.</li>
+        <li><strong>Failover time is a sum: health check + TTL + resolver + client DNS cache + connection pool.</strong> The measured 7m12s against a 90-second claim was <em>entirely</em> the last two terms; fixing <code>networkaddress.cache.ttl</code> and pool <code>maxLifetime</code> brought it to <strong>1m35s</strong> with no infrastructure change.</li>
+        <li>A health check may only test what its remedy can fix: regional failover needs a <strong>regional</strong> signal, or one shared-dependency blip fails over every Region at once.</li>
+        <li><strong>Route 53 ARC</strong> gives routing controls with a five-Region data plane, readiness checks and safety rules for ~<strong>$2,190/month</strong> — obviously right for payments, obviously wrong for internal tooling; the cheap approximation is failover records driven by a togglable health check.</li>
+        <li><strong>Cells with shuffle sharding cut blast radius superlinearly</strong>: 8 cells, 2 per tenant, gives 28 pairs — a poison-pill tenant fully affected <strong>3.6%</strong> of tenants instead of 100%.</li>
+        <li><strong>Drill announced, then unannounced with on-call driving.</strong> The 52 → 71 minute delta was documentation and permission-to-act, not engineering — the cheapest RTO reduction available, and the number worth publishing.</li>
+        <li><strong>Failback is the unrehearsed half.</strong> Reverse replication rather than "syncing back", snapshot the old primary before anything reconnects, and never fail back during the incident. Symmetric designs make failback just the next scheduled failover.</li>
+        <li>For logical corruption: <strong>restore beside, backfill idempotently, verify at the business level.</strong> Restoring in place would have lost the 6,204 legitimate writes made after the damage; <code>ON CONFLICT DO NOTHING</code> made the repair safe to re-run and impossible to worsen — <strong>zero data lost, 89 minutes read-only</strong>.</li>
+        <li>Rehearse <strong>logical damage</strong>, not only Region loss — it is far more common, and it is the drill almost nobody runs.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="well-architected.html">← The Well-Architected Trade-offs</a>
+      <a href="scaling-patterns.html">Scaling Patterns →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
