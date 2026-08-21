@@ -109,5 +109,5 @@ Set 10 is the mixed mock exam. Every question needs a non-empty `explain`.
 2. Whole track: `validate.py tutorials/<track>` reports 0 errors **and 0 warnings**
 3. Quiz bank: `quizcheck.py` reports `10 200 0`, no duplicates, `OK` (no skew)
 4. `quiz.html` checked for the stale `← CSS Track` link and for mojibake
-   (`Â·`, `â†’` — double-encoded UTF-8) before committing
+   (`·`, `→` — double-encoded UTF-8) before committing
 5. PROJECT_STATUS.md updated and pushed

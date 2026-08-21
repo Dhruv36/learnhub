@@ -57,7 +57,7 @@ Also: the five v3 files orphaned by the nav split (`pods-deployments`, `services
 `probes-resources`, `statefulsets-storage`, `rbac-network`) are now **redirect stubs**.
 
 ⚠️ **Scaffolding reminder:** any newly-copied `quiz.html` must be checked for BOTH the stale
-`← CSS Track` link AND mojibake (`Â·`, `â†’` — double-encoded UTF-8) before committing.
+`← CSS Track` link AND mojibake (`·`, `→` — double-encoded UTF-8) before committing.
 
 **🚧 IN PROGRESS: AWS v4 (track 17)** — `tutorials/aws/`, rebuilding 12 v3 lessons (~12KB) into
 **20 lessons at v4 depth** (56–75KB, `det=12 ex=6`). New `nav.js` written: 6 sections.
@@ -257,7 +257,7 @@ each file lands. Re-run the whole-track validate at the end.
      what triggers it.) Hit twice on this track.
   2. **A stray `</p>` closing a `<div class="note">`** that never opened one. Hit twice; fixed with `sed`
      after assembly.
-- **Mojibake check** (double-encoded UTF-8 from earlier sessions): `grep -c 'â€\|Â·\|â†’\|Ã' <file>` must
+- **Mojibake check** (double-encoded UTF-8 from earlier sessions): `grep -c 'â€\|·\|→\|Ã' <file>` must
   print `0`. Write the arrows/bullets as real UTF-8 characters, never as escapes.
 - Structural counts to confirm: `grep -c '<details class="solution">'` = **12**, `grep -c 'class="exercise"'` = **6**.
 - Pager: `prev` = the previous lesson in `nav.js` order, `next` = the following one. The forward link
@@ -450,7 +450,7 @@ grep the new file for `CSS` before committing.**
 Vector Databases & RAG finished from 9/15 → 15/15 + both quiz banks; track 21 done, all pushed & live.
 **Two gotchas worth carrying forward:**
 1. **`quiz.html` mojibake outlived its supposed fix.** The status file claimed it was repaired during
-   scaffolding; it still held `Â·` ×5 and `â†’` ×1 (double-encoded UTF-8). The hub cards split titles on
+   scaffolding; it still held `·` ×5 and `→` ×1 (double-encoded UTF-8). The hub cards split titles on
    `" · "`, so mojibake silently breaks card subtitles. **Grep new quiz.html files for `Â` and `â†` as
    well as `CSS`.**
 2. **`validate.py` earned its keep again** — it caught `<claim>` inside a `<pre>` in `evaluation.html`
