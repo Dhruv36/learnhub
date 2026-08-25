@@ -1,0 +1,1188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Database Migrations in CD — CI/CD — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">← All Tracks</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Database Migrations in CD <span class="level-badge level-ultra">Deployment</span></h1>
+
+    <p><strong>What you'll master:</strong> the asymmetry that makes this the hardest part of continuous
+       delivery — <strong>code rolls back in seconds and data does not roll back at all</strong>, so every
+       schema change must be designed so that the previous release still works; expand/contract as six explicit
+       phases rather than a slogan, including the one everybody skips and the rule that
+       <strong>the destructive phase belongs in a later release, never the same one</strong>; the lock
+       behaviour that turns a "one-line <code>ALTER TABLE</code>" into an outage —
+       <strong>an <code>ADD COLUMN … NOT NULL DEFAULT</code> on a 40M-row table held an
+       <code>ACCESS EXCLUSIVE</code> lock for 4m12s and queued 61,000 requests behind it</strong> — and the
+       <code>lock_timeout</code> discipline that makes it safe; backfills as throttled, resumable jobs outside
+       the migration, where a naive single <code>UPDATE</code> ran <strong>38 minutes and pushed replica lag to
+       94 seconds</strong>; where migrations run in the pipeline and how to stop two runners applying them at
+       once; rehearsal against a production-sized restore, which is the only honest way to know a migration's
+       duration; and the compatibility matrix test that proves old code still works against the new schema
+       before you deploy anything. Prerequisites:
+       <a href="deployment-strategies.html">Deployment Strategies</a>,
+       <a href="environments-promotion.html">Environments &amp; Promotion</a>, and
+       <a href="../sql/index.html">the SQL track</a> for the engine behaviour underneath.</p>
+
+    <h2>Part 1 — Code Rolls Back; Data Does Not</h2>
+
+<pre>
+THE SITUATION EVERY MIGRATION MUST SURVIVE
+
+  10:00  deploy v2, which includes: ALTER TABLE orders DROP COLUMN status
+  10:04  v2 turns out to be broken for an unrelated reason
+  10:05  roll back to v1 — 30 seconds, as designed
+  10:05  v1 starts: SELECT id, status, total FROM orders
+         ERROR: column "status" does not exist
+  -> the rollback completed successfully and the service is still down.
+
+  THE RULE THAT PREVENTS IT
+    A release may only contain schema changes that the PREVIOUS release
+    can also run against. Every time. No exceptions for "small" changes.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Change</th><th>Old code survives it?</th><th>Safe in one release?</th></tr>
+      <tr><td>Add a nullable column</td><td>Yes — it ignores it</td><td>Yes</td></tr>
+      <tr><td>Add a column with a default</td><td>Yes</td><td>Yes (but see the lock section)</td></tr>
+      <tr><td>Add an index</td><td>Yes</td><td>Yes, if built concurrently</td></tr>
+      <tr><td>Add a table</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td><strong>Drop a column</strong></td><td><strong>No</strong></td><td>No — later release, after nothing reads it</td></tr>
+      <tr><td><strong>Rename a column</strong></td><td><strong>No</strong></td><td>No — it is a drop plus an add</td></tr>
+      <tr><td><strong>Add NOT NULL to an existing column</strong></td><td>No — old code inserts nulls</td><td>No — backfill and enforce in stages</td></tr>
+      <tr><td><strong>Change a column type</strong></td><td>Usually no</td><td>No — new column, dual-write, switch, drop</td></tr>
+      <tr><td>Add a unique constraint</td><td>No — old code may insert duplicates</td><td>No — clean data first, then enforce</td></tr>
+      <tr><td>Add a foreign key</td><td>Sometimes — old code may insert orphans</td><td>Validate separately; consider <code>NOT VALID</code> first</td></tr>
+    </table>
+
+    <h3>1.1 Expand / contract, as six phases</h3>
+
+<pre>
+  GOAL: rename orders.status -&gt; orders.state, with zero downtime and a
+        working rollback at every point.
+
+  PHASE 1 — EXPAND (release N)
+    ALTER TABLE orders ADD COLUMN state text;        -- nullable, no default
+    -- old code: unaffected. new code: not deployed yet.
+
+  PHASE 2 — DUAL WRITE (release N, same or next deploy)
+    application writes BOTH columns on every insert/update.
+    reads still come from `status`.
+    -- rollback safe: old code reads and writes `status`, which is current.
+
+  PHASE 3 — BACKFILL (a job, NOT a migration — see Part 3)
+    UPDATE orders SET state = status WHERE state IS NULL   -- in batches,
+                                                            -- throttled
+    verify: SELECT count(*) FROM orders WHERE state IS DISTINCT FROM status;
+    -- must be 0 before proceeding.
+
+  PHASE 4 — SWITCH READS (release N+1)
+    application reads `state`, still writes both.
+    -- rollback safe: N still reads `status`, which dual-write keeps current.
+
+  PHASE 5 — STOP WRITING THE OLD COLUMN (release N+2)
+    application writes only `state`.
+    -- rollback to N+1 is safe (it reads `state`).
+    -- rollback to N is NOT safe any more. That is why phases are releases
+    --   apart: you keep a rollback window, not a rollback forever.
+
+  PHASE 6 — CONTRACT (release N+3, after verifying nothing reads it)
+    ALTER TABLE orders DROP COLUMN status;
+
+  THE PHASE PEOPLE SKIP IS 5. They go from "reads switched" straight to
+  DROP, while old code somewhere — a report, a worker, a lambda — is
+  still writing `status`, and its writes silently stop being read.
+</pre>
+
+    <div class="note">🔑 <strong>Expand/contract is not one deployment with six steps; it is several releases
+       with rollback windows between them.</strong> Compressing it into one release is the single most common
+       cause of "we could not roll back". The cost is calendar time — typically two to four releases — and the
+       benefit is that every intermediate state is one where both the current and previous version of the code
+       work.</div>
+
+    <h2>Part 2 — Locks: How a One-Line ALTER Becomes an Outage</h2>
+
+<pre>
+MEASURED: THE SAME STATEMENT ON A 40M-ROW TABLE
+
+  -- PostgreSQL 11+ (this is fast: metadata only)
+  ALTER TABLE orders ADD COLUMN state text;                        0.4 s
+
+  -- older engines, or a VOLATILE default: rewrites every row
+  ALTER TABLE orders ADD COLUMN state text NOT NULL DEFAULT gen_random_uuid();
+                                                                 4m 12s
+  during which an ACCESS EXCLUSIVE lock is held:
+    - every SELECT, INSERT, UPDATE on `orders` blocks
+    - connections pile up: 61,000 requests queued in 4 minutes
+    - the connection pool exhausts at t+38s
+    - the service is DOWN for a "one-line, additive" migration.
+
+THE LOCK QUEUE IS THE PART THAT SURPRISES PEOPLE
+
+  a migration waiting for a lock BLOCKS EVERYTHING BEHIND IT:
+
+    t+0    ALTER TABLE waits for a long-running SELECT to finish
+    t+0    it now holds a place in the lock QUEUE
+    t+0.1  every subsequent query on that table queues BEHIND the ALTER,
+           even though the ALTER has not started
+    t+90   the slow SELECT ends; the ALTER runs; everything unblocks
+
+  so a migration that never actually acquired a lock still took the
+  table down for 90 seconds. THIS is why lock_timeout matters more than
+  statement_timeout.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Operation</th><th>PostgreSQL</th><th>MySQL (InnoDB)</th><th>Safe form</th></tr>
+      <tr><td>Add nullable column</td><td>Metadata only (fast)</td><td>Instant in 8.0 (ALGORITHM=INSTANT)</td><td>Just do it</td></tr>
+      <tr><td>Add column with constant default</td><td>Fast since PG 11</td><td>Instant in 8.0</td><td>Constant defaults only — never a function</td></tr>
+      <tr><td>Add index</td><td>Blocks writes</td><td>Blocks writes (older)</td><td><code>CREATE INDEX CONCURRENTLY</code> / <code>ALGORITHM=INPLACE, LOCK=NONE</code></td></tr>
+      <tr><td>Drop column</td><td>Fast (metadata)</td><td>Rewrites in some versions</td><td>Still a compatibility problem — Part 1</td></tr>
+      <tr><td>Add NOT NULL</td><td>Full table scan, blocking</td><td>Rewrite</td><td>Add a <code>CHECK … NOT VALID</code>, validate, then set NOT NULL</td></tr>
+      <tr><td>Change type</td><td>Rewrite + lock</td><td>Rewrite</td><td>New column + dual write + backfill + switch</td></tr>
+      <tr><td>Add unique constraint</td><td>Builds an index, blocking</td><td>Blocking</td><td>Build the index concurrently, then attach the constraint</td></tr>
+      <tr><td>Add foreign key</td><td>Locks both tables to validate</td><td>Locks</td><td><code>NOT VALID</code>, then <code>VALIDATE CONSTRAINT</code> separately</td></tr>
+    </table>
+
+<pre>
+THE FOUR-LINE PREAMBLE THAT MAKES MIGRATIONS SAFE
+
+  SET lock_timeout = '3s';        -- do not queue behind a long query,
+                                  -- and do not make others queue behind me
+  SET statement_timeout = '30s';  -- a migration that runs long is a bug
+  SET idle_in_transaction_session_timeout = '10s';
+
+  -- and then, for anything that can be slow, retry the whole thing:
+  --   attempt -&gt; lock_timeout fires -&gt; wait 5s -&gt; attempt again
+  -- rather than holding the queue open.
+
+  WITH THESE, THE FAILURE MODE CHANGES:
+    without: the migration takes the site down for 4 minutes
+    with:    the migration FAILS in 3 seconds, the deploy stops, and
+             you fix the approach instead of the incident.
+</pre>
+
+    <div class="note">⚠️ <strong><code>CREATE INDEX CONCURRENTLY</code> cannot run inside a transaction, and
+       most migration tools wrap each migration in one.</strong> The result is either an error or — worse, with
+       some tools — a silent fallback to a blocking build. Mark such migrations as non-transactional
+       explicitly (<code>disable_ddl_transaction!</code> in Rails, <code>atomic = False</code> in Django,
+       <code>-- +goose NO TRANSACTION</code> in goose), and be aware that a concurrent build can leave an
+       <strong>INVALID index</strong> behind if it fails, which must be dropped before retrying.</div>
+
+    <h2>Part 3 — Backfills Are Jobs, Not Migrations</h2>
+
+<pre>
+THE NAIVE VERSION, MEASURED ON 40M ROWS
+
+  UPDATE orders SET state = status WHERE state IS NULL;
+
+    duration ................... 38 min
+    rows locked ................ all of them, progressively
+    replica lag peak ........... 94 s      &lt;-- read replicas served
+                                               stale data for 90+ seconds
+    WAL generated .............. 22 GB     &lt;-- disk alerts on the primary
+    deploy pipeline ............ blocked for 38 minutes
+    if it fails at minute 37 ... the whole transaction rolls back
+
+THE BATCHED, THROTTLED, RESUMABLE VERSION
+
+  #!/usr/bin/env python3
+  BATCH = 5_000
+  while True:
+      n = execute("""
+          WITH batch AS (
+            SELECT id FROM orders
+            WHERE state IS NULL
+            ORDER BY id
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+          )
+          UPDATE orders o SET state = o.status
+          FROM batch b WHERE o.id = b.id
+      """, (BATCH,)).rowcount
+      if n == 0:
+          break
+      # THROTTLE ON THE SIGNAL THAT ACTUALLY MATTERS
+      lag = query("SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))")
+      while lag &gt; 5:
+          sleep(2); lag = ...
+      sleep(0.2)                       # be a polite background job
+      log(f"backfilled {n}, remaining {remaining()}")
+
+    duration ................... 51 min (slower on purpose)
+    replica lag peak ........... 5.2 s  (throttled)
+    longest single lock ........ 40 ms
+    deploy pipeline ............ not blocked — it runs separately
+    resumable .................. yes: re-run it, it continues
+</pre>
+
+    <table class="tbl">
+      <tr><th>Backfill property</th><th>Why</th></tr>
+      <tr><td><strong>Batched</strong></td><td>Short locks, small transactions, bounded WAL</td></tr>
+      <tr><td><strong>Idempotent</strong></td><td>Re-running after a failure must be safe and must continue, not restart</td></tr>
+      <tr><td><strong>Throttled on replica lag</strong></td><td>The real constraint; CPU and IO are proxies for it</td></tr>
+      <tr><td><strong>Observable</strong></td><td>Rows remaining, rate, ETA — someone must be able to see it is progressing</td></tr>
+      <tr><td><strong>Killable</strong></td><td>Stopping it must leave the database consistent, not half-migrated within a batch</td></tr>
+      <tr><td><strong>Outside the deploy path</strong></td><td>A 51-minute deploy is a broken deploy; a 51-minute background job is normal</td></tr>
+      <tr><td><strong>Verified</strong></td><td>A query proving zero remaining discrepancies is the gate for the next phase</td></tr>
+    </table>
+
+    <h2>Part 4 — Running Migrations in the Pipeline</h2>
+
+    <table class="tbl">
+      <tr><th>Where</th><th>Mechanism</th><th>Pros</th><th>Cons</th></tr>
+      <tr><td><strong>Separate pipeline job, before deploy</strong></td><td>A job that runs <code>migrate up</code> then gates the deploy</td><td>Clear ordering, visible, easy to lock</td><td>A window where the new schema meets old code (which is fine if expand/contract is followed)</td></tr>
+      <tr><td>Init container / release command</td><td>Runs as part of the app's own rollout</td><td>Atomic-feeling; no separate job</td><td><strong>Every replica tries to run it</strong> — needs a lock; failures look like crash loops</td></tr>
+      <tr><td>Application on startup</td><td>The app migrates itself</td><td>Simplest to write</td><td>Worst option at scale: races, partial application, slow starts, no visibility</td></tr>
+      <tr><td>Manual, by a DBA</td><td>A human runs it</td><td>Careful for genuinely dangerous changes</td><td>Not continuous delivery; drifts from the code</td></tr>
+    </table>
+
+<pre>
+THE STANDARD SHAPE
+
+  jobs:
+    migrate:
+      needs: [build, test]
+      environment: production
+      concurrency:
+        group: migrate-production        # NEVER cancel-in-progress
+      steps:
+        - run: ./ci/assert-safe-migration.sh    # see below
+        - run: |
+            set -euo pipefail
+            ./ci/with-advisory-lock.sh 4711 \
+              migrate -path ./migrations -database "$DATABASE_URL" up
+        - run: ./ci/verify-schema.sh            # expected version applied
+
+    deploy:
+      needs: [migrate]
+      steps: [ ... deploy the digest ... ]
+
+  # ci/with-advisory-lock.sh — one migrator at a time, even if two
+  # pipelines somehow run together
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+    "SELECT pg_advisory_lock($1)" &amp;&amp; trap 'psql ... -c "SELECT pg_advisory_unlock($1)"' EXIT
+  "${@:2}"
+</pre>
+
+<pre>
+FAILURE HANDLING — WHAT "HALF-APPLIED" MEANS PER ENGINE
+
+  PostgreSQL: DDL is TRANSACTIONAL. A failed migration inside a
+    transaction rolls back cleanly — except CREATE INDEX CONCURRENTLY
+    and a few others, which cannot be in a transaction and CAN leave
+    an INVALID index behind:
+      SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+      -- drop it before retrying
+
+  MySQL: DDL is NOT transactional (before 8.0 atomic DDL, and even then
+    only per statement). A migration with three ALTERs that fails on the
+    second leaves the first applied. Therefore:
+      - ONE logical change per migration file
+      - make each file idempotent where possible
+        (IF NOT EXISTS, or a guard query)
+      - never assume "the migration failed" means "nothing happened"
+
+  BOTH: record the version AFTER success, and make the recording part
+  of the same transaction where the engine allows it.
+</pre>
+
+    <div class="note">💡 <strong>The migration job must be gated by a check, not by hope.</strong> A script that
+       inspects the pending migrations for destructive statements, missing <code>CONCURRENTLY</code>, or
+       missing timeouts turns a class of outage into a failed pipeline step. It is the highest-value twenty
+       lines in this lesson — a linter for SQL, applied to the diff.</div>
+
+    <h2>Part 5 — Rehearsal: The Only Honest Way to Know</h2>
+
+<pre>
+WHY STAGING DOES NOT TELL YOU
+
+  staging orders table ..........  180,000 rows
+  production orders table ....... 41,300,000 rows
+
+  ALTER TABLE ... (the same statement)
+    staging ...... 0.3 s     "the migration is instant"
+    production ... 4m 12s    with the table locked
+
+  the ratio is not linear either — index builds, sort memory and
+  checkpoint behaviour all change shape at scale.
+
+REHEARSE AGAINST A RESTORED PRODUCTION-SIZED COPY
+
+  # nightly, automatically
+  jobs:
+    rehearse:
+      steps:
+        - run: ./ci/restore-latest-snapshot.sh rehearsal-db     # ~14 min
+        - run: |
+            set -euo pipefail
+            START=$(date +%s)
+            ./ci/with-timeouts.sh migrate -path ./migrations \
+                -database "$REHEARSAL_URL" up
+            echo "migration_duration_seconds=$(( $(date +%s) - START ))"
+        - run: ./ci/measure-locks.sh          # longest lock held
+        - run: ./ci/compat-matrix.sh          # Part 5.1
+        - run: ./ci/rehearse-rollback.sh      # can the previous release run?
+
+  OUTPUT THAT GOES ON THE PULL REQUEST
+    migration 0042_add_state_column
+      duration ................ 4m12s      ⚠ exceeds the 30s budget
+      longest lock ............ ACCESS EXCLUSIVE on orders, 4m12s   ✗
+      rows affected ........... 41,300,000
+      replica lag induced ..... 61 s                                 ✗
+      old code compatible ..... YES
+      new code compatible ..... YES
+    VERDICT: BLOCKED — rewrite as add-nullable + backfill job.
+</pre>
+
+    <h3>5.1 The compatibility matrix test</h3>
+
+<pre>
+  the question expand/contract exists to answer, tested mechanically:
+
+    for schema in (before, after):
+      for code in (previous_release, this_release):
+        run the integration suite
+
+    schema \ code      v1 (previous)     v2 (this release)
+    ------------------------------------------------------
+    before             ✅ (today)        ✅ must pass — v2 deploys
+                                            before migration finishes
+    after              ✅ MUST PASS      ✅ (the target state)
+                       ^^^^^^^^^^^^^^
+                       this is the cell that catches "we cannot roll back",
+                       and it is the one nobody tests.
+
+  # ci/compat-matrix.sh
+  for schema in before after; do
+    ./ci/restore-snapshot.sh "$schema"
+    for ref in "$PREV_RELEASE_SHA" "$GITHUB_SHA"; do
+      git checkout "$ref" -- app/
+      pytest tests/integration -q || fail "schema=$schema code=$ref"
+    done
+  done
+</pre>
+
+    <h2>Part 6 — The Contract Phase: Dropping Things Safely</h2>
+
+<pre>
+BEFORE DROPPING ANYTHING, PROVE NOTHING USES IT
+
+  1. STATIC: search the whole organisation, not just this repository
+     $ gh search code 'orders.status' --owner acme --limit 100
+       -> found in: shop-api, reporting-etl, admin-portal,
+                    a Metabase saved question, two Airflow DAGs
+
+  2. RUNTIME: ask the database, which cannot lie
+     -- PostgreSQL, with pg_stat_statements
+     SELECT calls, query FROM pg_stat_statements
+     WHERE query ILIKE '%status%' AND query ILIKE '%orders%'
+     ORDER BY calls DESC LIMIT 10;
+
+     -- or column-level: log a sample of queries for 24h and grep
+
+  3. INSTRUMENT: make the code tell you
+     def status(self):
+         emit_metric("deprecated_field_read", field="orders.status")
+         return self._status
+     -> wait until the metric is ZERO for two weeks across ALL services,
+        including monthly batch jobs. A month-end report that reads the
+        column once every 30 days is the classic thing this catches.
+
+  4. THEN drop it, in its own release, with nothing else in it.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Contract-phase rule</th><th>Reason</th></tr>
+      <tr><td>At least N releases after the last write</td><td>Preserves a rollback window; N ≥ 2 in practice</td></tr>
+      <tr><td>Zero deprecated-read telemetry for two weeks</td><td>Catches weekly and monthly jobs that static search misses</td></tr>
+      <tr><td>Search across every repository and BI tool</td><td>Dashboards and ETL are code too, and nobody thinks of them</td></tr>
+      <tr><td>Drop in its own release</td><td>If it breaks something, the cause is unambiguous</td></tr>
+      <tr><td>Take a snapshot immediately before</td><td>The drop is the one migration you cannot undo</td></tr>
+      <tr><td>Consider renaming first</td><td><code>ALTER … RENAME TO status_deprecated_20260901</code> breaks readers loudly and is instantly reversible</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The rename-before-drop trick is underused.</strong> Renaming a column is fast,
+       reversible in one statement, and makes every remaining reader fail immediately and visibly rather than
+       silently reading a column that is about to disappear. Leave it renamed for a release; if nothing breaks,
+       drop it. If something does break, rename it back in seconds.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A release containing <code>ALTER TABLE orders DROP COLUMN status</code>, an
+         <code>ADD COLUMN NOT NULL DEFAULT gen_random_uuid()</code>, a 40-million-row <code>UPDATE</code> in the
+         same migration file, run on application startup by every replica, with no timeouts and no
+         rehearsal.</strong> The <code>ALTER</code> holds an <code>ACCESS EXCLUSIVE</code> lock for four
+         minutes, queues 61,000 requests, exhausts the connection pool at 38 seconds and takes the service
+         down — for a change described in review as "additive". The backfill runs 38 minutes inside the deploy,
+         pushes replica lag to 94 seconds so every read replica serves stale data, and generates 22 GB of WAL
+         that alerts the DBA. Because migrations run at startup, eight replicas race to apply them and two
+         partially succeed against MySQL's non-transactional DDL, leaving a schema that matches no migration
+         version. And when the release turns out to be broken for an unrelated reason, the thirty-second
+         rollback completes perfectly and the service stays down, because v1 selects a column that no longer
+         exists. Staging said the migration took 0.3 seconds, because staging has 180,000 rows.</p>
+      <p>✅ <strong>Expand/contract across releases, locks bounded by timeouts, backfills as throttled resumable
+         jobs, one migrator holding an advisory lock, and rehearsal against a production-sized restore.</strong>
+         Design every schema change so the <em>previous</em> release still runs against it, and spread the six
+         phases over several releases so there is always a rollback window — the drop belongs two or more
+         releases after the last write, in a release containing nothing else. Set <code>lock_timeout</code> to a
+         few seconds so a migration that cannot get its lock fails fast instead of queueing the entire table
+         behind it, use <code>CREATE INDEX CONCURRENTLY</code> outside a transaction, and prefer
+         <code>NOT VALID</code> constraints validated separately. Move data changes out of migrations entirely:
+         batched, idempotent, throttled on replica lag, observable and resumable — 51 minutes as a background
+         job beats 38 minutes of blocked deploy and 94 seconds of lag. Run migrations in a dedicated pipeline
+         job holding an advisory lock, gated by a linter that rejects destructive or unbounded statements, and
+         verify the applied version afterwards. Rehearse nightly on a restored production-sized copy, publish
+         duration and longest lock on the pull request, and run the compatibility matrix — old code against the
+         new schema is the cell that proves rollback still works. Then, before dropping anything, prove nothing
+         reads it with telemetry over a period long enough to include the month-end jobs.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What happens</th><th>Do this instead</th></tr>
+      <tr><td>Dropping or renaming a column in the same release that stops using it</td><td>Rollback completes and the service stays down</td><td>Expand/contract; drop two or more releases later</td></tr>
+      <tr><td><code>ADD COLUMN NOT NULL DEFAULT &lt;function&gt;</code></td><td>Full table rewrite under an exclusive lock — 4m12s and 61,000 queued requests</td><td>Add nullable, backfill in batches, then add the constraint</td></tr>
+      <tr><td>No <code>lock_timeout</code></td><td>A migration waiting for a lock queues the entire table behind it</td><td><code>SET lock_timeout = '3s'</code> and retry the statement</td></tr>
+      <tr><td>Blocking index builds</td><td>Writes stop for the duration of the build</td><td><code>CREATE INDEX CONCURRENTLY</code> outside a transaction; clean up INVALID indexes on failure</td></tr>
+      <tr><td>Adding a foreign key or check directly</td><td>Locks both tables while it validates</td><td><code>NOT VALID</code>, then <code>VALIDATE CONSTRAINT</code> separately</td></tr>
+      <tr><td>Backfilling inside a migration</td><td>38-minute deploy, 94 s replica lag, 22 GB of WAL, all-or-nothing</td><td>A separate batched, throttled, resumable job</td></tr>
+      <tr><td>Backfill throttled on nothing</td><td>Replicas fall behind and serve stale data</td><td>Throttle on measured replica lag, with a ceiling</td></tr>
+      <tr><td>Migrations on application startup</td><td>Every replica races; partial application; crash loops</td><td>A dedicated job holding an advisory lock</td></tr>
+      <tr><td>Multiple logical changes per migration file</td><td>On MySQL, a mid-file failure leaves a schema matching no version</td><td>One change per file; idempotent where possible</td></tr>
+      <tr><td>Assuming a failed migration changed nothing</td><td>True in Postgres transactions, false in MySQL and for concurrent index builds</td><td>Verify the schema state explicitly after a failure</td></tr>
+      <tr><td>Judging duration from staging</td><td>0.3 s on 180k rows, 4m12s on 41M</td><td>Rehearse on a restored production-sized copy</td></tr>
+      <tr><td>Never testing old code against the new schema</td><td>The rollback path is untested — the cell that matters</td><td>The compatibility matrix in CI</td></tr>
+      <tr><td>Dropping after a code search only</td><td>Dashboards, ETL and monthly jobs still read it</td><td>Deprecation telemetry at zero for two weeks across all services</td></tr>
+      <tr><td>Bundling a drop with other changes</td><td>When something breaks, the cause is ambiguous</td><td>Destructive changes ship alone</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why can't you just rename a database column in the same release that renames it in the code?</summary>
+      <p>Because two versions of the code run at the same time, and because rollback must keep working.</p>
+      <p>During any rolling deploy, some instances run the old code and some the new. If the migration renames
+         <code>status</code> to <code>state</code>, every old instance immediately starts failing —
+         <code>column "status" does not exist</code> — for the whole rollout.</p>
+      <p>And the worse case is rollback. If the release turns out to be broken for an unrelated reason, you roll
+         the code back in thirty seconds, the rollback succeeds, and the service is still down, because the old
+         code needs a column that no longer exists. <strong>Code rolls back; data does not.</strong></p>
+      <p>The safe form is expand/contract: add the new column, write both, backfill, switch reads, stop writing
+         the old one, and drop it several releases later. It takes longer in calendar time, and every
+         intermediate state is one where both the current and previous release work.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is expand/contract and what are its phases?</summary>
+      <p>A pattern for changing a schema without breaking either the running code or the ability to roll back.
+         Six phases, spread over several releases:</p>
+      <ol>
+        <li><strong>Expand</strong> — add the new structure (nullable column, new table). Old code ignores it.</li>
+        <li><strong>Dual write</strong> — the application writes both old and new, still reads the old.</li>
+        <li><strong>Backfill</strong> — copy existing data, as a batched background job, not as a migration.</li>
+        <li><strong>Switch reads</strong> — read from the new structure, keep writing both.</li>
+        <li><strong>Stop writing the old</strong> — this is the phase that ends the rollback window to the
+            earliest release, which is why it is separate.</li>
+        <li><strong>Contract</strong> — drop the old structure, once telemetry proves nothing reads it.</li>
+      </ol>
+      <p>The phase people skip is 5: they go from switching reads straight to dropping, while some
+         service — a report, a worker, a dashboard — is still writing the old column, and its writes silently
+         stop mattering.</p>
+      <p>The cost is calendar time: two to four releases for one rename. The benefit is that at no point does a
+         rollback leave you with code that cannot run.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A migration adds a column with a default to a 40-million-row table and takes the site down. What went wrong and how do you fix it?</summary>
+      <p>Two separate problems, and both need naming.</p>
+      <p><strong>The rewrite:</strong> on older engines — or on any engine when the default is a
+         <em>function</em> rather than a constant — <code>ADD COLUMN … NOT NULL DEFAULT</code> rewrites every
+         row while holding an <code>ACCESS EXCLUSIVE</code> lock. Measured: 4m12s, during which every query on
+         the table blocked, 61,000 requests queued and the connection pool exhausted at 38 seconds.</p>
+      <p><strong>The lock queue:</strong> even a fast <code>ALTER</code> is dangerous if it has to <em>wait</em>
+         for a lock. Once it is queued, every subsequent query on the table queues behind it — so a long-running
+         <code>SELECT</code> plus a migration equals a table-wide outage for the duration of that select.</p>
+      <p><strong>The fix, in order:</strong></p>
+      <ul>
+        <li><code>SET lock_timeout = '3s'</code> so the migration fails fast instead of queueing everything
+            behind it; retry with backoff rather than waiting.</li>
+        <li>Add the column <strong>nullable and without a default</strong> (metadata-only), then backfill in
+            batches, then add the <code>NOT NULL</code> constraint via a validated
+            <code>CHECK</code>.</li>
+        <li>Rehearse on a restored production-sized copy and publish the measured duration and longest lock on
+            the pull request — staging said 0.3 seconds because staging has 180,000 rows.</li>
+        <li>Add a migration linter to CI that rejects this pattern before review.</li>
+      </ul>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How would you backfill 40 million rows without impacting production?</summary>
+      <p>As a <strong>job, not a migration</strong>, with five properties:</p>
+      <table class="tbl">
+        <tr><th>Property</th><th>Implementation</th></tr>
+        <tr><td>Batched</td><td>5,000 rows per transaction, ordered by primary key, <code>FOR UPDATE SKIP LOCKED</code></td></tr>
+        <tr><td>Idempotent and resumable</td><td>Filter on <code>WHERE state IS NULL</code>; re-running continues rather than restarting</td></tr>
+        <tr><td>Throttled on the right signal</td><td>Measured <strong>replica lag</strong>, pausing above ~5 s — CPU and IO are proxies, lag is the actual user-visible harm</td></tr>
+        <tr><td>Observable</td><td>Log rows done, rows remaining and rate; someone must see progress</td></tr>
+        <tr><td>Outside the deploy path</td><td>A 51-minute deploy is broken; a 51-minute background job is normal</td></tr>
+      </table>
+      <p>The comparison that makes the case: a single <code>UPDATE</code> took 38 minutes, drove replica lag to
+         94 seconds, generated 22 GB of WAL and blocked the pipeline — and a failure at minute 37 rolled back
+         everything. The batched version took 51 minutes, held no lock longer than 40 ms, kept lag under
+         5.2 seconds, and could be stopped and resumed at any point.</p>
+      <p>Then <strong>verify before proceeding</strong>: a query proving zero remaining discrepancies is the
+         gate for the next expand/contract phase, and it belongs in the pipeline, not in someone's memory.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Where should migrations run in a CD pipeline, and how do you prevent two runners applying them simultaneously?</summary>
+      <p><strong>A dedicated job between test and deploy</strong>, not on application startup and not by hand.</p>
+      <table class="tbl">
+        <tr><th>Option</th><th>Verdict</th></tr>
+        <tr><td>Dedicated pipeline job before deploy</td><td><strong>Preferred</strong> — visible, orderable, lockable, and its failure stops the deploy</td></tr>
+        <tr><td>Init container / release command</td><td>Workable, but every replica attempts it — requires a lock, and failures look like crash loops</td></tr>
+        <tr><td>Application on startup</td><td>Worst at scale: races, partial application, slow starts, no visibility</td></tr>
+        <tr><td>Manual by a DBA</td><td>Not continuous delivery; the schema drifts from the code</td></tr>
+      </table>
+      <p><strong>Preventing concurrent application</strong>, in layers: a CI <code>concurrency</code> group for
+         the migrate job (never cancel-in-progress — a cancelled migration is worse than a queued one), and a
+         <strong>database advisory lock</strong> held for the duration, which protects against anything outside
+         CI too. Most migration tools take such a lock themselves; verify it rather than assuming, because the
+         ones that do not fail silently and interleave.</p>
+      <p><strong>Failure handling depends on the engine, and the difference matters:</strong> PostgreSQL DDL is
+         transactional, so a failed migration usually rolls back cleanly — except
+         <code>CREATE INDEX CONCURRENTLY</code>, which cannot run in a transaction and can leave an INVALID
+         index that must be dropped before retrying. MySQL DDL is not transactional, so a file with three
+         <code>ALTER</code>s that fails on the second leaves the first applied. That is the argument for one
+         logical change per migration file and for verifying schema state after any failure rather than
+         assuming nothing happened.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do you gain confidence in a risky migration before it runs against production?</summary>
+      <p>Rehearsal on production-sized data, an automated safety review, and a test of the rollback path — none
+         of which staging provides.</p>
+      <table class="tbl">
+        <tr><th>Control</th><th>What it proves</th></tr>
+        <tr><td><strong>Restore a production snapshot nightly and run the pending migrations</strong></td><td>Real duration and real lock behaviour. Staging said 0.3 s; production was 4m12s</td></tr>
+        <tr><td><strong>Measure the longest lock held</strong></td><td>Duration alone is not the risk — an exclusive lock for four minutes is</td></tr>
+        <tr><td><strong>Compatibility matrix</strong>: {old schema, new schema} × {previous release, this release}</td><td>The old-code-against-new-schema cell is the one that proves rollback still works, and it is the cell nobody tests</td></tr>
+        <tr><td><strong>Migration linter in CI</strong></td><td>Rejects destructive statements, missing <code>CONCURRENTLY</code>, missing timeouts — before review</td></tr>
+        <tr><td><strong>Publish results on the pull request</strong></td><td>Duration, longest lock, rows affected, induced replica lag — so review is informed rather than aesthetic</td></tr>
+        <tr><td><strong>Rehearse the rollback</strong></td><td>Deploy the previous release against the migrated schema and run its tests</td></tr>
+      </table>
+      <p>For genuinely dangerous changes I would add two operational precautions: take a snapshot immediately
+         before, and consider <strong>renaming instead of dropping</strong> — a rename is fast, instantly
+         reversible, and makes any remaining reader fail loudly rather than silently. Leave it renamed for a
+         release; if nothing breaks, drop it.</p>
+      <p>And the organisational point: the pull request for a migration should carry its rehearsal output the
+         way a code change carries test results. Without that, review of a schema change is people reading SQL
+         and guessing how long it will take.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Take a "simple" rename and rewrite it as an expand/contract
+      sequence, marking the rollback window at every phase.
+      <details class="solution"><summary>Solution</summary>
+      <p>The request: rename <code>orders.status</code> to <code>orders.state</code>. What arrives in review is
+         usually one file:</p>
+<pre>
+  -- 0042_rename_status.sql        ❌ THE VERSION THAT BREAKS ROLLBACK
+  ALTER TABLE orders RENAME COLUMN status TO state;
+
+  what happens: during the rolling deploy, every old replica fails with
+  `column "status" does not exist`; and rolling back the code leaves
+  v1 running against a schema it cannot use.
+</pre>
+<pre>
+THE SEQUENCE, WITH THE ROLLBACK WINDOW MARKED AT EACH STEP
+
+  RELEASE N
+    migration 0042: ALTER TABLE orders ADD COLUMN state text;
+    code: writes BOTH columns; reads `status`
+    can roll back to N-1?  YES — N-1 reads/writes `status`, untouched
+    can roll forward?      YES
+
+  BACKGROUND (between N and N+1)
+    job: backfill state = status, batched and throttled
+    gate: SELECT count(*) FROM orders WHERE state IS DISTINCT FROM status
+          must be 0
+    can roll back?  YES — nothing depends on `state` yet
+
+  RELEASE N+1
+    code: reads `state`; still writes BOTH
+    can roll back to N?    YES — N reads `status`, which is still written
+    the rollback window is still open
+
+  RELEASE N+2
+    code: writes ONLY `state`
+    can roll back to N+1?  YES  (N+1 reads `state`)
+    can roll back to N?    ❌ NO — N reads `status`, which is now stale
+    -> the window to N closes here. This is why it is its own release.
+
+  RELEASE N+3  (only after telemetry proves nothing reads `status`)
+    migration 0051: ALTER TABLE orders DROP COLUMN status;
+    ships ALONE — no other change in this release
+    take a snapshot immediately before
+</pre>
+        <table class="tbl">
+          <tr><th>Release</th><th>Schema</th><th>Code writes</th><th>Code reads</th><th>Can roll back to</th></tr>
+          <tr><td>N-1</td><td>status</td><td>status</td><td>status</td><td>—</td></tr>
+          <tr><td>N</td><td>status, state</td><td>both</td><td>status</td><td>N-1</td></tr>
+          <tr><td>N+1</td><td>status, state</td><td>both</td><td><strong>state</strong></td><td>N</td></tr>
+          <tr><td>N+2</td><td>status, state</td><td><strong>state</strong></td><td>state</td><td>N+1</td></tr>
+          <tr><td>N+3</td><td><strong>state</strong></td><td>state</td><td>state</td><td>N+2</td></tr>
+        </table>
+      <p>Four releases for one rename. That is the actual cost of continuous delivery on a stateful system, and
+         it is much cheaper than the alternative — the rename that completes successfully and leaves you unable
+         to roll back a broken release.</p>
+      <div class="note">🔑 <strong>Write the rollback column in the pull request.</strong> A one-line answer to
+         "if we roll this back right now, does the previous release still work?" catches almost every unsafe
+         migration at review time, and it forces the author to notice which phase they are in.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Add a migration linter to CI that rejects the dangerous
+      patterns before review.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+  #!/usr/bin/env bash
+  # ci/assert-safe-migration.sh — run on every PR touching migrations/
+  set -euo pipefail
+  BASE="${1:-origin/main}"
+  FILES=$(git diff --name-only "$BASE...HEAD" -- 'migrations/*.sql')
+  [ -z "$FILES" ] &amp;&amp; { echo "no migrations changed"; exit 0; }
+  FAIL=0
+  note() { echo "::error file=$1::$2"; FAIL=1; }
+  warn() { echo "::warning file=$1::$2"; }
+
+  for f in $FILES; do
+    SQL=$(tr 'a-z' 'A-Z' &lt; "$f")
+
+    # 1. destructive DDL must be explicitly acknowledged
+    if grep -qE 'DROP (COLUMN|TABLE)|RENAME COLUMN' &lt;&lt;&lt;"$SQL"; then
+      grep -q 'expand-contract-phase: contract' "$f" \
+        || note "$f" "destructive DDL without an 'expand-contract-phase: contract' marker"
+      grep -q 'verified-unused-since:' "$f" \
+        || note "$f" "destructive DDL without a 'verified-unused-since:' date"
+    fi
+
+    # 2. indexes must be concurrent, and therefore non-transactional
+    if grep -q 'CREATE INDEX' &lt;&lt;&lt;"$SQL" &amp;&amp; ! grep -q 'CONCURRENTLY' &lt;&lt;&lt;"$SQL"; then
+      note "$f" "CREATE INDEX without CONCURRENTLY blocks writes"
+    fi
+    if grep -q 'CONCURRENTLY' &lt;&lt;&lt;"$SQL" &amp;&amp; ! grep -q 'no-transaction' "$f"; then
+      note "$f" "CONCURRENTLY requires a 'no-transaction' marker for the runner"
+    fi
+
+    # 3. volatile defaults rewrite the table
+    if grep -qE 'ADD COLUMN.*DEFAULT *(GEN_RANDOM_UUID|NOW|CURRENT_|UUID_)' &lt;&lt;&lt;"$SQL"; then
+      note "$f" "ADD COLUMN with a volatile DEFAULT rewrites every row under an exclusive lock"
+    fi
+
+    # 4. NOT NULL on an existing column
+    if grep -qE 'ALTER COLUMN .* SET NOT NULL' &lt;&lt;&lt;"$SQL"; then
+      grep -q 'NOT VALID' &lt;&lt;&lt;"$SQL" \
+        || warn "$f" "SET NOT NULL scans the whole table; consider CHECK ... NOT VALID then VALIDATE"
+    fi
+
+    # 5. constraints that validate on creation
+    if grep -qE 'ADD CONSTRAINT.*(FOREIGN KEY|CHECK)' &lt;&lt;&lt;"$SQL" \
+       &amp;&amp; ! grep -q 'NOT VALID' &lt;&lt;&lt;"$SQL"; then
+      warn "$f" "constraint validates on creation and locks; consider NOT VALID + VALIDATE"
+    fi
+
+    # 6. data changes do not belong in migrations
+    if grep -qE '^\s*(UPDATE|DELETE|INSERT)' &lt;&lt;&lt;"$SQL"; then
+      grep -q 'LIMIT' &lt;&lt;&lt;"$SQL" \
+        || note "$f" "unbounded DML in a migration — use a batched backfill job"
+    fi
+
+    # 7. timeouts must be set
+    grep -q 'LOCK_TIMEOUT' &lt;&lt;&lt;"$SQL" \
+      || note "$f" "missing SET lock_timeout — a waiting migration queues the whole table"
+
+    # 8. one logical change per file (MySQL non-transactional DDL)
+    n=$(grep -cE '^\s*ALTER TABLE' &lt;&lt;&lt;"$SQL" || true)
+    [ "$n" -le 1 ] || warn "$f" "$n ALTER statements in one file; split them"
+  done
+  exit "$FAIL"
+</pre>
+<pre>
+RUNNING IT ON A REAL PULL REQUEST
+
+$ ./ci/assert-safe-migration.sh origin/main
+  ::error file=migrations/0042_add_state.sql::ADD COLUMN with a volatile
+    DEFAULT rewrites every row under an exclusive lock
+  ::error file=migrations/0042_add_state.sql::missing SET lock_timeout
+  ::error file=migrations/0043_drop_status.sql::destructive DDL without an
+    'expand-contract-phase: contract' marker
+  ::warning file=migrations/0044_add_fk.sql::constraint validates on
+    creation and locks; consider NOT VALID + VALIDATE
+
+  THE FIXED VERSION
+  -- migrations/0042_add_state.sql
+  -- expand-contract-phase: expand
+  SET lock_timeout = '3s';
+  ALTER TABLE orders ADD COLUMN state text;          -- nullable, no default
+</pre>
+        <table class="tbl">
+          <tr><th>Rule</th><th>Catches</th><th>Severity</th></tr>
+          <tr><td>Destructive DDL needs a phase marker and a verified date</td><td>The rollback-breaking drop</td><td>Error</td></tr>
+          <tr><td>Index without CONCURRENTLY</td><td>Writes blocked for the build</td><td>Error</td></tr>
+          <tr><td>Volatile default on ADD COLUMN</td><td>Full table rewrite under a lock</td><td>Error</td></tr>
+          <tr><td>Unbounded DML</td><td>38-minute deploy, replica lag</td><td>Error</td></tr>
+          <tr><td>Missing lock_timeout</td><td>Table-wide queueing</td><td>Error</td></tr>
+          <tr><td>Validating constraints, multiple ALTERs</td><td>Locks; partial application on MySQL</td><td>Warning</td></tr>
+        </table>
+      <div class="note">💡 <strong>Markers beat prohibitions.</strong> Requiring
+         <code>expand-contract-phase: contract</code> and a <code>verified-unused-since:</code> date does not
+         stop anyone dropping a column — it forces them to state which phase they believe they are in, which is
+         exactly the conversation review should be having.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Convert a blocking migration into a safe sequence and
+      measure the lock behaviour of each version.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE TARGET: orders.state must become NOT NULL with a default.
+41.3M rows, ~2,400 writes/second.
+
+VERSION A — THE ONE-LINER
+
+  ALTER TABLE orders
+    ADD COLUMN state text NOT NULL DEFAULT gen_random_uuid();
+
+  -- measured on the rehearsal restore, while a synthetic load ran:
+$ psql -c "SELECT pid, mode, granted, query FROM pg_locks l
+           JOIN pg_stat_activity a USING (pid)
+           WHERE relation = 'orders'::regclass" &amp;
+  4711 | AccessExclusiveLock | t | ALTER TABLE orders ADD COLUMN ...
+  4712 | AccessShareLock     | f | SELECT * FROM orders WHERE id = $1
+  4713 | RowExclusiveLock    | f | UPDATE orders SET ...
+  ... 612 waiting sessions
+
+  duration ................. 4m 12s
+  longest lock ............. ACCESS EXCLUSIVE, 4m 12s
+  queued queries ........... 61,000 over the window
+  pool exhausted at ........ t+38s
+  VERDICT: an outage.
+
+VERSION B — THE SAFE SEQUENCE (four migrations + one job)
+
+  -- 0042_add_state.sql       (expand-contract-phase: expand)
+  SET lock_timeout = '3s';
+  ALTER TABLE orders ADD COLUMN state text;
+  -- measured: 0.4 s, ACCESS EXCLUSIVE held for 0.4 s (metadata only)
+
+  -- 0043_default_for_new_rows.sql
+  SET lock_timeout = '3s';
+  ALTER TABLE orders ALTER COLUMN state SET DEFAULT 'pending';
+  -- measured: 0.3 s. New rows get the default; existing rows untouched.
+
+  -- backfill job (Part 3 shape), run outside the pipeline
+  -- measured: 51 min, longest lock 40 ms, replica lag peak 5.2 s
+
+  -- 0044_check_not_null.sql
+  SET lock_timeout = '3s';
+  ALTER TABLE orders
+    ADD CONSTRAINT orders_state_not_null CHECK (state IS NOT NULL) NOT VALID;
+  -- measured: 0.2 s — NOT VALID means no scan, no long lock
+
+  -- 0045_validate.sql
+  SET lock_timeout = '3s';
+  ALTER TABLE orders VALIDATE CONSTRAINT orders_state_not_null;
+  -- measured: 38 s, but only a SHARE UPDATE EXCLUSIVE lock:
+  --   reads and writes CONTINUE during validation
+
+  -- 0046_set_not_null.sql   (PG 12+: uses the validated constraint,
+  --                          so this is a metadata change)
+  SET lock_timeout = '3s';
+  ALTER TABLE orders ALTER COLUMN state SET NOT NULL;
+  -- measured: 0.3 s
+</pre>
+        <table class="tbl">
+          <tr><th>Version</th><th>Total elapsed</th><th>Longest blocking lock</th><th>Queries blocked</th><th>Deploy impact</th></tr>
+          <tr><td>A — one statement</td><td>4m12s</td><td><strong>4m12s exclusive</strong></td><td>61,000</td><td>Outage</td></tr>
+          <tr><td>B — sequence + job</td><td>~52 min wall clock</td><td><strong>0.4 s</strong></td><td>~0</td><td>None</td></tr>
+        </table>
+<pre>
+MEASURE IT YOURSELF — THE LOCK OBSERVER
+
+  # ci/measure-locks.sh, run during the rehearsal migration
+  psql "$REHEARSAL_URL" -At -c "
+    SELECT now(), a.pid, l.mode, l.granted, left(a.query, 60)
+    FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+    WHERE l.relation = 'orders'::regclass" &gt;&gt; /tmp/locks.log &amp;
+  OBS=$!
+  # ... run the migration ...
+  kill "$OBS"
+  awk -F'|' '$4=="f" {blocked++} END {print blocked" blocked observations"}' \
+    /tmp/locks.log
+</pre>
+      <div class="note">⚠️ <strong>Elapsed time is not the risk; lock time is.</strong> Version B takes twelve
+         times longer in wall clock and causes no impact at all, because its longest blocking lock is 0.4
+         seconds. Publish "longest lock held" on every migration pull request — it is a far better review signal
+         than duration, and it is the number that predicts whether the deploy becomes an incident.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Write a backfill job that is batched, throttled,
+      resumable and observable — then verify the data before advancing a phase.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+  #!/usr/bin/env python3
+  """Backfill orders.state from orders.status. Safe to stop and re-run."""
+  import os, sys, time, logging, psycopg
+  BATCH        = int(os.environ.get("BATCH", 5000))
+  MAX_LAG_S    = float(os.environ.get("MAX_LAG_S", 5))
+  PAUSE_S      = float(os.environ.get("PAUSE_S", 0.2))
+  log = logging.getLogger("backfill")
+
+  SQL_BATCH = """
+    WITH batch AS (
+      SELECT id FROM orders
+      WHERE state IS NULL
+      ORDER BY id
+      LIMIT %s
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE orders o SET state = o.status
+    FROM batch b WHERE o.id = b.id
+  """
+  SQL_LAG = """
+    SELECT COALESCE(EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())), 0)
+    FROM pg_stat_replication LIMIT 1
+  """
+  SQL_REMAINING = "SELECT count(*) FROM orders WHERE state IS NULL"
+
+  def replica_lag(cur):
+      cur.execute(SQL_LAG); row = cur.fetchone()
+      return float(row[0]) if row else 0.0
+
+  def main():
+      done = 0
+      t0 = time.time()
+      with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+          with conn.cursor() as cur:
+              cur.execute("SET lock_timeout = '3s'")
+              cur.execute("SET statement_timeout = '30s'")
+              cur.execute(SQL_REMAINING); total = cur.fetchone()[0]
+              log.info("starting: %s rows to backfill", f"{total:,}")
+              while True:
+                  try:
+                      cur.execute(SQL_BATCH, (BATCH,))
+                      n = cur.rowcount
+                  except psycopg.errors.LockNotAvailable:
+                      log.warning("lock timeout; backing off"); time.sleep(5); continue
+                  if n == 0:
+                      break
+                  done += n
+                  lag = replica_lag(cur)
+                  while lag &gt; MAX_LAG_S:                    # THROTTLE
+                      log.warning("replica lag %.1fs &gt; %.1fs — pausing", lag, MAX_LAG_S)
+                      time.sleep(2); lag = replica_lag(cur)
+                  rate = done / max(time.time() - t0, 1)
+                  log.info("done=%s remaining≈%s rate=%.0f/s eta=%.0fmin lag=%.1fs",
+                           f"{done:,}", f"{max(total-done,0):,}", rate,
+                           max(total-done, 0) / max(rate, 1) / 60, lag)
+                  time.sleep(PAUSE_S)                        # be polite
+      log.info("complete: %s rows in %.1f min", f"{done:,}", (time.time()-t0)/60)
+
+  if __name__ == "__main__":
+      logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+      sys.exit(main())
+
+RUNNING IT
+
+$ BATCH=5000 MAX_LAG_S=5 python backfill_state.py
+  2026-08-21 09:02:11 starting: 41,300,000 rows to backfill
+  2026-08-21 09:02:13 done=5,000 remaining≈41,295,000 rate=2381/s eta=289min lag=0.4s
+  ...
+  2026-08-21 09:31:44 replica lag 6.2s &gt; 5.0s — pausing
+  2026-08-21 09:31:48 done=8,120,000 remaining≈33,180,000 rate=13245/s eta=42min lag=1.1s
+  ...
+  2026-08-21 09:53:20 complete: 41,300,000 rows in 51.2 min
+
+  # stop it and restart it — it continues:
+$ ^C
+$ python backfill_state.py
+  2026-08-21 10:04:02 starting: 12,400,000 rows to backfill
+
+VERIFY BEFORE ADVANCING THE PHASE (this is a pipeline gate)
+
+  # ci/verify-backfill.sh
+  REMAINING=$(psql -At -c "SELECT count(*) FROM orders WHERE state IS NULL")
+  MISMATCH=$(psql -At -c "SELECT count(*) FROM orders
+                          WHERE state IS DISTINCT FROM status")
+  echo "remaining=$REMAINING mismatch=$MISMATCH"
+  [ "$REMAINING" = "0" ] &amp;&amp; [ "$MISMATCH" = "0" ] \
+    || { echo "::error::backfill incomplete — do not switch reads"; exit 1; }
+</pre>
+        <table class="tbl">
+          <tr><th>Property</th><th>How it is achieved here</th><th>Failure it prevents</th></tr>
+          <tr><td>Batched</td><td><code>LIMIT 5000</code> per transaction</td><td>Long locks, huge WAL, all-or-nothing rollback</td></tr>
+          <tr><td>Resumable</td><td><code>WHERE state IS NULL</code> — the filter is the cursor</td><td>Restarting from zero after an interruption</td></tr>
+          <tr><td>Non-blocking</td><td><code>FOR UPDATE SKIP LOCKED</code></td><td>Fighting live traffic for rows</td></tr>
+          <tr><td>Throttled</td><td>Pauses above measured replica lag</td><td>Read replicas serving stale data</td></tr>
+          <tr><td>Bounded</td><td><code>lock_timeout</code>, <code>statement_timeout</code></td><td>A stuck batch holding a lock</td></tr>
+          <tr><td>Observable</td><td>Rate, remaining, ETA, lag per batch</td><td>"Is it still running?" during a 51-minute job</td></tr>
+          <tr><td>Verified</td><td>A gate query before the next phase</td><td>Switching reads onto incomplete data</td></tr>
+        </table>
+      <div class="note">🔑 <strong>Throttle on replica lag, not on CPU.</strong> Lag is the thing users
+         experience — a read replica 90 seconds behind serves a customer their order list without the order
+         they just placed. CPU and IO are proxies that can look fine while lag climbs, particularly on managed
+         databases where you cannot see the host metrics anyway.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build nightly migration rehearsal on a production-sized
+      restore, with the compatibility matrix, and publish the results on the pull request.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE PIPELINE
+
+  # .github/workflows/migration-rehearsal.yml
+  on:
+    pull_request:
+      paths: ['migrations/**']
+    schedule: [ { cron: '0 2 * * *' } ]
+
+  jobs:
+    rehearse:
+      runs-on: [self-hosted, db-rehearsal]     # needs network access to
+                                               # the snapshot store
+      timeout-minutes: 90
+      steps:
+        - uses: actions/checkout@v4
+          with: { fetch-depth: 0 }
+
+        - name: Restore last night's production snapshot
+          run: |
+            set -euo pipefail
+            ./ci/restore-snapshot.sh --latest --target rehearsal-db
+            psql "$REHEARSAL_URL" -At -c \
+              "SELECT count(*) FROM orders" | xargs -I{} echo "rows: {}"
+            # rows: 41,300,000
+
+        - name: Record the schema version before
+          run: ./ci/schema-hash.sh &gt; /tmp/schema-before.txt
+
+        - name: Run pending migrations, under load, with lock observation
+          run: |
+            set -euo pipefail
+            ./ci/synthetic-load.sh start           # ~2,000 qps against orders
+            ./ci/measure-locks.sh start
+            START=$(date +%s)
+            ./ci/with-timeouts.sh migrate -path ./migrations \
+              -database "$REHEARSAL_URL" up
+            echo "DURATION=$(( $(date +%s) - START ))" &gt;&gt; "$GITHUB_ENV"
+            ./ci/measure-locks.sh stop &gt; /tmp/locks.txt
+            ./ci/synthetic-load.sh stop &gt; /tmp/load.txt
+
+        - name: Compatibility matrix
+          run: ./ci/compat-matrix.sh "$PREV_RELEASE_SHA" "$GITHUB_SHA"
+
+        - name: Publish the verdict on the PR
+          if: github.event_name == 'pull_request'
+          run: ./ci/post-rehearsal-comment.sh
+
+  # ci/compat-matrix.sh
+  #!/usr/bin/env bash
+  set -euo pipefail
+  PREV="$1"; CUR="$2"; FAIL=0
+  for schema in before after; do
+    ./ci/restore-snapshot.sh --schema "$schema" --target matrix-db
+    for ref in "$PREV" "$CUR"; do
+      git checkout -q "$ref" -- app/
+      if DATABASE_URL="$MATRIX_URL" pytest tests/integration -q &gt;/dev/null 2&gt;&amp;1; then
+        echo "PASS schema=$schema code=${ref:0:8}"
+      else
+        echo "FAIL schema=$schema code=${ref:0:8}"; FAIL=1
+      fi
+    done
+  done
+  git checkout -q "$CUR" -- app/
+  exit "$FAIL"
+</pre>
+<pre>
+THE COMMENT THAT LANDS ON THE PULL REQUEST
+
+  ## Migration rehearsal — 0042_add_state.sql
+
+  Restored snapshot: prod-2026-08-20 (41,300,000 rows in `orders`)
+
+  | metric | value | budget | |
+  |---|---|---|---|
+  | duration | 4m12s | 30s | ❌ |
+  | longest blocking lock | ACCESS EXCLUSIVE 4m12s | 1s | ❌ |
+  | queries blocked during migration | 61,004 | 0 | ❌ |
+  | replica lag induced | 61s | 5s | ❌ |
+  | WAL generated | 18.4 GB | 2 GB | ❌ |
+
+  ### Compatibility matrix
+  | schema \ code | v1 (a913bb02) | v2 (this PR) |
+  |---|---|---|
+  | before | ✅ | ✅ |
+  | after | ✅ | ✅ |
+
+  **VERDICT: BLOCKED.** The column is added with a volatile DEFAULT,
+  which rewrites all 41.3M rows under an exclusive lock.
+  Suggested: add nullable, set a constant default, backfill in batches,
+  then add a validated NOT NULL constraint (see docs/migrations.md#safe).
+</pre>
+        <table class="tbl">
+          <tr><th>Rehearsal output</th><th>Why it belongs on the PR</th></tr>
+          <tr><td>Duration on real data</td><td>Staging said 0.3 s; production is 4m12s</td></tr>
+          <tr><td>Longest blocking lock</td><td>The number that predicts an outage, better than duration</td></tr>
+          <tr><td>Queries blocked under synthetic load</td><td>Makes the impact concrete rather than theoretical</td></tr>
+          <tr><td>Induced replica lag</td><td>Read replicas serving stale data is user-visible</td></tr>
+          <tr><td>Compatibility matrix</td><td>The old-code/new-schema cell is the rollback guarantee</td></tr>
+          <tr><td>A verdict with a suggested rewrite</td><td>Review becomes a decision, not a guess</td></tr>
+        </table>
+      <div class="note">💡 <strong>Restore, do not clone.</strong> Rehearsing against a restored
+         <em>snapshot</em> also exercises your backup — you learn that the restore takes 14 minutes and that it
+         works, every single night. Teams that rehearse migrations this way discover broken backups within a
+         day rather than during a disaster.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Prove a column is safe to drop, then drop it — including
+      the telemetry that catches the monthly job nobody remembered.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — STATIC SEARCH, ACROSS EVERYTHING (not just this repo)
+
+$ gh search code 'orders.status' --owner acme --limit 200 \
+    --json repository,path --jq '.[] | "\(.repository.name)/\(.path)"' | sort -u
+  shop-api/app/models/order.py
+  reporting-etl/dags/daily_orders.py
+  admin-portal/src/OrderTable.tsx
+  data-platform/dbt/models/fct_orders.sql          &lt;-- not a "service"
+  ops-scripts/monthly_reconciliation.rb            &lt;-- runs on the 1st
+
+$ # and the places code search cannot see:
+$ ./ci/list-bi-queries.sh --contains "orders.status"
+  Metabase: "Orders by status" (saved question #412, 3 dashboards)
+  Looker: explore orders -&gt; dimension status
+
+STEP 2 — RUNTIME EVIDENCE FROM THE DATABASE
+
+  -- who is actually reading it, over the last week?
+  SELECT calls, mean_exec_time, left(query, 80) AS q
+  FROM pg_stat_statements
+  WHERE query ILIKE '%status%' AND query ILIKE '%orders%'
+  ORDER BY calls DESC LIMIT 10;
+
+   calls  | mean_exec_time |                    q
+  --------+----------------+------------------------------------------
+   84,102 |          1.204 | SELECT id, state, status FROM orders ...
+      412 |         84.100 | SELECT status, count(*) FROM orders GROUP ...
+        1 |       2941.000 | SELECT ... FROM orders WHERE status = ...
+                             ^^^ ONE call. Monthly reconciliation.
+
+STEP 3 — INSTRUMENT THE APPLICATION AND WAIT
+
+  # in the model
+  @property
+  def status(self):
+      metrics.increment("deprecated_field_read",
+                        tags=[f"field:orders.status", f"service:{SERVICE}"])
+      return self._status
+
+  # dashboard: deprecated_field_read by service, daily
+  week 1:  shop-api 84,102 | reporting-etl 3,201 | admin-portal 612
+  week 3:  shop-api      0 | reporting-etl 3,201 | admin-portal   0
+  week 5:  shop-api      0 | reporting-etl     0 | admin-portal   0
+  week 6:  ALL ZERO ... except:
+  week 6 (1st of the month): ops-scripts 1        &lt;-- CAUGHT IT
+  -> the monthly reconciliation job. Fixed, redeployed.
+  week 10 (1st of the month): all zero. NOW it is safe.
+
+STEP 4 — RENAME FIRST (reversible in one statement)
+
+  -- 0050_rename_status_deprecated.sql
+  -- expand-contract-phase: contract
+  -- verified-unused-since: 2026-07-01
+  SET lock_timeout = '3s';
+  ALTER TABLE orders RENAME COLUMN status TO status_deprecated_20260901;
+
+  -- leave it for one full release cycle. Anything still reading it now
+  -- fails LOUDLY and immediately, and the fix is:
+  --   ALTER TABLE orders RENAME COLUMN status_deprecated_20260901 TO status;
+  -- which takes milliseconds.
+
+STEP 5 — DROP, ALONE, WITH A SNAPSHOT
+
+  # the release contains ONLY this
+  - run: ./ci/snapshot.sh --tag pre-drop-orders-status
+  - run: |
+      psql -v ON_ERROR_STOP=1 &lt;&lt;'SQL'
+      SET lock_timeout = '3s';
+      ALTER TABLE orders DROP COLUMN status_deprecated_20260901;
+      SQL
+  - run: ./ci/verify-schema.sh
+</pre>
+        <table class="tbl">
+          <tr><th>Evidence source</th><th>Catches</th><th>Misses</th></tr>
+          <tr><td>Code search across the org</td><td>Services, ETL, dbt models, scripts</td><td>BI tools, ad-hoc queries, anything not in git</td></tr>
+          <tr><td>BI tool inventory</td><td>Saved questions, dashboards, explores</td><td>Users' personal queries</td></tr>
+          <tr><td><code>pg_stat_statements</code></td><td>Everything that actually ran</td><td>Anything less frequent than the stats window</td></tr>
+          <tr><td>Application telemetry</td><td>Reads by service, including rare ones</td><td>Direct database access outside the app</td></tr>
+          <tr><td><strong>Waiting through a month boundary</strong></td><td><strong>Monthly jobs — the classic miss</strong></td><td>Quarterly and annual jobs (wait longer, or check the scheduler)</td></tr>
+          <tr><td>Rename-before-drop</td><td>Everything the above missed, loudly and reversibly</td><td>Nothing — this is the backstop</td></tr>
+        </table>
+      <div class="note">⚠️ <strong>Wait through at least one month boundary before dropping anything.</strong>
+         The monthly reconciliation job that reads a column once every thirty days is invisible to a two-week
+         observation window, invisible to a code search that nobody thought to run against
+         <code>ops-scripts</code>, and catastrophic on the 1st. If quarterly jobs exist, check the scheduler
+         explicitly rather than waiting a quarter.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Code rolls back in seconds; data does not roll back at all.</strong> Every schema change must leave the <em>previous</em> release able to run — a successful rollback onto a dropped column still leaves the service down.</li>
+        <li><strong>Expand/contract is several releases, not one deployment with six steps</strong>: expand, dual write, backfill, switch reads, stop writing the old, contract.</li>
+        <li>Phase 5 — stop writing the old column — is the one people skip, and it is where the rollback window to the earliest release deliberately closes.</li>
+        <li><strong>Locks, not duration, are the risk.</strong> <code>ADD COLUMN NOT NULL DEFAULT gen_random_uuid()</code> held an exclusive lock for 4m12s on 41M rows, queued 61,000 requests and exhausted the pool at 38 seconds.</li>
+        <li><strong>A migration waiting for a lock queues the whole table behind it</strong> — so a long-running <code>SELECT</code> plus a migration is a table-wide outage even before the migration starts.</li>
+        <li><code>SET lock_timeout</code> changes the failure mode from "four-minute outage" to "the deploy stops in three seconds and you fix the approach".</li>
+        <li>Use <code>CREATE INDEX CONCURRENTLY</code> (outside a transaction — most tools wrap migrations in one), and <code>NOT VALID</code> constraints validated separately, which takes a weaker lock that lets reads and writes continue.</li>
+        <li><strong>Backfills are jobs, not migrations</strong>: a single <code>UPDATE</code> ran 38 minutes, pushed replica lag to 94 s and generated 22 GB of WAL; the batched version took 51 minutes with a 40 ms longest lock.</li>
+        <li>A backfill must be batched, idempotent, resumable, <strong>throttled on measured replica lag</strong>, observable and outside the deploy path — and gated by a verification query before the next phase.</li>
+        <li><strong>Run migrations in a dedicated pipeline job holding an advisory lock</strong>, never on application startup where every replica races.</li>
+        <li>Engine differences matter on failure: PostgreSQL DDL is transactional (except concurrent index builds, which can leave an INVALID index); MySQL DDL is not, so one file with three <code>ALTER</code>s can half-apply.</li>
+        <li><strong>Staging cannot tell you a migration's duration</strong> — 0.3 s on 180k rows against 4m12s on 41.3M. Rehearse against a restored production-sized snapshot.</li>
+        <li><strong>Publish duration, longest blocking lock, blocked queries and induced replica lag on the pull request</strong>, so review is a decision rather than people reading SQL and guessing.</li>
+        <li><strong>The compatibility matrix — {old schema, new schema} × {previous release, this release} — is the rollback guarantee</strong>, and the old-code/new-schema cell is the one nobody tests.</li>
+        <li>A migration linter in CI catches destructive DDL without a phase marker, volatile defaults, non-concurrent indexes, unbounded DML and missing timeouts — before review.</li>
+        <li><strong>Markers beat prohibitions</strong>: requiring <code>expand-contract-phase</code> and <code>verified-unused-since</code> forces the author to state which phase they are in.</li>
+        <li><strong>Before dropping, prove nothing reads it</strong> with code search across every repository, a BI-tool inventory, <code>pg_stat_statements</code>, and application telemetry at zero.</li>
+        <li><strong>Wait through a month boundary</strong> — the monthly reconciliation job that reads a column once every thirty days is invisible to a two-week window and catastrophic on the 1st.</li>
+        <li><strong>Rename before dropping.</strong> A rename is fast, reversible in one statement, and makes any remaining reader fail loudly instead of silently — the cheapest backstop available.</li>
+        <li>Destructive changes ship <strong>alone</strong>, after a snapshot, so that if something breaks the cause is unambiguous.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="environments-promotion.html">← Environments &amp; Promotion</a>
+      <a href="progressive-delivery.html">Progressive Delivery &amp; Feature Flags →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
