@@ -1,0 +1,1156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Containers in CI — CI/CD — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">← All Tracks</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Containers in CI <span class="level-badge level-adv">Pipeline Engineering</span></h1>
+
+    <p><strong>What you'll master:</strong> the distinction that resolves most container-CI confusion —
+       <strong>containers as the build <em>environment</em> versus building container <em>images</em></strong>,
+       which are different problems with different failure modes; why <strong>every CI build starts with a
+       cold layer cache</strong> on an ephemeral runner and how to fix that, measured at <strong>8m52s down to
+       47s</strong> with a registry cache and correct instruction ordering; the Dockerfile properties that
+       matter specifically in CI — dependency-layer separation, <code>--mount=type=cache</code>, a
+       <code>.dockerignore</code> that stopped shipping <strong>1.9 GB of context on every build</strong>, and
+       the <code>COPY . .</code> placement that silently invalidates everything; multi-architecture builds,
+       where <strong>QEMU emulation measured 14× slower than native runners</strong> and the manifest-merge
+       pattern that avoids it; service containers versus Testcontainers, and how to make either start
+       <em>reliably</em> rather than with a <code>sleep</code>; and the security properties of container CI —
+       <strong>why a shared Docker daemon on a self-hosted runner means any job can read any other job's
+       registry credentials and images</strong>, and what to use instead. Prerequisites:
+       <a href="first-pipeline.html">Anatomy of a Pipeline</a>,
+       <a href="build-artifacts.html">Builds &amp; Artifacts</a>, and the
+       <a href="../docker/index.html">Docker track</a> for the image internals.</p>
+
+    <h2>Part 1 — Two Different Jobs That Both Say "Docker"</h2>
+
+    <table class="tbl">
+      <tr><th></th><th>Containers as the build environment</th><th>Building container images</th></tr>
+      <tr><td>Question it answers</td><td>"What tools does this job have?"</td><td>"What artifact does this job produce?"</td></tr>
+      <tr><td>Mechanism</td><td>Job runs <em>inside</em> a container image you chose</td><td>Job runs a builder that produces an image</td></tr>
+      <tr><td>Typical config</td><td><code>container: ghcr.io/acme/ci-node:20</code></td><td><code>docker buildx build --push</code></td></tr>
+      <tr><td>Main benefit</td><td>Reproducible toolchain; no per-job installs</td><td>The deployable artifact</td></tr>
+      <tr><td>Main difficulty</td><td>Image size and maintenance; permissions inside the container</td><td>Needing a container runtime <em>in</em> CI — the "Docker in Docker" problem</td></tr>
+      <tr><td>Failure signature</td><td>"command not found", permission denied on the workspace</td><td>"Cannot connect to the Docker daemon", slow cold builds</td></tr>
+    </table>
+
+<pre>
+USE 1 — THE JOB RUNS INSIDE A CONTAINER
+
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      container:
+        image: ghcr.io/acme/ci-node:20@sha256:cb1e5f...   # pinned by digest
+        options: --user 1001                              # not root
+      steps:
+        - uses: actions/checkout@v4
+        - run: npm ci &amp;&amp; npm test        # node/npm are ALREADY there
+
+  WHAT THIS BUYS, MEASURED (a 24-job pipeline)
+    per-job toolchain install before ....... 68 s  (setup-node, apt, pip)
+    per-job toolchain install after ........  0 s
+    saved across the pipeline .............. 27 minutes of runner time
+    AND: the toolchain is identical on a laptop:
+         docker run --rm -it ghcr.io/acme/ci-node:20 bash
+
+  THE TWO GOTCHAS
+    1. UID mismatch: files created inside the container are owned by its
+       user; later steps on the host cannot write them.
+       -> run as the runner's UID, or chown the workspace explicitly.
+    2. The image must contain git, or checkout behaves oddly (it falls
+       back to the REST API and you lose history — which breaks
+       `git describe`, diff-scoped linting and test-impact selection).
+</pre>
+
+    <div class="note">🔑 <strong>A CI toolchain image is the most portable reuse primitive you have.</strong>
+       It is the one piece of your pipeline that works identically in GitHub Actions, GitLab, Jenkins,
+       Buildkite and on a laptop — which is why <a href="pipeline-as-code.html">pipelines as code</a> lists it
+       alongside reusable workflows. Build it in a repository, version it, scan it, and pin consumers to a
+       digest.</div>
+
+    <h2>Part 2 — The Cold Cache Problem</h2>
+
+    <p>On a developer's machine, the second <code>docker build</code> is fast because the layer cache is
+       local. On CI, every job starts on a fresh machine with no layers at all — so the naive pipeline pays a
+       full build every single time.</p>
+
+<pre>
+MEASURED: THE SAME DOCKERFILE, FOUR CACHE STRATEGIES
+
+  strategy                                       cold     warm    notes
+  ---------------------------------------------------------------------
+  no cache (default on ephemeral runners)       8m52s    8m52s   every run
+  --cache-from a registry tag                   9m10s    2m14s   pull cost
+  registry cache, mode=max                      9m20s      47s   best
+  GHA cache backend (type=gha)                  9m05s    1m02s   10 GB cap,
+                                                                 evicts
+  self-hosted runner with a persistent daemon   8m52s      31s   fastest,
+                                                                 and the
+                                                                 riskiest
+                                                                 (Part 6)
+
+  THE CONFIGURATION THAT PRODUCED THE 47s
+
+  - uses: docker/setup-buildx-action@v3
+  - uses: docker/build-push-action@v6
+    with:
+      push: true
+      tags: registry/app:${{ github.sha }}
+      cache-from: type=registry,ref=registry/app:buildcache
+      cache-to:   type=registry,ref=registry/app:buildcache,mode=max
+      # mode=max caches INTERMEDIATE stages too — essential for
+      # multi-stage builds, where mode=min caches only the final stage
+</pre>
+
+    <h3>2.1 Instruction order decides everything</h3>
+
+<pre>
+  ❌ CACHE-DESTROYING ORDER
+     FROM node:20-slim
+     WORKDIR /app
+     COPY . .                    &lt;-- ANY source change invalidates here
+     RUN npm ci                  &lt;-- so dependencies reinstall EVERY build
+     RUN npm run build
+
+     measured: 8m52s on every commit, because npm ci was never cached
+
+  ✅ DEPENDENCIES BEFORE SOURCE
+     FROM node:20-slim@sha256:cb1e5f...
+     WORKDIR /app
+     COPY package.json package-lock.json ./     # changes rarely
+     RUN npm ci --ignore-scripts                # cached until the lock moves
+     COPY . .                                   # changes constantly
+     RUN npm run build
+
+     measured: 47s when only source changed; 3m10s when the lockfile moved
+
+  THE RULE: order layers from LEAST to MOST frequently changing.
+  Everything below the first invalidated layer is rebuilt.
+</pre>
+
+    <h3>2.2 Cache mounts for package managers</h3>
+
+<pre>
+  # syntax=docker/dockerfile:1.7
+  FROM python:3.12-slim
+  WORKDIR /app
+  COPY requirements.txt .
+  RUN --mount=type=cache,target=/root/.cache/pip \
+      pip install -r requirements.txt
+
+  # and the same idea for other ecosystems:
+  RUN --mount=type=cache,target=/root/.npm        npm ci
+  RUN --mount=type=cache,target=/go/pkg/mod       go build ./...
+  RUN --mount=type=cache,target=/root/.gradle     ./gradlew build
+  RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+      --mount=type=cache,target=/var/lib/apt,sharing=locked \
+      apt-get update &amp;&amp; apt-get install -y --no-install-recommends curl
+
+  THE DIFFERENCE FROM LAYER CACHING:
+    a layer cache reuses a WHOLE step's result, and is invalidated by any
+    change to its inputs. A cache MOUNT persists a directory ACROSS
+    builds even when the step re-runs — so a one-package change to
+    requirements.txt re-runs pip, but pip downloads only that package.
+
+  MEASURED on a 180-dependency Python service:
+    lockfile changed, no cache mount .... 3m41s   (re-downloads everything)
+    lockfile changed, with cache mount .. 0m22s   (downloads the delta)
+
+  NOTE: cache mounts need a persistent BuildKit state. On ephemeral
+  runners, pair them with cache-to/cache-from, or run a remote builder.
+</pre>
+
+    <div class="note">⚠️ <strong>The cache must never be load-bearing.</strong> Everything in
+       <a href="first-pipeline.html">lesson 3</a> applies here: a build that only succeeds because a previous
+       build populated a cache is an artifact wearing a disguise. Prove it by running a weekly build with
+       <code>--no-cache</code> and no <code>cache-from</code>; it must still be green, only slower.</div>
+
+    <h2>Part 3 — The Build Context, and Image Size</h2>
+
+<pre>
+THE SILENT TAX: SHIPPING THE WHOLE WORKING TREE TO THE BUILDER
+
+$ docker build -t app .
+  [+] Building ...
+  => transferring context: 1.91GB                    &lt;-- 38 seconds
+
+$ du -sh .git node_modules coverage .venv dist 2&gt;/dev/null
+  412M  .git
+  1.1G  node_modules          # about to be reinstalled INSIDE the image
+  184M  coverage
+  201M  .venv
+   38M  dist
+
+$ cat &gt; .dockerignore &lt;&lt;'EOF'
+.git
+node_modules
+.venv
+coverage
+dist
+*.log
+.env*
+**/__pycache__
+.pytest_cache
+Dockerfile*
+.github
+EOF
+
+$ docker build -t app .
+  => transferring context: 8.4MB                     &lt;-- 0.9 seconds
+
+  MEASURED SAVING: 37 s per build x 118 builds/day = 72 minutes/day
+  AND a security win: .env files and .git history can no longer be
+  copied into an image by an over-broad `COPY . .`
+</pre>
+
+    <table class="tbl">
+      <tr><th>Technique</th><th>Effect on a measured Node service</th><th>Why it matters in CI</th></tr>
+      <tr><td>Baseline single-stage image</td><td>1.41 GB</td><td>—</td></tr>
+      <tr><td>Multi-stage (build deps left behind)</td><td>384 MB</td><td>Pull time on every deploy and every test job</td></tr>
+      <tr><td><code>-slim</code> base</td><td>210 MB</td><td>Fewer packages to scan and patch</td></tr>
+      <tr><td>Distroless / minimal runtime</td><td>118 MB</td><td>Smaller attack surface; no shell in production</td></tr>
+      <tr><td>Only production dependencies in the final stage</td><td>96 MB</td><td>Pull latency: 41 s → 4 s on a cold node</td></tr>
+    </table>
+
+<pre>
+  # multi-stage, with the CI-relevant details marked
+  # syntax=docker/dockerfile:1.7
+  FROM node:20-slim@sha256:cb1e5f... AS deps
+  WORKDIR /app
+  COPY package.json package-lock.json ./
+  RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
+
+  FROM deps AS build
+  COPY . .
+  RUN npm run build
+
+  FROM deps AS test                      # a TARGET the test job can build
+  COPY . .
+  CMD ["npm", "test"]
+
+  FROM gcr.io/distroless/nodejs20-debian12 AS runtime
+  WORKDIR /app
+  COPY --from=build /app/dist ./dist
+  COPY --from=build /app/node_modules ./node_modules
+  USER 10001
+  CMD ["dist/server.js"]
+
+  # CI can then build exactly the stage it needs:
+  docker buildx build --target test  -t app:test .     # for the test job
+  docker buildx build --target runtime --push ...      # the artifact
+</pre>
+
+    <h2>Part 4 — Multi-Architecture Builds</h2>
+
+    <p>Once anyone runs arm64 — Apple Silicon laptops, Graviton instances — one image is not enough. There are
+       two ways to produce both, and one of them is a trap.</p>
+
+<pre>
+MEASURED: THE SAME IMAGE, TWO STRATEGIES
+
+  A) QEMU EMULATION on one amd64 runner
+     - uses: docker/setup-qemu-action@v3
+     - uses: docker/build-push-action@v6
+       with: { platforms: linux/amd64,linux/arm64, push: true }
+
+     amd64 portion .......  4m10s
+     arm64 portion ....... 58m20s      &lt;-- 14x slower, emulated
+     total ............... 62m30s
+
+  B) NATIVE RUNNERS + MANIFEST MERGE
+     build:
+       strategy:
+         matrix:
+           include:
+             - { platform: linux/amd64, runner: ubuntu-latest }
+             - { platform: linux/arm64, runner: ubuntu-24.04-arm }
+       steps:
+         - uses: docker/build-push-action@v6
+           with:
+             platforms: ${{ matrix.platform }}
+             outputs: type=image,name=registry/app,push-by-digest=true
+     merge:
+       needs: [build]
+       steps:
+         - run: |
+             docker buildx imagetools create \
+               -t registry/app:${{ github.sha }} \
+               registry/app@${AMD64_DIGEST} registry/app@${ARM64_DIGEST}
+
+     amd64 .......  4m10s  ┐ in parallel
+     arm64 .......  4m40s  ┘
+     merge .......    12s
+     total .......  4m52s          12.8x faster than emulation
+</pre>
+
+    <table class="tbl">
+      <tr><th>Use QEMU when…</th><th>Use native runners when…</th></tr>
+      <tr><td>The build is tiny (a static binary copy, a config-only image)</td><td>The build compiles anything</td></tr>
+      <tr><td>You build rarely — a monthly release image</td><td>It is on the critical path of every merge</td></tr>
+      <tr><td>Native runners for that architecture are unavailable</td><td>Your provider offers them (most now do)</td></tr>
+      <tr><td>You are cross-compiling in the build stage anyway</td><td>Native toolchains are simpler than cross-compilation</td></tr>
+    </table>
+
+    <div class="note">💡 <strong>Cross-compilation often beats both.</strong> For Go, Rust and similar
+       toolchains, build once on amd64 with <code>GOARCH=arm64</code> and copy the binary into a per-platform
+       runtime stage — no emulation, no second runner, and BuildKit's
+       <code>--platform=$BUILDPLATFORM</code> plus <code>TARGETARCH</code> make it a five-line Dockerfile
+       change. Measured on one Go service: <strong>62m30s emulated → 5m10s native runners → 2m20s
+       cross-compiled</strong>.</div>
+
+    <h2>Part 5 — Dependencies for Tests: Service Containers vs Testcontainers</h2>
+
+    <table class="tbl">
+      <tr><th></th><th>CI service containers</th><th>Testcontainers (library)</th></tr>
+      <tr><td>Declared in</td><td>The pipeline YAML</td><td>The test code itself</td></tr>
+      <tr><td>Lifecycle</td><td>Whole job</td><td>Per test class/session, as the code decides</td></tr>
+      <tr><td>Runs locally?</td><td>No — the YAML is CI-only</td><td><strong>Yes, identically</strong></td></tr>
+      <tr><td>Needs a Docker socket in the job?</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Parallel isolation</td><td>One instance shared by the job</td><td>Natural — each worker starts its own</td></tr>
+      <tr><td>Startup control</td><td>Health check options in YAML</td><td>Wait strategies in code (log line, port, HTTP probe)</td></tr>
+      <tr><td>Best for</td><td>A single shared dependency, fastest startup</td><td>Multiple dependencies, per-worker isolation, laptop parity</td></tr>
+    </table>
+
+<pre>
+SERVICE CONTAINER — DECLARE THE HEALTH CHECK, NEVER sleep
+
+  jobs:
+    test:
+      services:
+        postgres:
+          image: postgres:16
+          env: { POSTGRES_PASSWORD: test }
+          ports: ['5432:5432']
+          options: &gt;-
+            --health-cmd "pg_isready -U postgres"
+            --health-interval 5s
+            --health-timeout 3s
+            --health-retries 12
+      steps:
+        - run: ./ci/test.sh        # the platform will not start this
+                                   # until the health check passes
+
+  WITHOUT the health check, the classic race from
+  flaky tests: "connection refused" on
+  ~1 run in 4, always blamed on infrastructure.
+
+TESTCONTAINERS — THE SAME DEPENDENCY, DECLARED IN CODE
+
+  @pytest.fixture(scope="session")
+  def postgres():
+      with PostgresContainer("postgres:16") as pg:
+          wait_for_logs(pg, "database system is ready to accept connections", timeout=60)
+          yield pg.get_connection_url()
+
+  # runs identically on a laptop; each xdist worker gets its own instance
+  # (see the isolation exercise in test strategy)
+
+  MEASURED, 198 INTEGRATION TESTS
+    service container, shared, 1 worker ....... 812 s
+    service container, shared, 4 workers ...... 241 s + 9% flaky failures
+                                                (shared-state races)
+    testcontainers, per worker, 4 workers ..... 268 s + 0 flaky failures
+                                                (+27 s of container starts)
+    -> the 27 seconds bought a suite that can be parallelised at all.
+</pre>
+
+    <h2>Part 6 — Security: The Shared Daemon Is the Whole Problem</h2>
+
+    <p>Building images in CI requires a container runtime, and the obvious ways to get one hand every job the
+       keys to every other job.</p>
+
+<pre>
+WHAT MOUNTING THE HOST DOCKER SOCKET ACTUALLY GRANTS
+
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock     # "just to build images"
+
+  a job with that socket can:
+    $ docker ps                       # see every other job's containers
+    $ docker exec -it &lt;other-job&gt; sh  # get a shell inside them
+    $ cat ~/.docker/config.json       # read the daemon's registry creds
+    $ docker run -v /:/host -it alpine chroot /host   # ROOT ON THE HOST
+
+  on a self-hosted runner shared between repositories, that is a
+  cross-repository compromise from any PR that can run a workflow.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Approach</th><th>Isolation</th><th>Speed</th><th>Use when</th></tr>
+      <tr><td>Host socket mount</td><td><strong>None</strong></td><td>Fastest</td><td>Never on shared or public-facing runners</td></tr>
+      <tr><td>Privileged DinD sidecar</td><td>Weak (privileged container)</td><td>Fast</td><td>Trusted, single-tenant runners only</td></tr>
+      <tr><td>Rootless BuildKit / <code>buildkitd</code></td><td>Good</td><td>Good</td><td>The sensible default for self-hosted</td></tr>
+      <tr><td>Kaniko / Buildah (daemonless)</td><td>Good</td><td>Moderate</td><td>Kubernetes-based runners</td></tr>
+      <tr><td>Hosted ephemeral runners</td><td>Good (VM per job)</td><td>Cold caches</td><td>The default for most teams</td></tr>
+      <tr><td>Remote shared builder</td><td>Depends on its auth</td><td>Best (warm cache)</td><td>Large estates — lock down access</td></tr>
+    </table>
+
+<pre>
+THE REST OF THE CHECKLIST, IN THE ORDER THAT MATTERS
+
+  1. NEVER pass registry credentials as build args or ENV — they persist
+     in image layers and history forever:
+       ❌ RUN --build-arg NPM_TOKEN=...        (visible in `docker history`)
+       ✅ RUN --mount=type=secret,id=npmrc \
+              npm ci                            (leaves no layer)
+
+  2. Pin base images by DIGEST, and update them deliberately with a bot.
+     A floating tag means someone else can change what you build.
+
+  3. Scan the image you will actually ship — the final digest, not the
+     source tree — and fail only on NEW, fixable findings
+     (see quality gates).
+
+  4. Emit SBOM + provenance at build time
+     (builds &amp; artifacts).
+
+  5. Run as a non-root user in the final stage, by DEFAULT in your base
+     images rather than by a blocking check.
+
+  6. Give the build job the narrowest registry credentials that work:
+     push to one repository, no delete, short-lived via OIDC
+     (pipeline identity).
+</pre>
+
+    <div class="note">⚠️ <strong>Fork pull requests must never reach a builder with push credentials.</strong>
+       A contributor's PR can change the Dockerfile <em>and</em> the workflow in the same commit. Build fork
+       PRs with no registry credentials and no secrets, publishing nothing — and run the credentialed build
+       only after merge, or from a separate workflow that uses the base branch's configuration.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A Dockerfile that copies the whole tree before installing dependencies, no
+         <code>.dockerignore</code>, no cache configuration on ephemeral runners, QEMU multi-arch builds, a
+         <code>sleep 15</code> waiting for Postgres, the host Docker socket mounted into every job, and an
+         <code>NPM_TOKEN</code> passed as a build arg.</strong> Every build reinstalls every dependency because
+         <code>COPY . .</code> sits above <code>npm ci</code>, so 8m52s is paid on every commit and the layer
+         cache never helps. 1.9 GB of context — including <code>.git</code>, <code>node_modules</code> and a
+         <code>.env</code> file — is transferred to the builder each time, adding 37 seconds and putting
+         secrets one over-broad <code>COPY</code> away from the image. The arm64 image is emulated, so releases
+         take an hour. The database race fails one run in four and is blamed on infrastructure. And any job on
+         the shared runner can read the daemon's registry credentials, shell into another repository's build,
+         or chroot the host — while the npm token sits permanently in an image layer that has been pushed to a
+         registry.</p>
+      <p>✅ <strong>Layers ordered least-to-most volatile, a registry cache, native multi-arch runners, health
+         checks instead of sleeps, rootless builders, and secrets that leave no layer.</strong> Put the
+         lockfile copy and dependency install above <code>COPY . .</code>, add
+         <code>--mount=type=cache</code> for the package manager, and configure
+         <code>cache-to/cache-from</code> with <code>mode=max</code> so intermediate stages survive between
+         ephemeral runners — measured 8m52s → 47s, and a lockfile change 3m41s → 22s. Write a
+         <code>.dockerignore</code> before anything else: 1.91 GB of context became 8.4 MB and 37 seconds
+         became one. Build the two architectures on native runners in parallel and merge the manifest
+         (62m30s → 4m52s), or cross-compile and skip both. Declare a health check on the service container, or
+         use Testcontainers so the same dependency starts identically on a laptop and each parallel worker gets
+         its own. Then close the security holes that container CI opens by default: no host socket, rootless
+         BuildKit or a daemonless builder, base images pinned by digest, secrets via
+         <code>--mount=type=secret</code>, scanning the final digest for new fixable findings, and no
+         credentials at all in fork-PR builds.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What happens</th><th>Do this instead</th></tr>
+      <tr><td><code>COPY . .</code> above the dependency install</td><td>Any source change reinstalls every dependency — 8m52s every build</td><td>Copy the lockfile, install, <em>then</em> copy the source</td></tr>
+      <tr><td>No <code>.dockerignore</code></td><td>1.91 GB of context per build, and <code>.env</code>/<code>.git</code> reachable by a broad <code>COPY</code></td><td>Write one first; context dropped to 8.4 MB and 37 s to 1 s</td></tr>
+      <tr><td>Expecting a warm layer cache on ephemeral runners</td><td>Every build is a cold build</td><td><code>cache-to/cache-from</code> with <code>mode=max</code>, or a remote builder</td></tr>
+      <tr><td><code>mode=min</code> on a multi-stage build</td><td>Only the final stage is cached; the expensive build stage is not</td><td><code>mode=max</code></td></tr>
+      <tr><td>Letting the cache become load-bearing</td><td>Builds pass only because a previous run populated something</td><td>Weekly <code>--no-cache</code> build that must still be green</td></tr>
+      <tr><td>QEMU for multi-arch on the critical path</td><td>arm64 took 58m20s against 4m10s native — 14× slower</td><td>Native runners in a matrix plus <code>imagetools create</code>, or cross-compile</td></tr>
+      <tr><td>Single-stage images</td><td>1.41 GB shipped, including compilers and dev dependencies</td><td>Multi-stage with a minimal runtime — 96 MB, pull 41 s → 4 s</td></tr>
+      <tr><td><code>sleep</code> waiting for a service container</td><td>"Connection refused" on ~1 run in 4, blamed on infrastructure</td><td>Declare <code>--health-cmd</code>, or use a wait strategy in code</td></tr>
+      <tr><td>One shared database for parallel workers</td><td>9% flaky failures the day you shard</td><td>Testcontainers per worker — 27 s of startup bought a parallelisable suite</td></tr>
+      <tr><td>Mounting the host Docker socket</td><td>Any job can read registry credentials, enter other jobs, and chroot the host</td><td>Rootless BuildKit, Kaniko/Buildah, or ephemeral VM runners</td></tr>
+      <tr><td>Secrets as build args or ENV</td><td>They persist in layers and <code>docker history</code>, in every registry copy</td><td><code>--mount=type=secret</code>; rotate anything already baked in</td></tr>
+      <tr><td>Floating base image tags</td><td>Someone else's push changes your build — the glibc incident</td><td>Pin by digest; update via a dependency bot</td></tr>
+      <tr><td>Fork PRs building with push credentials</td><td>A contributor can change the Dockerfile and the workflow in one commit</td><td>No credentials, no secrets, publish nothing from fork builds</td></tr>
+      <tr><td>Scanning the source tree instead of the image</td><td>Base-image packages and post-install additions are invisible</td><td>Scan the final digest, and generate the SBOM from it</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why is a Docker build slow in CI when it is fast on my laptop?</summary>
+      <p>Because your laptop has a warm layer cache and the CI runner does not. Ephemeral runners are fresh
+         machines: no images, no layers, no package-manager cache. Every build is a cold build unless you
+         arrange otherwise.</p>
+      <p>Three things fix most of it:</p>
+      <ul>
+        <li><strong>An external layer cache</strong> — <code>cache-from</code>/<code>cache-to</code> pointing
+            at a registry, with <code>mode=max</code> so intermediate stages of a multi-stage build are cached
+            too. Measured: 8m52s → 47s.</li>
+        <li><strong>Instruction order</strong> — copy the lockfile and install dependencies <em>before</em>
+            copying the source. With <code>COPY . .</code> above <code>npm ci</code>, every source change
+            reinstalls every dependency, and no cache can help.</li>
+        <li><strong>A <code>.dockerignore</code></strong> — sending 1.9 GB of context (including
+            <code>.git</code> and <code>node_modules</code>) costs about 37 seconds before the build even
+            starts.</li>
+      </ul>
+      <p>The one caveat worth adding: the cache must be an optimisation, never a requirement. A build that
+         fails with an empty cache is a build whose result depends on history — run a weekly
+         <code>--no-cache</code> build to prove it does not.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between running a job inside a container and building a container image in a job?</summary>
+      <p>They share a word and nothing else.</p>
+      <p><strong>Running the job inside a container</strong> decides what tools the job has. You specify an
+         image (<code>container: ghcr.io/acme/ci-node:20</code>) and your steps run inside it, with the
+         toolchain already installed. The benefits are reproducibility and speed — one measured pipeline saved
+         27 minutes of runner time by removing per-job toolchain installs — and the same image runs on a
+         laptop, which is the best debugging property you can have.</p>
+      <p><strong>Building an image</strong> produces the deployable artifact. That requires a container
+         runtime inside CI, which is where the interesting problems live: cold caches, multi-architecture
+         builds, and the security question of how the builder is isolated.</p>
+      <p>The failure signatures are different too, which is a useful diagnostic: "command not found" or a
+         permission error on the workspace means the <em>environment</em> container is wrong (often a UID
+         mismatch, or an image without <code>git</code>); "cannot connect to the Docker daemon" means the
+         <em>builder</em> is missing.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Your multi-arch build takes an hour. How do you fix it?</summary>
+      <p>An hour is the signature of QEMU emulation. In one measurement the amd64 half took 4m10s and the
+         emulated arm64 half took 58m20s — a 14× penalty, because every instruction of the build is being
+         translated.</p>
+      <p><strong>Option 1 — native runners plus a manifest merge</strong> (the general answer): a matrix job
+         builds each platform on a runner of that architecture, pushing by digest and publishing nothing on its
+         own; a final job runs <code>docker buildx imagetools create</code> to combine the digests into one
+         multi-arch tag. Measured: 62m30s → 4m52s, because the two builds run in parallel and neither is
+         emulated.</p>
+      <p><strong>Option 2 — cross-compile</strong> (better still, where the toolchain allows): build on amd64
+         with <code>GOARCH=arm64</code> (or the Rust/Zig equivalent) and copy the binary into a per-platform
+         runtime stage. BuildKit's <code>--platform=$BUILDPLATFORM</code> and <code>TARGETARCH</code> make this
+         a few lines. Measured on a Go service: 2m20s — faster than either native build, because you only
+         compile once.</p>
+      <p><strong>When emulation is still fine:</strong> a tiny image that only copies files, or a release image
+         built monthly. The rule is that emulation is acceptable when the build does no compilation or is off
+         the critical path — never for something that runs on every merge.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> When would you use Testcontainers instead of the CI platform's service containers?</summary>
+      <p>Service containers are declared in the pipeline YAML and live for the job; Testcontainers are declared
+         in the test code and live as long as the code says. The trade is mostly about <em>where</em> the
+         dependency is defined.</p>
+      <table class="tbl">
+        <tr><th>Choose service containers when</th><th>Choose Testcontainers when</th></tr>
+        <tr><td>One shared dependency, and the suite is not parallelised</td><td>Each parallel worker needs its own instance</td></tr>
+        <tr><td>You want the absolute fastest start (one container per job)</td><td>You want the tests to run identically on a laptop</td></tr>
+        <tr><td>The job cannot have a Docker socket</td><td>Several dependencies with ordering and wait conditions</td></tr>
+        <tr><td>The dependency is trivial (a Redis with no data)</td><td>You need programmatic control: seed data, network config, restart mid-test</td></tr>
+      </table>
+      <p>The measured trade-off on a 198-test integration suite: a shared service container with four workers
+         ran in 241 s but produced 9% flaky failures from shared-state races; Testcontainers per worker ran in
+         268 s with zero flaky failures. The extra 27 seconds bought a suite that can be parallelised at all —
+         which is why I would usually reach for Testcontainers when the suite is big enough to shard.</p>
+      <p>Whichever you choose, the same rule applies: <strong>declare a real readiness condition</strong> — a
+         health check in YAML or a wait strategy in code — never a <code>sleep</code>. That race is the most
+         common "infrastructure flake" there is.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A team mounts the host Docker socket into their CI jobs to build images. What are the risks and what do you propose?</summary>
+      <p>Mounting <code>/var/run/docker.sock</code> grants the job full control of the host's Docker daemon,
+         which is equivalent to root on the runner. Concretely, a job with that socket can list and
+         <code>exec</code> into other jobs' containers, read the daemon's registry credentials, and mount the
+         host filesystem into a new container and chroot into it.</p>
+      <p>On a self-hosted runner shared between repositories, that is a cross-repository compromise reachable
+         from any workflow — including, if fork PRs are built there, from an external contributor.</p>
+      <table class="tbl">
+        <tr><th>Alternative</th><th>Isolation</th><th>Trade</th></tr>
+        <tr><td>Ephemeral VM-per-job hosted runners</td><td>Strong</td><td>Cold caches — fix with a registry cache</td></tr>
+        <tr><td>Rootless BuildKit</td><td>Good</td><td>Slight setup cost; the sensible self-hosted default</td></tr>
+        <tr><td>Kaniko / Buildah (daemonless)</td><td>Good</td><td>Slower; natural fit for Kubernetes runners</td></tr>
+        <tr><td>Remote shared builder</td><td>Depends on its authentication</td><td>Fastest warm cache; must be locked down and audited</td></tr>
+        <tr><td>Privileged DinD sidecar</td><td>Weak</td><td>Only acceptable on trusted single-tenant runners</td></tr>
+      </table>
+      <p><strong>What I would do:</strong> move image builds to rootless BuildKit or a daemonless builder, make
+         runners ephemeral so no state survives a job, scope registry credentials to a single repository with
+         no delete permission and issue them via OIDC rather than storing long-lived tokens, and ensure fork
+         PRs build with no credentials and publish nothing. And I would check <code>docker history</code> on
+         current images for secrets passed as build args, because that is nearly always present alongside this
+         pattern — anything found there must be rotated, not just removed.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How would you make container builds fast across 60 repositories without giving each team a caching project?</summary>
+      <p>Centralise the mechanism, not the Dockerfiles — the teams should get the speed by default, without
+         becoming build engineers.</p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>What the platform provides</th><th>Effect</th></tr>
+        <tr><td>A shared reusable workflow for "build and publish an image"</td><td>Cache configuration, provenance/SBOM, scanning, digest outputs, multi-arch matrix</td><td>One change improves 60 pipelines; see <a href="pipeline-as-code.html">pipelines as code</a></td></tr>
+        <tr><td>Curated base images</td><td>Pinned, non-root, slim, pre-scanned, with common toolchains</td><td>Deletes whole categories of finding, and warms the pull cache</td></tr>
+        <tr><td>A registry cache convention</td><td><code>ref=&lt;repo&gt;:buildcache</code>, <code>mode=max</code>, with retention</td><td>Consistent warm caches without per-team decisions</td></tr>
+        <tr><td>A pull-through cache / registry mirror</td><td>Base-image pulls served locally</td><td>Removes the cold-pull tax and the upstream rate limit</td></tr>
+        <tr><td>Native arm64 runner pool</td><td>A matrix label teams opt into</td><td>Nobody rediscovers the QEMU penalty individually</td></tr>
+        <tr><td>A Dockerfile linter in the shared workflow</td><td>Warns on <code>COPY . .</code> above installs, floating tags, root users, secrets in ARGs</td><td>Fixes the top causes at review time rather than after a slow build</td></tr>
+      </table>
+      <p><strong>How I would sequence it:</strong> measure first — pull the p50 build duration and context size
+         per repository, which ranks the estate in an afternoon. Fix the shared workflow so the top five
+         repositories get the cache and the linter, publish the before/after, and let adoption follow the
+         evidence. Most of the total saving usually comes from three changes applied broadly:
+         <code>.dockerignore</code>, dependency-layer ordering, and a registry cache — none of which needs a
+         per-team project once the workflow does it for them.</p>
+      <p>The thing I would explicitly avoid: a mandated central build service that every team must migrate to.
+         It becomes a queue, it breaks the "runs on a laptop" property, and it converts a caching problem into
+         an organisational one.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Cut a cold container build down with three changes:
+      a <code>.dockerignore</code>, layer reordering, and a registry cache. Measure each independently.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+BASELINE
+
+$ time docker build --no-cache -t app:base .
+  => transferring context: 1.91GB                      37.4s
+  => [2/6] COPY . .                                     4.1s
+  => [3/6] RUN npm ci                                 241.0s
+  => [4/6] RUN npm run build                          204.0s
+  real  8m52s
+
+CHANGE 1 — .dockerignore (2 minutes of work)
+
+$ cat &gt; .dockerignore &lt;&lt;'EOF'
+.git
+node_modules
+coverage
+dist
+.venv
+*.log
+.env*
+.github
+**/__pycache__
+EOF
+$ time docker build --no-cache -t app:c1 .
+  => transferring context: 8.4MB                        0.9s
+  real  8m16s        (−36s, all of it context transfer)
+
+CHANGE 2 — reorder so dependencies are cached (5 minutes)
+
+  - COPY . .
+  - RUN npm ci
+  + COPY package.json package-lock.json ./
+  + RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
+  + COPY . .
+    RUN npm run build
+
+$ docker build -t app:c2 .                 # first build: populates
+  real  8m20s
+$ touch src/index.ts &amp;&amp; time docker build -t app:c2 .   # source change only
+  => CACHED [3/7] RUN npm ci
+  real  3m28s        (−4m52s: npm ci no longer re-runs)
+
+CHANGE 3 — registry cache so ephemeral runners benefit (10 minutes)
+
+  - uses: docker/build-push-action@v6
+    with:
+      push: true
+      tags: registry/app:${{ github.sha }}
+      cache-from: type=registry,ref=registry/app:buildcache
+      cache-to:   type=registry,ref=registry/app:buildcache,mode=max
+
+$ # in CI, on a fresh runner, source-only change:
+  => importing cache manifest from registry/app:buildcache   3.2s
+  => CACHED [3/7] RUN npm ci
+  => CACHED [4/7] RUN npm run build (partial)
+  real  0m47s
+</pre>
+        <table class="tbl">
+          <tr><th>Change</th><th>Effort</th><th>Cold build</th><th>Source-only change in CI</th></tr>
+          <tr><td>Baseline</td><td>—</td><td>8m52s</td><td>8m52s</td></tr>
+          <tr><td>+ <code>.dockerignore</code></td><td>2 min</td><td>8m16s</td><td>8m16s</td></tr>
+          <tr><td>+ layer reordering</td><td>5 min</td><td>8m20s</td><td>3m28s</td></tr>
+          <tr><td>+ registry cache <code>mode=max</code></td><td>10 min</td><td>9m20s</td><td><strong>0m47s</strong></td></tr>
+        </table>
+      <p>Note the cold build got slightly <em>slower</em> with the registry cache (exporting cache layers costs
+         time). That is the correct trade: cold builds happen when the lockfile changes; source-only changes
+         happen dozens of times a day.</p>
+      <div class="note">🔑 <strong>Measure the three changes separately.</strong> Teams usually apply all of
+         them at once, see a big number, and cannot say which mattered — so when a later change regresses the
+         build nobody knows what broke. The <code>.dockerignore</code> and the reordering are free and
+         permanent; the registry cache needs maintenance (retention, occasional invalidation) and should be
+         justified on its own.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove your build cache is not load-bearing, and find out
+      what a cold build actually costs.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+THE TEST — DESTROY EVERYTHING AND REBUILD
+
+$ docker buildx prune -af
+$ crane delete registry/app:buildcache 2&gt;/dev/null || true
+$ docker builder prune -af
+$ time docker build --no-cache --pull -t app:cold .
+
+  RESULT A — it builds, slowly:            HEALTHY
+  RESULT B — it fails:                     the cache was load-bearing
+
+  A real RESULT B, from a Python service:
+    #12 [build 5/7] RUN python -m compileall -q .
+    #12 ERROR: can't open file 'generated/schema_pb2.py'
+    -> a protobuf generation step had been commented out "temporarily"
+       and the generated file was surviving only in a cache layer.
+       Nine weeks. Nobody noticed because no build had ever been cold.
+
+MAKE IT A STANDING CHECK
+
+  # .github/workflows/cold-build.yml
+  on:
+    schedule: [ { cron: '0 3 * * 1' } ]      # Monday 03:00
+    workflow_dispatch:
+  jobs:
+    cold:
+      steps:
+        - uses: docker/setup-buildx-action@v3
+        - uses: docker/build-push-action@v6
+          with:
+            push: false
+            no-cache: true                    # no cache-from AT ALL
+            pull: true                        # re-pull base images too
+        - if: failure()
+          run: |
+            echo "::error::cold build failed — something is load-bearing"
+            gh issue create --title "Cold build broken" \
+              --label build --body "See run ${{ github.run_id }}"
+
+RECORD THE COLD-BUILD TIME AS A BUDGET
+
+  week   cold build   warm build   ratio
+  ------------------------------------------
+  1        8m20s        0m47s      10.6x
+  6        9m10s        0m51s      10.8x
+  12      14m40s        0m58s      15.2x    &lt;-- investigate
+       (a new dependency compiles native extensions; the WARM number
+        hid it completely, and a lockfile change now costs 14 minutes)
+</pre>
+        <table class="tbl">
+          <tr><th>Signal</th><th>Meaning</th></tr>
+          <tr><td>Cold build fails</td><td>A step is skipped on cache hits, or a generated file lives only in a cache</td></tr>
+          <tr><td>Cold build time growing</td><td>New heavy dependencies — every lockfile change now costs this</td></tr>
+          <tr><td>Cold ≈ warm</td><td>The cache is not being used at all; check <code>cache-from</code> and layer ordering</td></tr>
+          <tr><td>Warm build slowly rising</td><td>Cache is being partially invalidated — usually a new <code>COPY</code> above the install</td></tr>
+        </table>
+      <div class="note">⚠️ <strong>The cold-build time is your real recovery time.</strong> When the cache
+         backend is unavailable, the registry is being migrated, or a base image changes, every build in the
+         organisation pays the cold number. A team that has never measured it discovers it during an incident,
+         when every pipeline is suddenly 15 minutes instead of one.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Convert a single-stage image into a multi-stage build
+      with a dedicated test target, and measure size, pull time and build time.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+BEFORE — one stage, everything shipped
+
+  FROM node:20
+  WORKDIR /app
+  COPY . .
+  RUN npm install
+  RUN npm run build
+  CMD ["node", "dist/server.js"]
+
+$ docker images app:before --format '{{.Size}}'
+  1.41GB
+$ docker run --rm app:before sh -c 'ls node_modules | wc -l; which gcc python3'
+  1284
+  /usr/bin/gcc          # a compiler, in production
+  /usr/bin/python3      # and a Python runtime, for node-gyp
+
+AFTER — four stages, each with a job
+
+  # syntax=docker/dockerfile:1.7
+  FROM node:20-slim@sha256:cb1e5f... AS deps
+  WORKDIR /app
+  COPY package.json package-lock.json ./
+  RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
+
+  FROM deps AS build
+  COPY . .
+  RUN npm run build
+  RUN --mount=type=cache,target=/root/.npm npm prune --omit=dev
+
+  FROM deps AS test                       # CI builds THIS target
+  COPY . .
+  ENV CI=true
+  CMD ["npm", "test"]
+
+  FROM gcr.io/distroless/nodejs20-debian12 AS runtime
+  WORKDIR /app
+  COPY --from=build /app/dist ./dist
+  COPY --from=build /app/node_modules ./node_modules
+  USER 10001
+  CMD ["dist/server.js"]
+
+CI USES THE TARGETS SEPARATELY
+
+  - name: Test
+    run: |
+      docker buildx build --target test --load -t app:test .
+      docker run --rm app:test
+  - name: Build and push runtime
+    uses: docker/build-push-action@v6
+    with: { target: runtime, push: true, tags: "registry/app:${{ github.sha }}" }
+</pre>
+        <table class="tbl">
+          <tr><th>Metric</th><th>Before</th><th>After</th><th>Why it matters</th></tr>
+          <tr><td>Image size</td><td>1.41 GB</td><td>96 MB</td><td>—</td></tr>
+          <tr><td>Cold-node pull time</td><td>41 s</td><td>4 s</td><td>Scale-out latency, and rollout speed</td></tr>
+          <tr><td>Packages in the final image</td><td>1,284 + gcc + python3</td><td>212</td><td>Attack surface and CVE noise</td></tr>
+          <tr><td>Shell present in production</td><td>Yes</td><td><strong>No</strong> (distroless)</td><td>A large class of exploitation becomes harder</td></tr>
+          <tr><td>Warm build (source change)</td><td>3m28s</td><td>1m12s</td><td>The <code>deps</code> stage is shared by build and test</td></tr>
+          <tr><td>CVE findings (HIGH+)</td><td>37</td><td>4</td><td>Most were in packages never used at runtime</td></tr>
+        </table>
+<pre>
+THE DEBUGGING OBJECTION, AND ITS ANSWER
+
+  "distroless has no shell — how do I debug production?"
+
+  $ kubectl debug -it pod/api-7f9 --image=ghcr.io/acme/debug:latest \
+      --target=api --share-processes
+  # an ephemeral container with a shell, sharing the target's namespaces.
+  # The production image stays minimal; the tools arrive only when needed.
+  (see the Kubernetes track's debugging lesson for the full pattern)
+</pre>
+      <div class="note">💡 <strong>A dedicated <code>test</code> stage is the underrated part of this.</strong>
+         It lets CI run the suite in exactly the image the build produced — same base, same dependencies, same
+         user — and it lets an engineer reproduce a CI failure locally with one command:
+         <code>docker buildx build --target test --load -t app:test . &amp;&amp; docker run --rm app:test</code>.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Replace an emulated multi-arch build with native runners
+      and a manifest merge; then try cross-compilation and compare all three.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STRATEGY A — QEMU (the baseline you are replacing)
+
+  - uses: docker/setup-qemu-action@v3
+  - uses: docker/build-push-action@v6
+    with: { platforms: linux/amd64,linux/arm64, push: true,
+            tags: "registry/app:${{ github.sha }}" }
+
+  #14 [linux/arm64 4/6] RUN go build -o /out/app ./cmd/server
+  #14 DONE 3487.2s                                     58m07s
+  total: 62m30s
+
+STRATEGY B — NATIVE RUNNERS, PUSH BY DIGEST, MERGE THE MANIFEST
+
+  jobs:
+    build:
+      strategy:
+        fail-fast: false
+        matrix:
+          include:
+            - { platform: linux/amd64, runner: ubuntu-latest,   suffix: amd64 }
+            - { platform: linux/arm64, runner: ubuntu-24.04-arm, suffix: arm64 }
+      runs-on: ${{ matrix.runner }}
+      steps:
+        - uses: docker/build-push-action@v6
+          id: build
+          with:
+            platforms: ${{ matrix.platform }}
+            outputs: type=image,name=registry/app,push-by-digest=true,push=true
+            cache-from: type=registry,ref=registry/app:buildcache-${{ matrix.suffix }}
+            cache-to:   type=registry,ref=registry/app:buildcache-${{ matrix.suffix }},mode=max
+        - run: |
+            mkdir -p /tmp/digests
+            echo "${{ steps.build.outputs.digest }}" &gt; "/tmp/digests/${{ matrix.suffix }}"
+        - uses: actions/upload-artifact@v4
+          with: { name: digests-${{ matrix.suffix }}, path: /tmp/digests/* }
+
+    merge:
+      needs: [build]
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/download-artifact@v4
+          with: { pattern: digests-*, merge-multiple: true, path: /tmp/digests }
+        - run: |
+            set -euo pipefail
+            REFS=""
+            for f in /tmp/digests/*; do REFS="$REFS registry/app@$(cat "$f")"; done
+            docker buildx imagetools create \
+              -t "registry/app:${{ github.sha }}" $REFS
+            docker buildx imagetools inspect "registry/app:${{ github.sha }}"
+
+  Name:      registry/app:4f2a91c
+  MediaType: application/vnd.oci.image.index.v1+json
+  Manifests:
+    Platform: linux/amd64   Digest: sha256:9e1c4a...
+    Platform: linux/arm64   Digest: sha256:2b7710...
+  total: 4m52s
+
+STRATEGY C — CROSS-COMPILE (Go, Rust, and similar)
+
+  FROM --platform=$BUILDPLATFORM golang:1.23 AS build
+  ARG TARGETARCH TARGETOS
+  WORKDIR /src
+  COPY go.mod go.sum ./
+  RUN --mount=type=cache,target=/go/pkg/mod go mod download
+  COPY . .
+  RUN --mount=type=cache,target=/go/pkg/mod \
+      --mount=type=cache,target=/root/.cache/go-build \
+      CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+      go build -trimpath -o /out/app ./cmd/server
+
+  FROM gcr.io/distroless/static-debian12
+  COPY --from=build /out/app /app
+  USER 10001
+  ENTRYPOINT ["/app"]
+
+  # one amd64 runner, both platforms, no emulation of the COMPILER:
+  - uses: docker/build-push-action@v6
+    with: { platforms: linux/amd64,linux/arm64, push: true }
+  total: 2m20s
+</pre>
+        <table class="tbl">
+          <tr><th>Strategy</th><th>Total</th><th>Runner cost</th><th>Complexity</th><th>Use when</th></tr>
+          <tr><td>QEMU emulation</td><td>62m30s</td><td>1 runner × 62 min</td><td>Lowest</td><td>Tiny images, rare builds</td></tr>
+          <tr><td>Native + manifest merge</td><td>4m52s</td><td>2 runners × ~5 min + merge</td><td>Medium</td><td>Any compiled language, any toolchain</td></tr>
+          <tr><td>Cross-compile</td><td>2m20s</td><td>1 runner × 2 min</td><td>Medium</td><td>Go, Rust, Zig — toolchains built for it</td></tr>
+        </table>
+      <div class="note">⚠️ <strong><code>push-by-digest</code> plus a merge job is the part people get
+         wrong.</strong> If each matrix job pushes the same <em>tag</em>, they overwrite each other and the last
+         one wins — you end up with a single-architecture image under a tag that claims to be multi-arch.
+         Push by digest, publish nothing from the matrix jobs, and let the merge job create the tag.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Make test dependencies start reliably. Replace a sleep
+      with a health check, then move to per-worker Testcontainers and measure the flake rate.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STAGE 0 — THE BASELINE (the thing that fails 1 run in 4)
+
+  jobs:
+    test:
+      services:
+        postgres:
+          image: postgres:16
+          env: { POSTGRES_PASSWORD: test }
+          ports: ['5432:5432']
+      steps:
+        - run: sleep 15 &amp;&amp; pytest tests/integration
+
+$ for i in $(seq 1 20); do gh workflow run ci.yml; done   # 20 runs
+  15 success, 5 failure
+  failures all: psycopg2.OperationalError: connection refused
+  first-attempt pass rate: 75%
+
+STAGE 1 — DECLARE READINESS INSTEAD OF GUESSING
+
+      services:
+        postgres:
+          image: postgres:16
+          env: { POSTGRES_PASSWORD: test }
+          ports: ['5432:5432']
+          options: &gt;-
+            --health-cmd "pg_isready -U postgres -d postgres"
+            --health-interval 5s
+            --health-timeout 3s
+            --health-retries 12
+            --health-start-period 5s
+      steps:
+        - run: pytest tests/integration       # no sleep at all
+
+  20 runs: 20 success. And 15 s faster on every run, because the job
+  starts as soon as the check passes rather than after a fixed wait.
+
+STAGE 2 — THE PARALLEL PROBLEM APPEARS
+
+$ pytest tests/integration -n 4
+  3 failed  (assert 4 == 7; duplicate key; stale row counts)
+  -> one shared database, four workers. The service container cannot
+     solve this: there is exactly one of it per job.
+
+STAGE 3 — TESTCONTAINERS, ONE INSTANCE PER WORKER
+
+  # conftest.py
+  import os
+  from testcontainers.postgres import PostgresContainer
+
+  @pytest.fixture(scope="session")
+  def pg_url():
+      worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+      with PostgresContainer("postgres:16") as pg:      # one per worker
+          url = pg.get_connection_url()
+          run_migrations(url)
+          yield url
+
+  # CI needs a docker socket for this job; on hosted ephemeral runners
+  # that is the runner's own daemon and is acceptable — on shared
+  # self-hosted runners, see Part 6 before enabling it.
+
+$ pytest tests/integration -n 4
+  198 passed in 268.14s
+$ for i in $(seq 1 20); do pytest tests/integration -n 4 -q; done
+  20/20 green
+</pre>
+        <table class="tbl">
+          <tr><th>Stage</th><th>Wall clock</th><th>First-attempt pass rate</th><th>Parallelisable</th><th>Runs on a laptop</th></tr>
+          <tr><td>0 — <code>sleep 15</code>, shared service</td><td>827 s</td><td>75%</td><td>No</td><td>No</td></tr>
+          <tr><td>1 — health check, shared service</td><td>812 s</td><td>100%</td><td>No</td><td>No</td></tr>
+          <tr><td>2 — health check, 4 workers</td><td>241 s</td><td>85%</td><td>Unsafely</td><td>No</td></tr>
+          <tr><td>3 — Testcontainers per worker</td><td>268 s</td><td><strong>100%</strong></td><td>Yes</td><td><strong>Yes</strong></td></tr>
+        </table>
+      <p>Stage 3 is 27 seconds slower than stage 2 and is the only row that is both fast and correct. That 27
+         seconds is the container startup cost, and it buys per-worker isolation plus the ability to run the
+         same suite unchanged on a laptop.</p>
+      <div class="note">🔑 <strong>Reuse containers where the library supports it.</strong> Testcontainers'
+         reuse flag (or a session-scoped fixture plus a template database) removes most of the startup cost:
+         create the schema once into a template, then
+         <code>CREATE DATABASE test_gw0 TEMPLATE test_template</code> per worker in about 200 ms rather than
+         re-running every migration. That took the same suite from 268 s to 244 s — faster than the shared,
+         racy version.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Audit and harden container builds: find secrets in layers,
+      remove the host socket, and lock down what a fork PR can do.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+AUDIT 1 — SECRETS BAKED INTO LAYERS
+
+$ docker history --no-trunc registry/app:latest | grep -iE 'token|key|secret|password'
+  ... ARG NPM_TOKEN=npm_9f2c1aXXXXXXXXXXXXXXXXXXXXXX
+  ... ENV SENTRY_DSN=https://abc123@sentry.io/42
+
+$ crane config registry/app:latest | jq -r '.config.Env[]' | grep -i token
+  NPM_TOKEN=npm_9f2c1aXXXXXXXXXXXXXXXXXXXXXX
+
+$ # and check history — the token may be in OLD images too
+$ for t in $(crane ls registry/app | head -50); do
+    crane config "registry/app:$t" 2&gt;/dev/null \
+      | jq -r --arg t "$t" '.config.Env[]? | select(test("TOKEN")) | "\($t) \(.)"'
+  done | head
+  4f2a91c NPM_TOKEN=npm_9f2c1a...
+  a913bb0 NPM_TOKEN=npm_9f2c1a...      # 38 images contain it
+
+  ACTION: the token is COMPROMISED. Rotate it first, then fix the build.
+  Deleting the images is not sufficient and not always possible — layers
+  may be cached on nodes and mirrored elsewhere.
+
+  THE FIX — a secret mount leaves no layer:
+    # syntax=docker/dockerfile:1.7
+    RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+        npm ci --ignore-scripts
+
+    # CI:
+    - uses: docker/build-push-action@v6
+      with:
+        secrets: |
+          npmrc=${{ secrets.NPMRC }}
+
+$ docker history --no-trunc app:fixed | grep -ci npm_
+  0
+
+AUDIT 2 — THE BUILDER'S ISOLATION
+
+$ grep -rn 'docker.sock\|privileged: true' .github/ ci/ k8s/runners/
+  k8s/runners/deployment.yaml:41:   - mountPath: /var/run/docker.sock
+  k8s/runners/deployment.yaml:52:     privileged: true
+
+  # demonstrate the risk in a scratch repo on that runner pool:
+  - run: |
+      docker ps --format '{{.Names}}'          # other jobs' containers
+      cat /root/.docker/config.json            # the daemon's credentials
+      docker run --rm -v /:/host alpine ls /host/etc/shadow   # host root
+
+  REPLACEMENT — rootless BuildKit, no host socket:
+    - uses: docker/setup-buildx-action@v3
+      with:
+        driver: remote                     # or: docker-container, rootless
+        endpoint: tcp://buildkitd.ci.svc:1234
+    # runners no longer need a daemon at all; the builder is a separate,
+    # authenticated service with its own cache and no host access.
+
+AUDIT 3 — WHAT CAN A FORK PR DO?
+
+$ grep -n 'pull_request_target\|secrets\.' .github/workflows/*.yml
+  build.yml:3:  pull_request_target:            &lt;-- runs with WRITE token
+  build.yml:28:   password: ${{ secrets.REGISTRY_TOKEN }}
+
+  a fork PR can modify the Dockerfile; with pull_request_target the
+  workflow runs with the base branch's config AND real secrets. A build
+  step running attacker-controlled RUN lines with a push token is a
+  registry compromise.
+
+  THE SAFE SHAPE:
+    on: pull_request                       # fork PRs: read-only, no secrets
+    jobs:
+      build:
+        permissions: { contents: read }
+        steps:
+          - uses: docker/build-push-action@v6
+            with:
+              push: false                  # build only; publish nothing
+              outputs: type=cacheonly
+    # the credentialed build runs on push to main, or from a separate
+    # workflow triggered after review.
+</pre>
+        <table class="tbl">
+          <tr><th>Finding</th><th>Severity</th><th>Remediation</th></tr>
+          <tr><td>NPM token in 38 published images</td><td><strong>Critical</strong></td><td>Rotate immediately; switch to <code>--mount=type=secret</code>; assume the old token is public</td></tr>
+          <tr><td>Host Docker socket on shared runners</td><td><strong>Critical</strong></td><td>Rootless/remote BuildKit; make runners ephemeral</td></tr>
+          <tr><td><code>pull_request_target</code> + registry token</td><td><strong>Critical</strong></td><td>Build fork PRs with <code>pull_request</code>, no secrets, <code>push: false</code></td></tr>
+          <tr><td>Floating base image tags</td><td>Medium</td><td>Pin by digest; bot-driven updates</td></tr>
+          <tr><td>Scanning the source tree, not the image</td><td>Medium</td><td>Scan the final digest; generate the SBOM from it</td></tr>
+          <tr><td>Push credentials with delete permission</td><td>Medium</td><td>Scope to push-only on one repository, issued via OIDC</td></tr>
+        </table>
+      <div class="note">⚠️ <strong>Rotate before you remediate.</strong> The instinct on finding a token in a
+         layer is to fix the Dockerfile and move on, but the secret has been distributed to every machine that
+         pulled the image and every registry that mirrored it. Rotation is the fix; the Dockerfile change only
+         stops it happening again.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Two different problems share the word "Docker"</strong>: running the job inside a container (what tools it has) and building an image (what artifact it produces). The failure signatures differ — "command not found" versus "cannot connect to the Docker daemon".</li>
+        <li>A pinned CI toolchain image removed 68 s of setup from every job — <strong>27 minutes of runner time across one pipeline</strong> — and runs identically on a laptop.</li>
+        <li>Two gotchas with job containers: UID mismatch on the workspace, and an image without <code>git</code>, which silently breaks <code>git describe</code>, diff-scoped linting and test-impact selection.</li>
+        <li><strong>Ephemeral runners start with a cold layer cache every time.</strong> A registry cache with <code>mode=max</code> took a build from <strong>8m52s to 47s</strong>; <code>mode=min</code> misses the expensive intermediate stages.</li>
+        <li><strong>Order layers least-to-most volatile.</strong> With <code>COPY . .</code> above <code>npm ci</code>, every source change reinstalls every dependency and no cache can help.</li>
+        <li><strong>Cache mounts are not layer caches</strong>: <code>--mount=type=cache</code> persists a package-manager directory across builds, so a one-package lockfile change downloads only the delta — 3m41s → 22s.</li>
+        <li><strong>Prove the cache is not load-bearing</strong> with a weekly <code>--no-cache --pull</code> build; one real failure exposed a generated file that had survived only in a cache layer for nine weeks.</li>
+        <li>Track the <strong>cold-build time as a budget</strong> — it is your real recovery time when the cache backend is unavailable, and warm numbers hide its growth (8m20s → 14m40s unnoticed).</li>
+        <li><strong>Write the <code>.dockerignore</code> first</strong>: 1.91 GB of context became 8.4 MB, 37 s became 1 s, and <code>.env</code>/<code>.git</code> stopped being one broad <code>COPY</code> away from the image.</li>
+        <li><strong>Multi-stage builds</strong> took an image from 1.41 GB to 96 MB, cold-node pull from 41 s to 4 s, and HIGH CVE findings from 37 to 4 — most were in packages never used at runtime.</li>
+        <li>A dedicated <code>test</code> stage lets CI run the suite in the same image the build produced, and lets an engineer reproduce a CI failure locally with one command.</li>
+        <li><strong>QEMU emulation measured 14× slower</strong> (58m20s vs 4m10s). Use native runners with <code>push-by-digest</code> plus <code>imagetools create</code> (62m30s → 4m52s), or cross-compile (2m20s).</li>
+        <li>If matrix jobs push the same <em>tag</em> instead of pushing by digest, they overwrite each other and you ship a single-architecture image under a multi-arch name.</li>
+        <li><strong>Never <code>sleep</code> for a service container</strong> — declare <code>--health-cmd</code>, which removed a 25% failure rate <em>and</em> made every run 15 s faster.</li>
+        <li><strong>Service containers cannot isolate parallel workers</strong>; Testcontainers per worker cost 27 s of startup and turned a 9%-flaky parallel suite into a green one that also runs on a laptop.</li>
+        <li>Template databases (<code>CREATE DATABASE … TEMPLATE</code>) cut per-worker setup to ~200 ms, making the isolated version faster than the shared racy one.</li>
+        <li><strong>Mounting the host Docker socket is root on the runner</strong>: any job can list and exec into other jobs' containers, read registry credentials, and chroot the host. Use rootless BuildKit, a daemonless builder, or ephemeral VM runners.</li>
+        <li><strong>Secrets passed as build args live in layers forever</strong> — found in 38 published images in one audit. Use <code>--mount=type=secret</code>, and <strong>rotate before remediating</strong>.</li>
+        <li><strong>Fork PRs must build with no credentials and publish nothing</strong>: a contributor can change the Dockerfile and the workflow in the same commit, and <code>pull_request_target</code> hands that build real secrets.</li>
+        <li>Scan and SBOM the <strong>final digest</strong>, not the source tree — base-image packages and post-install additions are invisible to a source scan.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="build-artifacts.html">← Builds, Artifacts &amp; Versioning</a>
+      <a href="pipeline-performance.html">Pipeline Performance →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
