@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pipeline Reliability &amp; Debugging — CI/CD — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">← All Tracks</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Pipeline Reliability &amp; Debugging <span class="level-badge level-adv">Pipeline Engineering</span></h1>
+
+    <p><strong>What you'll master:</strong> the reframing that makes all of this tractable — <strong>the
+       pipeline is a production system whose users are engineers</strong>, so it gets SLIs, an error budget, an
+       owner and an on-call rotation, and "CI is down" becomes an incident with a severity rather than a Slack
+       complaint; the failure taxonomy that decides what may be retried, because <strong>retrying a
+       deterministic failure is a slow way to fail and retrying a deploy step is a way to deploy twice</strong>;
+       retries done properly — classified by error signature, bounded by a budget, with idempotent steps —
+       against the measured alternative where <strong>blanket retries hid a 40-minute registry outage and
+       turned it into a four-hour one</strong>; timeouts, where a missing one let a hung job burn
+       <strong>six hours of runner time and block the merge queue for an afternoon</strong>, and the watchdog
+       that detects a stuck step rather than a slow one; a debugging method built on <strong>structured logs,
+       an environment preamble and correlation IDs across jobs</strong>, so the first question of any failure
+       is answered from the log rather than by re-running; and how to run a CI incident — declaring it,
+       degrading deliberately, and writing the postmortem that stops the same 40 minutes happening quarterly.
+       Prerequisites: <a href="flaky-tests.html">Flaky Tests</a>,
+       <a href="runners-infrastructure.html">Runners &amp; Build Infrastructure</a> and
+       <a href="quality-gates.html">Quality Gates</a>.</p>
+
+    <h2>Part 1 — The Pipeline Is Production</h2>
+
+    <p>When CI is down or slow, every engineer is blocked. That is the same shape as a production outage, so it
+       deserves the same instrumentation — and the absence of that instrumentation is why most CI problems are
+       discovered by complaint rather than by alert.</p>
+
+    <table class="tbl">
+      <tr><th>SLI</th><th>Definition</th><th>Reasonable target</th><th>What it protects</th></tr>
+      <tr><td><strong>Availability</strong></td><td>% of pushes that get <em>a</em> result (not a lost run)</td><td>&gt; 99.5% in working hours</td><td>The ability to merge at all</td></tr>
+      <tr><td><strong>Job start latency</strong></td><td>Queued → running, p95</td><td>&lt; 60 s</td><td>Feedback time</td></tr>
+      <tr><td><strong>Duration</strong></td><td>PR pipeline p50 and p90</td><td>&lt; 10 min / &lt; 20 min</td><td>Whether the gate is respected</td></tr>
+      <tr><td><strong>Signal fidelity</strong></td><td>First-attempt pass rate on green commits</td><td>&gt; 95%</td><td>Whether red means broken</td></tr>
+      <tr><td><strong>Infra failure rate</strong></td><td>Failures not attributable to the change</td><td>&lt; 0.5% of runs</td><td>Trust, and wasted engineer time</td></tr>
+      <tr><td><strong>MTTR (of the pipeline)</strong></td><td>Detection → CI usable again</td><td>&lt; 30 min</td><td>The cost of an outage, in blocked engineers</td></tr>
+    </table>
+
+<pre>
+THE ERROR BUDGET, IN THE UNITS THAT GET ATTENTION
+
+  200 engineers, 118 pipeline runs/day, 34% of runs waited on
+
+  a 40-minute CI outage at 14:00 on a Tuesday:
+    engineers blocked ................ ~140 (those mid-task)
+    average productive time lost ...... 22 min (not 40 — people
+                                        context-switch, badly)
+    engineer-hours ................... 51 h
+    cost at $85/h .................... $4,335
+    ... plus 3 merge-queue evictions and one delayed release
+
+  THE SAME OUTAGE FOUR TIMES A QUARTER = $17,340/quarter,
+  which is the budget line that funds an owner for the pipeline.
+
+  AND THE COMPARISON THAT MAKES THE POINT: the same organisation's
+  customer-facing SLO breach that quarter cost an estimated $6,000.
+  CI outages were 3x more expensive and had no owner, no alert and
+  no postmortem.
+</pre>
+
+    <div class="note">🔑 <strong>Alert on the pipeline, not on individual runs.</strong> A single failed run is
+       normal; a <em>rate</em> of infrastructure failures, a collapse in first-attempt pass rate, or a queue
+       depth that will not drain are incidents. Page on those three and you will hear about CI problems from a
+       monitor rather than from the fourth person to give up and post in a channel.</div>
+
+    <h2>Part 2 — A Failure Taxonomy You Can Act On</h2>
+
+    <p>Every decision in this lesson — retry or not, alert or not, page or not — depends on which of four
+       categories a failure falls into. Guessing produces both retried real failures and unretried transients.</p>
+
+    <table class="tbl">
+      <tr><th>Category</th><th>Examples</th><th>Retry?</th><th>Alert?</th></tr>
+      <tr><td><strong>1. Deterministic — the change is broken</strong></td><td>Test assertion, compile error, lint violation, type error</td><td><strong>Never</strong></td><td>No — this is the pipeline working</td></tr>
+      <tr><td><strong>2. Nondeterministic in our code or tests</strong></td><td>Race, order dependence, timing</td><td>No — quarantine instead</td><td>Track the rate (see <a href="flaky-tests.html">flaky tests</a>)</td></tr>
+      <tr><td><strong>3. Transient infrastructure</strong></td><td>Runner lost, image pull timeout, DNS blip, 503 from a registry</td><td><strong>Yes</strong>, by signature, bounded</td><td>On rate, not on instance</td></tr>
+      <tr><td><strong>4. External dependency outage</strong></td><td>Package index down, cloud API throttling, the CI provider itself</td><td>Bounded retry, then <em>degrade</em></td><td>Page if it blocks merges</td></tr>
+    </table>
+
+<pre>
+CLASSIFYING AUTOMATICALLY — SIGNATURES, NOT GUESSES
+
+  # ci/classify.sh — run on every failure, before anything else decides
+  case "$(tail -300 "$LOG")" in
+    *"no space left on device"*)                    C=infra_disk ;;
+    *"toomanyrequests"*|*"pull rate limit"*)        C=infra_registry ;;
+    *"received a shutdown signal"*|\
+     *"lost communication with the server"*)        C=infra_runner_lost ;;
+    *"Temporary failure in name resolution"*|\
+     *"TLS handshake timeout"*)                     C=infra_network ;;
+    *"429 Too Many Requests"*)                      C=external_throttle ;;
+    *"ECONNREFUSED"*|*"connection refused"*)        C=maybe_readiness ;;
+    *"AssertionError"*|*"FAILED tests/"*|\
+     *"error TS"*|*"SyntaxError"*)                  C=deterministic ;;
+    *)                                              C=unclassified ;;
+  esac
+
+  the `unclassified` bucket is the useful one: every week, read those
+  logs and add a signature. It should trend toward zero.
+  MEASURED: 31% unclassified in week 1 -> 4% by week 6.
+</pre>
+
+    <h3>2.1 Degrading deliberately when something external is down</h3>
+
+<pre>
+  npm registry returns 503 for 40 minutes. Three possible postures:
+
+  ❌ FAIL EVERYTHING
+     every pipeline red; nobody can merge; 140 engineers blocked
+
+  ❌ RETRY FOREVER
+     jobs hang for the full 6-hour default timeout, the runner pool
+     fills with waiting jobs, and the queue never drains. This is how
+     a 40-minute outage became a 4-hour one, MEASURED.
+
+  ✅ BOUNDED RETRY, THEN DEGRADE WITH A LOUD, HONEST STATUS
+     - retry 3 times with backoff (covers most blips)
+     - then fall back to the package proxy's cached copy if present
+     - if that fails, FAIL FAST with a message naming the dependency:
+         ::error::npm registry unavailable (503 after 3 attempts).
+                  This is not your change. Status: status.npmjs.org
+     - and post once to the engineering channel, not once per run
+</pre>
+
+    <div class="note">⚠️ <strong>A failure message that names the cause is a reliability feature.</strong> The
+       difference between "npm ERR! code E503" buried at line 2,400 and an annotation saying <em>"this is not
+       your change"</em> is roughly twenty minutes per affected engineer — and it is the difference between one
+       person investigating and forty people investigating the same thing simultaneously.</div>
+
+    <h2>Part 3 — Retries That Help Rather Than Hide</h2>
+
+<pre>
+  THE THREE RULES
+
+  1. RETRY BY SIGNATURE, NEVER BY OUTCOME.
+     ❌ retry-on: failure                 # retries broken code too
+     ✅ retry only when classify.sh says infra_* or external_*
+
+  2. THE STEP MUST BE IDEMPOTENT.
+     safe to retry:    checkout, dependency install, image pull,
+                       read-only API calls, most test runs
+     NOT safe:         `docker push` of a mutable tag, a deploy,
+                       a database migration, sending a notification,
+                       anything that creates a resource without a key
+
+  3. BOUND IT — attempts, total time, AND a budget across the fleet.
+     3 attempts, exponential backoff with jitter, 10-minute ceiling,
+     and an alert if more than 5% of runs retried in an hour.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Step</th><th>Idempotent?</th><th>Retry policy</th></tr>
+      <tr><td>Checkout, restore cache, install dependencies</td><td>Yes</td><td>3 attempts, backoff</td></tr>
+      <tr><td>Image pull</td><td>Yes</td><td>3 attempts; then try the mirror</td></tr>
+      <tr><td>Test job</td><td>Yes, but see rule 1</td><td>Retry only on <em>infrastructure</em> signatures</td></tr>
+      <tr><td>Push an immutable tag / digest</td><td>Yes (same content, same digest)</td><td>3 attempts</td></tr>
+      <tr><td>Push a mutable tag</td><td>Ambiguous</td><td>Prefer digests; retry with care</td></tr>
+      <tr><td>Deploy</td><td><strong>Only if designed to be</strong></td><td>Never blind-retry; re-run through the pipeline with a lock</td></tr>
+      <tr><td>Database migration</td><td>Only if written to be</td><td>Never automatically — see <a href="database-migrations.html">migrations</a></td></tr>
+      <tr><td>Notifications, tickets, releases</td><td>No</td><td>Idempotency key, or do not retry</td></tr>
+    </table>
+
+<pre>
+IMPLEMENTATION — A RETRY WRAPPER WITH BACKOFF AND JITTER
+
+  # ci/retry.sh -- attempts backoff_base -- command...
+  #!/usr/bin/env bash
+  set -uo pipefail
+  ATTEMPTS="${ATTEMPTS:-3}"; BASE="${BASE:-5}"; n=1
+  until "$@"; do
+    rc=$?
+    ./ci/classify.sh /tmp/last.log &gt; /tmp/class || true
+    case "$(cat /tmp/class)" in
+      infra_*|external_*) : ;;                    # retryable
+      *) echo "::error::not a transient failure ($(cat /tmp/class)); not retrying"
+         exit "$rc" ;;
+    esac
+    if [ "$n" -ge "$ATTEMPTS" ]; then
+      echo "::error::failed after $n attempts: $*"; exit "$rc"
+    fi
+    sleep_for=$(( BASE * (2 ** (n - 1)) + RANDOM % BASE ))
+    echo "::warning::attempt $n failed ($(cat /tmp/class)); retrying in ${sleep_for}s"
+    sleep "$sleep_for"; n=$(( n + 1 ))
+  done
+
+  # and RECORD every retry, or you cannot see the outage forming:
+  ./ci/push-metric.sh ci_retry_total "{class=\"$(cat /tmp/class)\"}" 1
+</pre>
+
+    <div class="note">💡 <strong>Retries must be visible or they become camouflage.</strong> The measured
+       four-hour outage happened because blanket retries kept jobs "in progress" — no failure rate rose, no
+       alert fired, and the actual 40-minute registry problem was invisible until the queue was hours deep.
+       Emit a metric per retry and alert when the retry rate crosses a threshold: that is the signal that
+       something external has broken, long before anyone reports it.</div>
+
+    <h2>Part 4 — Timeouts, Hangs and Watchdogs</h2>
+
+<pre>
+THE DEFAULT THAT COSTS A DAY
+
+  no timeout specified -> the platform default (6 hours on GitHub
+  Actions). One hung job then:
+    - occupies a runner slot for 6 hours
+    - holds the concurrency group, so the merge queue stalls behind it
+    - reports nothing until it is killed
+  MEASURED: one hung integration job blocked the merge queue for an
+  afternoon; 14 PRs waited; nobody could tell whether it was "slow"
+  or "stuck" because the log had been silent for hours.
+
+SET THREE LAYERS OF TIMEOUT, DELIBERATELY
+
+  jobs:
+    test:
+      timeout-minutes: 20             # JOB: ~2x the p95 duration
+      steps:
+        - run: ./ci/test.sh
+          timeout-minutes: 12         # STEP: the one that can hang
+        - run: timeout 60s ./ci/smoke.sh    # COMMAND: inside the step
+
+  RULE OF THUMB: job timeout ≈ 2x p95. Tight enough to fail fast,
+  loose enough that a legitimately slow run is not killed. Then ALERT
+  on jobs that exceed 1.5x p95 rather than waiting for the timeout.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Usual cause</th><th>Fix</th></tr>
+      <tr><td>Silent log, then timeout</td><td>Waiting on a prompt, or a network call with no timeout</td><td><code>CI=true</code>, <code>--yes</code>, explicit client timeouts</td></tr>
+      <tr><td>Hangs only on CI, never locally</td><td>A service that never became ready; no TTY</td><td>Readiness waits with deadlines; run non-interactively locally too</td></tr>
+      <tr><td>Hangs after tests pass</td><td>Non-daemon threads, open connections, a child process not reaped</td><td>Close pools in teardown; <code>--forceExit</code> as a last resort, after finding the leak</td></tr>
+      <tr><td>Hangs at the end of the job</td><td>Artifact upload of a huge directory</td><td>Upload less; compress; check the post-job steps</td></tr>
+      <tr><td>Intermittent 6-hour jobs</td><td>Deadlock under contention</td><td>Watchdog + thread dump (below)</td></tr>
+    </table>
+
+<pre>
+A WATCHDOG THAT TELLS YOU WHY IT WAS STUCK
+
+  - name: Tests with a watchdog
+    run: |
+      set -euo pipefail
+      ( ./ci/test.sh 2&gt;&amp;1 | tee /tmp/test.log ) &amp;
+      TEST_PID=$!
+      ( while kill -0 "$TEST_PID" 2&gt;/dev/null; do
+          sleep 60
+          if [ -z "$(find /tmp/test.log -newermt '-120 seconds')" ]; then
+            echo "::warning::no output for 120s — dumping diagnostics"
+            ps auxf | head -40
+            jstack "$(pgrep -f java | head -1)" 2&gt;/dev/null || true
+            py-spy dump --pid "$(pgrep -f pytest | head -1)" 2&gt;/dev/null || true
+            ss -tanp | head -20
+          fi
+        done ) &amp;
+      WATCHDOG=$!
+      wait "$TEST_PID"; RC=$?
+      kill "$WATCHDOG" 2&gt;/dev/null || true
+      exit "$RC"
+
+  a timeout tells you the job hung. This tells you WHERE — and it costs
+  one background loop. In the measured case it revealed a test waiting
+  on a connection pool that had been exhausted by a leaked session.
+</pre>
+
+    <h2>Part 5 — A Debugging Method That Does Not Start With "Re-run"</h2>
+
+    <p><a href="first-pipeline.html">Lesson 3</a> gave the ladder — read the log, correlate across runs,
+       reproduce in the runner's image, then a gated interactive session. This part is about making the first
+       rung actually work, because most CI logs are unreadable by design.</p>
+
+<pre>
+THE PREAMBLE — PRINT WHAT THE NEXT PERSON WILL ASK FOR
+
+  # ci/preamble.sh, sourced by every script
+  set -euo pipefail
+  trap 'echo "::error::failed at ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}"' ERR
+
+  echo "::group::environment"
+  echo "commit    $(git rev-parse HEAD)"
+  echo "run       ${GITHUB_RUN_ID:-local} attempt ${GITHUB_RUN_ATTEMPT:-1}"
+  echo "runner    $(uname -srm)  cpus=$(nproc)  mem=$(free -m | awk 'NR==2{print $2}')MB"
+  echo "disk      $(df -h / | awk 'NR==2{print $4" free ("$5" used)"}')"
+  node --version; python3 --version; docker --version
+  printenv | grep -viE 'token|secret|password|key' | sort
+  echo "::endgroup::"
+
+  WHY EACH LINE EARNS ITS PLACE:
+    commit + run + attempt  -> correlate with other jobs and reruns
+    cpus/mem                -> "it only fails on the small runners"
+    disk                    -> the 61% failure cause from &lt;runners&gt;
+    tool versions           -> "works on my machine" in one line
+    filtered env            -> the empty-variable class of bug
+</pre>
+
+    <table class="tbl">
+      <tr><th>Technique</th><th>What it buys</th></tr>
+      <tr><td><code>::group::</code> / <code>::endgroup::</code></td><td>A collapsible log someone will actually read</td></tr>
+      <tr><td><code>::error file=…,line=…::</code> annotations</td><td>The failure appears inline on the PR diff, not in a log</td></tr>
+      <tr><td>A correlation ID exported to every job</td><td>Joins the build, test and deploy jobs of one run in your log system</td></tr>
+      <tr><td>Uploading diagnostics on failure only</td><td>Screenshots, server logs, thread dumps — without the publish cost on green runs</td></tr>
+      <tr><td>A job summary (<code>$GITHUB_STEP_SUMMARY</code>)</td><td>The three facts a reviewer needs, without opening the log</td></tr>
+      <tr><td>Printing the <em>decision</em> a script made</td><td>"selected 84 of 1,100 tests", "tag=pr-91", "shard 2 of 4"</td></tr>
+    </table>
+
+<pre>
+  - name: Diagnostics on failure
+    if: failure()
+    run: |
+      mkdir -p /tmp/diag
+      cp /tmp/test.log /tmp/diag/ 2&gt;/dev/null || true
+      docker logs "$(docker ps -aqf name=postgres)" &gt; /tmp/diag/postgres.log 2&gt;&amp;1 || true
+      df -h &gt; /tmp/diag/disk.txt; ps auxf &gt; /tmp/diag/processes.txt
+      env | grep -viE 'token|secret|password' &gt; /tmp/diag/env.txt
+  - uses: actions/upload-artifact@v4
+    if: failure()
+    with: { name: diagnostics-${{ github.run_id }}, path: /tmp/diag, retention-days: 7 }
+
+  MEASURED EFFECT: median time-to-diagnose for infrastructure failures
+  fell from 34 minutes to 6, because the second engineer no longer had
+  to reproduce the failure to see the state it happened in.
+</pre>
+
+    <h2>Part 6 — Running a CI Incident</h2>
+
+<pre>
+THE RUNBOOK — WRITE IT BEFORE YOU NEED IT
+
+  DECLARE when any of these is true:
+    - infrastructure failure rate &gt; 10% for 10 minutes
+    - queue depth rising for 15 minutes with no drain
+    - the merge queue has been blocked for 20 minutes
+    - a required check cannot pass for reasons unrelated to changes
+
+  FIRST FIVE MINUTES
+    1. POST ONCE, centrally: what is broken, what to do meanwhile,
+       who is on it, next update time. One message, updated in place —
+       not forty people discovering it separately.
+    2. STOP THE BLEEDING: pause the merge queue rather than letting it
+       evict PRs; disable the affected optional check; scale the pool.
+    3. Decide on DEGRADATION: which checks may be skipped, by whom, and
+       with what follow-up (this is the break-glass path from
+       &lt;quality gates&gt;, already designed).
+
+  DURING
+    - keep a timeline; you will need it for the postmortem
+    - prefer reverting the CI change over fixing forward — the same
+      rule as trunk in &lt;lesson 1&gt;
+    - resist "just merge with admin rights" as a general instruction:
+      use the audited break-glass so the bypasses are countable
+
+  AFTER
+    - postmortem with the same template as a production incident
+    - the action item that matters is usually DETECTION, not the fix
+</pre>
+
+    <table class="tbl">
+      <tr><th>CI incident</th><th>Immediate mitigation</th><th>Durable fix</th></tr>
+      <tr><td>Registry or package index down</td><td>Switch to the mirror/proxy; announce</td><td>Pull-through cache; bounded retries; fail fast with a named cause</td></tr>
+      <tr><td>Runner pool exhausted</td><td>Raise the ceiling; pause nightly jobs</td><td>Queue-depth alerting; warm floor; cancel superseded runs</td></tr>
+      <tr><td>A shared workflow broke every repo</td><td>Move the major tag back (~90 s)</td><td>Canary consumers before moving the tag (<a href="pipeline-as-code.html">pipelines as code</a>)</td></tr>
+      <tr><td>Credentials expired</td><td>Rotate; break-glass for urgent merges</td><td>OIDC short-lived credentials; expiry alerting</td></tr>
+      <tr><td>The CI provider itself is degraded</td><td>Announce; pause the merge queue; do not thrash</td><td>Documented "what we do when the provider is down" — including whether you can deploy at all</td></tr>
+      <tr><td>Disk exhaustion across the pool</td><td>Emergency prune; drain and recreate runners</td><td>Ephemeral runners; watermark pruning; alert at 70%</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The most valuable postmortem action item is almost always about
+       detection.</strong> In the four-hour registry incident the fix was trivial — point at the mirror — and
+       the real finding was that <em>nobody knew for 90 minutes</em>, because retries hid the failure rate and
+       no alert existed. Fixing the detection turns the next occurrence into 10 minutes; fixing only the cause
+       leaves the next unrelated outage exactly as expensive.</div>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A pipeline with no owner, no SLIs and no alerts; blanket retries on every failure; the
+         default six-hour timeout; logs that print nothing about the machine; and an incident process that
+         consists of people complaining in a channel until someone notices.</strong> A 40-minute registry
+         outage becomes four hours because retries keep every job "in progress", so no failure rate rises and
+         nothing alerts — the queue simply fills until it is hours deep. Broken code gets retried three times
+         and still fails, wasting runner minutes and confusing the author, while a genuinely transient runner
+         loss is not retried at all because nothing distinguishes them. A hung job holds a concurrency group
+         for six hours and blocks the merge queue all afternoon, and nobody can tell whether it is slow or
+         stuck because the log has been silent since 13:02. When something does fail, the first engineer
+         re-runs it, the second re-runs it, and the third finally reads a log that does not say which Node
+         version, how much disk was free, or which of the four services was unreachable. There is no
+         postmortem, so the same afternoon repeats next quarter.</p>
+      <p>✅ <strong>Treat the pipeline as production: SLIs, an owner, alerts on rates, classified failures,
+         bounded and visible retries, layered timeouts, logs that answer the first question, and a real
+         incident runbook.</strong> Publish availability, job start latency, duration, first-attempt pass rate,
+         infrastructure failure rate and pipeline MTTR — and price an outage in blocked engineer-hours, which
+         is what funds the owner. Classify every failure by signature before anything decides what to do with
+         it, and shrink the unclassified bucket weekly (31% → 4% in six weeks). Retry only <code>infra_*</code>
+         and <code>external_*</code> signatures, only on idempotent steps, with backoff, a cap and a
+         <em>metric per retry</em>, so a rising retry rate becomes the early warning that something external
+         has broken. Set job, step and command timeouts at roughly twice the p95, alert at 1.5×, and attach a
+         watchdog that dumps stacks when output goes quiet — a timeout says it hung, a watchdog says where.
+         Print an environment preamble, group the logs, annotate failures inline, and upload diagnostics on
+         failure only: median time-to-diagnose fell from 34 minutes to 6. Then write the runbook — declare,
+         announce once centrally, pause the merge queue, degrade through the audited break-glass path — and
+         make the postmortem's first action item about <em>detection</em>.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What happens</th><th>Do this instead</th></tr>
+      <tr><td>Treating CI as a tool rather than a production system</td><td>No owner, no alerts; outages are discovered by complaint</td><td>SLIs, an owner, an on-call, and an error budget priced in blocked engineer-hours</td></tr>
+      <tr><td>Alerting on individual failed runs</td><td>Noise, then muted alerts</td><td>Alert on <em>rates</em>: infra failure rate, first-attempt pass rate, queue depth</td></tr>
+      <tr><td>Retrying by outcome instead of by signature</td><td>Broken code retried three times; real transients unretried</td><td>Classify first; retry only <code>infra_*</code> and <code>external_*</code></td></tr>
+      <tr><td>Invisible retries</td><td>A 40-minute outage became four hours because nothing showed a failure rate</td><td>Emit a metric per retry; alert when the retry rate crosses a threshold</td></tr>
+      <tr><td>Retrying non-idempotent steps</td><td>Double deploys, duplicate notifications, half-applied migrations</td><td>Retry only idempotent steps; deploys go through a lock and a fresh run</td></tr>
+      <tr><td>Unbounded retries during an outage</td><td>Jobs hang to the default timeout and the pool fills</td><td>3 attempts, backoff with jitter, then fail fast with a named cause</td></tr>
+      <tr><td>No job timeout</td><td>A hung job burned six hours and blocked the merge queue all afternoon</td><td>Job ≈ 2× p95, plus step and command timeouts; alert at 1.5×</td></tr>
+      <tr><td>Timeout without diagnostics</td><td>You learn it hung, never why</td><td>A watchdog that dumps <code>ps</code>, stacks and sockets when output stops</td></tr>
+      <tr><td>Logs with no environment preamble</td><td>Every investigation starts by re-running to gather basics</td><td>Print commit, runner, cpus, memory, disk, tool versions and filtered env</td></tr>
+      <tr><td>No diagnostics artifact on failure</td><td>The second engineer must reproduce the failure to see its state</td><td>Upload logs, service logs, disk and process state on failure only — 34 min → 6 min</td></tr>
+      <tr><td>Failure messages that do not name the cause</td><td>Forty engineers investigate the same external outage</td><td>Annotate: "this is not your change", with the dependency and its status page</td></tr>
+      <tr><td>Announcing an outage in many threads</td><td>Duplicate investigation and no single source of truth</td><td>One central message, updated in place, with a next-update time</td></tr>
+      <tr><td>"Just merge with admin rights" during an incident</td><td>Untracked bypasses that outlive the incident</td><td>The audited break-glass path, designed in advance</td></tr>
+      <tr><td>No postmortem for CI incidents</td><td>The same afternoon repeats quarterly</td><td>Same template as production; the first action item is usually detection</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Should CI automatically retry failed jobs?</summary>
+      <p>Only for failures that are not about the change — and that means classifying before retrying.</p>
+      <table class="tbl">
+        <tr><th>Category</th><th>Retry?</th></tr>
+        <tr><td>Deterministic (assertion, compile error, lint)</td><td><strong>Never</strong> — it will fail identically, slower</td></tr>
+        <tr><td>Nondeterministic in our tests</td><td>No — quarantine it; retrying hides a real signal</td></tr>
+        <tr><td>Transient infrastructure (runner lost, pull timeout, DNS)</td><td>Yes — bounded, with backoff</td></tr>
+        <tr><td>External outage (registry 503, API throttling)</td><td>Bounded retry, then fail fast with a named cause</td></tr>
+      </table>
+      <p>Two conditions on top of that. The step must be <strong>idempotent</strong> — retrying a deploy, a
+         migration or a notification can do the thing twice. And the retry must be <strong>visible</strong>:
+         emit a metric per retry, because retries that are silent become camouflage. In one measured case,
+         blanket retries kept jobs "in progress" during a 40-minute registry outage, so no failure rate rose,
+         nothing alerted, and the incident lasted four hours.</p>
+      <p>The blanket <code>retry-on: failure</code> setting fails all three tests at once, which is why it is
+         the default people regret.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why do CI jobs need timeouts, and how do you choose them?</summary>
+      <p>Because the platform default is generous — six hours on GitHub Actions — and a hung job does more than
+         waste that time. It occupies a runner slot, holds its concurrency group, and blocks anything queued
+         behind it. One hung integration job blocked a merge queue for an entire afternoon while 14 PRs waited,
+         and nobody could tell whether it was slow or stuck.</p>
+      <p><strong>Set three layers:</strong></p>
+      <ul>
+        <li><strong>Job timeout</strong> ≈ 2× the p95 duration — tight enough to fail fast, loose enough not to
+            kill a legitimately slow run.</li>
+        <li><strong>Step timeout</strong> on the step that can actually hang (the test run, the deploy wait).</li>
+        <li><strong>Command timeout</strong> (<code>timeout 60s …</code>) around anything talking to the
+            network.</li>
+      </ul>
+      <p>And <strong>alert before the timeout</strong> — at about 1.5× p95 — because a timeout is a blunt
+         instrument that tells you a job hung and nothing about why. Pair it with a watchdog that dumps process
+         state and stacks when output goes quiet for a couple of minutes; that is what turns "it timed out
+         again" into "it was waiting on an exhausted connection pool".</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What SLIs would you define for a CI system, and what would you alert on?</summary>
+      <p>Six, chosen so each one maps to something engineers actually experience:</p>
+      <table class="tbl">
+        <tr><th>SLI</th><th>Target</th><th>Experience it protects</th></tr>
+        <tr><td>Availability (pushes that get a result)</td><td>&gt; 99.5% in working hours</td><td>Being able to merge at all</td></tr>
+        <tr><td>Job start latency p95</td><td>&lt; 60 s</td><td>Feedback time — the invisible queue term</td></tr>
+        <tr><td>PR pipeline duration p50/p90</td><td>&lt; 10 / &lt; 20 min</td><td>Whether people treat the gate as a gate</td></tr>
+        <tr><td>First-attempt pass rate</td><td>&gt; 95%</td><td>Whether red means broken</td></tr>
+        <tr><td>Infrastructure failure rate</td><td>&lt; 0.5% of runs</td><td>Trust, and time wasted on non-problems</td></tr>
+        <tr><td>Pipeline MTTR</td><td>&lt; 30 min</td><td>The cost of an outage in blocked engineers</td></tr>
+      </table>
+      <p><strong>Alert on rates and trends, never on individual runs.</strong> A single failure is normal; page
+         on an infrastructure failure rate above 10% for ten minutes, a queue depth rising for fifteen minutes
+         without draining, a collapse in first-attempt pass rate, and a retry rate spike — the last is usually
+         the earliest signal that something external has broken.</p>
+      <p>The framing that gets this funded: price an outage in blocked engineer-hours. A 40-minute outage at
+         2pm cost roughly 51 engineer-hours (~$4,335) in one measured organisation — three times the quarter's
+         customer-facing SLO breach, with no owner, no alert and no postmortem.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A job hangs intermittently and eventually times out. How do you find the cause?</summary>
+      <p>A timeout tells you it hung; it never tells you where. So the first change is to make the next
+         occurrence self-explanatory rather than trying to reproduce a hang.</p>
+      <ol>
+        <li><strong>Add a watchdog</strong>: a background loop that, when the log has produced no output for
+            ~120 seconds, dumps <code>ps auxf</code>, thread stacks (<code>jstack</code>,
+            <code>py-spy dump</code>), and open sockets (<code>ss -tanp</code>). This costs one background
+            process and usually identifies the cause on the very next occurrence.</li>
+        <li><strong>Check the usual suspects</strong> while waiting: a prompt waiting for input (fix with
+            <code>CI=true</code>, <code>--yes</code>), a network call with no client timeout, a service that
+            never became ready, non-daemon threads or unclosed pools keeping the process alive after tests
+            pass, and slow post-job artifact uploads.</li>
+        <li><strong>Correlate</strong>: does it hang only on small runners, only under contention, only on a
+            specific shard? That distinguishes a resource problem from a deadlock.</li>
+        <li><strong>Reproduce under constraint</strong> — the runner's image with
+            <code>--cpus 0.5 --memory 2g</code> — which turns many rare hangs into reliable ones.</li>
+        <li><strong>Then fix the cause and lower the timeout</strong>, so the next unrelated hang is caught in
+            minutes rather than hours.</li>
+      </ol>
+      <p>In the measured case the watchdog showed every thread blocked on a connection pool that a leaked
+         session had exhausted — a product bug, found on the first occurrence after adding twelve lines of
+         diagnostics, having previously been "flaky CI" for weeks.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> An upstream package registry is down for 40 minutes. What should your pipeline do?</summary>
+      <p>The goal is that a 40-minute external outage costs 40 minutes, not four hours — which is what happened
+         in the measured case, because retries hid it.</p>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Behaviour</th></tr>
+        <tr><td><strong>Bounded retry</strong></td><td>3 attempts with exponential backoff and jitter — this alone absorbs most blips without anyone noticing</td></tr>
+        <tr><td><strong>Fallback</strong></td><td>A package proxy in your own network serves cached copies of every version you have installed before; most builds proceed unaffected</td></tr>
+        <tr><td><strong>Fail fast, honestly</strong></td><td>If both fail: stop immediately with an annotation naming the dependency and its status page — "this is not your change"</td></tr>
+        <tr><td><strong>Announce once</strong></td><td>A single central message with a next-update time, so forty engineers do not investigate the same thing</td></tr>
+        <tr><td><strong>Degrade deliberately</strong></td><td>Pause the merge queue rather than letting it evict PRs; decide which checks may be bypassed via the audited break-glass path</td></tr>
+        <tr><td><strong>Detect it early</strong></td><td>Alert on the retry rate and on <code>external_*</code> classifications — the earliest available signal</td></tr>
+      </table>
+      <p><strong>What to avoid:</strong> unbounded retries (jobs hang to the six-hour default and the runner
+         pool fills, converting a 40-minute problem into a queue that takes hours to drain), and silent
+         retries (no failure rate rises, so nothing alerts and nobody knows for 90 minutes).</p>
+      <p><strong>The durable fix</strong> is the package proxy and registry mirror from
+         <a href="runners-infrastructure.html">the runners lesson</a>: after installing one, upstream outages
+         stopped blocking CI entirely, and the same infrastructure removed 39 seconds from every job as a side
+         effect.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do you run a CI outage as an incident, and what does the postmortem look like?</summary>
+      <p>Exactly like a production incident, because the users — every engineer in the company — are blocked
+         the same way.</p>
+      <p><strong>Declare</strong> on objective criteria, agreed in advance: infrastructure failure rate above
+         10% for ten minutes, queue depth rising for fifteen without draining, the merge queue blocked for
+         twenty, or a required check that cannot pass for reasons unrelated to changes. Without criteria, the
+         incident starts whenever someone loses patience, which is typically 40 minutes late.</p>
+      <p><strong>In the first five minutes:</strong> post once, centrally, with what is broken, what to do
+         meanwhile, who is on it and the next update time — updated in place, not a new thread. Stop the
+         bleeding: pause the merge queue so it stops evicting PRs, disable an affected optional check, scale
+         the pool. Then decide degradation explicitly, using the break-glass path that
+         <a href="quality-gates.html">already exists</a> rather than inventing "just use admin merge", which
+         produces untracked bypasses that outlive the incident.</p>
+      <p><strong>During:</strong> keep a timeline, and prefer reverting the CI change over fixing forward —
+         the same rule as a red trunk.</p>
+      <p><strong>The postmortem</strong> uses the production template, and its most valuable action item is
+         almost always about <em>detection</em> rather than the cause. In the registry incident the fix was one
+         config line pointing at a mirror; the finding worth acting on was that nobody knew for 90 minutes,
+         because retries suppressed the failure rate and no alert existed. Fixing detection makes the next
+         outage — which will have a different cause — ten minutes instead of four hours.</p>
+      <p>I would also record the cost in blocked engineer-hours. It is the number that turns "CI was flaky
+         again" into a prioritised reliability backlog with an owner.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Build the CI reliability dashboard: six SLIs from data you
+      already have, and price one outage in blocked engineer-hours.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+COLLECT — one script, run hourly, pushing to whatever you already use
+
+  #!/usr/bin/env bash
+  # ci/slis.sh
+  set -euo pipefail
+  W=7    # days
+
+  runs=$(gh run list --workflow=ci.yml --limit 1000 \
+      --json conclusion,createdAt,startedAt,updatedAt,attempt,event)
+
+  # availability: runs that reached a conclusion at all
+  echo "$runs" | jq -r --argjson w "$W" '
+    [.[] | select(.conclusion != null)] | length as $done
+    | length as $total
+    | "availability \(100 * $done / $total | floor)%"'
+
+  # job start latency
+  echo "$runs" | jq -r '[.[] | (.startedAt|fromdate)-(.createdAt|fromdate)]
+    | sort | .[(length*0.95|floor)] | "start_latency_p95 \(.)s"'
+
+  # duration
+  echo "$runs" | jq -r '[.[] | (.updatedAt|fromdate)-(.startedAt|fromdate)]
+    | sort | "duration_p50 \(.[(length*0.5|floor)])s duration_p90 \(.[(length*0.9|floor)])s"'
+
+  # first-attempt pass rate
+  echo "$runs" | jq -r '[.[] | select(.attempt==1)] as $f
+    | ([$f[] | select(.conclusion=="success")] | length) as $ok
+    | "first_attempt_pass \(100 * $ok / ($f|length) | floor)%"'
+
+  # infrastructure failure rate (needs ci/classify.sh output, see ex. 2)
+  ./ci/failure-classes.sh --days "$W" \
+    | awk '/^infra_|^external_/ {i+=$2} {t+=$2} END {printf "infra_failure_rate %.2f%%\n", 100*i/t}'
+
+$ ./ci/slis.sh
+  availability 99.1%
+  start_latency_p95 1140s
+  duration_p50 1900s duration_p90 2560s
+  first_attempt_pass 61%
+  infra_failure_rate 4.10%
+</pre>
+        <table class="tbl">
+          <tr><th>SLI</th><th>Measured</th><th>Target</th><th>Verdict</th></tr>
+          <tr><td>Availability</td><td>99.1%</td><td>&gt; 99.5%</td><td>Marginal — ~7 lost runs/week</td></tr>
+          <tr><td>Start latency p95</td><td>19m00s</td><td>&lt; 60 s</td><td><strong>Failing badly</strong> — capacity/concurrency</td></tr>
+          <tr><td>Duration p50 / p90</td><td>31m40s / 42m40s</td><td>&lt; 10 / &lt; 20 min</td><td>Failing</td></tr>
+          <tr><td>First-attempt pass rate</td><td>61%</td><td>&gt; 95%</td><td><strong>Failing</strong> — the trust problem</td></tr>
+          <tr><td>Infra failure rate</td><td>4.1%</td><td>&lt; 0.5%</td><td>Failing — 8× the target</td></tr>
+        </table>
+<pre>
+PRICE ONE OUTAGE — THE NUMBER THAT FUNDS AN OWNER
+
+  engineers ....................... 200
+  fraction mid-task at any moment .. 70%   -> 140 affected
+  outage length ................... 40 min
+  productive time lost per person .. 22 min  (context switch, not the
+                                              full 40 — be conservative)
+  engineer-hours .................. 140 x 22 / 60 = 51 h
+  loaded cost ..................... 51 x $85       = $4,335
+  frequency last year ............. 11 outages     = $47,685
+
+  COMPARISON FOR THE SAME PERIOD
+    customer-facing SLO breaches ... 2, estimated  = $6,000
+  -> CI outages cost 8x more and had no owner, no alert, no postmortem.
+</pre>
+      <div class="note">🔑 <strong>Lead with the money, not the percentages.</strong> "First-attempt pass rate
+         is 61%" invites a discussion about whether that is bad. "CI outages cost us $47,685 last year, eight
+         times our customer-facing incidents, and nobody owns it" gets a team assigned. Both sentences describe
+         the same dashboard.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Classify every pipeline failure automatically, then drive
+      the unclassified bucket toward zero.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — CLASSIFY AT THE POINT OF FAILURE
+
+  # last step of every job
+  - name: Classify failure
+    if: failure()
+    id: classify
+    run: |
+      CLASS="$(./ci/classify.sh "${RUNNER_TEMP}/job.log")"
+      echo "class=$CLASS" &gt;&gt; "$GITHUB_OUTPUT"
+      echo "::notice title=Failure class::$CLASS"
+      ./ci/push-metric.sh "ci_failure_total{class=\"$CLASS\"}" 1
+      # keep the tail of unclassified logs for weekly triage
+      if [ "$CLASS" = "unclassified" ]; then
+        tail -300 "${RUNNER_TEMP}/job.log" \
+          &gt; "/tmp/unclassified-${GITHUB_RUN_ID}.log"
+      fi
+  - uses: actions/upload-artifact@v4
+    if: failure() &amp;&amp; steps.classify.outputs.class == 'unclassified'
+    with: { name: unclassified-${{ github.run_id }}, path: /tmp/unclassified-*.log }
+
+STEP 2 — WEEK 1 RESULTS
+
+  class                 count   share
+  ---------------------------------------
+  deterministic            97    32%
+  infra_disk              114    38%
+  infra_registry           28     9%
+  infra_runner_lost        21     7%
+  unclassified             93    31%      &lt;-- read these
+  ---------------------------------------
+  (percentages exceed 100 because unclassified overlaps nothing —
+   93 of 299 failures were simply not understood)
+
+STEP 3 — TRIAGE THE UNCLASSIFIED BUCKET WEEKLY, ADD SIGNATURES
+
+$ gh run download --name 'unclassified-*' --dir /tmp/unc
+$ grep -hoE '(Error|error|ERROR)[^"]{0,60}' /tmp/unc/*.log \
+    | sort | uniq -c | sort -rn | head
+   31 error: could not resolve host: nexus.acme.internal
+   22 Error: The operation was canceled.
+   14 ERROR: Job failed: execution took longer than 1h0m0s
+    9 error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly
+
+  -> add four signatures:
+     *"could not resolve host"*)              C=infra_network ;;
+     *"The operation was canceled"*)          C=cancelled ;;      # not a failure
+     *"execution took longer than"*)          C=timeout ;;
+     *"RPC failed; curl"*|*"HTTP/2 stream"*)  C=infra_scm ;;
+
+STEP 4 — SIX WEEKS LATER
+
+  week   unclassified   biggest class
+  ---------------------------------------------------
+  1          31%        infra_disk 38%
+  2          19%        infra_disk 36%
+  3          12%        infra_disk 31%
+  4           8%        deterministic 41%   (disk fixed)
+  5           6%        deterministic 47%
+  6           4%        deterministic 58%   &lt;-- healthy: most failures
+                                                are now real failures
+</pre>
+        <table class="tbl">
+          <tr><th>Why classification is the first move</th></tr>
+          <tr><td>It routes work to the team that can fix it — infrastructure failures were nobody's ticket while they looked like flaky tests</td></tr>
+          <tr><td>It makes retries defensible: retry <code>infra_*</code>, never "the job failed"</td></tr>
+          <tr><td>It gives the pool a real SLI, so reliability work can be prioritised</td></tr>
+          <tr><td>A rising share of <code>deterministic</code> is <em>success</em> — it means failures are increasingly about the code</td></tr>
+        </table>
+      <div class="note">💡 <strong>Watch the ratio, not the count.</strong> A healthy pipeline has most
+         failures in the <code>deterministic</code> bucket — those are the pipeline doing its job. When
+         <code>infra_*</code> exceeds roughly 10% of failures, engineers stop reading red, and every other
+         quality control you own degrades with it.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Replace blanket retries with classified, bounded,
+      visible ones — and prove that a broken commit is no longer retried.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+BEFORE — THE SETTING THAT HIDES OUTAGES
+
+  # a common "fix" for flaky CI
+  - uses: nick-fields/retry@v3
+    with:
+      max_attempts: 3
+      command: ./ci/test.sh          # retries EVERYTHING
+
+  what it does to a broken commit:
+    attempt 1: FAILED tests/test_pricing.py::test_threshold  (4m10s)
+    attempt 2: FAILED tests/test_pricing.py::test_threshold  (4m10s)
+    attempt 3: FAILED tests/test_pricing.py::test_threshold  (4m10s)
+    total: 12m30s to tell the author what attempt 1 knew.
+
+  what it does during an outage: keeps jobs "in progress" so no
+  failure rate rises, and nothing alerts.
+
+AFTER — CLASSIFY, THEN DECIDE
+
+  - name: Tests
+    id: test
+    run: ./ci/retry.sh ./ci/test.sh 2&gt;&amp;1 | tee "${RUNNER_TEMP}/job.log"
+
+  # ci/retry.sh (from Part 3): classifies before each retry,
+  # refuses to retry `deterministic`, records a metric per attempt
+
+$ ATTEMPTS=3 ./ci/retry.sh ./ci/test.sh
+  FAILED tests/test_pricing.py::test_threshold
+  ::error::not a transient failure (deterministic); not retrying
+  -> 4m10s, and the author gets the answer immediately
+
+$ # simulate a transient:
+$ ATTEMPTS=3 ./ci/retry.sh bash -c 'echo "toomanyrequests: pull rate limit" &gt;&amp;2; exit 1'
+  ::warning::attempt 1 failed (infra_registry); retrying in 7s
+  ::warning::attempt 2 failed (infra_registry); retrying in 13s
+  ::error::failed after 3 attempts
+
+VISIBILITY — THE PART THAT PREVENTS THE FOUR-HOUR OUTAGE
+
+  # alert rule
+  - alert: CIRetryRateHigh
+    expr: |
+      sum(rate(ci_retry_total[10m]))
+        / sum(rate(ci_job_total[10m])) &gt; 0.05
+    for: 10m
+    annotations:
+      summary: "CI retry rate {{ $value | humanizePercentage }} — check
+                external dependencies before the queue backs up"
+
+  MEASURED: this alert fired 6 minutes into the next registry incident.
+  Previous incident: noticed after 90 minutes, resolved at 4 hours.
+  This one: mirror switched at 11 minutes, total impact 14 minutes.
+</pre>
+        <table class="tbl">
+          <tr><th>Property</th><th>Blanket retry</th><th>Classified retry</th></tr>
+          <tr><td>Broken commit</td><td>3 attempts, 12m30s</td><td>1 attempt, 4m10s, clear message</td></tr>
+          <tr><td>Transient infra</td><td>Retried (correctly)</td><td>Retried, with backoff and jitter</td></tr>
+          <tr><td>Flaky test</td><td>Hidden</td><td>Not retried — quarantined instead</td></tr>
+          <tr><td>External outage</td><td>Invisible; queue fills</td><td>Alert at 5% retry rate within minutes</td></tr>
+          <tr><td>Runner minutes during an outage</td><td>3× everything</td><td>Bounded, then fail fast</td></tr>
+        </table>
+      <div class="note">⚠️ <strong>Check the idempotency of anything you wrap in a retry.</strong> Wrapping
+         <code>./ci/deploy.sh</code> in the same helper is how a retry deploys twice, or resumes a
+         half-finished migration. The rule from Part 3: retry only steps that are safe to run twice, and route
+         deploys through a lock and a fresh pipeline run instead.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Add layered timeouts and a watchdog, then use them to
+      diagnose an intermittent hang.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — FIND JOBS WITH NO TIMEOUT (they inherit 6 hours)
+
+$ for f in .github/workflows/*.yml; do
+    python3 - "$f" &lt;&lt;'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+for name, job in (d.get("jobs") or {}).items():
+    if "timeout-minutes" not in job:
+        print(f"{sys.argv[1]}: job '{name}' has NO timeout (default 6h)")
+PY
+  done
+  ci.yml: job 'integration' has NO timeout (default 6h)
+  ci.yml: job 'e2e' has NO timeout (default 6h)
+  deploy.yml: job 'deploy-production' has NO timeout (default 6h)
+
+STEP 2 — CHOOSE VALUES FROM MEASURED p95, NOT FROM FEELINGS
+
+$ gh run list --workflow=ci.yml --limit 200 --json jobs 2&gt;/dev/null \
+  | jq -r '.[].jobs[]? | select(.conclusion=="success")
+      | [.name, ((.completedAt|fromdate)-(.startedAt|fromdate))] | @tsv' \
+  | awk -F'\t' '{a[$1][++c[$1]]=$2}
+      END {for (j in a) {n=asort(a[j]); printf "%-14s p95 %4ds -> timeout %2d min\n",
+             j, a[j][int(n*0.95)], int(a[j][int(n*0.95)]*2/60)+1}}'
+  integration    p95  402s -> timeout 14 min
+  e2e            p95  790s -> timeout 27 min
+  build          p95  221s -> timeout  8 min
+
+STEP 3 — THE THREE LAYERS
+
+  jobs:
+    integration:
+      timeout-minutes: 14                     # 2x p95
+      steps:
+        - run: ./ci/wait-for.sh postgres 5432 # readiness, with a deadline
+          timeout-minutes: 2
+        - run: ./ci/test.sh integration
+          timeout-minutes: 10
+        - run: timeout 30s ./ci/smoke.sh      # command level
+
+STEP 4 — THE WATCHDOG THAT SAYS *WHY*
+
+  - name: Integration tests (watched)
+    timeout-minutes: 14
+    run: |
+      set -uo pipefail
+      ./ci/test.sh integration 2&gt;&amp;1 | tee /tmp/test.log &amp;
+      TEST=$!
+      ( while kill -0 "$TEST" 2&gt;/dev/null; do
+          sleep 30
+          if [ -z "$(find /tmp/test.log -newermt '-120 seconds')" ]; then
+            echo "::warning::no output for 120s — diagnostics follow"
+            ps auxf | head -30
+            for pid in $(pgrep -f 'pytest|java|node'); do
+              py-spy dump --pid "$pid" 2&gt;/dev/null || jstack "$pid" 2&gt;/dev/null || true
+            done
+            ss -tanp 2&gt;/dev/null | head -25
+            docker ps --format '{{.Names}}\t{{.Status}}' 2&gt;/dev/null || true
+          fi
+        done ) &amp; WD=$!
+      wait "$TEST"; RC=$?; kill "$WD" 2&gt;/dev/null || true; exit "$RC"
+
+STEP 5 — WHAT IT FOUND, ON THE FIRST OCCURRENCE
+
+  ::warning::no output for 120s — diagnostics follow
+  runner    12345  0.0  ... python -m pytest tests/integration
+  Thread 0x7f2a (idle): "MainThread"
+    _wait_for_connection (sqlalchemy/pool/base.py:1123)
+    connect (sqlalchemy/engine/base.py:3204)
+    test_bulk_import (tests/integration/test_orders.py:88)
+  ESTAB  0  0  10.0.4.19:44212  10.0.4.90:5432   users:(("python",pid=12345))
+  ... 20 established connections, pool_size=20
+
+  -> the pool was exhausted: a fixture opened a session per test and
+     never closed it on the failure path. Fixed in 30 minutes, after
+     three weeks of "the integration job is flaky".
+</pre>
+        <table class="tbl">
+          <tr><th>Layer</th><th>Value</th><th>Catches</th></tr>
+          <tr><td>Job timeout</td><td>≈ 2× p95</td><td>Any hang; frees the runner and the concurrency group</td></tr>
+          <tr><td>Step timeout</td><td>≈ 1.5× that step's p95</td><td>Which step hung, without reading the log</td></tr>
+          <tr><td>Command timeout</td><td>Tight (seconds)</td><td>Network calls with no client-side timeout</td></tr>
+          <tr><td>Alert at 1.5× p95</td><td>Before the timeout</td><td>A human looks while the job is still running</td></tr>
+          <tr><td>Watchdog on log silence</td><td>120 s</td><td><em>Why</em> it hung — the part a timeout never tells you</td></tr>
+        </table>
+      <div class="note">🔑 <strong>Alert before the timeout, not on it.</strong> A timeout is a post-mortem
+         notification: the evidence has already been destroyed with the job. An alert at 1.5× p95 gives someone
+         the chance to attach to a <em>live</em> hung job — and combined with the watchdog dump, most
+         intermittent hangs are solved on their first occurrence rather than their tenth.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Make failures self-diagnosing: add the preamble,
+      structured groups, inline annotations and a failure-only diagnostics bundle. Measure time-to-diagnose.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+BASELINE — WHAT AN ENGINEER FACES TODAY
+
+  2,412 lines of log. Line 1,908:
+    E   psycopg2.OperationalError: could not connect to server
+  Questions the log cannot answer:
+    which Postgres? was it up? how much disk was free? which Python?
+    which shard? was this a retry? what did the previous step decide?
+  MEASURED median time-to-diagnose (infra failures): 34 minutes,
+  and 3 of 5 investigations began with "let me re-run it".
+
+CHANGE 1 — THE PREAMBLE (12 lines, once, in ci/preamble.sh)
+
+  echo "::group::environment"
+  echo "commit  $(git rev-parse --short HEAD)   attempt ${GITHUB_RUN_ATTEMPT:-1}"
+  echo "job     ${GITHUB_JOB:-local}  shard ${SHARD:-n/a}"
+  echo "runner  $(uname -srm)  cpus=$(nproc)  mem=$(free -m|awk 'NR==2{print $2}')MB"
+  echo "disk    $(df -h / | awk 'NR==2{print $4" free ("$5" used)"}')"
+  python3 --version; node --version 2&gt;/dev/null || true
+  echo "services: $(docker ps --format '{{.Names}}={{.Status}}' | tr '\n' ' ')"
+  printenv | grep -viE 'token|secret|password|key' | sort
+  echo "::endgroup::"
+
+CHANGE 2 — GROUPS AND INLINE ANNOTATIONS
+
+  echo "::group::database migrations"; ./ci/migrate.sh; echo "::endgroup::"
+  # and on failure, point at the source line:
+  echo "::error file=tests/integration/test_orders.py,line=88::\
+  could not connect to postgres:5432 after 30s — service status: exited(1)"
+
+CHANGE 3 — A CORRELATION ID SHARED BY EVERY JOB IN THE RUN
+
+  # first job
+  outputs: { trace: ${{ steps.t.outputs.trace }} }
+  - id: t
+    run: echo "trace=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" &gt;&gt; "$GITHUB_OUTPUT"
+  # every other job
+  env: { TRACE_ID: ${{ needs.setup.outputs.trace }} }
+  # every log line and every uploaded artifact carries it, so build,
+  # test and deploy jobs can be joined in the log system
+
+CHANGE 4 — DIAGNOSTICS BUNDLE, ON FAILURE ONLY
+
+  - name: Collect diagnostics
+    if: failure()
+    run: |
+      mkdir -p /tmp/diag
+      cp /tmp/test.log /tmp/diag/ 2&gt;/dev/null || true
+      for c in $(docker ps -aq); do
+        docker logs "$c" &gt; "/tmp/diag/container-$(docker inspect \
+          --format '{{.Name}}' "$c" | tr -d /).log" 2&gt;&amp;1 || true
+      done
+      df -h &gt; /tmp/diag/disk.txt
+      ps auxf &gt; /tmp/diag/processes.txt
+      ss -tanp &gt; /tmp/diag/sockets.txt 2&gt;/dev/null || true
+      env | grep -viE 'token|secret|password' &gt; /tmp/diag/env.txt
+      git log --oneline -5 &gt; /tmp/diag/recent-commits.txt
+  - uses: actions/upload-artifact@v4
+    if: failure()
+    with:
+      name: diag-${{ github.run_id }}-${{ github.job }}
+      path: /tmp/diag
+      retention-days: 7
+
+CHANGE 5 — A JOB SUMMARY SO NOBODY OPENS THE LOG AT ALL
+
+  - if: always()
+    run: |
+      {
+        echo "### Integration tests"
+        echo "| field | value |"; echo "|---|---|"
+        echo "| result | ${{ job.status }} |"
+        echo "| shard | ${SHARD:-n/a} |"
+        echo "| tests | $(grep -c '^tests/' /tmp/test.log || echo '?') |"
+        echo "| first failure | $(grep -m1 '^FAILED' /tmp/test.log || echo none) |"
+        echo "| duration | $(( $(date +%s) - STEP_START ))s |"
+      } &gt;&gt; "$GITHUB_STEP_SUMMARY"
+</pre>
+        <table class="tbl">
+          <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+          <tr><td>Median time-to-diagnose (infrastructure failures)</td><td>34 min</td><td>6 min</td></tr>
+          <tr><td>Investigations that began with a re-run</td><td>3 in 5</td><td>1 in 12</td></tr>
+          <tr><td>Log lines read to reach the cause</td><td>~1,900</td><td>The summary, or the annotation</td></tr>
+          <tr><td>Escalations to the platform team</td><td>9/week</td><td>2/week</td></tr>
+        </table>
+      <div class="note">💡 <strong>The preamble is the highest-value twelve lines in your pipeline.</strong>
+         Nearly every "why did this fail here and not locally?" is answered by the tool versions, the CPU and
+         memory, the free disk, or an empty environment variable — all of which the preamble prints before
+         anything can go wrong. It costs under a second per job and removes the most common reason for a
+         re-run.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Run a CI outage end to end: declaration criteria, the
+      first five minutes, deliberate degradation, and the postmortem with a detection-focused action item.
+      <details class="solution"><summary>Solution</summary>
+      <p>Scenario: at 14:02 the internal package proxy starts returning 503. Builds begin failing at the
+         dependency-install step across every repository.</p>
+<pre>
+T+0  DETECTION — BY ALERT, NOT BY COMPLAINT
+
+  14:06  CIRetryRateHigh fires (retry rate 5% -&gt; 41% in 4 minutes)
+  14:07  ci_failure_total{class="external_throttle"} spike confirms it
+  -> declared: "the merge queue is blocked and the failure rate is
+     above 10% for 10 minutes" (criteria agreed in advance)
+
+T+5  ONE MESSAGE, CENTRALLY, UPDATED IN PLACE
+
+  🔴 CI INCIDENT — package proxy returning 503 (started 14:02)
+  Impact: dependency installs failing in all repos. This is NOT your change.
+  Do now: don't re-run; your PR will be fine once we're green.
+  Merge queue: PAUSED (so it stops evicting PRs).
+  Owner: @platform-oncall (me). Next update: 14:25.
+
+T+6  STOP THE BLEEDING
+
+  - pause the merge queue                    (prevents 14 evictions)
+  - point the proxy config at upstream directly for read-through:
+      npm config set registry https://registry.npmjs.org
+    via a repo-variable the shared workflow reads, so ONE change
+    affects all 60 repositories (see &lt;pipelines as code&gt;)
+  - do NOT bump retry counts: that fills the pool and hides recovery
+
+T+14 DEGRADE DELIBERATELY, THROUGH THE DESIGNED PATH
+
+  urgent security fix needs to ship:
+    label `break-glass` + BREAK-GLASS-REASON in the PR description
+    -> announced in #eng-alerts, follow-up issue opened automatically
+    -> ONE bypass, audited, rather than an admin disabling checks
+
+T+31 RECOVERED
+
+  14:33  proxy healthy; config reverted; merge queue resumed
+  14:36  ✅ update posted: total impact 31 minutes, 1 break-glass merge
+
+POSTMORTEM (same template as a production incident)
+
+  IMPACT
+    31 minutes; ~140 engineers affected; 51 engineer-hours (~$4,335);
+    1 break-glass merge; 0 PRs evicted (queue paused in time)
+
+  TIMELINE
+    14:02 proxy begins returning 503 (disk full on the proxy host)
+    14:06 alert fires
+    14:07 incident declared
+    14:12 announcement posted
+    14:14 registry fallback applied
+    14:33 proxy restarted with more disk; recovered
+
+  WHAT WENT WELL
+    - detection took 4 minutes (previous similar incident: 90 minutes)
+    - the merge queue pause prevented evictions
+    - one shared workflow change fixed 60 repositories at once
+
+  ROOT CAUSE
+    the package proxy's cache volume filled; no alerting on it
+
+  ACTION ITEMS (detection first, deliberately)
+    1. [DETECTION] alert on proxy disk at 70% — owner @platform, 1 week
+    2. [DETECTION] synthetic canary: install a package every 60 s and
+       alert on failure, so we learn before developers do — 2 weeks
+    3. [RESILIENCE] proxy falls back to upstream automatically on 5xx
+    4. [CAPACITY] proxy cache volume 100 GB -&gt; 500 GB with a retention
+       policy
+    5. [PROCESS] add "pause merge queue" to the runbook's first 5
+       minutes (it was remembered, not documented)
+</pre>
+        <table class="tbl">
+          <tr><th>Decision</th><th>Why</th></tr>
+          <tr><td>Declare on objective criteria</td><td>Without them, incidents start ~40 minutes late, when someone loses patience</td></tr>
+          <tr><td>One message, updated in place</td><td>Forty engineers investigating separately is the second-biggest cost after the outage itself</td></tr>
+          <tr><td>Pause the merge queue early</td><td>It stops evicting PRs, which otherwise creates a second wave of work afterwards</td></tr>
+          <tr><td>Do not increase retries during an outage</td><td>It fills the runner pool and hides recovery — the four-hour failure mode</td></tr>
+          <tr><td>Use the designed break-glass path</td><td>Bypasses stay countable and reviewable rather than becoming an admin habit</td></tr>
+          <tr><td>Detection-first action items</td><td>The next outage will have a different cause; detection generalises, the fix does not</td></tr>
+        </table>
+      <div class="note">⚠️ <strong>The synthetic canary is the action item that keeps paying.</strong> A tiny
+         job that installs one package, pulls one image and runs one trivial pipeline every minute detects
+         dependency and platform breakage <em>before</em> a developer does — and it works for causes you have
+         not thought of yet, which is exactly what the last incident proved you needed.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>The pipeline is a production system whose users are engineers</strong> — it needs SLIs, an owner, an on-call and an error budget, or its outages are found by complaint.</li>
+        <li>Six SLIs worth publishing: availability, job start latency p95, duration p50/p90, first-attempt pass rate, infrastructure failure rate, and pipeline MTTR.</li>
+        <li><strong>Price outages in blocked engineer-hours.</strong> A 40-minute outage cost ~51 engineer-hours ($4,335); eleven of them cost $47,685 — eight times the same year's customer-facing SLO breaches, with no owner.</li>
+        <li><strong>Alert on rates, never on individual runs</strong>: infra failure rate, first-attempt pass rate, queue depth that will not drain, and the retry rate.</li>
+        <li><strong>Classify every failure by signature before deciding anything</strong> — deterministic, nondeterministic-in-our-tests, transient infrastructure, or external outage. Each has a different correct response.</li>
+        <li>Drive the <code>unclassified</code> bucket down weekly by reading those logs and adding signatures — 31% to 4% in six weeks — and treat a rising <em>deterministic</em> share as success.</li>
+        <li><strong>Retry by signature, never by outcome.</strong> Blanket retries turn a broken commit into 12m30s of identical failures and hide real outages.</li>
+        <li><strong>Retries must be visible.</strong> Silent retries kept jobs "in progress" during a 40-minute registry outage, so nothing alerted and the incident lasted four hours; a retry-rate alert caught the next one in six minutes.</li>
+        <li><strong>Only retry idempotent steps.</strong> Deploys, migrations and notifications are not — route those through a lock and a fresh run instead.</li>
+        <li>Bound retries: three attempts, exponential backoff with jitter, a ceiling, and a fleet-wide alert threshold.</li>
+        <li><strong>No timeout means six hours</strong> — one hung job held a concurrency group and blocked the merge queue all afternoon while 14 PRs waited.</li>
+        <li>Set three layers — job ≈ 2× p95, step, and command — and <strong>alert at 1.5× p95, before the timeout</strong>, so someone can attach to a live hung job instead of reading its corpse.</li>
+        <li><strong>A watchdog tells you <em>why</em> it hung.</strong> Dumping <code>ps</code>, stacks and sockets after 120 s of log silence found an exhausted connection pool on the first occurrence, after three weeks of "flaky".</li>
+        <li><strong>The environment preamble is the highest-value twelve lines in a pipeline</strong>: commit, attempt, runner, CPUs, memory, free disk, tool versions and filtered env — most "why here and not locally?" questions are answered before anything fails.</li>
+        <li>Group logs, annotate failures inline on the diff, export a correlation ID to every job, and write a job summary so the log usually does not need opening.</li>
+        <li><strong>Upload diagnostics on failure only</strong> — container logs, disk, processes, sockets. Median time-to-diagnose fell from 34 minutes to 6, and re-runs as a first step fell from 3-in-5 to 1-in-12.</li>
+        <li>A failure message that names the cause — "this is not your change", with the dependency and its status page — is a reliability feature worth ~20 minutes per affected engineer.</li>
+        <li><strong>Declare CI incidents on objective criteria</strong>, post once centrally with a next-update time, pause the merge queue early, and degrade through the pre-designed break-glass path rather than inventing admin merges.</li>
+        <li><strong>Never raise retry counts during an outage</strong> — it fills the pool and hides recovery.</li>
+        <li><strong>The best postmortem action item is about detection</strong>, because the next outage will have a different cause. A synthetic canary that installs a package and pulls an image every minute catches breakage you have not imagined yet.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="runners-infrastructure.html">← Runners &amp; Build Infrastructure</a>
+      <a href="deployment-strategies.html">Deployment Strategies →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
