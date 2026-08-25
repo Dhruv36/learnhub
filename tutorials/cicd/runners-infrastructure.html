@@ -1,0 +1,1095 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Runners &amp; Build Infrastructure — CI/CD — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">← All Tracks</a><a href="quiz.html">Quizzes</a><a href="../docker/index.html">Docker</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Runners &amp; Build Infrastructure <span class="level-badge level-adv">Pipeline Engineering</span></h1>
+
+    <p><strong>What you'll master:</strong> when self-hosted runners are genuinely justified and when they are
+       a cost-saving that costs more — <strong>a team that moved to save $4,100/month spent 31 engineer-days a
+       year maintaining the pool, and the maintenance alone was $21,000</strong>; the single most important
+       property of a runner, which is that it is <strong>ephemeral</strong>, demonstrated by the persistent
+       pool where <strong>a build passed for six weeks only because a previous job had left a file behind</strong>;
+       the security model that most organisations get wrong exactly once —
+       <strong>a self-hosted runner executing a fork pull request is arbitrary code execution inside your
+       network, with whatever that machine can reach</strong>, and the audit that found runners able to reach a
+       production database; capacity and autoscaling, where scale-up lag turned a 12-second queue into
+       <strong>4m40s of waiting</strong> until a warm pool fixed it, plus the pool-sizing arithmetic that comes
+       from Little's law rather than from guessing; the five failure modes that make runners flaky —
+       <strong>disk exhaustion caused 61% of one quarter's infrastructure failures</strong> — and how to run
+       the pool as a service with an SLO; and the supporting infrastructure that decides whether a fast
+       pipeline is possible at all: pull-through caches, package proxies and egress costs. Prerequisites:
+       <a href="containers-in-ci.html">Containers in CI</a> and
+       <a href="pipeline-performance.html">Pipeline Performance</a>.</p>
+
+    <h2>Part 1 — Hosted or Self-Hosted</h2>
+
+    <table class="tbl">
+      <tr><th></th><th>Hosted runners</th><th>Self-hosted runners</th></tr>
+      <tr><td>Isolation</td><td>Fresh VM per job, discarded after</td><td>Whatever you build — the default is <em>none</em></td></tr>
+      <tr><td>Maintenance</td><td>None</td><td>Yours: images, disk, upgrades, capacity, on-call</td></tr>
+      <tr><td>Cost shape</td><td>Per minute, no idle cost</td><td>Per hour of instance, idle included</td></tr>
+      <tr><td>Cold caches</td><td>Always — mitigate with a registry cache</td><td>Optional (and dangerous if you rely on them)</td></tr>
+      <tr><td>Network position</td><td>Public internet, no access to your VPC</td><td><strong>Inside your network</strong> — the reason to have them, and the risk</td></tr>
+      <tr><td>Machine sizes</td><td>Fixed catalogue</td><td>Anything: 64 cores, GPUs, macOS, bare metal</td></tr>
+      <tr><td>Queue behaviour</td><td>Plan concurrency limit</td><td>Your pool size and autoscaler</td></tr>
+    </table>
+
+<pre>
+THE FIVE LEGITIMATE REASONS FOR SELF-HOSTED, IN ORDER OF HOW OFTEN
+THEY ARE TRUE
+
+  1. NETWORK ACCESS — the build must reach a private artifact repository,
+     an internal package registry, a licence server, or a database in a
+     VPC. No amount of tunnelling makes hosted runners a good fit.
+  2. HARDWARE — GPUs, huge memory, specific CPU features, physical
+     devices, macOS at volume.
+  3. COMPLIANCE — data residency, or an auditor who requires that source
+     never leaves your infrastructure.
+  4. SCALE ECONOMICS — genuinely enormous CI volume where per-minute
+     pricing dominates and you already run a platform team.
+  5. WARM CACHES — the weakest reason, and usually solvable with a
+     registry cache instead (see &lt;pipeline performance&gt;).
+
+THE COST COMPARISON PEOPLE DO, AND THE ONE THEY SHOULD
+
+  what was presented:
+    hosted:       74,900 minutes/month x $0.008        = $599/month
+    self-hosted:  4 x c6i.4xlarge, 24/7                = $1,970/month
+    ... "but we can run 8 jobs per machine" ->         = $492/month
+    saving claimed                                       $4,100/year
+
+  what it actually cost, measured over the first year:
+    instances (including idle nights and weekends)       $5,900
+    storage, egress, load balancer                         $780
+    ENGINEER TIME: 31 days x $680/day                   $21,080
+      - image maintenance and toolchain upgrades  9 days
+      - disk-full incidents and cleanup jobs      7 days
+      - autoscaler tuning                         5 days
+      - security review and hardening             6 days
+      - runner outages during working hours       4 days
+    ------------------------------------------------------------
+    total                                              $27,760
+    versus hosted                                       $7,188
+</pre>
+
+    <div class="note">🔑 <strong>Self-hosted runners are a platform product, not a cost lever.</strong> If none
+       of reasons 1–3 applies, the honest comparison includes an engineer's time, and it rarely favours
+       self-hosting until CI volume is very large. If reason 1 applies — and it often does — then self-hosting
+       is correct and the maintenance is simply the price of the capability, which is a much easier
+       conversation to have honestly up front.</div>
+
+    <h2>Part 2 — Ephemeral Is the Property That Matters</h2>
+
+    <p>Whatever you choose, each job must start from a known state and leave nothing behind. Persistent runners
+       break this quietly, and the resulting bugs are among the hardest in this entire track to diagnose.</p>
+
+<pre>
+WHAT A PERSISTENT RUNNER ACCUMULATES
+
+  $ ls -la /home/runner/_work/                # eight repositories' checkouts
+  $ docker images | wc -l                     # 412 images, 180 GB
+  $ cat ~/.netrc ~/.docker/config.json        # credentials from other jobs
+  $ ls /tmp | head                            # test fixtures, sockets, pid files
+  $ env | grep -i token                       # exported by a previous step
+  $ crontab -l                                # a "temporary" cleanup job
+                                              # someone added in 2024
+
+THE BUG THIS PRODUCES — SIX WEEKS OF A GREEN BUILD THAT WAS NOT
+
+  a job in repo A ran `npm install -g @acme/cli` (a leftover debug step)
+  a job in repo B invoked `acme-cli generate` in its build
+  repo B's package.json did NOT declare the dependency
+
+  on the persistent pool: green, for six weeks.
+  the day repo B ran on a fresh runner: "acme-cli: command not found"
+  the day repo A removed the debug step: repo B broke, and repo A got
+    the blame in three separate incident channels.
+
+  This is the &lt;first-pipeline&gt; isolation guarantee failing at the
+  infrastructure layer instead of the test layer.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Model</th><th>State between jobs</th><th>Startup cost</th><th>Verdict</th></tr>
+      <tr><td>Long-lived runner, no cleanup</td><td>Everything</td><td>0</td><td><strong>Never.</strong> Correctness and security both fail</td></tr>
+      <tr><td>Long-lived runner + cleanup script</td><td>"Whatever we remembered"</td><td>Seconds</td><td>Fragile — the cleanup is a denylist and always incomplete</td></tr>
+      <tr><td>Container per job (Kubernetes runners)</td><td>None (fresh pod)</td><td>5–20 s</td><td>Good default for self-hosted</td></tr>
+      <tr><td>VM per job (ephemeral instances)</td><td>None</td><td>40–90 s</td><td>Strongest isolation; pair with a warm pool</td></tr>
+      <tr><td>Hosted runners</td><td>None</td><td>Included</td><td>Ephemeral by construction</td></tr>
+    </table>
+
+<pre>
+  # Kubernetes-based ephemeral runners (Actions Runner Controller shape)
+  apiVersion: actions.github.com/v1alpha1
+  kind: AutoscalingRunnerSet
+  spec:
+    minRunners: 2                 # warm pool: see Part 4
+    maxRunners: 40
+    template:
+      spec:
+        containers:
+          - name: runner
+            image: ghcr.io/acme/ci-runner:2026-08@sha256:...
+            resources:
+              requests: { cpu: "2", memory: "8Gi" }
+              limits:   { cpu: "4", memory: "8Gi" }
+        # NOTE: no docker socket mount. Builds go to a rootless
+        # BuildKit service — see &lt;containers in CI&gt;.
+
+  every job gets a fresh pod. There is no cleanup script to forget,
+  because there is nothing to clean.
+</pre>
+
+    <h2>Part 3 — The Security Model</h2>
+
+    <p>A self-hosted runner is a machine inside your network that executes code from your repositories. The
+       question that decides your posture is: <em>whose code?</em></p>
+
+<pre>
+THE SENTENCE TO INTERNALISE
+
+  A SELF-HOSTED RUNNER THAT BUILDS FORK PULL REQUESTS IS AN
+  UNAUTHENTICATED REMOTE CODE EXECUTION ENDPOINT, INSIDE YOUR NETWORK.
+
+  a contributor opens a PR:
+    -  .github/workflows/ci.yml  (their version, if the trigger allows)
+    -  Makefile / package.json scripts / Dockerfile RUN lines
+    -  a test file that runs on `pytest`
+  any of these executes on your machine, with its network position,
+  its cached credentials, and its disk.
+
+WHAT THE MACHINE COULD REACH — A REAL AUDIT
+
+$ # run from a scratch workflow ON the runner pool
+$ curl -s -m2 -o /dev/null -w '%{http_code}\n' http://169.254.169.254/latest/meta-data/
+  200        &lt;-- instance metadata: the runner's IAM role
+$ nc -zv postgres-prod.internal 5432
+  Connection to postgres-prod.internal 5432 succeeded!    &lt;-- !!
+$ nc -zv vault.internal 8200
+  succeeded
+$ cat ~/.docker/config.json | jq -r '.auths | keys[]'
+  registry.acme.io                                        &lt;-- push creds
+$ aws sts get-caller-identity
+  arn:aws:sts::1111:assumed-role/ci-runner-role/i-0abc     &lt;-- what can it do?
+</pre>
+
+    <table class="tbl">
+      <tr><th>Control</th><th>What it prevents</th><th>Notes</th></tr>
+      <tr><td><strong>Never build fork PRs on self-hosted runners</strong></td><td>Arbitrary code execution from strangers</td><td>Route fork PRs to hosted runners with no secrets, or require approval before any run</td></tr>
+      <tr><td><strong>Ephemeral runners</strong></td><td>Persistence and cross-job credential theft</td><td>One job per runner, then destroy the machine</td></tr>
+      <tr><td><strong>Network egress/ingress policy</strong></td><td>Reaching production databases and internal services</td><td>Runners belong in their own subnet with an explicit allowlist</td></tr>
+      <tr><td><strong>Blocked instance metadata (or IMDSv2 + hop limit 1)</strong></td><td>Stealing the runner's cloud identity</td><td>The classic escalation path</td></tr>
+      <tr><td><strong>Short-lived, narrowly scoped credentials (OIDC)</strong></td><td>A stolen token being useful later</td><td>See <a href="secrets-and-auth.html">pipeline identity</a></td></tr>
+      <tr><td><strong>No Docker socket; rootless builder</strong></td><td>Host takeover and cross-job access</td><td>See <a href="containers-in-ci.html">containers in CI</a></td></tr>
+      <tr><td><strong>Separate pools per trust level</strong></td><td>A low-trust repo compromising a high-trust one</td><td>Deploy-capable runners are a different pool with different labels</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>Runner labels are not a security boundary.</strong> Any workflow in any
+       repository with access to the pool can request <code>runs-on: [self-hosted, prod-deploy]</code>. If a
+       pool holds production credentials, restrict it at the <em>platform</em> level — runner groups scoped to
+       specific repositories — not by convention. Several published breaches follow exactly this path: a
+       low-value repository schedules a job onto a high-value pool.</div>
+
+    <h2>Part 4 — Capacity and Autoscaling</h2>
+
+<pre>
+POOL SIZING FROM LITTLE'S LAW, NOT FROM GUESSING
+
+  L = λ × W        jobs in the system = arrival rate × time in system
+
+  measured: 118 jobs/day, but arrivals are not uniform —
+  peak hour (14:00-15:00) sees 31 jobs, mean duration 6.2 min
+
+    λ_peak = 31 jobs/hour = 0.52 jobs/min
+    W      = 6.2 min
+    L      = 0.52 × 6.2 = 3.2 jobs running concurrently, on average
+
+  ... but AVERAGE concurrency is not capacity. Jobs arrive in bursts
+  (a merge queue batch, a nightly fan-out), so size for the p95 of
+  concurrent demand:
+
+$ ./ci/concurrent-jobs.sh --day 2026-08-20 --percentile 95
+  p50 concurrent: 3   p95: 11   p99: 17   max: 20
+
+  capacity 11 -> ~5% of jobs queue briefly
+  capacity 17 -> ~1% queue
+  capacity 20 -> essentially never queue, and idle most of the day
+  => autoscale between 2 (warm) and 20 (burst).
+</pre>
+
+<pre>
+SCALE-UP LAG IS THE NUMBER THAT SURPRISES PEOPLE
+
+  MEASURED, EC2-based ephemeral runners, cold pool:
+    autoscaler notices the queued job ......  30 s (polling interval)
+    RunInstances -> instance running ........ 42 s
+    boot + cloud-init + agent registration .. 98 s
+    docker pull of the toolchain image ...... 90 s
+    -------------------------------------------------
+    total from queued to executing ......... 4m40s
+
+  FIXES, IN ORDER OF EFFECT
+    minRunners: 2-4 (a warm pool)          -> first jobs start in ~5 s
+    bake the toolchain into the AMI/image   -> removes the 90 s pull
+    pre-registered, paused runners          -> removes agent registration
+    faster polling (10 s)                   -> removes 20 s
+    Kubernetes pods instead of VMs          -> 4m40s becomes 8-20 s
+  after: p50 queue 12 s, p95 47 s, with 2 warm runners costing $94/month
+</pre>
+
+    <table class="tbl">
+      <tr><th>Scaling signal</th><th>Behaviour</th><th>Comment</th></tr>
+      <tr><td>Queued job count (webhook-driven)</td><td>Scales on the actual demand signal</td><td>Best — reacts before anyone waits</td></tr>
+      <tr><td>CPU utilisation of the pool</td><td>Scales after jobs are already slow</td><td>Wrong metric: a queued job uses no CPU</td></tr>
+      <tr><td>Fixed schedule (bigger 09:00–18:00)</td><td>Crude but effective</td><td>Cheap, and often enough; pair with a small burst margin</td></tr>
+      <tr><td>Spot/preemptible instances</td><td>50–70% cheaper, can vanish mid-job</td><td>Fine for retryable jobs; never for deploys or anything holding a lock</td></tr>
+    </table>
+
+    <h2>Part 5 — Runners Are a Service: Reliability</h2>
+
+<pre>
+INFRASTRUCTURE FAILURES BY CAUSE, ONE QUARTER, SELF-HOSTED POOL
+
+  cause                                   incidents   share
+  ------------------------------------------------------------
+  disk full (images, caches, workspaces)      114      61%
+  registry pull rate limit / auth expiry       28      15%
+  runner agent lost / instance terminated      21      11%
+  DNS or egress proxy failure                  14       7%
+  memory exhaustion (OOM-killed jobs)          11       6%
+  ------------------------------------------------------------
+  ALL of these were reported by developers as "flaky tests".
+  Not one was a test.
+
+THE DISK PROBLEM IS THE WHOLE PROBLEM, AND IT IS FIXABLE
+
+  ❌ a cron job running `docker system prune -af` every night
+     - it runs at 03:00; the disk fills at 15:00
+     - it deletes the layer cache everyone depends on, so the first
+       builds after it are 8 minutes slower
+     - it can delete an image a running job is using
+
+  ✅ ephemeral runners: nothing accumulates, by construction
+  ✅ if persistent: prune by WATERMARK, not by schedule
+       docker system prune -af --filter "until=24h" \
+         &amp;&amp; [ "$(df --output=pcent / | tail -1 | tr -dc 0-9)" -lt 80 ]
+     triggered when usage crosses 75%, targeting 60%
+  ✅ alert on disk at 70% so the fix precedes the incident
+  ✅ separate volumes: workspace, docker data, caches — so one filling
+     up does not take down the others
+</pre>
+
+    <table class="tbl">
+      <tr><th>SLI for the runner pool</th><th>Target</th><th>Why it matters</th></tr>
+      <tr><td>Job start latency (queued → running), p95</td><td>&lt; 60 s</td><td>Directly part of everyone's feedback time</td></tr>
+      <tr><td>Infrastructure failure rate</td><td>&lt; 0.5% of jobs</td><td>Above this, red stops meaning "broken"</td></tr>
+      <tr><td>Pool availability</td><td>&gt; 99.5% in working hours</td><td>When it is down, the whole organisation is blocked</td></tr>
+      <tr><td>Disk headroom</td><td>&gt; 25% free</td><td>The single largest cause of failures</td></tr>
+      <tr><td>Runner image age</td><td>&lt; 14 days</td><td>Stale images mean per-job installs creep back</td></tr>
+    </table>
+
+    <div class="note">💡 <strong>Classify infrastructure failures separately from test failures, in the
+       data.</strong> Until you do, 186 disk-full and rate-limit incidents are indistinguishable from flaky
+       tests, and two teams spend a quarter debugging each other's problem. Tag them by error signature at the
+       point of failure, and report them against the pool's SLO rather than against the test suite's
+       first-attempt pass rate (see <a href="flaky-tests.html">flaky tests</a>).</div>
+
+    <h2>Part 6 — The Infrastructure Around the Runners</h2>
+
+    <table class="tbl">
+      <tr><th>Component</th><th>Problem it solves</th><th>Measured effect</th></tr>
+      <tr><td><strong>Registry pull-through cache</strong></td><td>Repeated base-image pulls; upstream rate limits</td><td>Base-image pull 41 s → 3 s; rate-limit incidents 28 → 0</td></tr>
+      <tr><td><strong>Package proxy</strong> (npm/PyPI/Maven mirror)</td><td>Slow or flaky upstream package downloads</td><td><code>npm ci</code> 60 s → 21 s; removes a whole class of infra flake</td></tr>
+      <tr><td><strong>Local artifact/cache storage</strong></td><td>Cache round trips across regions</td><td>412 MB restore 71 s → 9 s when co-located</td></tr>
+      <tr><td><strong>Egress proxy with an allowlist</strong></td><td>Runners reaching arbitrary internet hosts</td><td>Security control <em>and</em> a bandwidth bill reduction</td></tr>
+      <tr><td><strong>Remote build cache</strong> (BuildKit/Bazel/Gradle)</td><td>Cold builds on ephemeral machines</td><td>Docker build 8m52s → 47s</td></tr>
+    </table>
+
+<pre>
+CO-LOCATION MATTERS MORE THAN PEOPLE EXPECT
+
+  runners in eu-west-1, cache bucket in us-east-1:
+    cache restore (412 MB) ....... 71 s
+    egress charges ............... $0.02/GB x ~9 TB/month = $180/month
+
+  same cache bucket in eu-west-1:
+    cache restore ................. 9 s
+    egress ........................ $0 (same region)
+
+  the fix was a bucket and one config line. It removed 62 seconds from
+  every job in the estate and $180/month, and it had been that way for
+  two years because nobody had looked at where the cache lived.
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A persistent self-hosted pool adopted to save $4,100 a year, building fork pull requests,
+         with the Docker socket mounted, a nightly <code>docker system prune -af</code>, no disk alerting, no
+         network segmentation, and cache storage in another region.</strong> The saving was never real: 31
+         engineer-days of maintenance cost $21,000 against a $600/month hosted bill. State leaks between jobs,
+         so one repository's globally-installed CLI made another repository's build pass for six weeks and then
+         break with no related change. Disk exhaustion causes 61% of the quarter's failures and every one is
+         reported as a flaky test, while the nightly prune deletes the layer cache and makes the first builds
+         of each morning eight minutes slower. Any workflow in any repository can target the pool by label,
+         including the pool that holds production deploy credentials, and a fork PR runs a contributor's
+         Makefile on a machine that can open a TCP connection to the production database and read the
+         instance's IAM role from the metadata endpoint. Meanwhile every job pays 62 seconds and $180 a month
+         to fetch its cache across an ocean.</p>
+      <p>✅ <strong>Ephemeral runners in their own network segment, hosted runners for anything untrusted,
+         autoscaling driven by queue depth with a small warm pool, and the pool run as a service with an
+         SLO.</strong> Decide self-hosting on capability — private network access, hardware, compliance — and
+         put the engineer-days in the business case, because they dominate it. Make every runner ephemeral so
+         there is no cleanup script to forget and no credential to leave behind; one job per machine, then
+         destroy it. Never build fork PRs on a self-hosted runner: route them to hosted runners with no secrets
+         and nothing to publish. Put runners in their own subnet with an egress allowlist, block or hop-limit
+         the metadata endpoint, issue short-lived credentials via OIDC, and scope high-privilege pools with
+         platform-level runner groups rather than labels, which are not a boundary. Scale on queued-job count,
+         keep two warm runners (measured $94/month to take job start from 4m40s to 12 s), and bake the
+         toolchain into the image so the pull is not on the critical path. Then treat the pool as production:
+         alert on disk at 70%, prune by watermark rather than by cron, classify infrastructure failures
+         separately from test failures so 186 incidents stop being mistaken for flakiness, and put the cache
+         next to the runners — a bucket in the right region removed 62 seconds from every job in the estate.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What happens</th><th>Do this instead</th></tr>
+      <tr><td>Self-hosting to save money</td><td>$4,100/year of claimed saving against $21,000 of engineer time</td><td>Self-host for capability; put maintenance days in the business case</td></tr>
+      <tr><td>Persistent runners</td><td>A build passed for six weeks because another repo's job installed a CLI</td><td>Ephemeral: fresh pod or VM per job</td></tr>
+      <tr><td>Cleanup scripts instead of ephemerality</td><td>A denylist that is always missing the thing that mattered</td><td>Destroy the machine; there is nothing to clean</td></tr>
+      <tr><td>Building fork PRs on self-hosted runners</td><td>Arbitrary code execution inside your network, from strangers</td><td>Hosted runners, no secrets, nothing published; approval before any run</td></tr>
+      <tr><td>Treating runner labels as security</td><td>Any repo can schedule onto the production-credential pool</td><td>Runner groups scoped to specific repositories, enforced by the platform</td></tr>
+      <tr><td>Reachable instance metadata</td><td>A job steals the runner's cloud identity</td><td>Block it, or IMDSv2 with hop limit 1</td></tr>
+      <tr><td>Runners in the general VPC</td><td>A CI job can open a socket to the production database</td><td>Dedicated subnet, egress allowlist, no path to production data</td></tr>
+      <tr><td>Scaling on CPU utilisation</td><td>A queued job uses no CPU, so the signal arrives late</td><td>Scale on queued-job count</td></tr>
+      <tr><td>No warm pool</td><td>4m40s from queued to executing on a cold pool</td><td>2–4 minimum runners; bake the toolchain into the image</td></tr>
+      <tr><td>Spot instances for deploys</td><td>A reclaimed instance leaves a half-finished deploy</td><td>Spot for retryable jobs only; on-demand for deploys and lock holders</td></tr>
+      <tr><td>Nightly <code>docker system prune -af</code></td><td>Deletes the cache everyone needs and still fills up by afternoon</td><td>Watermark-triggered pruning with an <code>until</code> filter; alert at 70%</td></tr>
+      <tr><td>No disk alerting</td><td>61% of one quarter's infrastructure failures</td><td>Alert on free space; separate volumes for workspace, images and caches</td></tr>
+      <tr><td>Counting infra failures as flaky tests</td><td>Two teams debug each other's problem for a quarter</td><td>Classify by error signature; report against the pool's SLO</td></tr>
+      <tr><td>Cache and registry in another region</td><td>62 s and $180/month, for two years, unnoticed</td><td>Co-locate cache, registry mirror and package proxy with the runners</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between hosted and self-hosted runners, and when would you choose each?</summary>
+      <p><strong>Hosted runners</strong> are provided by the CI platform: a fresh virtual machine per job,
+         discarded afterwards, billed per minute, with no maintenance. <strong>Self-hosted runners</strong> are
+         machines you own and operate, which the CI platform dispatches jobs to.</p>
+      <p>The legitimate reasons to self-host, in the order they are actually true:</p>
+      <ol>
+        <li><strong>Network access</strong> — the build needs a private registry, licence server or database
+            inside your network.</li>
+        <li><strong>Hardware</strong> — GPUs, very large machines, specific CPU features, macOS at volume.</li>
+        <li><strong>Compliance</strong> — data residency or a requirement that source stays on your
+            infrastructure.</li>
+        <li><strong>Scale economics</strong> — genuinely huge CI volume, where you already run a platform
+            team.</li>
+      </ol>
+      <p>The reason people usually give — cost — is usually wrong. One measured migration claimed $4,100/year
+         of savings and consumed 31 engineer-days of maintenance in its first year, which at any realistic day
+         rate is several times the hosted bill. If a capability reason applies, self-hosting is correct and the
+         maintenance is the price of that capability; if none does, hosted runners plus a registry cache
+         usually beat it on both cost and reliability.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why should CI runners be ephemeral?</summary>
+      <p>Two reasons, one about correctness and one about security.</p>
+      <p><strong>Correctness:</strong> a persistent runner accumulates state — installed packages, cached
+         files, environment variables, Docker images — and jobs start depending on it without anyone deciding
+         to. The measured example: a job in one repository globally installed a CLI as a leftover debug step; a
+         job in a different repository used that CLI without declaring it. The second build passed for six
+         weeks, then failed the day it landed on a fresh machine — and the failure had no relationship to any
+         change in that repository.</p>
+      <p><strong>Security:</strong> whatever a job leaves behind is available to the next job, including
+         registry credentials in <code>~/.docker/config.json</code>, tokens in the environment, and cloned
+         source from a private repository. On a pool shared between repositories that is a cross-repository
+         data leak by default.</p>
+      <p>Ephemeral means one job per machine — a fresh pod or VM — destroyed afterwards. The cost is startup
+         time, which is why you pair it with a warm pool and a prebuilt image; the alternative, a cleanup
+         script, is a denylist that is always missing the thing that mattered.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Your self-hosted runners have a 4-minute queue at peak. How do you diagnose and fix it?</summary>
+      <p>First separate the two things a "queue" can mean: <strong>no capacity</strong> (all runners busy) or
+         <strong>capacity exists but is slow to arrive</strong> (scale-up lag). The shape of the data tells you
+         which.</p>
+      <table class="tbl">
+        <tr><th>Observation</th><th>Cause</th><th>Fix</th></tr>
+        <tr><td>Queue tracks working hours and the pool is pinned at max</td><td>Insufficient capacity</td><td>Remove waste first (cancellation, path filters), then raise the ceiling</td></tr>
+        <tr><td>Queue spikes for ~4 minutes and clears, pool not at max</td><td>Scale-up lag</td><td>Warm pool, prebaked images, faster polling, pods instead of VMs</td></tr>
+        <tr><td>Only large jobs queue</td><td>Scarce big machines</td><td>Right-size — most jobs do not need them</td></tr>
+        <tr><td>Fixed daily spike</td><td>Scheduled jobs overlapping peak</td><td>Move the cron or use a separate pool</td></tr>
+      </table>
+      <p>For scale-up lag specifically, the measured breakdown was: 30 s of autoscaler polling, 42 s to launch
+         the instance, 98 s of boot and agent registration, and 90 s pulling the toolchain image —
+         <strong>4m40s total</strong>. Two warm runners at $94/month took the p50 to 12 seconds; baking the
+         toolchain into the image removed the 90-second pull; moving to Kubernetes pods would have taken the
+         whole thing to under 20 seconds.</p>
+      <p>And the sizing question underneath: size for the <strong>p95 of concurrent demand</strong>, not the
+         mean. Averages say three concurrent jobs; the p95 says eleven and the max says twenty — so autoscale
+         between a small warm floor and the burst ceiling.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What are the security risks of self-hosted runners?</summary>
+      <p>The core risk is stated in one sentence: <strong>a self-hosted runner executes code from your
+         repositories on a machine inside your network</strong>. Everything follows from asking whose code and
+         what that machine can reach.</p>
+      <table class="tbl">
+        <tr><th>Risk</th><th>Mechanism</th><th>Control</th></tr>
+        <tr><td>Untrusted code execution</td><td>A fork PR can change workflows, build scripts, Dockerfiles and tests</td><td><strong>Never build fork PRs on self-hosted runners</strong>; hosted, no secrets, nothing published</td></tr>
+        <tr><td>Lateral movement</td><td>The runner can reach internal services — one audit found a path to the production database</td><td>Dedicated subnet, egress allowlist, no route to production data</td></tr>
+        <tr><td>Cloud identity theft</td><td>The instance metadata endpoint yields the runner's IAM role</td><td>Block metadata, or IMDSv2 with hop limit 1; scope the role minimally</td></tr>
+        <tr><td>Cross-job credential theft</td><td>Persistent runners keep <code>~/.docker/config.json</code>, tokens, source</td><td>Ephemeral runners; short-lived OIDC credentials</td></tr>
+        <tr><td>Host takeover</td><td>Mounted Docker socket or privileged containers</td><td>Rootless/daemonless builders</td></tr>
+        <tr><td>Pool targeting</td><td><strong>Labels are not a boundary</strong> — any repo can request a label</td><td>Runner groups scoped to specific repositories, at the platform level</td></tr>
+      </table>
+      <p>The one I would emphasise unprompted is the last: teams separate a "prod-deploy" pool by label and
+         believe it is isolated, when any workflow in any repository with access to the pool can request that
+         label. Several published incidents follow this exact path — a low-value repository schedules a job
+         onto a high-value pool and inherits its credentials and network position.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a runner platform for 200 engineers across 60 repositories, with some builds needing private network access.</summary>
+      <p>The requirement splits the estate cleanly, and the design should follow that split rather than
+         standardising on one answer.</p>
+      <table class="tbl">
+        <tr><th>Tier</th><th>Runs</th><th>Implementation</th></tr>
+        <tr><td><strong>Public / untrusted</strong></td><td>Fork PRs, open-source repos</td><td>Hosted runners, no secrets, publish nothing, approval required before first run</td></tr>
+        <tr><td><strong>Standard</strong></td><td>Most internal CI</td><td>Hosted runners plus a registry cache and package proxy — no maintenance, ephemeral by construction</td></tr>
+        <tr><td><strong>Private-network</strong></td><td>Builds needing internal registries, licence servers, databases</td><td>Ephemeral Kubernetes runners in a dedicated subnet, egress allowlist, no route to production data</td></tr>
+        <tr><td><strong>Deploy</strong></td><td>Jobs holding production credentials</td><td>A separate pool in a runner group scoped to the deployment repositories only; on-demand instances, never spot</td></tr>
+        <tr><td><strong>Special hardware</strong></td><td>GPU, macOS, large-memory builds</td><td>Small dedicated pools, scaled on schedule, with explicit ownership</td></tr>
+      </table>
+      <p><strong>Cross-cutting decisions:</strong> every runner ephemeral, one job per pod; autoscale on queued
+         job count with a warm floor of two to four; toolchain baked into a weekly-refreshed image pinned by
+         digest; a pull-through registry cache and package proxy co-located with the runners; credentials
+         issued via OIDC with short lifetimes and per-repository scoping.</p>
+      <p><strong>Run it as a service:</strong> published SLIs — job start latency p95 under 60 s,
+         infrastructure failure rate under 0.5%, pool availability above 99.5% in working hours — with a named
+         owning team and an on-call rotation. At 200 engineers the pool is production: when it is slow, the
+         entire company is slow.</p>
+      <p><strong>What I would avoid:</strong> one big shared pool for everything (it forces the security
+         posture of the least-trusted workload onto everyone), persistent runners for cache warmth (buy that
+         with a remote build cache instead), and letting teams add their own runners to shared groups without
+         review — that is how a pool with production credentials acquires an unexpected member.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Developers complain about "flaky CI". You find most failures are infrastructure. How do you handle that?</summary>
+      <p><strong>First, separate the two populations in the data</strong>, because until you do, both teams are
+         debugging the wrong thing. Classify every failure by error signature at the point of failure —
+         disk-full, image pull, agent lost, DNS, OOM — and report infrastructure failures against the runner
+         pool's SLO rather than against the test suite's first-attempt pass rate.</p>
+      <p>In one measured quarter that reclassification moved 186 incidents out of "flaky tests": 61% disk
+         exhaustion, 15% registry rate limits and auth expiry, 11% lost agents, 7% DNS/egress, 6% OOM. Not one
+         was a test, and the test team had been spending its time on them.</p>
+      <p><strong>Then fix them as reliability work, in order of share:</strong></p>
+      <ul>
+        <li><strong>Disk</strong> — the dominant cause. Ephemeral runners remove it entirely; if persistent,
+            prune by watermark rather than by cron (a nightly <code>prune -af</code> both deletes the cache
+            everyone needs and still fills up by afternoon), alert at 70%, and split workspace, image and cache
+            volumes.</li>
+        <li><strong>Registry limits</strong> — a pull-through cache took these from 28 incidents to zero.</li>
+        <li><strong>Lost agents</strong> — retry infrastructure errors specifically, matched by signature, not
+            by "the job failed" (which is the retry-by-default trap from <a href="flaky-tests.html">flaky
+            tests</a>).</li>
+        <li><strong>DNS/egress and OOM</strong> — resource requests per job, and monitoring the proxy as a
+            dependency.</li>
+      </ul>
+      <p><strong>And close the loop with the developers</strong>: publish the classification weekly. The
+         complaint "CI is flaky" is a single undifferentiated signal; showing that 61% of it was disk space on
+         the build pool converts an argument about test quality into a reliability backlog with an owner — and
+         it restores trust in the red/green signal, which is the thing that was actually being lost.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Build the honest business case for self-hosted runners:
+      compute the hosted bill, the instance bill, and the maintenance cost that decides it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — WHAT ARE YOU ACTUALLY SPENDING ON HOSTED MINUTES?
+
+$ gh api "/repos/acme/shop-api/actions/workflows" --jq '.workflows[].id' \
+  | while read -r w; do
+      gh api "/repos/acme/shop-api/actions/workflows/$w/timing" \
+        --jq '.billable.UBUNTU.total_ms // 0'
+    done | awk '{s+=$1} END {printf "%.0f minutes/month\n", s/60000}'
+  74,900 minutes/month
+
+  74,900 x $0.008 = $599/month = $7,188/year
+
+STEP 2 — THE INSTANCE BILL, INCLUDING THE HOURS NOBODY USES
+
+  proposed: 4 x c6i.4xlarge (16 vCPU) running 24/7
+    on-demand  4 x $0.68/h x 730 h            = $1,986/month
+    ... "we'll autoscale to 1 at night"       =   $890/month
+    EBS 4 x 200 GB gp3                        =    $64/month
+    NAT gateway + egress (~9 TB)              =   $310/month
+    load balancer / control plane             =    $22/month
+    ------------------------------------------------------
+    infrastructure                            = $1,286/month = $15,432/yr
+
+STEP 3 — THE TERM THAT DECIDES IT (track it for a year, or estimate
+         from a comparable team's history)
+
+  activity                                   days/year
+  ------------------------------------------------------
+  runner image maintenance, toolchain bumps      9
+  disk-full incidents and cleanup work           7
+  autoscaler tuning and capacity changes         5
+  security review, hardening, patching           6
+  outages during working hours (incl. the
+    cost of 200 people waiting, once)            4
+  ------------------------------------------------------
+  total                                         31 days
+  31 x $680/day (loaded)                    = $21,080/year
+
+STEP 4 — THE COMPARISON, STATED HONESTLY
+
+  option                        year 1      year 2+   capability
+  ---------------------------------------------------------------------
+  hosted                        $7,188      $7,188    no private network
+  self-hosted (as proposed)    $36,512     $30,000    private network,
+                                                       big machines
+  hosted + a small private
+    pool for the 6 repos that
+    actually need VPC access     $9,900     $9,400    private network
+                                                       where needed
+</pre>
+        <table class="tbl">
+          <tr><th>Question to answer before migrating</th><th>If the answer is…</th></tr>
+          <tr><td>Which repositories genuinely need private network access?</td><td>"Six of sixty" → build a small pool for those six, not a replacement for everything</td></tr>
+          <tr><td>Who owns the pool, with what on-call?</td><td>"Nobody yet" → you are not ready; this is the 31 days</td></tr>
+          <tr><td>Is the driver cost or capability?</td><td>Cost → recheck with maintenance included; it usually reverses</td></tr>
+          <tr><td>What is the plan for fork PRs?</td><td>"They'll just run on it" → stop; see exercise 4</td></tr>
+        </table>
+      <div class="note">🔑 <strong>The hybrid answer is almost always the right one.</strong> Very few estates
+         need every job on private infrastructure — typically a handful of repositories touch internal
+         services. A small dedicated pool for those, with everything else on hosted runners, gives you the
+         capability without adopting the maintenance burden for sixty repositories.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Prove a persistent runner is leaking state between jobs,
+      then show the same job on an ephemeral runner.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+PROBE — A WORKFLOW THAT INSPECTS ITS OWN MACHINE
+
+  name: runner-forensics
+  on: workflow_dispatch
+  jobs:
+    inspect:
+      runs-on: [self-hosted, linux]
+      steps:
+        - run: |
+            echo "=== who else has been here ==="
+            ls -1 "${RUNNER_WORKSPACE%/*}" 2&gt;/dev/null | head
+            echo "=== globally installed tooling ==="
+            npm ls -g --depth=0 2&gt;/dev/null | tail -n +2
+            pip list --user 2&gt;/dev/null | tail -n +3 | head
+            echo "=== credentials on disk ==="
+            ls -la ~/.docker/config.json ~/.netrc ~/.aws 2&gt;/dev/null
+            jq -r '.auths | keys[]' ~/.docker/config.json 2&gt;/dev/null
+            echo "=== images and disk ==="
+            docker images | wc -l; df -h / | tail -1
+            echo "=== leftovers in /tmp ==="
+            ls -1 /tmp | head
+            echo "=== marker from a previous run? ==="
+            cat /tmp/marker-from-last-job 2&gt;/dev/null || echo "(none)"
+            date &gt; /tmp/marker-from-last-job
+
+OUTPUT, PERSISTENT POOL
+
+  === who else has been here ===
+  acme/shop-api
+  acme/notify
+  acme/billing                    &lt;-- three repositories' checkouts
+  acme/internal-tools
+  === globally installed tooling ===
+  @acme/cli@2.3.0                 &lt;-- installed by someone else's job
+  serverless@3.38.0
+  === credentials on disk ===
+  -rw------- 1 runner runner 412 ~/.docker/config.json
+  registry.acme.io                &lt;-- push credentials, from another job
+  === images and disk ===
+  412
+  /dev/nvme0n1p1  200G  186G  14G  93% /       &lt;-- 93% full
+  === leftovers in /tmp ===
+  pytest-of-runner
+  .X11-unix
+  postgres-test-data
+  === marker from a previous run? ===
+  Wed Aug 20 14:22:07 UTC 2026    &lt;-- STATE SURVIVES BETWEEN JOBS
+
+OUTPUT, EPHEMERAL POOL (same workflow, pods)
+
+  === who else has been here ===
+  acme/shop-api
+  === globally installed tooling ===
+  (empty)
+  === credentials on disk ===
+  (none)
+  === images and disk ===
+  0
+  overlay  100G  2.1G  98G   3% /
+  === marker from a previous run? ===
+  (none)
+</pre>
+<pre>
+THE DEPENDENCY THIS HIDES — REPRODUCE IT DELIBERATELY
+
+  # job A (repo: internal-tools)
+  - run: npm install -g @acme/cli
+
+  # job B (repo: shop-api) — does NOT declare the dependency
+  - run: acme-cli generate-types &gt; src/types.ts
+
+  on the persistent pool  : job B is green
+  on an ephemeral pool    : "acme-cli: command not found"
+
+  FIND THESE BEFORE THEY FIND YOU:
+$ # run the whole pipeline on a fresh machine and diff the result
+$ gh workflow run ci.yml --ref "$BRANCH" -f runner=ubuntu-latest
+$ # or, on the persistent pool, strip the environment first:
+$ docker run --rm -v "$PWD:/w" -w /w ghcr.io/acme/ci-node:20 ./ci/build.sh
+</pre>
+      <div class="note">⚠️ <strong>The credential line is the one to escalate.</strong> Finding another
+         repository's registry push credentials readable by your job is a cross-repository compromise, not an
+         inconvenience — and on a pool that also builds fork PRs it is reachable by anyone who can open a pull
+         request. Treat any token found this way as exposed and rotate it.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Size a runner pool from your own data, then measure and
+      fix scale-up lag.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — CONCURRENT DEMAND, NOT AVERAGE DEMAND
+
+$ gh run list --limit 1000 --json startedAt,updatedAt \
+    --jq '.[] | [(.startedAt|fromdate), (.updatedAt|fromdate)] | @tsv' &gt; spans.tsv
+
+$ python - &lt;&lt;'PY'
+import collections
+events = []
+for line in open("spans.tsv"):
+    a, b = line.split()
+    events += [(int(a), 1), (int(b), -1)]
+events.sort()
+cur = peak = 0
+hist = collections.Counter()
+prev = events[0][0]
+for t, d in events:
+    hist[cur] += t - prev          # time spent at each concurrency level
+    prev = t; cur += d; peak = max(peak, cur)
+total = sum(hist.values())
+run = 0
+for level in sorted(hist):
+    run += hist[level]
+    print(f"{level:3d} concurrent  {100*run/total:5.1f}% of the time")
+print("peak:", peak)
+PY
+
+    0 concurrent   41.2% of the time
+    3 concurrent   68.0%
+    7 concurrent   89.4%
+   11 concurrent   95.1%      &lt;-- p95
+   17 concurrent   99.0%
+   20 concurrent  100.0%      &lt;-- peak
+
+  SIZING: floor 2 (warm), ceiling 20 (burst), and expect the autoscaler
+  to sit between 3 and 11 for most of the working day.
+
+STEP 2 — MEASURE THE LAG THAT MAKES THE CEILING IRRELEVANT
+
+  instrument the runner image's first step:
+    - run: |
+        echo "queued_at=$(date -d "$RUN_QUEUED_AT" +%s) now=$(date +%s)"
+        echo "lag=$(( $(date +%s) - $(date -d "$RUN_QUEUED_AT" +%s) ))s"
+
+  cold-pool breakdown (EC2 ephemeral runners):
+    autoscaler poll interval ............  30 s
+    RunInstances -> running .............  42 s
+    boot + cloud-init + agent register ...  98 s
+    docker pull toolchain image .........  90 s
+    ---------------------------------------------
+    total ............................... 4m40s
+
+STEP 3 — FIX IT, CHEAPEST FIRST
+
+  a) warm floor
+     minRunners: 2                     -> first 2 jobs start in ~5 s
+     cost: 2 x c6i.xlarge x 730h = $94/month
+
+  b) bake the toolchain into the image (AMI or container image)
+     -90 s from every cold start; also removes registry rate-limit risk
+
+  c) tighten the scaling signal
+     scale on QUEUED JOBS via webhook, not on a 30 s poll of CPU
+     -30 s, and it reacts before anyone waits
+
+  d) pre-registered paused runners (or Kubernetes pods)
+     removes agent registration entirely: 4m40s -> 8-20 s
+
+  MEASURED AFTER (a)+(b)+(c):
+    job start latency p50 ....... 12 s   (was 380 s)
+    p95 ......................... 47 s   (was 1,140 s)
+    additional cost ............. $94/month
+    engineer time recovered ..... ~3.4 h/day
+</pre>
+        <table class="tbl">
+          <tr><th>Signal</th><th>Reacts</th><th>Verdict</th></tr>
+          <tr><td>Queued-job webhook</td><td>Immediately on demand</td><td>Best — scale before anyone waits</td></tr>
+          <tr><td>Queued-job polling (30 s)</td><td>Up to 30 s late</td><td>Acceptable; shorten the interval</td></tr>
+          <tr><td>Pool CPU utilisation</td><td>After jobs are already running</td><td>Wrong metric — a queued job uses no CPU</td></tr>
+          <tr><td>Fixed schedule</td><td>Predictably</td><td>Crude but effective; pair with a burst margin</td></tr>
+        </table>
+      <div class="note">💡 <strong>A warm floor is cheap insurance against the worst-felt latency.</strong>
+         The first job of the morning, the first after lunch, and the first after any quiet period all hit the
+         cold path — which is precisely when someone is watching. Two warm runners at $94/month removed the
+         entire experience of "CI is slow today" from the measured team.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Audit what a runner can reach and what a fork PR could
+      do, then close the gaps.
+      <details class="solution"><summary>Solution</summary>
+      <p>Run this from a scratch repository on the pool you are auditing, with permission, and treat every
+         success as a finding.</p>
+<pre>
+THE PROBE WORKFLOW
+
+  name: runner-blast-radius
+  on: workflow_dispatch
+  jobs:
+    audit:
+      runs-on: [self-hosted, linux]
+      steps:
+        - name: Cloud identity
+          run: |
+            curl -s -m2 http://169.254.169.254/latest/meta-data/iam/info || true
+            aws sts get-caller-identity 2&gt;/dev/null || true
+            aws iam list-attached-role-policies \
+              --role-name "$(curl -s -m2 http://169.254.169.254/latest/meta-data/iam/security-credentials/)" \
+              2&gt;/dev/null || true
+        - name: Network reachability
+          run: |
+            for hp in postgres-prod.internal:5432 vault.internal:8200 \
+                      k8s-api.internal:6443 registry.acme.io:443 \
+                      10.0.0.1:22 evil.example.com:443; do
+              h="${hp%%:*}"; p="${hp##*:}"
+              timeout 2 bash -c "&gt;/dev/tcp/$h/$p" 2&gt;/dev/null \
+                &amp;&amp; echo "REACHABLE  $hp" || echo "blocked    $hp"
+            done
+        - name: Credentials lying around
+          run: |
+            ls -la ~/.docker ~/.aws ~/.kube ~/.netrc 2&gt;/dev/null || true
+            env | grep -iE 'token|secret|key' | cut -c1-40 || true
+
+FINDINGS
+
+  REACHABLE  postgres-prod.internal:5432      ← CRITICAL
+  REACHABLE  vault.internal:8200              ← CRITICAL
+  REACHABLE  k8s-api.internal:6443            ← HIGH
+  REACHABLE  registry.acme.io:443             ← expected
+  REACHABLE  evil.example.com:443             ← unrestricted egress
+  blocked    10.0.0.1:22
+
+  arn:aws:sts::1111:assumed-role/ci-runner-role/i-0abc
+  attached: AmazonS3FullAccess, AmazonEC2FullAccess   ← far too broad
+
+WHO CAN RUN CODE HERE?
+
+$ grep -rn 'runs-on' .github/workflows/*.yml
+  ci.yml:12:    runs-on: [self-hosted, linux]
+$ grep -n 'on:' -A6 .github/workflows/ci.yml
+  on:
+    pull_request:            ← INCLUDING FROM FORKS
+  -> any GitHub user can execute code on a machine that can open a
+     socket to the production database.
+</pre>
+<pre>
+THE REMEDIATION, IN PRIORITY ORDER
+
+  1. STOP FORK PRs ON THIS POOL — today
+     jobs:
+       test:
+         runs-on: ${{ github.event.pull_request.head.repo.fork
+                      &amp;&amp; 'ubuntu-latest' || fromJSON('["self-hosted","linux"]') }}
+     plus: Settings → Actions → "Require approval for all outside
+     collaborators" (or first-time contributors at minimum)
+
+  2. NETWORK SEGMENTATION
+     - runners in their own subnet
+     - security group: egress to the registry, package proxy and the
+       CI control plane ONLY
+     - explicit deny to production data subnets
+     re-run the probe: every internal host must print "blocked"
+
+  3. METADATA
+     aws ec2 modify-instance-metadata-options --instance-id i-0abc \
+       --http-tokens required --http-put-response-hop-limit 1
+     (containers then cannot reach it through the extra hop)
+
+  4. IAM
+     replace *FullAccess with: push to one ECR repository, read one
+     S3 prefix. Better: no instance role at all, and per-job OIDC.
+
+  5. RUNNER GROUPS, NOT LABELS
+     Settings → Actions → Runner groups → "private-network"
+       repository access: 6 named repositories
+     labels are a scheduling hint; groups are the boundary.
+</pre>
+        <table class="tbl">
+          <tr><th>Finding</th><th>Severity</th><th>Fix</th></tr>
+          <tr><td>Fork PRs run on the pool</td><td><strong>Critical</strong></td><td>Route forks to hosted runners; require approval</td></tr>
+          <tr><td>Production database reachable</td><td><strong>Critical</strong></td><td>Dedicated subnet with an egress allowlist</td></tr>
+          <tr><td>Vault reachable</td><td><strong>Critical</strong></td><td>Same; plus scope any policy the runner identity holds</td></tr>
+          <tr><td>Metadata endpoint reachable from containers</td><td>High</td><td>IMDSv2 with hop limit 1</td></tr>
+          <tr><td>Over-broad instance role</td><td>High</td><td>Minimal role, or per-job OIDC with no instance role</td></tr>
+          <tr><td>Unrestricted internet egress</td><td>Medium</td><td>Proxy with an allowlist — also cuts the bandwidth bill</td></tr>
+          <tr><td>Pool selected by label only</td><td>Medium</td><td>Runner groups scoped to named repositories</td></tr>
+        </table>
+      <div class="note">⚠️ <strong>Run the probe again after every change, and keep it as a scheduled
+         job.</strong> Network policy drifts: a new peering connection, a security-group edit, a shared subnet
+         reused for convenience. A weekly job that asserts "these hosts must be unreachable from CI" turns a
+         one-time audit into a control — and it fails loudly the week someone opens a path.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Classify a quarter of "flaky CI" failures by root cause,
+      then fix the infrastructure ones and prove the improvement.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+STEP 1 — CLASSIFY BY ERROR SIGNATURE, AUTOMATICALLY
+
+  # ci/classify-failure.sh — runs as the last step, on failure
+  #!/usr/bin/env bash
+  set -euo pipefail
+  LOG="${1:?log file}"
+  case "$(tail -200 "$LOG")" in
+    *"no space left on device"*|*"No space left"*)  C=infra_disk ;;
+    *"toomanyrequests"*|*"pull rate limit"*)        C=infra_registry ;;
+    *"The runner has received a shutdown signal"*|\
+     *"lost communication with the server"*)        C=infra_runner_lost ;;
+    *"Temporary failure in name resolution"*|\
+     *"proxyconnect tcp"*)                          C=infra_network ;;
+    *"Killed"*|*"OOMKilled"*|*"MemoryError"*)       C=infra_oom ;;
+    *"AssertionError"*|*"FAILED tests/"*)           C=test_failure ;;
+    *)                                              C=unclassified ;;
+  esac
+  ./ci/push-metric.sh "ci_failure_total{class=\"$C\"}" 1
+  echo "::notice::failure classified as $C"
+
+STEP 2 — THE QUARTER'S DATA, ONCE CLASSIFIED
+
+  class                 count   share   owner
+  ---------------------------------------------------------
+  infra_disk              114    38%    platform
+  test_failure             97    32%    the teams
+  infra_registry           28     9%    platform
+  infra_runner_lost        21     7%    platform
+  infra_network            14     5%    platform
+  infra_oom                11     4%    platform
+  unclassified             14     5%    -&gt; improve the classifier
+  ---------------------------------------------------------
+  186 of 299 failures (62%) were INFRASTRUCTURE, and all of them had
+  been reported as "flaky tests" in the developer survey.
+
+STEP 3 — FIX THEM IN SHARE ORDER
+
+  DISK (38%)
+    ❌ 0 3 * * *  docker system prune -af
+       - fires at 03:00; disk fills at 15:00
+       - deletes the layer cache: first builds each morning +8 min
+    ✅ watermark-based, and it never touches in-use images:
+       #!/usr/bin/env bash
+       USED=$(df --output=pcent / | tail -1 | tr -dc 0-9)
+       [ "$USED" -lt 75 ] &amp;&amp; exit 0
+       docker system prune -f --filter "until=24h"
+       docker builder prune -f --keep-storage 20GB
+       USED=$(df --output=pcent / | tail -1 | tr -dc 0-9)
+       [ "$USED" -lt 85 ] || docker system prune -af --filter "until=6h"
+    ✅ and the structural fix: ephemeral runners, where nothing accrues
+    ✅ alert at 70% free-space, paging the platform team
+
+  REGISTRY (9%)
+    ✅ pull-through cache in the runner subnet
+       registry-mirrors: ["https://mirror.acme.internal"]
+       -> 28 incidents to 0, and base-image pulls 41 s -> 3 s
+
+  RUNNER LOST (7%)
+    ✅ retry ONLY on this signature, never on "the job failed":
+       if: failure() &amp;&amp; contains(steps.classify.outputs.class, 'runner_lost')
+    ✅ and stop using spot instances for jobs that hold locks
+
+  NETWORK (5%) — proxy monitored as a dependency, with its own alert
+  OOM (4%)    — per-job memory requests; the two offenders were a Node
+                build with no --max-old-space-size and a test loading a
+                200 MB fixture
+
+STEP 4 — PROVE IT, IN THE DEVELOPERS' UNITS
+
+  metric                          before      after 8 weeks
+  -----------------------------------------------------------
+  infrastructure failures/week      14.3           0.9
+  first-attempt pass rate            61%            91%
+  disk alerts (pre-incident)           0             11  (all handled
+                                                     before impact)
+  developer survey: "CI is
+    unreliable"                   72% agree    18% agree
+</pre>
+        <table class="tbl">
+          <tr><th>Why classification comes first</th></tr>
+          <tr><td>It routes the work to the team that can fix it — 62% of these were nobody's ticket because they looked like test failures</td></tr>
+          <tr><td>It makes retries defensible: retrying <em>infrastructure</em> signatures is legitimate; retrying "the job failed" is the trap from <a href="flaky-tests.html">flaky tests</a></td></tr>
+          <tr><td>It gives the pool a real SLI, so reliability work can be prioritised against features</td></tr>
+          <tr><td>It stops the test team from chasing ghosts, which is where the quarter had been going</td></tr>
+        </table>
+      <div class="note">🔑 <strong>Publish the classification weekly, to everyone.</strong> "CI is flaky" is an
+         undifferentiated complaint that produces arguments; "61% of last week's failures were disk exhaustion
+         on the build pool, owned by platform, fix landing Thursday" produces a backlog with an owner — and it
+         is the fastest way to restore trust in the red/green signal.</div>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build the supporting infrastructure — pull-through cache,
+      package proxy, co-located storage — and measure what each removes from every job.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+BASELINE — WHERE A JOB'S TIME GOES BEFORE ANY OF THIS
+
+  step                                    duration   cause
+  ---------------------------------------------------------------
+  pull base image node:20-slim              41 s     Docker Hub, no mirror
+  npm ci (cold)                             60 s     registry.npmjs.org
+  restore build cache (412 MB)              71 s     bucket in us-east-1,
+                                                     runners in eu-west-1
+  docker build (cold layers)               8m52s     no remote build cache
+  ---------------------------------------------------------------
+  10m44s of a 12-minute job is fetching things over the internet.
+
+COMPONENT 1 — REGISTRY PULL-THROUGH CACHE
+
+  # registry mirror, in the runner subnet
+  # /etc/docker/daemon.json on the runner image
+  { "registry-mirrors": ["https://mirror.acme.internal"] }
+
+  # or a Kubernetes-level mirror (containerd hosts.toml)
+  [host."https://mirror.acme.internal/v2/docker.io"]
+    capabilities = ["pull", "resolve"]
+
+  pull base image: 41 s -> 3 s
+  Docker Hub rate-limit incidents: 28/quarter -> 0
+  monthly egress saved: ~2.1 TB
+
+COMPONENT 2 — PACKAGE PROXY
+
+  # npm
+  npm config set registry https://nexus.acme.internal/repository/npm-group/
+  # pip
+  export PIP_INDEX_URL=https://nexus.acme.internal/repository/pypi/simple
+  # maven / gradle: a mirror block in settings.xml
+
+  npm ci (cold): 60 s -> 21 s
+  and upstream outages stop being CI outages: the proxy serves the
+  cached copy of every version you have ever installed.
+
+COMPONENT 3 — CO-LOCATE THE CACHE
+
+$ aws s3api get-bucket-location --bucket acme-ci-cache
+  { "LocationConstraint": "us-east-1" }        # runners are in eu-west-1
+
+  restore 412 MB: 71 s, and $0.02/GB egress on ~9 TB/month = $180
+
+  after creating acme-ci-cache-euw1 and repointing:
+  restore: 9 s     egress: $0
+
+COMPONENT 4 — REMOTE BUILD CACHE
+
+  - uses: docker/setup-buildx-action@v3
+    with:
+      driver: remote
+      endpoint: tcp://buildkitd.ci.svc.cluster.local:1234
+  # one warm BuildKit service, shared, with a persistent cache volume
+  # (authenticate it — an open builder is an open door)
+
+  docker build: 8m52s -> 47 s on a source-only change
+</pre>
+        <table class="tbl">
+          <tr><th>Component</th><th>Removed per job</th><th>Also fixes</th><th>Cost</th></tr>
+          <tr><td>Registry pull-through cache</td><td>38 s</td><td>28 rate-limit incidents/quarter</td><td>~$40/month</td></tr>
+          <tr><td>Package proxy</td><td>39 s</td><td>Upstream outages stop blocking CI</td><td>Shared with the above</td></tr>
+          <tr><td>Co-located cache bucket</td><td>62 s</td><td>$180/month of egress</td><td>$0 (a config line)</td></tr>
+          <tr><td>Remote build cache</td><td>~8 min on source-only changes</td><td>Cold-start penalty of ephemeral runners</td><td>~$90/month</td></tr>
+        </table>
+<pre>
+CUMULATIVE
+
+  job duration p50 ........ 12m10s -&gt; 2m40s
+  infra failures/week ..... 14.3   -&gt; 0.9
+  monthly infra cost ...... +$130 (mirror + builder)
+  monthly egress saved .... −$180
+  net cost ................ −$50/month, and every job is 9.5 min faster
+</pre>
+      <div class="note">💡 <strong>This is the infrastructure that makes ephemeral runners affordable.</strong>
+         The standard objection to "a fresh machine per job" is the cold-start cost — and every item here
+         attacks exactly that: the base image comes from next door, packages come from a proxy, the build cache
+         is warm and shared, and the artifact cache is in the same region. With them in place, ephemerality
+         costs seconds rather than minutes, and you keep the isolation properties for free.</div>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Self-host for capability, never for cost.</strong> A migration claiming $4,100/year of savings consumed <strong>31 engineer-days ($21,000)</strong> in its first year against a $7,188 hosted bill.</li>
+        <li>The legitimate reasons, in order of how often they are true: private network access, special hardware, compliance, genuine scale economics — and warm caches, which a registry cache usually solves better.</li>
+        <li><strong>The hybrid is usually right</strong>: a small private pool for the handful of repositories that need VPC access, hosted runners for everything else.</li>
+        <li><strong>Ephemeral is the property that matters.</strong> A persistent pool let one repository's global <code>npm install -g</code> keep another repository's build green for six weeks.</li>
+        <li>Persistent runners also leak credentials: another job's registry push token sitting in <code>~/.docker/config.json</code> is a cross-repository compromise, not an inconvenience.</li>
+        <li>Cleanup scripts are a denylist and are always missing something — destroy the machine instead; there is then nothing to clean.</li>
+        <li><strong>A self-hosted runner building fork PRs is unauthenticated remote code execution inside your network.</strong> An audit found runners able to open a socket to the production database and read the instance IAM role.</li>
+        <li><strong>Runner labels are not a security boundary</strong> — any workflow in any repository with pool access can request them. Use platform-level runner groups scoped to named repositories.</li>
+        <li>Block the instance metadata endpoint (or IMDSv2 with hop limit 1), give runners their own subnet with an egress allowlist, and prefer per-job OIDC credentials over an instance role.</li>
+        <li><strong>Size the pool from the p95 of concurrent demand</strong>, not the mean — averages said 3 concurrent jobs where the p95 was 11 and the peak 20.</li>
+        <li><strong>Scale-up lag makes the ceiling irrelevant</strong>: 30 s polling + 42 s launch + 98 s boot + 90 s image pull = <strong>4m40s</strong> from queued to executing.</li>
+        <li>Fix it with a warm floor (2 runners, $94/month, p50 380 s → 12 s), a baked toolchain image, a queued-job scaling signal, and pods instead of VMs.</li>
+        <li><strong>Scale on queued jobs, never on CPU</strong> — a queued job consumes no CPU, so the metric arrives after people are already waiting.</li>
+        <li>Spot instances are fine for retryable jobs and wrong for deploys or anything holding a lock.</li>
+        <li><strong>Disk exhaustion caused 61% of one quarter's infrastructure failures</strong>, and a nightly <code>prune -af</code> made it worse by deleting the cache while still filling up by afternoon. Prune by watermark, alert at 70%, split the volumes.</li>
+        <li><strong>Classify infrastructure failures separately from test failures</strong> — 186 of 299 failures were infrastructure and every one had been reported as a flaky test.</li>
+        <li>Classification also makes retries defensible: retry on an <em>infrastructure signature</em>, never on "the job failed".</li>
+        <li><strong>Run the pool as a service</strong> with published SLIs: job start latency p95 under 60 s, infrastructure failure rate under 0.5%, availability above 99.5% in working hours, disk headroom above 25%.</li>
+        <li><strong>Supporting infrastructure decides whether fast pipelines are possible</strong>: a pull-through registry cache (−38 s, 28 rate-limit incidents → 0), a package proxy (−39 s), a co-located cache bucket (−62 s and $180/month), and a remote build cache (8m52s → 47 s).</li>
+        <li>Together those make ephemeral runners affordable — they attack precisely the cold-start cost that is the usual argument against a fresh machine per job.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="pipeline-performance.html">← Pipeline Performance</a>
+      <a href="pipeline-reliability.html">Pipeline Reliability &amp; Debugging →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
