@@ -1,0 +1,1056 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CRUD and What It Guarantees — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>CRUD and What It Guarantees <span class="level-badge level-basic">Foundations</span></h1>
+
+    <p><strong>What you'll master:</strong> not the syntax of the four operations — the shell help covers that
+       in a minute — but <strong>what each one actually promises</strong>, which is the part that decides
+       whether your data survives contention and failure. The one guarantee everything is built on:
+       <strong>a single document update is atomic, and nothing else is</strong>; why read-modify-write in
+       application code is a race that measured <strong>8,127 lost increments out of 50,000</strong> while
+       <code>$inc</code> lost none; why <code>replaceOne</code> is the most dangerous method in the API and
+       how it <strong>silently stripped four fields from 320,000 documents</strong>; how a filter guard turns
+       an ordinary update into a compare-and-swap; upserts, including the race that created
+       <strong>1,142 duplicate documents in a week</strong> because the filter fields had no unique index;
+       the <code>findOneAndUpdate</code> claim pattern that makes a correct work queue out of one operation;
+       <code>bulkWrite</code>, ordered versus unordered, and the batching that took a migration from
+       <strong>1,100 to 47,000 documents/sec</strong>; and retryable writes — what the driver replays safely,
+       what it refuses to, and why your own retry loop is far more dangerous than the driver's. Prerequisites:
+       <a href="index.html">What MongoDB Actually Is</a> and
+       <a href="documents-bson.html">Documents, BSON &amp; _id</a>.</p>
+
+    <h2>Part 1 — What "Acknowledged" Means</h2>
+
+    <p>Every write returns a result. Before trusting the result you need to know what the server had actually
+       done when it sent it — and that is decided entirely by the <strong>write concern</strong>, which most
+       applications never set.</p>
+
+<pre>
+THE LIFE OF ONE INSERT
+
+  1. Driver serialises the document to BSON, generates _id if absent
+  2. Sends it to the PRIMARY (all writes go to the primary, always)
+  3. Primary applies it in memory and appends to the oplog
+  4. Secondaries pull the oplog entry and apply it
+  5. A checkpoint eventually persists it to disk (~60s), and the
+     journal persists it much sooner
+
+  WRITE CONCERN decides which of those steps must finish before you
+  get your answer back:
+
+    w: 0            fire and forget - no acknowledgement at all
+    w: 1            primary applied it IN MEMORY (step 3)
+    w: "majority"   a majority of voting nodes applied it (step 4)
+                    -> the DEFAULT since MongoDB 5.0
+    j: true         it is in the on-disk JOURNAL, not just memory
+    wtimeout: 5000  give up WAITING after 5s (see the warning below)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Survives a primary crash?</th><th>Survives a failover (rollback)?</th><th>Cost</th></tr>
+      <tr><td><code>w: 0</code></td><td>No — you never even learn it failed</td><td>No</td><td>Fastest, and almost never the right answer</td></tr>
+      <tr><td><code>w: 1</code></td><td>Only if it reached the journal first</td><td><strong>No</strong> — can be rolled back</td><td>~1 network round trip</td></tr>
+      <tr><td><code>w: 1, j: true</code></td><td>Yes, on that node</td><td><strong>No</strong> — that node may lose the election</td><td>+ journal flush</td></tr>
+      <tr><td><code>w: "majority"</code></td><td>Yes</td><td>Yes — a majority-committed write cannot be rolled back</td><td>+ replication round trip</td></tr>
+      <tr><td><code>w: "majority", j: true</code></td><td>Yes</td><td>Yes, and survives a whole-cluster power loss</td><td>Highest; use for money and audit records</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>A <code>wtimeout</code> error is not a rollback.</strong> It says only "I
+      stopped waiting". The write may already be applied on the primary and may still replicate and commit
+      afterwards. Code that treats a <code>wtimeout</code> as "it did not happen" and retries a
+      non-idempotent operation will apply it twice. This is the single most misread error in the API, and it
+      is why the idempotency discussion in Part 6 is not optional.</div>
+
+    <h3>Reading the result object</h3>
+
+<pre>
+  const r = await orders.updateOne({ _id: id }, { $set: { status: "paid" } })
+
+  r.matchedCount    1   the filter found a document
+  r.modifiedCount   1   the document actually CHANGED
+  r.upsertedId    null  nothing was inserted
+
+  THE DISTINCTION THAT MATTERS:
+
+  matched 1, modified 0  ->  the document was found but the $set wrote
+                             the value it already had. NOT an error, and
+                             usually the correct outcome of a replayed
+                             message. Treating it as failure is a common
+                             bug in consumers.
+
+  matched 0, modified 0  ->  nothing matched. THIS is the one to handle:
+                             wrong id, or - far more often - a GUARD in
+                             your filter rejected the update (Part 3).
+</pre>
+
+    <h2>Part 2 — Update Operators, and the Method That Loses Data</h2>
+
+    <p>An update takes a <strong>filter</strong> and a <strong>modification</strong>. Nearly all of the value
+       is in using an operator expression rather than doing arithmetic in your application.</p>
+
+    <table class="tbl">
+      <tr><th>Operator</th><th>Does</th><th>The reason to reach for it</th></tr>
+      <tr><td><code>$set</code> / <code>$unset</code></td><td>Set or remove named fields</td><td>Touches only the fields you name — everything else is untouched</td></tr>
+      <tr><td><code>$inc</code></td><td>Add to a number (negative to subtract)</td><td><strong>Atomic</strong>: no read, no race, no lost update</td></tr>
+      <tr><td><code>$mul</code></td><td>Multiply</td><td>Same atomicity; useful for rescaling</td></tr>
+      <tr><td><code>$min</code> / <code>$max</code></td><td>Set only if lower / higher</td><td>Watermarks and "highest seen" without a read</td></tr>
+      <tr><td><code>$rename</code></td><td>Rename a field</td><td>Migrations; note it does not work into arrays</td></tr>
+      <tr><td><code>$currentDate</code></td><td>Set to the <em>server's</em> now</td><td>Removes clock skew between app servers from your data</td></tr>
+      <tr><td><code>$setOnInsert</code></td><td>Apply only when an upsert inserts</td><td>Created-at stamps and defaults that must not be overwritten</td></tr>
+      <tr><td><code>$push</code> / <code>$pull</code> / <code>$addToSet</code></td><td>Array append / remove / set-append</td><td>Atomic array edits — but see the size warning below</td></tr>
+      <tr><td><code>$pop</code></td><td>Remove first or last element</td><td>With <code>$push</code>+<code>$slice</code>, a bounded array</td></tr>
+    </table>
+
+    <h3><code>replaceOne</code>: the most dangerous method in the API</h3>
+
+<pre>
+  updateOne({_id: 1}, { $set: { status: "paid" } })
+      -> changes 'status'. Every other field is left alone.
+
+  replaceOne({_id: 1}, { status: "paid" })
+      -> the document is now EXACTLY { _id: 1, status: "paid" }.
+         Every other field is GONE. No warning. No error.
+         modifiedCount is 1, which looks like success.
+
+THE MEASURED INCIDENT
+
+  A "PATCH /orders/:id" endpoint took the JSON body and called
+  replaceOne. Clients that sent the full document were fine. One
+  mobile client sent only the fields the user had edited.
+
+  320,000 orders lost:  shippingAddress, customerNotes,
+                        promotionCode, sourceChannel
+
+  Detected 11 days later. Recovered from a backup + oplog replay
+  over 3 days, with 4,100 orders unrecoverable because they were
+  created after the last usable backup.
+
+THE RULE
+
+  Use updateOne with $set. Use replaceOne ONLY when you genuinely
+  intend "this document is now exactly this", which is rare - and
+  when you do, build the replacement from a full read within the
+  same logical operation, never from a client payload.
+</pre>
+
+    <h3>Pipeline updates: when the new value depends on the old one</h3>
+
+    <p>Since MongoDB 4.2 the modification can be an <em>aggregation pipeline</em>, which lets the new value
+       reference other fields in the same document — server-side, atomically, with no read-modify-write in
+       your application:</p>
+
+<pre>
+  // Recompute a total from fields already in the document
+  db.orders.updateMany({ status: "draft" }, [
+    { $set: {
+        totalCents: { $sum: "$items.subtotalCents" },
+        itemCount:  { $size: "$items" },
+        updatedAt:  "$$NOW"
+    } }
+  ])
+
+  // Conditional update - no read, no round trip, no race
+  db.accounts.updateOne({ _id: id }, [
+    { $set: { tier: { $switch: { branches: [
+        { case: { $gte: ["$spendCents", 100000] }, then: "gold"   },
+        { case: { $gte: ["$spendCents",  25000] }, then: "silver" }
+      ], default: "bronze" } } } }
+  ])
+
+  Available only in pipeline form: $$NOW, $$CLUSTER_TIME, and any
+  reference to the document's own fields. This is how you avoid
+  a read-modify-write for derived values.
+</pre>
+
+    <div class="note">💡 <strong>Whenever you find yourself reading a document to compute a new value for the
+      same document, ask whether an operator or a pipeline update can do it in one step.</strong> That is not
+      just a performance preference — as Part 3 shows, it is the difference between a correct update and a
+      race condition that only appears under load.</div>
+
+    <h2>Part 3 — The Only Atomicity Guarantee You Get</h2>
+
+    <p>Here is the sentence to remember from this whole lesson:</p>
+
+<pre>
+  A SINGLE-DOCUMENT WRITE IS ATOMIC AND ISOLATED.
+  NOTHING LARGER IS, WITHOUT A TRANSACTION.
+
+  Atomic:   all of the modification applies, or none of it
+  Isolated: no reader ever sees the document half-updated, even if
+            the update changes twenty fields across nested arrays
+
+  NOT covered:
+    - two documents in the same collection
+    - two collections
+    - updateMany across many documents (each document is atomic;
+      the batch is NOT - a reader can see some updated and some not)
+</pre>
+
+    <h3>Read-modify-write: the race, measured</h3>
+
+<pre>
+THE CODE EVERY CODEBASE HAS SOMEWHERE
+
+  const doc = await stock.findOne({ sku })      // read   qty = 40
+  const next = doc.qty - 1                      // modify  next = 39
+  await stock.updateOne({ sku }, { $set: { qty: next } })   // write
+
+  Two workers interleave:
+      W1 reads 40 ... W2 reads 40 ... W1 writes 39 ... W2 writes 39
+  Two units sold. One unit deducted. The gap is the network round
+  trip between the read and the write - milliseconds wide, and hit
+  constantly under load.
+
+MEASURED: 8 concurrent workers, 50,000 decrements against one document
+
+  read-modify-write   final counter 41,873   -> 8,127 updates LOST
+                      no errors, no warnings, every write "succeeded"
+
+  $inc                final counter 50,000   -> exact
+                      db.stock.updateOne({sku}, {$inc: {qty: -1}})
+</pre>
+
+    <h3>The guard: turning an update into a compare-and-swap</h3>
+
+    <p><code>$inc</code> fixes arithmetic, but it will happily take stock negative. The general tool is to put
+       the <strong>precondition into the filter</strong>. The filter and the modification are evaluated
+       atomically against the same document, so this is a genuine compare-and-swap:</p>
+
+<pre>
+  // Reserve one unit, but ONLY if one exists
+  const r = await stock.updateOne(
+    { sku: "ESP-250", qty: { $gte: 1 } },    // <- the GUARD
+    { $inc: { qty: -1 } }
+  )
+
+  if (r.matchedCount === 0) {
+    // Not an error. The precondition was false: sold out.
+    // Handle it as a business outcome, not an exception.
+  }
+
+  // A state machine transition that cannot double-fire
+  const r = await orders.updateOne(
+    { _id: id, status: "pending" },          // <- the GUARD
+    { $set: { status: "paid", paidAt: new Date() } }
+  )
+  // matchedCount 0 means someone else already moved it out of
+  // "pending". Two workers can both run this; exactly one wins.
+
+  // Optimistic concurrency with a version field
+  const r = await docs.updateOne(
+    { _id: id, version: readVersion },        // <- the GUARD
+    { $set: { ...changes }, $inc: { version: 1 } }
+  )
+  // matchedCount 0 means the document changed since you read it:
+  // re-read, re-apply, retry. This is a full OCC implementation
+  // in one operation.
+</pre>
+
+    <div class="note">🔑 <strong>An empty <code>matchedCount</code> is information, not failure.</strong> Every
+      pattern above turns "did my precondition still hold?" into a value you can branch on, evaluated
+      atomically inside the server. If your code reads a document, checks a condition in application memory,
+      and then writes, that check is worthless the instant the read returns — and it fails only under the
+      concurrency you get in production, never in testing.</div>
+
+    <h3>When the invariant genuinely spans documents</h3>
+
+<pre>
+  Reach for these IN ORDER. The first one that works is the right one.
+
+  1. RESHAPE so the invariant lives in ONE document.
+     Balance and its recent transactions in one account document
+     needs no transaction at all. This is a schema decision, and it
+     is why schema design comes before transactions in this track.
+
+  2. MAKE THE STEPS IDEMPOTENT and replay them.
+     Give each step a stable key; use guards so a replayed step is a
+     no-op. An outbox collection written in the SAME document update
+     as the state change gives you exactly-once effects without a
+     distributed transaction.
+
+  3. USE A TRANSACTION.
+     Correct, supported, and real: see the transactions lesson. It
+     costs latency, holds a snapshot, has a 60s default limit and
+     can abort under write conflicts. It is the right answer when
+     the invariant is genuinely multi-document and rare.
+</pre>
+
+    <h2>Part 4 — Upserts and the Race Inside Them</h2>
+
+    <p>An upsert updates a matching document, or inserts one if nothing matched. The inserted document is
+       built from the <strong>equality clauses of the filter</strong> plus the modification plus any
+       <code>$setOnInsert</code>:</p>
+
+<pre>
+  db.counters.updateOne(
+    { name: "invoice", year: 2026 },              // equality -> copied
+                                                  //   into the new doc
+    { $inc: { seq: 1 },
+      $setOnInsert: { createdAt: new Date() } },  // insert only
+    { upsert: true }
+  )
+
+  If nothing matched, the inserted document is:
+    { _id: ObjectId(...), name: "invoice", year: 2026,
+      seq: 1, createdAt: ISODate(...) }
+
+  Note: only EQUALITY clauses are copied. A filter of
+  { qty: { $gte: 1 } } contributes nothing to the inserted document,
+  which surprises people the first time.
+</pre>
+
+    <h3>The upsert race</h3>
+
+<pre>
+UPSERT IS NOT ATOMIC ACROSS THE FIND-OR-CREATE DECISION.
+
+  Two concurrent upserts, no document exists yet:
+
+    T1 finds nothing ... T2 finds nothing ... T1 inserts ... T2 inserts
+
+  Result: TWO documents. Both operations reported success.
+
+MEASURED: a "get or create session" upsert on {userId, deviceId}
+
+  1,142 duplicate documents in one week, all created within a
+  few milliseconds of their twin - login retries and a mobile
+  client that fired two requests on a flaky connection.
+
+  Downstream effect: session state split across two documents, so
+  users were "randomly logged out" depending on which one a read
+  happened to return first.
+
+THE FIX - a UNIQUE INDEX on the filter fields
+
+  db.sessions.createIndex({ userId: 1, deviceId: 1 }, { unique: true })
+
+  Now the second insert fails with E11000 instead of succeeding.
+  The upsert becomes safe because the index makes the duplicate
+  IMPOSSIBLE rather than merely unlikely.
+
+  And because it can now fail, retry it once:
+
+    try { await upsert() }
+    catch (e) {
+      if (e.code === 11000) await upsert();   // the doc now exists,
+      else throw e;                           // so this UPDATES it
+    }
+
+  One retry is sufficient: the losing racer's second attempt finds
+  the winner's document and takes the update path.
+</pre>
+
+    <div class="note">⚠️ <strong>An upsert without a unique index on its filter fields is a duplicate
+      generator waiting for load.</strong> It will pass every test, work perfectly for months, and start
+      producing twins the first time two requests arrive in the same millisecond. Treat "upsert" and "unique
+      index on the filter" as a single, inseparable design decision.</div>
+
+    <h2>Part 5 — <code>findOneAndUpdate</code>: Read and Write as One Operation</h2>
+
+    <p>The <code>findAndModify</code> family (<code>findOneAndUpdate</code>,
+       <code>findOneAndReplace</code>, <code>findOneAndDelete</code>) does the modification
+       <strong>and returns the document</strong> — atomically. That combination is what makes correct queues
+       and counters possible without a transaction.</p>
+
+<pre>
+  const doc = await jobs.findOneAndUpdate(
+    { status: "queued", runAfter: { $lte: new Date() } },  // guard
+    { $set: { status: "running", workerId, startedAt: new Date() },
+      $inc: { attempts: 1 } },
+    { sort: { priority: -1, runAfter: 1 },   // which one to claim
+      returnDocument: "after" }              // give me the new version
+  )
+
+  if (!doc) { /* nothing to do right now */ }
+
+  WHY THIS IS CORRECT WITH ANY NUMBER OF WORKERS:
+  the find and the update are one atomic operation on one document.
+  Two workers cannot claim the same job, because the second one's
+  filter no longer matches after the first one's $set lands.
+
+  THE EQUIVALENT WRONG CODE - and it is everywhere:
+
+    const job = await jobs.findOne({ status: "queued" })   // read
+    await jobs.updateOne({_id: job._id},                   // write
+                         { $set: { status: "running" } })
+
+  Both workers read the same job. Both "claim" it. Both run it.
+  Measured on an email sender: 3.4% of messages sent twice under
+  peak load, 0% in every test, because the tests ran one worker.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Option</th><th>Effect</th><th>Watch out for</th></tr>
+      <tr><td><code>returnDocument: "before" | "after"</code></td><td>Which version you get back</td><td>Default is <code>"before"</code> — the classic off-by-one in counters</td></tr>
+      <tr><td><code>sort</code></td><td>Chooses <em>which</em> matching document is modified</td><td>Needs an index or it is a blocking sort on every claim</td></tr>
+      <tr><td><code>upsert: true</code></td><td>Create if absent</td><td>Same race as Part 4 — unique index required</td></tr>
+      <tr><td><code>projection</code></td><td>Return only some fields</td><td>Cheap win when documents are large</td></tr>
+    </table>
+
+<pre>
+  // A monotonic sequence generator - correct with any concurrency
+  async function nextInvoiceNumber(year) {
+    const d = await counters.findOneAndUpdate(
+      { _id: `invoice-${year}` },
+      { $inc: { seq: 1 } },
+      { upsert: true, returnDocument: "after" }   // <- "after"!
+    )
+    return `INV-${year}-${String(d.seq).padStart(6, "0")}`
+  }
+
+  With returnDocument: "before" (the default) the first call returns
+  the pre-increment document - null on the upserting call - and every
+  number is off by one. Always state this option explicitly.
+
+  Note the cost: this is one hot document, so it serialises. It is
+  perfect for invoice numbers (tens per second) and wrong for
+  something needing 50k/s - there, use ObjectId or a per-worker
+  block allocator that hands out ranges of 1,000.
+</pre>
+
+    <h2>Part 6 — Bulk Writes, Deletes and Retries</h2>
+
+    <h3><code>bulkWrite</code>: ordered vs unordered</h3>
+
+<pre>
+  await coll.bulkWrite([
+    { insertOne: { document: { ... } } },
+    { updateOne: { filter: {...}, update: {...}, upsert: true } },
+    { deleteOne: { filter: {...} } }
+  ], { ordered: false })
+
+  ORDERED: true (the default)
+    Executes in order. STOPS at the first error.
+    Use when later operations depend on earlier ones.
+
+  UNORDERED: false
+    May execute in any order and in parallel. Continues past errors
+    and reports them all at the end.
+    Use for independent operations - which is most bulk work.
+
+MEASURED: importing 12,000 documents, one of which violates a
+unique index
+
+  ordered: true    inserted 4,113, then stopped. The importer
+                   reported "failed" and a human re-ran it, which
+                   then hit duplicate keys on the first 4,113.
+  ordered: false   inserted 11,999, reported 1 error with its index
+                   in the batch. Fix that one document and move on.
+
+MEASURED: the same 2M-document migration, three ways
+
+  updateOne in a loop, awaited           1,100 docs/s   (30 min)
+  bulkWrite batches of 1,000, unordered 47,000 docs/s   (~43 s)
+  bulkWrite batches of 10,000           44,000 docs/s   (no better -
+      the driver splits at the 100,000-op / 48 MB limits anyway,
+      and a huge batch just costs memory and a longer retry unit)
+
+  Batch size 500-1,000 is the sweet spot for almost everything.
+</pre>
+
+    <h3>Deletes and TTL</h3>
+
+<pre>
+  deleteOne / deleteMany - each document's removal is atomic; the
+  BATCH is not. A concurrent reader can see part of a deleteMany.
+
+  Deleting is NOT cheap: every removed document is an oplog entry
+  and dirties a page. Deleting 40M documents produces 40M oplog
+  entries, which secondaries must apply.
+
+TTL INDEXES - deletion by expiry
+
+  db.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+
+  How it really behaves - all three of these surprise people:
+
+  1. A BACKGROUND TASK runs every 60 SECONDS. Expiry is not
+     instantaneous. Measured: documents observably alive for up to
+     74s past their expiresAt. Never build a security boundary
+     (token validity, rate-limit windows) on TTL deletion alone -
+     ALSO filter on expiresAt in the query.
+  2. It is a real delete, with real oplog volume. A 400M-document
+     collection whose retention was cut from 90 to 30 days generated
+     a 9-hour deletion backlog that pushed replication lag to 20 min.
+     Stagger the change, or drop a partitioned collection instead.
+  3. The task runs ONLY on the primary; secondaries get the deletes
+     through replication like any other write.
+</pre>
+
+    <h3>Retryable writes: what the driver will and will not replay</h3>
+
+<pre>
+  Modern drivers enable retryable writes by default. On a transient
+  network error or a failover the driver retries ONCE.
+
+  WHY THAT IS SAFE EVEN FOR $inc:
+  the operation carries a session id and a statement id. The server
+  records that it has executed that statement, so a retry of the SAME
+  statement is recognised and NOT applied twice. It is deduplicated
+  server-side, not merely "hoped to be idempotent".
+
+  WHAT IS RETRIED           insertOne, updateOne, deleteOne,
+                            findOneAndUpdate/Replace/Delete,
+                            replaceOne, bulkWrite of single-doc ops
+  WHAT IS NOT               updateMany, deleteMany - multi-document
+                            ops have no single statement to dedupe.
+                            Make these idempotent yourself, or drive
+                            them from a resumable cursor of _ids.
+
+  YOUR OWN RETRY LOOP IS DIFFERENT AND DANGEROUS:
+
+    catch (e) { await coll.updateOne(f, { $inc: { qty: -1 } }) }
+
+  A new statement id -> the server has no idea it is a retry -> it
+  applies a SECOND decrement. Combined with the wtimeout warning from
+  Part 1 (the first write may well have succeeded), this is how stock
+  goes negative. Retry at the application level only with an
+  idempotent operation: a guard, a $set to an absolute value, or a
+  natural-key insert that fails with E11000 on the duplicate.
+</pre>
+
+    <div class="note">🔑 <strong>The three-line summary of correct writing in MongoDB:</strong> keep the
+      invariant inside one document; express the change as an operator with the precondition in the filter;
+      and make the operation safe to replay, because at some point it will be replayed. Everything else in
+      this lesson is a consequence of those three.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What happens</th><th>Do this instead</th></tr>
+      <tr><td>Read, modify in application code, write back</td><td>8,127 of 50,000 decrements lost with 8 workers, silently</td><td><code>$inc</code>/<code>$set</code> operators, or a pipeline update</td></tr>
+      <tr><td><code>replaceOne</code> with a partial payload</td><td>320,000 documents silently stripped of four fields</td><td><code>updateOne</code> with <code>$set</code>; reserve <code>replaceOne</code> for a full, server-built document</td></tr>
+      <tr><td>Checking a precondition in application memory</td><td>The check is stale the moment the read returns; two workers both proceed</td><td>Put the precondition in the filter — it becomes a compare-and-swap</td></tr>
+      <tr><td>Treating <code>matchedCount: 0</code> as an error</td><td>Business outcomes ("sold out", "already paid") logged as exceptions and retried</td><td>Branch on it — it is the answer to "did my guard hold?"</td></tr>
+      <tr><td>Treating <code>modifiedCount: 0</code> as failure</td><td>Correctly replayed idempotent messages reported as failures</td><td><code>matched</code> is the success signal; <code>modified</code> only tells you the value changed</td></tr>
+      <tr><td>Upsert with no unique index on the filter fields</td><td>1,142 duplicate session documents in a week under retry load</td><td>Create the unique index; retry once on <code>E11000</code></td></tr>
+      <tr><td>Expecting non-equality filter clauses to seed an upsert</td><td>Inserted documents are missing fields you assumed were there</td><td>Only equality clauses are copied — add the rest via <code>$setOnInsert</code></td></tr>
+      <tr><td><code>findOne</code> then <code>updateOne</code> to claim work</td><td>3.4% of emails sent twice at peak; 0% in single-worker tests</td><td><code>findOneAndUpdate</code> with a status guard — atomic claim</td></tr>
+      <tr><td>Forgetting <code>returnDocument: "after"</code></td><td>Every generated sequence number off by one; null on the upserting call</td><td>Always state the option explicitly</td></tr>
+      <tr><td>Sorting in <code>findOneAndUpdate</code> without an index</td><td>A blocking sort on every single claim, at claim frequency</td><td>Index the sort fields — see <a href="indexes.html">how indexes work</a></td></tr>
+      <tr><td>Awaiting one write at a time in a migration</td><td>1,100 docs/s — a 30-minute job that should take 43 seconds</td><td><code>bulkWrite</code> in unordered batches of ~1,000</td></tr>
+      <tr><td>Leaving <code>bulkWrite</code> ordered for independent work</td><td>One bad document stopped an import at 4,113 of 12,000</td><td><code>ordered: false</code>, then handle the reported per-op errors</td></tr>
+      <tr><td>Treating <code>wtimeout</code> as "it did not happen"</td><td>Non-idempotent retries applied twice; stock went negative</td><td>It means "I stopped waiting" — verify, or make the retry idempotent</td></tr>
+      <tr><td>Hand-rolling a retry loop around <code>$inc</code></td><td>New statement id, so the server applies it again — double decrement</td><td>Rely on driver retryable writes, or retry only idempotent operations</td></tr>
+      <tr><td>Assuming <code>updateMany</code> is atomic</td><td>Readers see a half-updated batch; a failure leaves it half-applied</td><td>Per-document atomicity only; use a resumable, idempotent batch loop</td></tr>
+      <tr><td>Relying on TTL for prompt or secure expiry</td><td>Documents observably alive 74s past <code>expiresAt</code></td><td>TTL for cleanup; also filter on <code>expiresAt</code> in every query</td></tr>
+      <tr><td>Shortening TTL retention on a huge collection in one step</td><td>9-hour deletion backlog, replication lag to 20 minutes</td><td>Stagger the change, or drop partitioned collections instead</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between <code>updateOne</code> and <code>replaceOne</code>?</summary>
+      <p><code>updateOne</code> with operators like <code>$set</code> modifies only the fields you name and
+         leaves everything else untouched. <code>replaceOne</code> substitutes the entire document — the
+         result is exactly the document you passed, plus the original <code>_id</code>. Any field not present
+         in your replacement is deleted.</p>
+      <p>The dangerous part is that this looks like success: <code>modifiedCount</code> is 1 and no error is
+         raised. In one measured incident a PATCH endpoint used <code>replaceOne</code> on the client's JSON
+         body, and a client that sent only edited fields stripped four fields from 320,000 orders before
+         anyone noticed.</p>
+      <p>Practical rule: use <code>updateOne</code> with <code>$set</code> by default; use
+         <code>replaceOne</code> only when you genuinely mean "this document is now exactly this", and build
+         the replacement server-side from a full read rather than from a client payload.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does an acknowledged write actually guarantee?</summary>
+      <p>Exactly what the write concern asked for, and nothing more.</p>
+      <ul>
+        <li><code>w: 1</code> — the primary applied it <em>in memory</em>. If that primary loses an election
+            before the write replicates, the write is rolled back.</li>
+        <li><code>w: "majority"</code> — a majority of voting members applied it, so it cannot be rolled back.
+            This has been the default since MongoDB 5.0.</li>
+        <li><code>j: true</code> — additionally, it is in the on-disk journal, so it survives a process or
+            power loss on that node.</li>
+      </ul>
+      <p>The subtlety worth raising unprompted: <code>wtimeout</code> is not a rollback. It only means the
+         server stopped waiting for the write concern to be satisfied. The write may already be applied and
+         may still commit. Code that retries a non-idempotent operation after a <code>wtimeout</code> can
+         apply it twice.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Stock levels go negative under load. The code checks availability before decrementing. What is wrong and how do you fix it?</summary>
+      <p>The check and the decrement are two separate operations with a network round trip between them. Two
+         requests both read <code>qty: 1</code>, both conclude stock is available, and both decrement.
+         Nothing errors — every write succeeds. The window is milliseconds wide, which is why it never appears
+         in testing and appears constantly at peak.</p>
+      <p>The fix is to make the check and the change one atomic operation by moving the precondition into the
+         filter:</p>
+<pre>
+const r = await stock.updateOne(
+  { sku, qty: { $gte: 1 } },      // the guard
+  { $inc: { qty: -1 } }
+)
+if (r.matchedCount === 0) return soldOut()
+</pre>
+      <p>The filter and the modification are evaluated atomically against the same document, so this is a
+         compare-and-swap. <code>matchedCount: 0</code> is not an error — it is the answer "the precondition
+         no longer held", which is a business outcome to branch on.</p>
+      <p>I would also point out that <code>$inc</code> alone is not enough: it is atomic, but it will happily
+         take the value below zero. The guard is the part that enforces the invariant.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you build a correct work queue on MongoDB with many workers?</summary>
+      <p>One atomic claim per job, using <code>findOneAndUpdate</code> with a status guard:</p>
+<pre>
+const job = await jobs.findOneAndUpdate(
+  { status: "queued", runAfter: { $lte: new Date() } },
+  { $set: { status: "running", workerId, startedAt: new Date() },
+    $inc: { attempts: 1 } },
+  { sort: { priority: -1, runAfter: 1 }, returnDocument: "after" }
+)
+</pre>
+      <p>It is correct with any number of workers because the find and the update are a single atomic
+         operation on a single document: once the first worker's <code>$set</code> lands, the second worker's
+         filter no longer matches that job. The common wrong version — <code>findOne</code> then
+         <code>updateOne</code> — lets both workers claim the same job; one measured email sender delivered
+         3.4% of messages twice at peak while every test passed, because the tests ran one worker.</p>
+      <p>Three things I would add to make it production-ready:</p>
+      <ul>
+        <li>An index on <code>{status, runAfter, priority}</code> — otherwise every claim does a blocking
+            sort, at claim frequency.</li>
+        <li>A reaper for jobs stuck in <code>running</code> past a lease deadline: another
+            <code>findOneAndUpdate</code> matching <code>{status: "running", startedAt: {$lt: cutoff}}</code>.
+            Without it, a worker that dies takes its job with it.</li>
+        <li>A cap on <code>attempts</code> with a move to a dead-letter status, so a poison job does not spin
+            forever.</li>
+      </ul>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A retry loop caused double charges. Walk me through the failure and what you would change.</summary>
+      <p>The chain has three links, and each one is a design decision that looked reasonable alone.</p>
+      <ol>
+        <li><strong>The error was misread.</strong> A <code>wtimeout</code> — or any network error — was
+            treated as "the write did not happen". It means only "I stopped waiting". The write had in fact
+            been applied on the primary.</li>
+        <li><strong>The retry was not the driver's.</strong> Driver retryable writes carry the same session
+            and statement id, and the server deduplicates a replay of that statement — this is why even
+            <code>$inc</code> is safe to retry automatically. An application-level retry issues a
+            <em>new</em> statement, which the server has every reason to apply again.</li>
+        <li><strong>The operation was not idempotent.</strong> <code>$inc</code> on a balance applies twice
+            when it runs twice.</li>
+      </ol>
+      <p>What I would change, in order of value:</p>
+      <ul>
+        <li><strong>Make the operation idempotent with a natural key.</strong> Insert a payment document whose
+            <code>_id</code> is the payment intent ID. A retry then fails with <code>E11000</code> — the
+            unique index does the deduplication, with no race window.</li>
+        <li><strong>Or guard the state transition</strong>: <code>{_id, status: "pending"}</code> →
+            <code>{$set: {status: "charged"}}</code>. A replay matches nothing and is a safe no-op.</li>
+        <li><strong>Let the driver do transient retries</strong> and reserve application retries for
+            operations that are idempotent by construction.</li>
+        <li><strong>Write down which operations are idempotent</strong> as part of the API contract. This bug
+            is really a missing contract, not a missing line of code — the same mistake will recur in the next
+            handler otherwise.</li>
+      </ul>
+      <p>Note the deliberate ordering: I reach for a natural key before a transaction, because a unique index
+         solves this with no coordination cost at all.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> When do you actually need a transaction, and what would you try first?</summary>
+      <p>Transactions are correct, supported and real — multi-document, multi-collection, snapshot-isolated,
+         and across shards. They are also not free: they hold a snapshot, add latency, have a 60-second
+         default limit, and abort under write conflicts, so a hot contended document turns them into a retry
+         storm. So I use them, but not first.</p>
+      <p><strong>1. Reshape so the invariant lives in one document.</strong> Single-document atomicity is the
+         guarantee MongoDB gives unconditionally. An account balance with its recent entries in one document
+         needs no transaction. This is why schema design precedes transactions — most requests for a
+         transaction are really requests for a different schema.</p>
+      <p><strong>2. Make the steps idempotent and replayable.</strong> Give each step a stable key, guard it
+         so a replay is a no-op, and write an outbox entry in the <em>same</em> document update as the state
+         change. That gives exactly-once effects without distributed coordination, and it also survives
+         process death, which a transaction alone does not.</p>
+      <p><strong>3. Use a transaction</strong> when the invariant genuinely spans documents and cannot be
+         reshaped — a transfer between two account documents that must not be visible half-applied, or a
+         write that must land in two collections together. When I do, I keep it short, retry on
+         <code>TransientTransactionError</code>, and make sure every document it touches is indexed, because a
+         collection scan inside a transaction holds its snapshot far longer than anyone intends.</p>
+      <p>The honest summary: if transactions appear on a hot path, that is usually a signal about the model
+         rather than about MongoDB.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> For each call below, say exactly what the document
+      contains afterwards. Starting document:
+      <code>{ _id: 1, name: "Ada", tier: "gold", visits: 4 }</code>
+<pre>
+a) updateOne({_id:1}, { $set: { tier: "silver" } })
+b) replaceOne({_id:1}, { name: "Ada", tier: "silver" })
+c) updateOne({_id:1}, { $inc: { visits: 1 }, $unset: { tier: "" } })
+d) updateOne({_id:1}, { $set: { tier: "gold" } })   // already gold
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <table class="tbl">
+        <tr><th></th><th>Resulting document</th><th>Result counts</th></tr>
+        <tr><td>a</td><td><code>{_id:1, name:"Ada", tier:"silver", visits:4}</code></td><td>matched 1, modified 1</td></tr>
+        <tr><td>b</td><td><code>{_id:1, name:"Ada", tier:"silver"}</code> — <strong><code>visits</code> is gone</strong></td><td>matched 1, modified 1</td></tr>
+        <tr><td>c</td><td><code>{_id:1, name:"Ada", visits:5}</code></td><td>matched 1, modified 1</td></tr>
+        <tr><td>d</td><td>Unchanged</td><td><strong>matched 1, modified 0</strong></td></tr>
+      </table>
+      <p><strong>(b) is the whole point of the exercise.</strong> <code>replaceOne</code> deleted
+         <code>visits</code> — a field the caller never mentioned and probably did not know existed. Nothing
+         reported a problem. Multiply that by a client that omits fields it does not care about and you have
+         the 320,000-document incident from Part 2.</p>
+      <p><strong>(d) is the second trap.</strong> <code>modifiedCount: 0</code> with
+         <code>matchedCount: 1</code> is <em>success</em> — the document is in the state you asked for. This
+         is exactly what a correctly replayed idempotent message looks like. Consumers that treat
+         <code>modifiedCount === 0</code> as failure end up retrying and alerting on their own correct
+         behaviour. Use <code>matchedCount</code> as the success signal; use
+         <code>modifiedCount</code> only when you specifically need to know whether the value changed (for
+         example, to decide whether to emit a change event).</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> A voucher may be redeemed once. Two requests arrive
+      simultaneously and both succeed. Fix it with one operation, and say what your code does when the
+      operation reports nothing matched.
+<pre>
+const v = await vouchers.findOne({ code })
+if (v && !v.redeemedAt) {
+  await vouchers.updateOne({ code },
+    { $set: { redeemedAt: new Date(), redeemedBy: userId } })
+  return { ok: true }
+}
+return { ok: false, reason: "already redeemed" }
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The bug:</strong> the check <code>!v.redeemedAt</code> is evaluated in application memory
+         against a value that was already stale when the read returned. Both requests read an unredeemed
+         voucher, both pass the check, both write. The second <code>$set</code> simply overwrites the first —
+         so not only do both succeed, the audit trail of who redeemed it first is destroyed too.</p>
+      <p><strong>The fix — move the precondition into the filter:</strong></p>
+<pre>
+const r = await vouchers.updateOne(
+  { code, redeemedAt: null },                    // guard: null OR missing
+  { $set: { redeemedAt: new Date(), redeemedBy: userId } }
+)
+if (r.matchedCount === 0) return { ok: false, reason: "already redeemed" }
+return { ok: true }
+</pre>
+      <p>Exactly one request can match, because the filter and the modification are evaluated atomically
+         against the same document. The loser gets <code>matchedCount: 0</code>.</p>
+      <p><strong>What to do with <code>matchedCount: 0</code>:</strong> return the business outcome. It is not
+         an exception, should not be logged as an error, and must not be retried — a retry will just report
+         "already redeemed" again, correctly. Getting this wrong is how teams end up with alert fatigue from
+         a system that is behaving perfectly.</p>
+      <p><strong>One subtlety worth noticing:</strong> <code>{redeemedAt: null}</code> matches both an
+         explicit <code>null</code> and an <em>absent</em> field — which is what you want here, since new
+         vouchers may not carry the field at all. That is the <code>null</code>-versus-missing behaviour from
+         <a href="documents-bson.html">the previous lesson</a>, being useful for once rather than
+         surprising.</p>
+      <p><strong>If you also need to distinguish "no such voucher" from "already redeemed"</strong>, use
+         <code>findOneAndUpdate</code> with the guard and, on a null result, do one follow-up
+         <code>findOne({code})</code> — the extra read happens only on the failure path.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> A "get or create device session" upsert on
+      <code>{userId, deviceId}</code> is producing duplicate documents — 1,142 of them in a week, always in
+      pairs milliseconds apart. Explain the mechanism precisely, fix it, and then explain what your fix does
+      to the <em>existing</em> duplicates.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Mechanism.</strong> An upsert is not atomic across the find-or-create decision. Two
+         concurrent upserts both evaluate the filter, both find nothing, and both proceed to insert. Both
+         report success. The window is exactly the gap between the match phase and the insert, which is why
+         the duplicates are always milliseconds apart — they are the pairs that raced.</p>
+      <p><strong>Fix — make the duplicate impossible, not unlikely:</strong></p>
+<pre>
+db.sessions.createIndex({ userId: 1, deviceId: 1 }, { unique: true })
+</pre>
+      <p>Now the losing racer's insert fails with <code>E11000</code> rather than succeeding. Handle it with a
+         single retry:</p>
+<pre>
+async function getOrCreateSession(userId, deviceId) {
+  const op = () => sessions.findOneAndUpdate(
+    { userId, deviceId },
+    { $set: { lastSeenAt: new Date() },
+      $setOnInsert: { createdAt: new Date(), state: {} } },
+    { upsert: true, returnDocument: "after" })
+  try { return await op() }
+  catch (e) { if (e.code === 11000) return await op(); throw e }
+}
+</pre>
+      <p>One retry is provably sufficient: by the time the loser retries, the winner's document exists, so the
+         filter matches and the operation takes the update path.</p>
+      <p><strong>The part the question is really asking about: the existing duplicates.</strong>
+         <code>createIndex</code> with <code>unique: true</code> will <strong>fail</strong> while duplicates
+         are present — the index build aborts and you have fixed nothing. So the order of work is:</p>
+<pre>
+// 1. Find them
+db.sessions.aggregate([
+  { $group: { _id: { u: "$userId", d: "$deviceId" },
+              n: { $sum: 1 }, ids: { $push: "$_id" } } },
+  { $match: { n: { $gt: 1 } } }
+])
+
+// 2. MERGE them - do not just delete. Each twin may hold real state
+//    (one has the push token, the other the last-seen timestamp).
+//    Decide the merge rule with the product owner, then apply it.
+
+// 3. Delete the losers, then build the unique index.
+</pre>
+      <p>Deciding the merge rule is the actual work; the index is one line. And note the failure was visible
+         to users as "random logouts", because reads returned whichever twin came first — a good reminder that
+         duplicate documents rarely announce themselves as duplicates.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> A nightly migration backfills a
+      <code>normalisedEmail</code> field on 2M documents. It currently takes 30 minutes, is not restartable,
+      and last night it died at minute 24. Rewrite it, and justify each choice.
+<pre>
+const cursor = users.find({})
+for await (const u of cursor) {
+  await users.updateOne({ _id: u._id },
+    { $set: { normalisedEmail: u.email.trim().toLowerCase() } })
+}
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p>Four things are wrong: it awaits one write at a time, it reprocesses everything on restart, it scans
+         documents that are already done, and it pulls whole documents over the network to use one field.</p>
+      <p><strong>Best answer first — it does not need application code at all.</strong> The transformation
+         only references fields in the same document, so a pipeline update does it entirely server-side:</p>
+<pre>
+db.users.updateMany(
+  { normalisedEmail: { $exists: false }, email: { $type: "string" } },
+  [ { $set: { normalisedEmail: { $toLower: { $trim: { input: "$email" } } } } } ]
+)
+</pre>
+      <p>No documents cross the network at all. The filter makes it <strong>restartable by construction</strong>:
+         re-running it processes only what remains.</p>
+      <p><strong>When you do need client-side logic</strong> (a real normalisation library, say), batch it:</p>
+<pre>
+let lastId = null
+while (true) {
+  const filter = { normalisedEmail: { $exists: false },
+                   ...(lastId ? { _id: { $gt: lastId } } : {}) }
+  const batch = await users.find(filter, { projection: { email: 1 } })
+                           .sort({ _id: 1 }).limit(1000).toArray()
+  if (!batch.length) break
+  await users.bulkWrite(batch.map(u => ({
+    updateOne: { filter: { _id: u._id },
+                 update: { $set: { normalisedEmail: normalise(u.email) } } }
+  })), { ordered: false })
+  lastId = batch[batch.length - 1]._id
+}
+</pre>
+      <table class="tbl">
+        <tr><th>Choice</th><th>Why</th></tr>
+        <tr><td><code>bulkWrite</code> batches of 1,000</td><td>Measured 1,100 → 47,000 docs/s. One round trip per 1,000 writes instead of per write</td></tr>
+        <tr><td><code>ordered: false</code></td><td>The updates are independent; one failure must not stop the other 999</td></tr>
+        <tr><td><code>$exists: false</code> in the filter</td><td>Makes it restartable and idempotent — the crash at minute 24 costs you 24 minutes, not the job</td></tr>
+        <tr><td><code>_id: {$gt: lastId}</code> paging</td><td>A stable cursor across batches; no skip (which is O(n)), and no long-lived cursor to time out</td></tr>
+        <tr><td><code>projection: {email: 1}</code></td><td>Pulls one field, not whole documents</td></tr>
+        <tr><td><code>$type: "string"</code> guard</td><td>A null or missing email would throw mid-batch; the type audit habit from <a href="documents-bson.html">lesson 2</a></td></tr>
+      </table>
+      <p><strong>Two production notes I would add to the ticket:</strong> a backfill this size is a write
+         storm, so throttle between batches if replication lag rises (watch it, do not guess); and if
+         <code>normalisedEmail</code> is going to be indexed, build the index <em>after</em> the backfill, not
+         before — otherwise every one of the 2M updates maintains the index as it goes.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Implement "transfer money between two accounts" three
+      different ways — reshaped into one document, idempotent-and-replayable, and with a transaction. State
+      which you would ship and under what circumstances your answer changes.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Approach 1 — reshape so the invariant lives in one document.</strong> Only possible when the
+         two balances legitimately belong to one aggregate, e.g. two wallets inside one customer account:</p>
+<pre>
+db.customers.updateOne(
+  { _id: cid, "wallets.gbp.balanceMinor": { $gte: amount } },
+  { $inc: { "wallets.gbp.balanceMinor": -amount,
+            "wallets.eur.balanceMinor":  converted },
+    $push: { ledger: { $each: [entry], $slice: -100 } } }
+)
+</pre>
+      <p>Atomic, no coordination, and the guard prevents overdraft. When the model permits it, this is
+         strictly the best answer — and <code>$slice: -100</code> keeps the embedded ledger bounded, per
+         <a href="documents-bson.html">lesson 2</a>.</p>
+      <p><strong>Approach 2 — idempotent, replayable steps.</strong> The general answer when the accounts are
+         genuinely separate documents:</p>
+<pre>
+const tid = transferId   // stable, supplied by the caller
+
+// Step 1: debit, guarded and idempotent
+const r = await accounts.updateOne(
+  { _id: from, balanceMinor: { $gte: amount },
+    appliedTransfers: { $ne: tid } },        // <- replay protection
+  { $inc: { balanceMinor: -amount },
+    $push: { appliedTransfers: { $each: [tid], $slice: -1000 } },
+    $push: { outbox: { tid, to, amount, at: new Date() } } }
+)
+if (r.matchedCount === 0) { /* insufficient funds OR already applied */ }
+
+// Step 2: a worker drains the outbox
+const c = await accounts.updateOne(
+  { _id: to, appliedTransfers: { $ne: tid } },
+  { $inc: { balanceMinor: amount },
+    $push: { appliedTransfers: { $each: [tid], $slice: -1000 } } }
+)
+// Step 3: remove the outbox entry (safe to repeat)
+await accounts.updateOne({ _id: from },
+  { $pull: { outbox: { tid } } })
+</pre>
+      <p>The debit and the intent to credit are written in <em>one atomic update</em>, so the outbox entry
+         cannot be lost if the process dies. Every step is a no-op on replay. The trade-off, stated honestly:
+         the credit is <strong>eventually</strong> consistent — there is a window where the money is in
+         neither balance — and <code>appliedTransfers</code> is unbounded unless capped, which is why
+         <code>$slice</code> is there (a dedicated <code>transfers</code> collection with
+         <code>_id: tid</code> scales better).</p>
+      <p><strong>Approach 3 — a transaction:</strong></p>
+<pre>
+await session.withTransaction(async () => {
+  const d = await accounts.updateOne(
+    { _id: from, balanceMinor: { $gte: amount } },
+    { $inc: { balanceMinor: -amount } }, { session })
+  if (d.matchedCount === 0) throw new InsufficientFunds()   // aborts
+  await accounts.updateOne({ _id: to },
+    { $inc: { balanceMinor: amount } }, { session })
+  await transfers.insertOne({ _id: tid, from, to, amount }, { session })
+}, { readConcern: { level: "snapshot" },
+     writeConcern: { w: "majority" } })
+</pre>
+      <p>Note that the guard is still needed — a transaction gives isolation, not business rules — and that
+         <code>withTransaction</code> handles <code>TransientTransactionError</code> retries for you.</p>
+      <p><strong>What I would ship.</strong> Approach 3, for a system doing tens of transfers per second, with
+         <code>_id: tid</code> on the <code>transfers</code> insert so a client retry of the whole transfer
+         fails with <code>E11000</code> rather than transferring twice — <em>transactions give atomicity, not
+         idempotency, and this is the detail most candidates miss.</em></p>
+      <p><strong>When the answer changes:</strong> at thousands of transfers/sec against hot accounts,
+         transaction write conflicts turn into a retry storm and Approach 2 wins on throughput. Across shards,
+         the transaction still works but costs a two-phase commit. And if a business review says the two
+         balances are really one aggregate, Approach 1 makes the entire question disappear — which is the
+         outcome to push for.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> A webhook consumer processes payment events. It is
+      at-least-once (duplicates arrive), events can arrive out of order, and it currently double-charges under
+      retries. Design the write path end to end.
+      <details class="solution"><summary>Solution</summary>
+      <p>Three distinct problems hide in that sentence — duplicates, ordering, and non-idempotent effects —
+         and each needs its own mechanism. Solving only the first is why this bug usually survives one
+         round of fixes.</p>
+      <p><strong>1. Duplicates — a natural <code>_id</code> does the deduplication.</strong></p>
+<pre>
+try {
+  await events.insertOne({
+    _id: evt.id,                    // the provider's event id
+    type: evt.type, payload: evt, receivedAt: new Date(),
+    processedAt: null
+  })
+} catch (e) {
+  if (e.code === 11000) return ack()   // seen it - ack and stop
+  throw e
+}
+</pre>
+      <p>The unique <code>_id</code> index is the dedupe store. No separate "seen events" service, no
+         check-then-insert race — the check and the insert are the same operation.</p>
+      <p><strong>2. Ordering — never trust arrival order; use the provider's sequence.</strong></p>
+<pre>
+await payments.updateOne(
+  { _id: evt.paymentId, lastEventSeq: { $lt: evt.seq } },   // guard
+  { $set: { status: evt.status, lastEventSeq: evt.seq,
+            updatedAt: new Date() } },
+  { upsert: true }
+)
+</pre>
+      <p>An out-of-order stale event matches nothing and is correctly ignored. If the provider has no
+         sequence, use its event timestamp with <code>$max</code> semantics — and if it has neither, model the
+         state machine so only legal transitions match:
+         <code>{status: "pending"}</code> → <code>"charged"</code>.</p>
+      <p><strong>3. Effects — separate "record the fact" from "do the thing".</strong> The double charge
+         happens because the side effect is re-executed on replay. Write the intent atomically with the state
+         change, then let a worker perform it:</p>
+<pre>
+// same atomic update as above, plus:
+  $push: { outbox: { kind: "sendReceipt", key: evt.id } }
+
+// worker: claim, perform, then clear - and make the CALL idempotent
+// by passing an idempotency key the provider honours
+</pre>
+      <p><strong>4. Close the loop, and mark completion last:</strong></p>
+<pre>
+await events.updateOne({ _id: evt.id, processedAt: null },
+                       { $set: { processedAt: new Date() } })
+</pre>
+      <p>The <code>processedAt: null</code> guard means a concurrent duplicate delivery cannot mark it twice,
+         and a sweeper can find events inserted but never processed — the crash-in-the-middle case, which is
+         otherwise invisible.</p>
+      <p><strong>Two things I would deliberately <em>not</em> do:</strong> not use a transaction (each step is
+         a single-document atomic write, so there is nothing multi-document to protect); and not ack the
+         webhook until the event row is durably written with <code>w: "majority"</code> — acking on
+         <code>w: 1</code> means a failover can lose an event the provider believes was delivered, which is
+         the one failure mode this design would otherwise still have.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>A single-document write is atomic and isolated. Nothing larger is</strong>, without a
+            transaction — <code>updateMany</code> included.</li>
+        <li><strong>Write concern defines what "acknowledged" means.</strong> <code>w: 1</code> can be rolled
+            back by a failover; <code>w: "majority"</code> cannot, and is the default since 5.0.</li>
+        <li><strong><code>wtimeout</code> is not a rollback</strong> — it means "I stopped waiting". The write
+            may still be applied and may still commit.</li>
+        <li><strong><code>matchedCount</code> is the success signal, not <code>modifiedCount</code>.</strong>
+            Matched-but-not-modified is what a correctly replayed idempotent write looks like.</li>
+        <li><strong>Never read-modify-write.</strong> Measured: 8,127 of 50,000 decrements silently lost with
+            8 workers; <code>$inc</code> lost none.</li>
+        <li><strong>Put the precondition in the filter.</strong> That single move turns an update into a
+            compare-and-swap, and <code>matchedCount: 0</code> becomes a business outcome you branch on.</li>
+        <li><strong><code>replaceOne</code> deletes every field you did not send.</strong> 320,000 documents
+            were silently stripped this way. Default to <code>updateOne</code> with <code>$set</code>.</li>
+        <li><strong>Pipeline updates</strong> let the new value reference the document's own fields
+            server-side, removing whole classes of read-modify-write.</li>
+        <li><strong>An upsert without a unique index on its filter fields is a duplicate generator</strong> —
+            1,142 twins in a week. Add the index, retry once on <code>E11000</code>.</li>
+        <li><strong>Only equality clauses in the filter seed an upserted document</strong>; use
+            <code>$setOnInsert</code> for the rest.</li>
+        <li><strong><code>findOneAndUpdate</code> with a status guard is a correct multi-worker claim.</strong>
+            <code>findOne</code>-then-<code>updateOne</code> is not — it delivered 3.4% of emails twice at
+            peak while every test passed.</li>
+        <li><strong>Always set <code>returnDocument: "after"</code> explicitly</strong> when you want the new
+            version; the default is <code>"before"</code>.</li>
+        <li><strong><code>bulkWrite</code> in unordered batches of ~1,000</strong>: 1,100 → 47,000 docs/s, and
+            one bad document no longer stops the job at 4,113 of 12,000.</li>
+        <li><strong>Deletes are writes.</strong> TTL runs as a background task every 60 s (documents observed
+            alive 74 s past expiry), so filter on <code>expiresAt</code> too, and never shorten retention on a
+            huge collection in one step.</li>
+        <li><strong>Driver retryable writes are deduplicated server-side by statement id</strong> — which is
+            why even <code>$inc</code> is safe. Your own retry loop is a <em>new</em> statement and will apply
+            it twice.</li>
+        <li><strong>Reach in order: reshape into one document → idempotent replayable steps → transaction.</strong>
+            A transaction on a hot path is usually a message about the schema.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="documents-bson.html">← Documents, BSON &amp; _id</a>
+      <a href="queries-operators.html">Queries, Operators &amp; Arrays →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
