@@ -282,7 +282,30 @@ were platform defects**; honest funding case with the shortfall stated)
 Also: the 7 orphaned v3 files (`what-is-ci`, `github-actions`, `testing-gates`, `artifacts-versioning`,
 `secrets-oidc`, `docker-in-ci`, `feature-flags`) are now **redirect stubs**.
 
-**⏳ NEXT: MongoDB v4 (track 19)** — the last v3 track. 12 v3 lessons (~9KB) → ~20 at v4.
+**🚧 IN PROGRESS: MongoDB v4 (track 19)** — `tutorials/mongodb/`, the **last v3 track**: rebuilding 12 v3
+lessons (~9KB) into **22 lessons at v4 depth**. New `nav.js` written: 6 sections — Foundations 4 ·
+Schema Design 4 · Indexes & Query Performance 4 · Aggregation 3 · Distribution & Durability 4 ·
+Production 3, + Practice. **1 of 22 done:**
+
+*§1 Foundations 1/4* — ✅ `index.html` (59KB, `det=12 ex=6`): **the atomic single document is the core
+primitive** and every design rule follows from it; model around what one request needs; snapshot-vs-live-
+reference before calling duplication a problem; **"schemaless" describes the database, not your data** —
+2.1M users in 6 shapes with defensive branches in 14 call sites, and dates-as-strings silently excluded
+from range queries; **WiredTiger working-set cliff: p99 1.4 ms → 340 ms at 12% over cache**, alert on
+`pages evicted by application threads` &gt; 0, and dropping 2 unused indexes recovered 6.2 GB; write concern
+vs read concern (majority default writes, **local default reads** = the read-your-writes trap;
+`wtimeout` is not a rollback); **index-or-scan** — 8.4M docs examined for 50 returned in 41 s → 50/50 in
+9 ms; honest fit assessment and the "both" answer with a dated ADR revisit trigger.
+
+**NEXT: `documents-bson.html`**, then `crud-semantics.html` and `queries-operators.html` to close §1.
+**End-of-track chores (as always):** (1) the v3 orphans after the nav split — `crud.html`, `queries.html`,
+`change-streams.html`, `performance.html` — become redirect stubs; (2) retune the MongoDB quiz bank to the
+v4 curriculum, then `node tools/quizshuffle.js tutorials/mongodb` + `python tools/quizcheck.py tutorials/mongodb`.
+
+**Authoring gotcha carried over from CI/CD:** inside a `<pre>` block, never write an escaped
+`&amp;lt;a href=…&amp;gt;` — it renders as literal tag text. Write the plain lesson name instead; the assembly
+step strips any that slip through with a regex. Also still watch for a stray `&lt;/p&gt;` closing a
+`.note` div.
 
 **Track-wide note (2026-08-21 audit, still open):** 19 of 23 quiz banks are answer-skewed (correct answer at
 index 1 for ~100% of questions); `cicd`, `docker`, `kubernetes`, `leetcode` and `redis` are clean. Fix per
