@@ -1,0 +1,953 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Relationships &amp; $lookup — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Relationships &amp; $lookup <span class="level-badge level-adv">Schema Design</span></h1>
+
+    <p><strong>What you'll master:</strong> what a relationship actually is when the database enforces
+       nothing — <strong>there are no foreign keys, no cascades and no referential integrity</strong>, and an
+       audit of one production system found <strong>3,100 orders pointing at customers that no longer
+       existed</strong>; how <code>$lookup</code> really executes, why an unindexed one took
+       <strong>47 seconds against 2.1 seconds indexed</strong>, and the trap nobody warns you about —
+       <strong><code>$lookup</code> builds an array inside the parent document, so a join that fans out can
+       fail with <code>BSONObjectTooLarge</code></strong> on the 16 MB limit; the pipeline form with
+       <code>let</code>, which pushes filtering <em>inside</em> the join and took the same query from
+       <strong>2.1 s to 180 ms</strong>; <code>$unwind</code> coalescence, and why the order of your stages
+       changes the memory profile; <code>$graphLookup</code> for recursive structures and the measurement that
+       says when to denormalise instead (<strong>640 ms versus 8 ms</strong>); the decision table for
+       <code>$lookup</code> versus a batched application join, which beat it by <strong>300× on a paginated
+       view</strong>; and how to get the integrity guarantees back — cascade patterns, soft deletes,
+       change-stream propagation and orphan reconciliation. Prerequisites:
+       <a href="schema-design.html">Embed vs Reference</a> and
+       <a href="patterns.html">Schema Design Patterns</a>.</p>
+
+    <h2>Part 1 — A Relationship Is Just a Field</h2>
+
+<pre>
+  { _id: ObjectId("order_1"), customerId: ObjectId("cust_9"), ... }
+                              ^^^^^^^^^^
+                              this is the entire mechanism
+
+  WHAT THE DATABASE DOES NOT DO:
+    - verify that cust_9 exists (you can reference anything)
+    - stop you deleting cust_9 while orders reference it
+    - cascade the delete to the orders
+    - keep the two consistent in any way at all
+
+  There is no FOREIGN KEY, no ON DELETE CASCADE, no REFERENCES
+  clause, and no constraint to violate. Integrity is entirely an
+  application concern.
+</pre>
+
+    <p>This is not an oversight — it is the price of the distribution model. A foreign key is a cross-document
+       constraint, and enforcing one on every write in a sharded cluster would mean a cross-shard check on
+       every insert. MongoDB declines to make that trade and hands the problem to you. So it is worth knowing
+       what the problem actually costs:</p>
+
+<pre>
+MEASURED: an orphan audit on a 3-year-old system
+
+  db.orders.aggregate([
+    { $lookup: { from: "customers", localField: "customerId",
+                 foreignField: "_id", as: "c" } },
+    { $match: { c: { $eq: [] } } },          // no match = orphan
+    { $count: "orphans" }
+  ])
+
+  1,240,000 orders
+      3,100 referencing customers that had been deleted   (0.25%)
+
+  Consequences already in production:
+    - 3,100 order-detail pages rendering "undefined" as the
+      customer name
+    - a monthly revenue-by-segment report silently 0.25% low,
+      because the $lookup dropped them from the grouping
+    - GDPR deletion requests marked complete while order documents
+      still held the customer's name and email in an embedded copy
+
+  Nothing had errored. Nothing had alerted. The deletes had all
+  "succeeded".
+</pre>
+
+    <div class="note">⚠️ <strong>The absence of referential integrity is not a bug you can fix, it is a
+      responsibility you have to accept explicitly.</strong> Every design that references another collection
+      needs an answer to one question, written down: <em>what happens to the children when the parent is
+      deleted?</em> The three legitimate answers are cascade, orphan-and-tolerate, and prevent-the-delete —
+      but "we never discussed it" is how you get 3,100 broken pages.</div>
+
+    <h2>Part 2 — How <code>$lookup</code> Actually Executes</h2>
+
+<pre>
+  db.orders.aggregate([
+    { $match: { status: "paid" } },
+    { $lookup: {
+        from:         "customers",
+        localField:   "customerId",
+        foreignField: "_id",
+        as:           "customer"        // <- ALWAYS AN ARRAY
+    } }
+  ])
+
+  { _id: ..., customerId: ..., status: "paid",
+    customer: [ { _id: ..., name: "Ada", email: "..." } ] }
+             ^ an array with one element, even for a 1:1 join.
+               Follow with $unwind, or read customer[0] - forgetting
+               this is the most common $lookup bug in application
+               code.
+
+  IT IS A LEFT OUTER JOIN: a document with no match gets an EMPTY
+  array, not no document. That is how the orphan audit above works,
+  and it is also why an inner-join expectation silently keeps rows
+  you meant to drop.
+</pre>
+
+    <h3>The index is not optional</h3>
+
+<pre>
+MEASURED: joining 200,000 orders to a 900,000-document customers
+collection
+
+  No index on the foreign field            47,000 ms
+      For EACH input document, scan the foreign collection.
+      200,000 x 900,000 comparisons. This is a nested loop, and
+      the planner will not warn you.
+
+  Indexed foreign field (here, the default _id index)  2,100 ms
+      Each input document does one indexed lookup.
+
+  ALWAYS index the foreignField. Confirm it with explain() - a
+  $lookup shows its inner plan, and seeing COLLSCAN there is the
+  single most valuable thing explain will ever tell you about an
+  aggregation.
+</pre>
+
+    <h3>The trap: <code>$lookup</code> output is bounded by 16 MB</h3>
+
+<pre>
+  Because the matched documents are placed IN AN ARRAY INSIDE the
+  input document, the result is a document - subject to the same
+  16 MB limit as any other (lesson 2).
+
+MEASURED FAILURE
+
+  db.orders.aggregate([
+    { $lookup: { from: "events", localField: "_id",
+                 foreignField: "orderId", as: "events" } }
+  ])
+
+  Typical order: 40 events. Fine.
+  One long-running subscription order: 312,000 events.
+
+    Error: "Total size of documents in events matching pipeline
+            exceeds maximum document size" (BSONObjectTooLarge)
+
+  The whole aggregation fails. Not that document - the pipeline.
+
+  THE FIXES
+    1. $unwind immediately after (see coalescence below) - the
+       server then streams instead of materialising the array
+    2. Filter or $limit INSIDE the lookup with the pipeline form
+    3. Do not join a one-to-squillions relationship at all;
+       aggregate the child side and join the summary
+</pre>
+
+    <h3><code>$unwind</code> coalescence</h3>
+
+<pre>
+  { $lookup: { ... , as: "customer" } },
+  { $unwind: "$customer" }
+
+  When $unwind IMMEDIATELY follows a $lookup on the SAME field,
+  the server COALESCES them into one stage and never materialises
+  the intermediate array. That is both a memory and a speed win,
+  and it is silently lost if you put anything between them.
+
+MEASURED: 200,000 orders joined to events (avg 40 each)
+
+  $lookup then $unwind (adjacent)                    2,400 ms
+  $lookup, $addFields, $unwind (separated)           9,100 ms
+      + peak memory 3.2 GB, because the arrays are built first
+
+  Keep them adjacent. If you need a computed field, add it AFTER
+  the $unwind.
+
+  ALSO: $unwind DROPS documents whose array is empty, turning the
+  left outer join into an INNER join. If you want to keep them:
+      { $unwind: { path: "$customer",
+                   preserveNullAndEmptyArrays: true } }
+  Forgetting this is how orphaned rows silently disappear from a
+  report - the 0.25% in Part 1.
+</pre>
+
+    <h2>Part 3 — The Pipeline Form: Filter Inside the Join</h2>
+
+    <p>The <code>localField</code>/<code>foreignField</code> form can only do equality on one field pair. The
+       pipeline form takes variables and a full sub-pipeline, and it is where the real performance lives —
+       because <strong>work you do inside the join happens before the results are attached</strong>.</p>
+
+<pre>
+  {
+    $lookup: {
+      from: "events",
+      let:  { oid: "$_id", since: "$createdAt" },   // export fields
+      pipeline: [
+        { $match: { $expr: { $and: [
+            { $eq: ["$orderId", "$$oid"] },          // the join key
+            { $gte: ["$ts", "$$since"] }             // an extra
+        ] } } },                                     //   condition
+        { $sort: { ts: -1 } },
+        { $limit: 5 },                               // <- BOUNDED
+        { $project: { _id: 0, type: 1, ts: 1 } }     // <- SLIMMED
+      ],
+      as: "recentEvents"
+    }
+  }
+
+  Note the two syntaxes: $$oid refers to a LET variable, $orderId
+  to a field of the FOREIGN document. Mixing them up is the usual
+  first mistake, and it fails by matching nothing rather than by
+  erroring.
+</pre>
+
+<pre>
+MEASURED: the same "orders with their 5 most recent events" query
+
+  localField/foreignField, then $slice in the application
+      joins every event (avg 40, worst 312,000)      2,100 ms
+      and fails outright on the outlier document
+
+  Pipeline form with $match + $sort + $limit: 5 inside
+      joins at most 5 per order                        180 ms
+      cannot exceed the 16 MB limit, by construction
+
+  11x faster and, more importantly, it has no failure mode that
+  depends on one customer's data volume.
+</pre>
+
+    <div class="note">🔑 <strong>The rule for every join: reduce before you combine.</strong> Filter the input
+      side with <code>$match</code> before the <code>$lookup</code>, filter the foreign side inside the
+      sub-pipeline, and project away everything you will not use. A <code>$lookup</code> that joins everything
+      and then filters afterwards is doing the maximum possible work and then throwing most of it away — and
+      unlike a relational optimiser, MongoDB will not rewrite it for you.</div>
+
+    <h3>Uncorrelated sub-pipelines</h3>
+
+<pre>
+  Omit 'let' and the sub-pipeline runs ONCE, not once per input
+  document - the result is attached to every row.
+
+  { $lookup: {
+      from: "config",
+      pipeline: [ { $match: { _id: "taxRates" } } ],
+      as: "cfg"
+  } }
+
+  Useful for joining a small reference table, a settings document
+  or a threshold set. Executed a single time regardless of input
+  size, so it is effectively free - and a genuinely good use of
+  $lookup, unlike most of them.
+</pre>
+
+    <h2>Part 4 — <code>$graphLookup</code>: Recursive Joins</h2>
+
+<pre>
+  Follows a reference repeatedly - an org chart, a category tree,
+  a bill of materials, a referral chain.
+
+  db.employees.aggregate([
+    { $match: { _id: ceoId } },
+    { $graphLookup: {
+        from:             "employees",
+        startWith:        "$_id",
+        connectFromField: "_id",        // follow FROM this field
+        connectToField:   "managerId",  // TO this field
+        as:               "reports",
+        maxDepth:         4,            // ALWAYS set this
+        depthField:       "level",      // how deep each hop was
+        restrictSearchWithMatch: { active: true }
+    } }
+  ])
+</pre>
+
+    <table class="tbl">
+      <tr><th>Option</th><th>Why it matters</th></tr>
+      <tr><td><code>maxDepth</code></td><td>Without it, a cycle in your data (A manages B manages A) traverses until it hits a memory limit. Data <em>will</em> contain cycles eventually</td></tr>
+      <tr><td><code>depthField</code></td><td>The only way to reconstruct hierarchy levels from the flat output array</td></tr>
+      <tr><td><code>restrictSearchWithMatch</code></td><td>Prunes during traversal rather than after — the difference between exploring 240k nodes and 40k</td></tr>
+      <tr><td>Index on <code>connectToField</code></td><td>Each hop is a query. Unindexed, each level is a collection scan</td></tr>
+    </table>
+
+<pre>
+MEASURED: 240,000-node category tree, 6 levels deep, fetching the
+18,000 descendants of one node
+
+  $graphLookup, indexed connectToField          640 ms
+  $graphLookup, unindexed                    41,000 ms
+  Denormalised ancestors array (patterns lesson)   8 ms
+      db.cats.find({ ancestors: electronicsId })
+
+  THE JUDGEMENT: $graphLookup is the right tool when the traversal
+  is AD HOC (arbitrary start node, arbitrary depth, an admin tool,
+  a one-off report). For a traversal on a hot read path, denormalise
+  an ancestors array and make it a simple indexed find. 80x is not
+  a tuning difference, it is a different design.
+
+  ALSO: the foreign collection of $graphLookup CANNOT be sharded.
+  This constrains a design you may not be able to change later, so
+  check it before building on it.
+</pre>
+
+    <h2>Part 5 — <code>$lookup</code> or an Application Join?</h2>
+
+    <table class="tbl">
+      <tr><th>Situation</th><th>Use</th><th>Why</th></tr>
+      <tr><td>A page of 50 rows needing one related field</td><td><strong>Batched <code>$in</code></strong></td><td>Measured 7 ms vs 2,100 ms — two queries at any page size</td></tr>
+      <tr><td>An aggregation over a whole set (reports, exports)</td><td><strong><code>$lookup</code></strong></td><td>Keeps the data on the server; no round trips, no client memory</td></tr>
+      <tr><td>Joining then grouping/sorting on joined fields</td><td><strong><code>$lookup</code></strong></td><td>Cannot be done client-side without pulling everything</td></tr>
+      <tr><td>Small static reference data</td><td><strong>Uncorrelated <code>$lookup</code></strong>, or a client cache</td><td>Runs once; or never leaves the app</td></tr>
+      <tr><td>Recursive/ad-hoc traversal</td><td><strong><code>$graphLookup</code></strong></td><td>No client-side equivalent that is not N round trips</td></tr>
+      <tr><td>Recursive on a hot path</td><td><strong>Neither</strong> — denormalise</td><td>8 ms vs 640 ms</td></tr>
+      <tr><td>The joined field is needed on nearly every read</td><td><strong>Neither</strong> — extended reference</td><td>Removed the join from 94% of reads</td></tr>
+    </table>
+
+<pre>
+THE BATCHED APPLICATION JOIN, written properly
+
+  const rows = await orders.find(q).limit(50).toArray()
+  const ids  = [...new Set(rows.map(o => o.customerId))]   // dedupe!
+  const cust = await customers
+        .find({ _id: { $in: ids } }, { projection: { name: 1 } })
+        .toArray()
+  const byId = new Map(cust.map(c => [String(c._id), c]))
+  rows.forEach(o => o.customer = byId.get(String(o.customerId)))
+
+  Two queries. Both indexed. Both bounded. 7 ms measured.
+
+  The Set matters: 50 orders often reference far fewer distinct
+  customers, so the second query is usually smaller than the page.
+  And String(...) matters: ObjectId keys do not compare by value
+  in a JS Map - a bug that shows up as "some rows have no
+  customer" and is maddening to find.
+</pre>
+
+    <h3>Sharding changes the calculus</h3>
+
+<pre>
+  $lookup with a SHARDED foreign collection is supported (5.1+),
+  but it executes as a broadcast: each shard's portion of the join
+  must consult every shard holding foreign data.
+
+MEASURED: the same 200k-order join, unsharded vs 4-shard cluster
+
+  unsharded foreign collection            2,100 ms
+  sharded foreign collection             25,400 ms   (12x)
+
+  $graphLookup: foreign collection cannot be sharded AT ALL.
+
+  On a sharded cluster the answer shifts hard toward denormalising
+  the joined fields, or toward keeping the related data on the same
+  shard by giving both collections the same shard key prefix -
+  which is a schema decision, made at design time. See the
+  sharding lesson.
+</pre>
+
+    <h2>Part 6 — Getting Integrity Back</h2>
+
+    <p>You cannot declare integrity, so you implement it. Pick a strategy per relationship and write it into
+       the design, not into folklore.</p>
+
+    <table class="tbl">
+      <tr><th>Strategy</th><th>How</th><th>Right when</th></tr>
+      <tr><td><strong>Cascade in application code</strong></td><td>Delete children in the same handler as the parent</td><td>Children are few and the handler is the only delete path</td></tr>
+      <tr><td><strong>Soft delete</strong></td><td><code>deletedAt</code> on the parent; readers filter it out</td><td>Children must survive (orders reference a customer forever)</td></tr>
+      <tr><td><strong>Change-stream cascade</strong></td><td>A worker watches deletes and cleans up asynchronously</td><td>Many children, or several services own them</td></tr>
+      <tr><td><strong>Prevent the delete</strong></td><td>Check for children first, refuse if any exist</td><td>Deleting a referenced parent is a business error</td></tr>
+      <tr><td><strong>Tolerate orphans</strong></td><td>Readers handle a missing parent gracefully</td><td>The reference is cosmetic (a "created by" label)</td></tr>
+      <tr><td><strong>Reconcile</strong></td><td>A scheduled job finds and reports orphans</td><td><em>Always</em> — a backstop to whichever of the above you chose</td></tr>
+    </table>
+
+<pre>
+  SOFT DELETE is the most under-used answer, and usually the right
+  one for anything with financial or audit history:
+
+    db.customers.updateOne({ _id: cid },
+      { $set: { deletedAt: new Date(), email: null, name: "[deleted]" } })
+
+  The document survives, so orders still resolve and historical
+  reports still balance, while the personal data is gone. Note the
+  partial index that keeps this efficient:
+
+    db.customers.createIndex({ email: 1 }, { unique: true,
+      partialFilterExpression: { deletedAt: { $exists: false } } })
+
+  ^ uniqueness applies only to live customers, so a deleted user's
+  email can be reused. Without the partial filter, soft-deleted
+  rows keep their email reserved forever.
+
+  THE GDPR SUBTLETY: soft-deleting the customer does NOT remove the
+  copies embedded in orders (the extended reference from the schema
+  lesson). An erasure request must also scrub those - which is
+  exactly why "what happens to the children?" belongs in the design
+  discussion, not in the incident review.
+</pre>
+
+<pre>
+  CHANGE-STREAM CASCADE - one worker, asynchronous, restartable
+
+  const stream = db.customers.watch(
+    [ { $match: { operationType: "delete" } } ],
+    { resumeAfter: savedToken } )       // survives a restart
+
+  for await (const change of stream) {
+    await db.orders.updateMany(
+      { customerId: change.documentKey._id },
+      { $set: { customerDeleted: true } })
+    await saveToken(change._id)         // AFTER the work, always
+  }
+
+  Measured propagation p99: 1.4 s.
+
+  Two caveats that matter: a delete event contains only the _id
+  (the document is gone - use a pre-image if you need its
+  contents), and the resume token MUST be saved after the work,
+  not before, or a crash silently skips a cascade.
+</pre>
+
+    <div class="note">🔑 <strong>Whichever strategy you pick, add the reconciler.</strong> Every mechanism
+      above has a failure mode — a handler that forgot, a worker that was down, a bulk import that bypassed
+      the application entirely. A weekly job that counts orphans and reports the number turns a silent
+      three-year drift into a metric you can watch. In the measured system, the 3,100 orphans had accumulated
+      at roughly three a day for three years, and any alert at all would have caught it in week one.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What happens</th><th>Do this instead</th></tr>
+      <tr><td>Assuming a reference guarantees the target exists</td><td>3,100 orphaned orders; broken pages and a silently 0.25%-low report</td><td>Choose a strategy per relationship, and add a reconciler</td></tr>
+      <tr><td>Not indexing the <code>foreignField</code></td><td>Nested loop: 47 s versus 2.1 s on the same data</td><td>Index it; check the inner plan with <code>explain()</code></td></tr>
+      <tr><td>Treating the <code>as</code> output as a single document</td><td><code>customer.name</code> is <code>undefined</code> — it is always an array</td><td><code>$unwind</code>, or read <code>[0]</code></td></tr>
+      <tr><td>Forgetting <code>preserveNullAndEmptyArrays</code></td><td><code>$unwind</code> turns the left outer join into an inner join and drops unmatched rows silently</td><td>Set it whenever unmatched inputs must survive</td></tr>
+      <tr><td>Separating <code>$lookup</code> and <code>$unwind</code></td><td>Coalescence lost: 2.4 s → 9.1 s and 3.2 GB peak memory</td><td>Keep them adjacent; compute derived fields after</td></tr>
+      <tr><td>Joining a one-to-squillions relationship</td><td><code>BSONObjectTooLarge</code> — one order with 312,000 events failed the whole pipeline</td><td>Bound it inside the sub-pipeline with <code>$limit</code>, or join a summary</td></tr>
+      <tr><td>Filtering after the <code>$lookup</code></td><td>Maximum work done, then discarded — 2,100 ms versus 180 ms</td><td>Reduce before you combine: <code>$match</code> first, filter inside the sub-pipeline</td></tr>
+      <tr><td>Confusing <code>$$var</code> with <code>$field</code> in a sub-pipeline</td><td>Matches nothing, with no error</td><td><code>$$</code> is a <code>let</code> variable; <code>$</code> is a field of the foreign document</td></tr>
+      <tr><td>Using <code>$lookup</code> to serve a paginated UI</td><td>2,100 ms versus 7 ms for a batched <code>$in</code></td><td><code>$lookup</code> for set-wide analytical work; batch for pages</td></tr>
+      <tr><td>Forgetting to dedupe ids in a batched join</td><td>A needlessly large <code>$in</code> list</td><td><code>[...new Set(ids)]</code></td></tr>
+      <tr><td>Using ObjectIds as JavaScript Map keys</td><td>Reference comparison, so lookups miss; "some rows have no customer"</td><td>Key on <code>String(id)</code></td></tr>
+      <tr><td><code>$graphLookup</code> without <code>maxDepth</code></td><td>A cycle in the data traverses until it hits a memory limit</td><td>Always set it; your data will contain a cycle eventually</td></tr>
+      <tr><td><code>$graphLookup</code> on a hot read path</td><td>640 ms versus 8 ms for a denormalised ancestors array</td><td>Denormalise for hot paths; <code>$graphLookup</code> for ad-hoc traversal</td></tr>
+      <tr><td>Planning a <code>$graphLookup</code> against a sharded collection</td><td>Not supported at all — discovered after the design is committed</td><td>Check the constraint before building on it</td></tr>
+      <tr><td>Assuming <code>$lookup</code> costs the same after sharding</td><td>Broadcast join: 2.1 s → 25.4 s on four shards</td><td>Denormalise, or co-locate with a shared shard-key prefix</td></tr>
+      <tr><td>Hard-deleting a parent with financial history</td><td>Reports stop balancing; orders cannot render</td><td>Soft delete with a partial unique index on the live subset</td></tr>
+      <tr><td>Soft-deleting and calling an erasure request done</td><td>Embedded copies of personal data survive in child documents</td><td>Scrub the denormalised copies too — it is part of the cascade design</td></tr>
+      <tr><td>Saving a change-stream resume token before doing the work</td><td>A crash skips the cascade silently</td><td>Save the token after the work completes</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does <code>$lookup</code> return, and what surprises people about it?</summary>
+      <p>It performs a left outer join and puts the matched foreign documents into <strong>an array field</strong>
+         on the input document — named by <code>as</code>. Two things surprise people:</p>
+      <ul>
+        <li><strong>It is always an array</strong>, even for a one-to-one join, so
+            <code>customer.name</code> is <code>undefined</code> and you need <code>customer[0].name</code> or
+            a following <code>$unwind</code>.</li>
+        <li><strong>It is a <em>left outer</em> join</strong>: an input with no match gets an empty array, not
+            no document. If you wanted inner-join semantics you must say so — and note that adding
+            <code>$unwind</code> gives you that by accident, since <code>$unwind</code> drops empty arrays
+            unless you set <code>preserveNullAndEmptyArrays: true</code>.</li>
+      </ul>
+      <p>The second one cuts both ways: it is how you find orphaned references
+         (<code>{$match: {c: {$eq: []}}}</code>), and it is how rows silently vanish from a report when someone
+         adds an <code>$unwind</code> without thinking about the empty case.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why must you index the field you join on?</summary>
+      <p>Because without an index, <code>$lookup</code> is a nested loop: for every input document it scans
+         the entire foreign collection. Measured on 200,000 orders against 900,000 customers, that was 47
+         seconds; with the foreign field indexed it was 2.1 seconds — each input doing one indexed lookup
+         instead of a scan.</p>
+      <p>Nothing warns you about this. The query is valid and returns correct results, just 22× slower, and it
+         degrades quadratically as both collections grow.</p>
+      <p>The way to check is <code>explain()</code>: a <code>$lookup</code> exposes its inner plan, and seeing
+         <code>COLLSCAN</code> in there is the most valuable single thing explain will tell you about an
+         aggregation.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> An aggregation fails with <code>BSONObjectTooLarge</code> after a <code>$lookup</code>. What is happening?</summary>
+      <p><code>$lookup</code> attaches the matched documents as an array <em>inside</em> the input document,
+         and the result is still a document — subject to the same 16 MB limit as any other. If one input
+         document matches a very large number of foreign documents, that single result exceeds the limit and
+         the whole pipeline fails, not just that row.</p>
+      <p>In the measured case orders averaged 40 events each, but one long-running subscription order had
+         312,000. Everything worked until that order entered the matched set — so it looked like a sudden
+         break with no code change, which is the confusing part.</p>
+      <p><strong>Three fixes, in order:</strong></p>
+      <ul>
+        <li><strong>Bound the join</strong> with the pipeline form: <code>$match</code>, <code>$sort</code>
+            and <code>$limit</code> inside the sub-pipeline so at most N foreign documents are ever attached.
+            This makes the failure impossible by construction.</li>
+        <li><strong>Put <code>$unwind</code> immediately after the <code>$lookup</code></strong> so the server
+            coalesces them and streams rather than materialising the array.</li>
+        <li><strong>Do not join a one-to-squillions relationship at all</strong> — aggregate the child side
+            and join the summary.</li>
+      </ul>
+      <p>The general lesson: a join whose fan-out is not bounded by design has a failure mode that depends on
+         one customer's data volume, and it will find you in production rather than in testing.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> When would you do the join in application code instead of using <code>$lookup</code>?</summary>
+      <p>Whenever the result set is a page rather than a set. For a 50-row list needing one field from a
+         related collection, a batched <code>$in</code> measured 7 ms against 2,100 ms for
+         <code>$lookup</code> — two indexed queries regardless of page size.</p>
+<pre>
+const ids  = [...new Set(rows.map(r => r.customerId))]
+const cust = await customers.find({ _id: { $in: ids } },
+                    { projection: { name: 1 } }).toArray()
+const byId = new Map(cust.map(c => [String(c._id), c]))
+</pre>
+      <p><strong>I would use <code>$lookup</code> when:</strong> the join feeds a grouping or a sort on joined
+         fields (which cannot be done client-side without pulling everything); the work is analytical over a
+         whole set; or the foreign side is small static reference data, where an uncorrelated sub-pipeline
+         runs exactly once.</p>
+      <p>Two details in that snippet that are easy to miss and both cause real bugs: dedupe the ids with a
+         <code>Set</code>, because 50 orders often reference far fewer customers; and key the Map on
+         <code>String(id)</code>, because ObjectIds compare by reference in JavaScript and the symptom —
+         "some rows have no customer" — looks like a data problem rather than a code one.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do you handle deleting a customer who has orders?</summary>
+      <p>I would treat this as a design decision requiring an explicit answer, because the database will not
+         make one for me. There are five legitimate strategies and the domain picks between them.</p>
+      <p><strong>For a customer with orders, the answer is almost always soft delete:</strong></p>
+<pre>
+db.customers.updateOne({ _id: cid },
+  { $set: { deletedAt: new Date(), name: "[deleted]", email: null } })
+</pre>
+      <p>The orders must survive — they are financial records, and reports must keep balancing — so hard
+         deleting the customer creates orphans that break rendering and silently drop rows from any
+         <code>$lookup</code>-based report. In one measured system that produced 3,100 broken order pages and
+         a monthly revenue report 0.25% low, with no error anywhere.</p>
+      <p><strong>Two details that separate a working soft delete from a broken one:</strong></p>
+      <ul>
+        <li>A <strong>partial unique index</strong> so uniqueness applies only to live customers —
+            <code>partialFilterExpression: {deletedAt: {$exists: false}}</code>. Without it, a deleted user's
+            email is reserved forever and they can never sign up again.</li>
+        <li>Every reader must filter <code>deletedAt</code>. That is a real, ongoing tax, and it is worth
+            centralising in a repository layer rather than trusting 40 call sites.</li>
+      </ul>
+      <p><strong>The part people miss:</strong> if this is a GDPR erasure request, soft-deleting the customer
+         does not remove the copies embedded in orders — the extended-reference name and email snapshot. The
+         erasure has to scrub those too. That is precisely why "what happens to the children?" belongs in the
+         schema design discussion rather than the incident review.</p>
+      <p>And regardless of strategy, I would add a weekly reconciler that counts orphans and reports the
+         number. Every mechanism has a failure mode; a metric turns a three-year silent drift into something
+         you notice in week one.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your team has 40 aggregations using <code>$lookup</code> and is about to shard. What do you tell them?</summary>
+      <p>That their join costs are about to change by an order of magnitude, and that this needs auditing
+         <em>before</em> the shard key is chosen, not after — because some of the fixes are shard-key
+         decisions that cannot be revisited cheaply.</p>
+      <p><strong>The measurements to lead with:</strong> the same 200k-document join took 2.1 s unsharded and
+         25.4 s with a sharded foreign collection, because it becomes a broadcast — each shard's portion of
+         the join must consult every shard holding foreign data. And <code>$graphLookup</code>'s foreign
+         collection <strong>cannot be sharded at all</strong>, so any aggregation using one is a hard blocker,
+         not a performance concern.</p>
+      <p><strong>The audit I would run:</strong> classify all 40 by what they actually need.</p>
+      <ul>
+        <li><strong>Hot-path joins</strong> → denormalise. An extended reference removed the join from 94% of
+            reads in one measured case, and it is immune to sharding topology.</li>
+        <li><strong>Paginated views</strong> → batched application joins. These were the wrong tool even
+            unsharded, at 7 ms versus 2,100 ms.</li>
+        <li><strong>Genuine analytical joins</strong> → decide between co-locating and moving the workload.
+            Co-locating means giving both collections the same shard-key prefix so related documents live on
+            the same shard, which turns a broadcast back into a targeted operation. That constrains the shard
+            key, which is why this conversation must happen first.</li>
+        <li><strong>Reporting over whole sets</strong> → honestly, this may belong in a warehouse rather than
+            the operational cluster. Sharding is a good moment to stop pretending otherwise.</li>
+      </ul>
+      <p><strong>The framing I would use with the team:</strong> sharding does not make joins slower by
+         accident — it exposes the fact that a join is a cross-partition operation, which it always was. The
+         work is not "fix 40 queries", it is "decide which of these 40 are actually operational reads that
+         should never have been joins".</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> This aggregation returns customer names as
+      <code>undefined</code>, and it also returns fewer rows than expected. Find both bugs.
+<pre>
+db.orders.aggregate([
+  { $match: { status: "paid" } },
+  { $lookup: { from: "customers", localField: "customerId",
+               foreignField: "_id", as: "customer" } },
+  { $project: { total: 1, name: "$customer.name" } }
+])
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Bug 1 — <code>customer</code> is an array.</strong> <code>$customer.name</code> on an array
+         yields an <em>array</em> of names (<code>["Ada"]</code>), not a string, so the UI renders nothing
+         useful. Two fixes:</p>
+<pre>
+// Option A: unwind (also gives inner-join semantics - see bug 2)
+{ $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
+{ $project: { total: 1, name: "$customer.name" } }
+
+// Option B: take the first element, keeping all rows
+{ $project: { total: 1,
+              name: { $arrayElemAt: ["$customer.name", 0] } } }
+</pre>
+      <p><strong>Bug 2 — the missing rows are orphans.</strong> Orders whose <code>customerId</code> points at
+         a deleted customer get an <strong>empty array</strong>, and if you add a plain <code>$unwind</code>
+         they are dropped entirely — the left outer join silently becomes an inner join. That is exactly how a
+         revenue report ends up 0.25% low with nothing erroring.</p>
+      <p><strong>The diagnostic worth running on any collection that has been live for years:</strong></p>
+<pre>
+db.orders.aggregate([
+  { $lookup: { from: "customers", localField: "customerId",
+               foreignField: "_id", as: "c" } },
+  { $match: { c: { $eq: [] } } },
+  { $count: "orphans" }
+])
+</pre>
+      <p><strong>One more thing that is not a bug but should be:</strong> the <code>$lookup</code> pulls whole
+         customer documents to use one field. Add a sub-pipeline projection, or the join carries every field
+         of every matched customer through the rest of the pipeline.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Rewrite this to attach only each order's 3 most recent
+      events, and say what failure mode you have removed.
+<pre>
+db.orders.aggregate([
+  { $lookup: { from: "events", localField: "_id",
+               foreignField: "orderId", as: "events" } },
+  { $addFields: { events: { $slice: ["$events", -3] } } }
+])
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The rewrite — bound the join inside the sub-pipeline:</strong></p>
+<pre>
+db.orders.aggregate([
+  { $lookup: {
+      from: "events",
+      let: { oid: "$_id" },
+      pipeline: [
+        { $match: { $expr: { $eq: ["$orderId", "$$oid"] } } },
+        { $sort:  { ts: -1 } },
+        { $limit: 3 },
+        { $project: { _id: 0, type: 1, ts: 1 } }
+      ],
+      as: "events"
+  } }
+])
+db.events.createIndex({ orderId: 1, ts: -1 })   // serves match+sort
+</pre>
+      <p><strong>The failure mode removed:</strong> the original joins <em>every</em> event and then throws
+         all but three away. Typical orders have 40 events, but one measured subscription order had 312,000 —
+         enough to blow the 16 MB document limit and fail the entire pipeline with
+         <code>BSONObjectTooLarge</code>. The rewritten version can never attach more than three documents, so
+         the failure is impossible by construction rather than merely unlikely.</p>
+      <p><strong>The performance difference on the same data:</strong> 2,100 ms → 180 ms. The index matters as
+         much as the rewrite — <code>{orderId: 1, ts: -1}</code> serves both the <code>$match</code> and the
+         <code>$sort</code>, so the <code>$limit</code> stops after three index entries instead of sorting
+         everything first.</p>
+      <p><strong>The general principle:</strong> reduce before you combine. Work done inside the sub-pipeline
+         happens before results are attached; work done after is work you already paid for. Unlike a
+         relational optimiser, MongoDB will not push that predicate down for you.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Build a monthly report: revenue by customer segment,
+      for paid orders in a date range, where the segment lives on the customer document. 4.1M orders, 900k
+      customers. Write it and justify the stage order.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+db.orders.aggregate([
+  // 1. REDUCE FIRST - indexed, and it removes ~97% of the input
+  { $match: { status: "paid",
+              createdAt: { $gte: monthStart, $lt: monthEnd } } },
+
+  // 2. Slim the documents before they enter the join
+  { $project: { customerId: 1, totalCents: 1 } },
+
+  // 3. Join, taking only the one field we need
+  { $lookup: {
+      from: "customers",
+      let: { cid: "$customerId" },
+      pipeline: [ { $match: { $expr: { $eq: ["$_id", "$$cid"] } } },
+                  { $project: { _id: 0, segment: 1 } } ],
+      as: "c" } },
+
+  // 4. Adjacent to the lookup -> coalesced. Keep orphans visible.
+  { $unwind: { path: "$c", preserveNullAndEmptyArrays: true } },
+
+  // 5. Group, defaulting orphans rather than dropping them
+  { $group: { _id: { $ifNull: ["$c.segment", "«unknown»"] },
+              revenue: { $sum: "$totalCents" },
+              orders:  { $sum: 1 } } },
+  { $sort: { revenue: -1 } }
+])
+
+db.orders.createIndex({ status: 1, createdAt: -1 })
+</pre>
+      <p><strong>Why the stage order is the whole answer:</strong></p>
+      <table class="tbl">
+        <tr><th>Stage</th><th>Reason</th></tr>
+        <tr><td><code>$match</code> first</td><td>Uses an index and cuts 4.1M documents to ~120k. Every later stage costs 97% less. Putting it after the <code>$lookup</code> would join 4.1M documents to discard most of them</td></tr>
+        <tr><td><code>$project</code> before the join</td><td>Orders carry embedded items; the report needs two fields. Slimming first reduces what flows through the pipeline</td></tr>
+        <tr><td>Sub-pipeline projection</td><td>Attaches one field per customer, not whole documents</td></tr>
+        <tr><td><code>$unwind</code> adjacent</td><td>Coalescence: the server never materialises the intermediate arrays — measured 2.4 s vs 9.1 s when separated, with 3.2 GB peak memory</td></tr>
+        <tr><td><code>preserveNullAndEmptyArrays</code></td><td>Without it, orphaned orders vanish and the report is silently low</td></tr>
+        <tr><td><code>$ifNull</code> in the group</td><td>Orphans land in a visible <code>«unknown»</code> bucket instead of disappearing. <strong>A report that shows you its own data quality is worth more than one that quietly rounds it away</strong></td></tr>
+      </table>
+      <p><strong>What I would suggest next if this ran monthly and mattered:</strong> denormalise
+         <code>segment</code> onto the order at write time. It is a snapshot anyway — the segment the customer
+         was in <em>when they ordered</em> is arguably more correct for a historical report than their segment
+         today — and it removes the join entirely.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> An org-chart endpoint returns everyone under a manager.
+      It uses <code>$graphLookup</code> and takes 640 ms; it is called on every page load of the admin
+      dashboard. It also hung once and had to be killed. Diagnose both and fix.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The hang first, because it is a correctness bug.</strong> A <code>$graphLookup</code> without
+         <code>maxDepth</code> traverses until it exhausts memory if the data contains a cycle — employee A
+         manages B manages A. That happens for mundane reasons: a data import, an interim manager
+         arrangement, someone set as their own manager during a reorg.</p>
+<pre>
+{ $graphLookup: { ..., maxDepth: 6, depthField: "level",
+                  restrictSearchWithMatch: { active: true } } }
+</pre>
+      <p><code>maxDepth</code> bounds it, <code>depthField</code> lets you reconstruct the hierarchy from the
+         flat output array, and <code>restrictSearchWithMatch</code> prunes <em>during</em> traversal rather
+         than after — in the measured tree that was the difference between exploring 240k nodes and 40k.
+         I would also add a cycle check to the write path that sets <code>managerId</code>, because bounding
+         the read does not fix the data.</p>
+      <p><strong>The 640 ms is a design problem, not a tuning one.</strong> This is a hot read path doing an
+         ad-hoc recursive traversal on every page load. First confirm the index exists on the
+         <code>connectToField</code> — unindexed it was 41 s, so 640 ms means the index is there and this is
+         as good as <code>$graphLookup</code> gets.</p>
+      <p><strong>Denormalise an ancestors array</strong> (from <a href="patterns.html">the patterns
+         lesson</a>):</p>
+<pre>
+{ _id: "emp_88", managerId: "emp_12",
+  ancestors: ["emp_1", "emp_4", "emp_12"] }
+db.employees.createIndex({ ancestors: 1 })
+
+db.employees.find({ ancestors: managerId })      // 8 ms
+</pre>
+      <p>80× faster, and it is a plain indexed <code>find</code> — no aggregation, no depth limit, no cycle
+         risk at read time.</p>
+      <p><strong>The trade I would state explicitly:</strong> moving someone with a large sub-org rewrites
+         every descendant's <code>ancestors</code>. In an org chart, reads happen thousands of times a day and
+         reorgs happen quarterly, so this is clearly the right trade — but say the number out loud rather than
+         discovering it during a reorg. Keep <code>managerId</code> alongside as the source of truth to
+         rebuild from if a move is interrupted halfway.</p>
+      <p><strong>Where I would keep <code>$graphLookup</code>:</strong> ad-hoc admin queries with an arbitrary
+         start node and depth. It is the right tool for exploration; it is the wrong tool for a dashboard.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Design deletion for a SaaS app: a workspace has projects,
+      projects have tasks, tasks have comments and attachments. Workspaces get deleted (billing lapse), and
+      users can request GDPR erasure. Specify the whole mechanism.
+      <details class="solution"><summary>Solution</summary>
+      <p>These are <strong>two different operations</strong> with different requirements, and conflating them
+         is the usual design error. Workspace deletion is a bulk lifecycle event; erasure is a targeted legal
+         obligation that cuts <em>across</em> workspaces.</p>
+      <p><strong>A. Workspace deletion — soft delete, then asynchronous reclamation.</strong></p>
+<pre>
+// 1. Immediate, atomic, single-document: access stops now
+db.workspaces.updateOne({ _id: wid },
+  { $set: { status: "deleted", deletedAt: new Date(),
+            purgeAfter: addDays(new Date(), 30) } })
+
+// 2. Every read path is workspace-scoped anyway, so one guard
+//    in the repository layer covers the whole app:
+//      { workspaceId: wid, ... } + workspace.status === "active"
+
+// 3. A worker purges after the grace period, bottom-up, in
+//    throttled batches, resumable:
+//      attachments (+ blob store) -> comments -> tasks
+//      -> projects -> workspace
+</pre>
+      <p><strong>Why bottom-up and not top-down:</strong> if the job dies halfway, children without parents are
+         still reachable by their own <code>workspaceId</code> and the job resumes. Deleting the workspace
+         first would strand everything else with no efficient way to find it.</p>
+      <p><strong>Why every child carries a denormalised <code>workspaceId</code></strong>, even a comment four
+         levels down: it makes purge, export and access control single-index operations rather than recursive
+         traversals. This is the single most important schema decision in the design, and it must be made at
+         the start — retrofitting it means backfilling every collection.</p>
+      <p><strong>Why 30 days:</strong> billing lapses get reversed. Immediate hard deletion converts a payment
+         problem into an unrecoverable data-loss incident.</p>
+      <p><strong>B. GDPR erasure — targeted, and it must cross workspaces.</strong> This is where the design
+         gets hard, because a user's personal data is scattered as <em>denormalised copies</em>:</p>
+<pre>
+users:       { _id, email, name }                    -> scrub
+comments:    { authorId, author: { name, avatar } }  -> extended
+tasks:       { assigneeId, assignee: { name } }         reference
+audit_log:   { actorId, actorEmail }                    copies!
+attachments: uploader metadata, and the FILE CONTENTS
+</pre>
+      <p><strong>The mechanism:</strong> maintain a registry of every location holding personal data — a
+         literal list in code, reviewed when any schema changes — and drive erasure from it:</p>
+<pre>
+// 1. Scrub the source
+db.users.updateOne({ _id: uid },
+  { $set: { email: null, name: "[erased]", erasedAt: new Date() },
+    $unset: { phone: "", avatarUrl: "" } })
+
+// 2. Scrub every denormalised copy, from the registry
+for (const loc of PII_LOCATIONS) {
+  await db[loc.coll].updateMany({ [loc.idField]: uid },
+                                { $set: loc.scrub })
+}
+
+// 3. Verify, and record the evidence
+db.comments.countDocuments({ authorId: uid, "author.name": { $ne: "[erased]" } })
+// must be 0, and the verification result is itself the audit record
+</pre>
+      <p><strong>Three points I would raise in review:</strong></p>
+      <ul>
+        <li><strong>Do not delete the user document.</strong> <code>authorId</code> references must still
+            resolve, or every comment thread breaks. Scrub the fields, keep the row — and keep
+            <code>erasedAt</code> so a later "why is this blank?" has an answer.</li>
+        <li><strong>The registry is the deliverable</strong>, not the script. Personal data spreads with every
+            new extended reference, and a schema-change checklist item ("does this add a copy of user data?")
+            is what keeps erasure correct in two years.</li>
+        <li><strong>Backups and the blob store are in scope</strong> and are usually forgotten. Backups are
+            typically handled by a documented retention window rather than surgical edits; attachment
+            <em>contents</em> need a real delete from object storage, which no MongoDB operation performs.</li>
+      </ul>
+      <p><strong>And a reconciler for both paths</strong>: a weekly job that counts orphaned children and
+         un-scrubbed personal data after a completed erasure. Every mechanism above has a failure mode, and
+         the only thing that catches a handler someone forgot to update is a number on a dashboard.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> A reporting aggregation joins four collections and takes
+      94 seconds. It runs hourly and is now overlapping with itself. Produce a diagnosis plan and a set of
+      options ranked by cost.
+<pre>
+orders -> customers -> segments        (two chained lookups)
+orders -> events                       (avg 40 per order)
+4.1M orders, 900k customers, 164M events
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Step 1 — find where the time goes before changing anything.</strong> Guessing at a four-stage
+         join wastes a day:</p>
+<pre>
+db.orders.explain("executionStats").aggregate([...])
+</pre>
+      <p>Read it for four specific things: (a) a <code>COLLSCAN</code> in any <code>$lookup</code>'s inner
+         plan; (b) where <code>nReturned</code> jumps — the fan-out point; (c) whether the initial
+         <code>$match</code> uses an index; (d) any <code>SORT</code> stage with a spill. Then bisect: run the
+         pipeline truncated after each stage and time it. The stage where the clock jumps is the target.</p>
+      <p><strong>Step 2 — the likely findings, in order of probability:</strong></p>
+      <table class="tbl">
+        <tr><th>Finding</th><th>Fix</th><th>Cost</th></tr>
+        <tr><td>Missing index on a <code>foreignField</code></td><td>Create it</td><td>Minutes — and worth 22× on the measured case</td></tr>
+        <tr><td>The <code>events</code> join fans out 4.1M → 164M</td><td>Bound it in the sub-pipeline, or pre-aggregate events per order</td><td>Hours</td></tr>
+        <tr><td><code>$match</code> after the joins</td><td>Move it first</td><td>Minutes</td></tr>
+        <tr><td><code>$unwind</code> separated from its <code>$lookup</code></td><td>Make them adjacent</td><td>Minutes</td></tr>
+        <tr><td>Chained <code>customers → segments</code></td><td>Denormalise <code>segment</code> onto the customer</td><td>Hours + a backfill</td></tr>
+      </table>
+      <p><strong>Step 3 — options ranked by cost, which is what the question is really asking:</strong></p>
+      <ol>
+        <li><strong>Stop the overlap immediately</strong> (minutes, and it is an outage risk, not a
+            performance one). A distributed lock or a "running" flag so a second run cannot start. Two
+            concurrent 94-second aggregations over 164M events compete for exactly the cache the operational
+            workload needs — this is how a reporting job becomes a production incident.</li>
+        <li><strong>Index and stage-order fixes</strong> (hours). Often 5–10× on their own.</li>
+        <li><strong>Pre-aggregate the events</strong> (a day). 164M events joined hourly to produce
+            per-order counts is the computed pattern begging to be applied: maintain
+            <code>eventCount</code> and <code>lastEventAt</code> on the order and the biggest join
+            disappears.</li>
+        <li><strong>Denormalise <code>segment</code> onto orders at write time</strong> (a day + backfill).
+            Removes both chained lookups. Also more correct for a historical report — the segment at order
+            time, not today's.</li>
+        <li><strong>Incremental reporting</strong> (a few days). Process only the last hour's orders into a
+            rollup collection instead of re-reading all 4.1M every hour. Cost becomes proportional to
+            <em>new</em> data, which is the only version of this that stays fixed as the collection grows.</li>
+        <li><strong>Move it off the operational cluster</strong> (a project). A secondary read preference with
+            a dedicated analytics node, or a warehouse. The honest observation is that a four-way join over
+            164M documents is warehouse work, and the cluster is being asked to do two jobs with one cache.</li>
+      </ol>
+      <p><strong>What I would actually do:</strong> ship 1 today, 2 this week, and propose 3+5 together — they
+         compose, and they convert an hourly cost that scales with total data into one that scales with new
+         data. I would present 6 as the direction of travel with a trigger ("when the incremental job exceeds
+         15 minutes") rather than as an immediate ask, because it is a project and the cheaper fixes buy the
+         time to do it properly.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>A relationship is just a field holding an <code>_id</code></strong> — no foreign keys, no
+            cascades, no integrity. One audit found 3,100 orphaned orders accumulated silently over three
+            years.</li>
+        <li><strong>Every reference needs a written answer to "what happens to the children on delete?"</strong>
+            Cascade, soft delete, change-stream cascade, prevent, or tolerate — plus a reconciler in every
+            case.</li>
+        <li><strong><code>$lookup</code> is a left outer join that returns an ARRAY</strong>, even for 1:1 —
+            and unmatched inputs get an empty array, not nothing.</li>
+        <li><strong>Index the <code>foreignField</code></strong>: 47 s unindexed versus 2.1 s indexed, with no
+            warning either way. Check the inner plan in <code>explain()</code>.</li>
+        <li><strong><code>$lookup</code> output is subject to the 16 MB document limit.</strong> One order
+            with 312,000 events failed an entire pipeline with <code>BSONObjectTooLarge</code>.</li>
+        <li><strong>Keep <code>$unwind</code> adjacent to its <code>$lookup</code></strong> so they coalesce:
+            2.4 s versus 9.1 s and 3.2 GB peak memory when separated.</li>
+        <li><strong><code>$unwind</code> silently converts a left join to an inner join</strong> unless you set
+            <code>preserveNullAndEmptyArrays</code>.</li>
+        <li><strong>The pipeline form with <code>let</code> lets you filter, sort and limit inside the
+            join</strong> — 2,100 ms to 180 ms, and it makes the 16 MB failure impossible by construction.</li>
+        <li><strong>Reduce before you combine.</strong> <code>$match</code> first, filter in the sub-pipeline,
+            project away what you will not use — MongoDB will not push predicates down for you.</li>
+        <li><strong><code>$$var</code> is a <code>let</code> variable; <code>$field</code> is a foreign
+            document's field.</strong> Confusing them matches nothing, with no error.</li>
+        <li><strong>An uncorrelated sub-pipeline runs exactly once</strong> — the right way to join small
+            static reference data.</li>
+        <li><strong><code>$graphLookup</code> always needs <code>maxDepth</code></strong>; your data will
+            contain a cycle eventually. Use <code>restrictSearchWithMatch</code> to prune during traversal.</li>
+        <li><strong>For hot-path traversal, denormalise instead</strong>: 8 ms for an ancestors array versus
+            640 ms for <code>$graphLookup</code>, and 41 s unindexed.</li>
+        <li><strong>For a page of rows, a batched <code>$in</code> beats <code>$lookup</code></strong> — 7 ms
+            versus 2,100 ms. Dedupe the ids, and key JavaScript Maps on <code>String(id)</code>.</li>
+        <li><strong>Sharding changes join economics by an order of magnitude</strong>: 2.1 s → 25.4 s for a
+            broadcast join, and <code>$graphLookup</code>'s foreign collection cannot be sharded at all. Audit
+            joins <em>before</em> choosing a shard key.</li>
+        <li><strong>Soft delete with a partial unique index</strong> is usually the right answer for anything
+            with financial history — and remember that it does not remove denormalised copies of personal
+            data.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="patterns.html">← Schema Design Patterns</a>
+      <a href="schema-validation.html">Schema Validation &amp; Evolution →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
