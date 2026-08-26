@@ -236,51 +236,60 @@ replicated**; **3.25 engineer-days closed a contractual SLA breach**)
 (→ `s3`/`edge-dns` and `rds-aurora`/`dynamodb`), and the quiz bank was rewritten to the v4 curriculum
 (`10 200 0`, 0 duplicate stems, de-skewed with `node tools/quizshuffle.js`).
 
-**🚧 IN PROGRESS: CI/CD v4 (track 18)** — `tutorials/cicd/`, rebuilding 12 v3 lessons (~11KB) into
-**20 lessons at v4 depth** (63–67KB, every one `det=12 ex=6`). New `nav.js` written: 6 sections —
-Foundations 4 · Building & Testing 4 · Pipeline Engineering 4 · Deployment 4 · Security & Supply Chain 3 ·
-Operating & Measuring 2, + Practice. **6 of 20 done:**
+**✅ CI/CD v4 (track 18) COMPLETE** — all **21 lessons** rebuilt from 12 v3 (~11KB) to v4 (59–67KB,
+every one `det=12 ex=6`) across 6 sections, both end-of-track chores done, and the **quiz bank rewritten
+to the v4 curriculum** (200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed 60/63/77). Whole
+track passes `python validate.py tutorials/cicd` with **0 errors and 0 warnings** (29 files); pushed & live.
 
-*§1 Foundations 4/4* — ✅ `index.html` (**CI is about merge frequency, not owning a pipeline**; branch-age
-conflict curve 4% at &lt;1 day → 61% at 14+ days; a 34-min pipeline = 71 engineer-hours/week of waiting vs
-$140/month of compute; batch-size arithmetic 26% vs 1.5% with MTTR 64 → 6 min; the five guarantees
-[reproducibility, isolation, immutability, honest signal, speed]; the silent zero — 8 weeks with 0 tests
-collected; red main = 927 engineer-hours/quarter, merge queue 61 → 7 incidents, revert-first 38 → 6 min) ·
-✅ `git-workflows.html` · ✅ `first-pipeline.html` (**a job is a machine, a step is a new shell**; trigger
-semantics incl. pull_request_target; path filters −56% runs and the required-check-never-runs trap;
-concurrency groups cancelled 41% of runs, **queue time 6m20s → 47s**; critical path 34 → 11 min via
-fan-out/fan-in at +41% runner-minutes; fail-fast backwards; **artifact vs cache and the load-bearing-cache
-bug** — 9 weeks with nothing compiled; build once, promote the digest; YAML orchestrates, `ci/*.sh`
-decides; the debugging ladder vs 22 pushes) · ✅ `pipeline-as-code.html` (copy-paste priced as change cost
-— 61 PRs, 11 weeks, **23 repos still unpatched**; composite-action capability boundary [no services,
-concurrency, matrix, runner]; **`@main` broke 47 repos in 2 minutes** → moving major tags, SHA-pinned
-third parties; dated deprecation 60 → 4 consumers in 8 weeks and the stragglers are unowned repos; the
-**config complexity clock** and escaping at step 3; five test layers incl. canaries for permissions;
-generation only when the graph depends on the diff — 34 builds/41 min → 2.8/9 min)
-*§2 Building & Testing 2/4* — ✅ `test-strategy.html` (**the pyramid is economics: diagnosis time 4 / 18 /
-71 min**, e2e = 4.6% of tests and 74% of cost; the placement rule; **mock drift = 8 production defects in
-5 months**, schema-validating doubles + consumer-driven contracts; fakes omit exactly what a DB is for;
-parallel isolation — one shared DB + 4 workers = 9% failures; **impact selection 41 → 6 min** with an
-always-run set and full post-merge suite, 1 escape in 612 PRs; **84% line coverage vs 47% mutation
-score**) · ✅ `flaky-tests.html` (**0.1% × 1,100 tests = 33% of runs green**; 9 tests caused 80% of flakes;
-first-attempt 61% vs reported 94%; nine kinds with signatures; **polling not sleeping: −31% duration AND
-−94% timing flakes**; detection from JUnit history; quarantine policy — auto-detect → auto-quarantine →
-nightly ×20 → CODEOWNERS owner → 14-day deadline → auto-delete, 2% cap, protected paths escalate;
-**19 of 63 quarantined tests were real product bugs**, two matching closed "could not reproduce" tickets)
+*§1 Foundations ×4* — `index.html` (**CI is merge frequency, not owning a pipeline**; branch-age conflicts
+4%→61%; 34-min pipeline = 71 engineer-hours/week vs $140/month compute; batch arithmetic 26% vs 1.5%; the
+five guarantees; the silent zero; red main = 927 engineer-hours/quarter; merge queue 61→7; revert-first
+38→6 min) · `git-workflows.html` · `first-pipeline.html` (**a job is a machine, a step is a new shell**;
+concurrency cancelled 41% of runs, queue 6m20s→47s; critical path 34→11 min; **artifact vs cache and the
+load-bearing-cache bug**) · `pipeline-as-code.html` (copy-paste = 61 PRs/11 weeks/23 unpatched;
+composite-action capability boundary; **`@main` broke 47 repos in 2 min**; config complexity clock)
+*§2 Building & Testing ×4* — `test-strategy.html` (**diagnosis time 4/18/71 min**; mock drift = 8 defects
+in 5 months; **impact selection 41→6 min**; 84% coverage vs 47% mutation) · `flaky-tests.html`
+(**0.1% × 1,100 = 33% green**; polling not sleeping −31%/−94%; quarantine with a 14-day deadline;
+**19 of 63 were real product bugs**) · `quality-gates.html` (**a routed-around gate is worse than none**;
+FP cliff at ~1%/20%; the ratchet 2,412→0 in 9 months; observe→warn→block; break glass) ·
+`build-artifacts.html` (build once promote the digest; reproducibility; retention that deleted prod's image;
+41TB→6.2TB)
+*§3 Pipeline Engineering ×4* — `containers-in-ci.html` (cold cache 8m52s→47s; QEMU 14× slower;
+**host socket = root on the runner**) · `pipeline-performance.html` (feedback = queue+setup+critical
+path+publish; four levers in order; sharding curve; capacity in money) · `runners-infrastructure.html`
+(self-host for capability — 31 engineer-days/yr; **fork PRs = RCE inside your network**; labels are not a
+boundary; disk = 61% of infra failures) · `pipeline-reliability.html` (CI as production with SLIs and a
+priced error budget; classified retries; layered timeouts + watchdog; detection-first postmortems)
+*§4 Deployment ×4* — `deployment-strategies.html` (blast radius × detection; draining 1,840 dropped
+requests → 0; **canary sample-size statistics**; rollback drilled 7m10s→74s) · `environments-promotion.html`
+(staging caused 9 incidents and caught 8; 61 config differences; digest promotion with an evidence record;
+previews $310 vs $4,900) · `database-migrations.html` (**code rolls back, data does not**; expand/contract
+as six phased releases; `ADD COLUMN … DEFAULT gen_random_uuid()` = 4m12s exclusive lock; backfills as jobs;
+compatibility matrix) · `progressive-delivery.html` (deploy ≠ release; **flag vendor on the request path =
+41-min outage**; deterministic bucketing; 312 flags with 71% dead; peeking 4.9%→22.4%)
+*§5 Security & Supply Chain ×3* — `secrets-and-auth.html` (**OIDC `sub` condition or the role is public**;
+masking fails on base64; rotate-first — key used 61 s after the push; `permissions: {}`) ·
+`supply-chain.html` (four links; provenance vs SBOM; **100% signed, 0% verified**; SBOM from the image
+214→389 components; admission audit-first found 3 hand-built images) · `dependency-management.html`
+(47 chosen, 1,284 installed; weekly grouped updates 2 days/month vs 19/batch; bot merge rate 41%→94%;
+847 advisories → 9 exploitable)
+*§6 Operating & Measuring ×2* — `dora-metrics.html` (the four keys as pairs; definitions decide the numbers
+9d vs 4h; 340% frequency from empty deploys; the constraint moves across three quarters) ·
+`platform-rollout.html` (paved road vs queue vs mandate; adoption 12→57/60 in 12 weeks; **10 of 14 opt-outs
+were platform defects**; honest funding case with the shortfall stated)
 
-**NEXT: `quality-gates.html`**, then `build-artifacts.html` to close §2, then §3 Pipeline Engineering
-(`containers-in-ci`, `pipeline-performance`, `runners-infrastructure`, `pipeline-reliability`), §4
-Deployment (`deployment-strategies`, `environments-promotion`, `database-migrations`,
-`progressive-delivery`), §5 (`secrets-and-auth`, `supply-chain`, `dependency-management`), §6
-(`dora-metrics`, `platform-rollout`).
-**THEN the two end-of-track chores:** (1) convert the 7 orphaned v3 files to redirect stubs —
-`what-is-ci`, `github-actions`, `testing-gates`, `artifacts-versioning`, `secrets-oidc`, `docker-in-ci`,
-`feature-flags`; (2) retune the CI/CD quiz bank to the v4 curriculum, then `node tools/quizshuffle.js`
-and `python tools/quizcheck.py tutorials/cicd`. Then **MongoDB** — the last v3 track.
+Also: the 7 orphaned v3 files (`what-is-ci`, `github-actions`, `testing-gates`, `artifacts-versioning`,
+`secrets-oidc`, `docker-in-ci`, `feature-flags`) are now **redirect stubs**.
 
-**Track-wide note (2026-08-21 audit):** 19 of 23 quiz banks are answer-skewed (correct answer at index 1
-for ~100% of questions); `docker`, `kubernetes`, `leetcode` and `redis` are clean. Fix per track with
-`node tools/quizshuffle.js tutorials/<track>` — awaiting the user's go-ahead.
+**⏳ NEXT: MongoDB v4 (track 19)** — the last v3 track. 12 v3 lessons (~9KB) → ~20 at v4.
+
+**Track-wide note (2026-08-21 audit, still open):** 19 of 23 quiz banks are answer-skewed (correct answer at
+index 1 for ~100% of questions); `cicd`, `docker`, `kubernetes`, `leetcode` and `redis` are clean. Fix per
+track with `node tools/quizshuffle.js tutorials/<track>` then `python tools/quizcheck.py tutorials/<track>` —
+awaiting the user's go-ahead.
+
+
 
 **Then the remaining infra two:** CI/CD → MongoDB, each 12 v3 → ~20 at v4.
 
