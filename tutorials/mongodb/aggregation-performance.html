@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aggregation Performance — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Aggregation Performance <span class="level-badge level-ultra">Aggregation</span></h1>
+
+    <p><strong>What you'll master:</strong> where the time in a pipeline actually goes, which is almost never
+       where people look — <strong>the first stage decides the cost of everything after it</strong>, and a
+       pipeline whose opening <code>$match</code> cannot use an index has already lost before the interesting
+       stages run; the ordering discipline stated as a measurable rule, with the numbers
+       (<strong>the same six stages reordered went from 9.1 s to 240 ms</strong>, and the single stage
+       inserted between <code>$sort</code> and <code>$limit</code> that cost <strong>3.2 GB of peak
+       memory</strong>); <code>$lookup</code> economics — why an unindexed join was <strong>47 s against
+       2.1 s indexed</strong>, why the sub-pipeline form took the same query to <strong>180 ms</strong>, and
+       the case where a batched application join beat <code>$lookup</code> by <strong>300×</strong>; how
+       memory is really budgeted (per blocking stage, per <code>$facet</code> branch, per
+       <code>$setWindowFields</code> partition) and why <strong><code>$group</code> cardinality, not document
+       count, predicts a spill</strong>; what a sharded aggregation does — which stages run on the shards,
+       which force a merge, and the pipeline whose <code>$group</code> ran <strong>12 times in parallel and
+       then once more on the merging node</strong>; and the decision that matters more than any of it:
+       <strong>whether the pipeline should run on the request path at all</strong>. Prerequisites:
+       <a href="aggregation.html">The Aggregation Pipeline</a>,
+       <a href="aggregation-advanced.html">Advanced Stages</a> and
+       <a href="explain-plans.html">Reading Explain Plans</a>.</p>
+
+    <h2>Part 1 — The First Stage Decides Everything</h2>
+
+    <p>A pipeline's cost is dominated by how many documents enter it. Only the first stage can use an index to
+       reduce that number, so the first stage is not one optimisation among several — it is the one that
+       determines whether the others matter.</p>
+
+<pre>
+  db.orders.explain("executionStats").aggregate([...])
+
+  The first thing to read is $cursor in the explain output:
+
+    "$cursor": {
+      "queryPlanner": { "winningPlan": { "stage": "IXSCAN", ... } },
+      "executionStats": { "nReturned": 4100,
+                          "totalDocsExamined": 4100 }
+    }
+
+  IXSCAN with a small nReturned  -> the pipeline starts small
+  COLLSCAN                       -> the pipeline reads everything,
+                                    and no later stage can undo that
+</pre>
+
+<pre>
+MEASURED: the same aggregation, four opening stages
+
+  Collection: 41M orders. Target: August revenue by region.
+
+  A. { $group: ... } first, $match on the group after
+       reads 41,000,000 documents                        118 s
+
+  B. { $match: { createdAt: { $gte: aug } } } first,
+     no index on createdAt
+       COLLSCAN 41,000,000, then groups 1,240,000          31 s
+
+  C. same $match, index { createdAt: -1 }
+       IXSCAN, 1,240,000 documents                        3.4 s
+
+  D. same, index { status: 1, createdAt: -1 } and the
+     status predicate moved into the leading $match
+       IXSCAN, 310,000 documents                          0.9 s
+
+  A to D is 131x, and three of the four changes are one line.
+</pre>
+
+    <div class="note">🔑 <strong>Read <code>$cursor</code> before anything else in an aggregation
+       explain.</strong> If it shows a <code>COLLSCAN</code> or a large <code>nReturned</code>, stop
+       optimising later stages — nothing downstream can recover the cost of reading the collection. Get an
+       indexed, selective first <code>$match</code>, then look at the rest.</div>
+
+    <h3>What the first stage can and cannot use</h3>
+
+    <table class="tbl">
+      <tr><th>Opening stage</th><th>Index-capable?</th></tr>
+      <tr><td><code>$match</code> with normal query operators</td><td>Yes — it becomes an ordinary indexed query</td></tr>
+      <tr><td><code>$match</code> with <code>$expr</code></td><td>Weakly. Some forms are optimised; many are not. Prefer the query form</td></tr>
+      <tr><td><code>$sort</code></td><td>Yes — an index in that order makes it non-blocking</td></tr>
+      <tr><td><code>$geoNear</code></td><td>Yes, and it <em>requires</em> a geo index. Must be first</td></tr>
+      <tr><td><code>$match</code> + <code>$sort</code> together</td><td>Yes, if one compound index serves both (ESR order — see <a href="indexes.html">How Indexes Work</a>)</td></tr>
+      <tr><td>Anything after a reshaping stage</td><td>No. Once a document has been transformed, indexes are irrelevant</td></tr>
+    </table>
+
+    <h2>Part 2 — Reduce Before You Compute</h2>
+
+    <p>The rule is one sentence: <em>every stage that removes data should come before every stage that adds
+       or computes it</em>. Here is what following it is worth.</p>
+
+<pre>
+MEASURED: six stages, two orders
+
+  BEFORE                                  AFTER
+    $set    (compute a label)               $match  (indexed)
+    $lookup (join users)                    $sort
+    $unwind                                 $limit 100
+    $sort                                   $lookup
+    $set    (compute another field)         $unwind
+    $limit 100                              $set, $set
+    $match  (filter!)
+                    9.1 s                            240 ms
+       peak memory 3.2 GB                     peak memory 41 MB
+       spilled to disk                        no spill
+
+  Nothing was added or removed. The stages were reordered.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Move</th><th>Why it pays</th><th>Typical effect</th></tr>
+      <tr><td><code>$match</code> to the front</td><td>Becomes an indexed query; every later stage sees fewer documents</td><td>The largest single win, usually 10–100×</td></tr>
+      <tr><td>Split a mixed <code>$match</code></td><td>The optimiser cannot push a <code>$match</code> forward if any clause depends on an earlier stage — but you can split it</td><td>Removes the join cost for the filtered-out majority</td></tr>
+      <tr><td><code>$project</code>/<code>$unset</code> before <code>$unwind</code></td><td><code>$unwind</code> multiplies the stream; unused fields are multiplied too</td><td>2–5× on memory</td></tr>
+      <tr><td><code>$sort</code> adjacent to <code>$limit</code></td><td>Coalesces into a bounded top-<em>k</em> holding <em>k</em> documents instead of all of them</td><td>3.2 GB → 40 MB in the measured case</td></tr>
+      <tr><td><code>$limit</code> before <code>$lookup</code></td><td>100 joins instead of millions</td><td>Often the difference between seconds and milliseconds</td></tr>
+      <tr><td>Computation last</td><td><code>$set</code>/<code>$project</code> expressions run per document; run them on the survivors</td><td>Proportional to how much you filtered</td></tr>
+    </table>
+
+<pre>
+  THE SPLIT THAT THE OPTIMISER CANNOT DO FOR YOU
+
+  { $lookup: { from: "customers", ... , as: "c" } },
+  { $unwind: "$c" },
+  { $match: { "c.region": "eu",                    // needs the join
+              createdAt: { $gte: cutoff } } }      // does NOT
+
+  Both clauses sit in one $match, so nothing moves. Split it:
+
+  { $match: { createdAt: { $gte: cutoff } } },     // indexed, first
+  { $lookup: { ... } },
+  { $unwind: "$c" },
+  { $match: { "c.region": "eu" } }
+
+  If the date filter keeps 3% of orders, you just removed 97% of
+  the join work with a two-line edit.
+</pre>
+
+    <h2>Part 3 — <code>$lookup</code> Economics</h2>
+
+<pre>
+  $lookup executes, conceptually, one query against the foreign
+  collection PER INPUT DOCUMENT. It is an N+1 inside the database.
+
+  Which means everything depends on two numbers:
+    N = how many documents reach the $lookup
+    cost of one foreign lookup (indexed or not)
+</pre>
+
+<pre>
+MEASURED: the same join, four ways
+
+  1.24M orders joined to customers
+
+  A. foreignField not indexed
+       COLLSCAN of customers per input document        47 s
+  B. foreignField indexed (_id)                        2.1 s
+  C. reduced N first ($match before the $lookup,
+     3% of orders survive)                             94 ms
+  D. sub-pipeline form: filter and project INSIDE
+     the join, so less crosses the boundary          180 ms
+     (on the full 1.24M input -- compare with B)
+</pre>
+
+<pre>
+  THE SUB-PIPELINE FORM
+
+  { $lookup: {
+      from: "orders",
+      let: { cid: "$_id" },
+      pipeline: [
+        { $match: { $expr: { $eq: ["$customerId", "$$cid"] } } },
+        { $match: { status: "paid" } },        // filter INSIDE
+        { $sort:  { createdAt: -1 } },
+        { $limit: 3 },                         // bound INSIDE
+        { $project: { total: 1, createdAt: 1 } }
+      ],
+      as: "recentOrders" } }
+
+  Three things this buys:
+    - the joined array is bounded by construction, so the 16 MB
+      document limit can never be hit
+    - only the fields you need cross the boundary
+    - $$cid is a let variable; $customerId is a field of the
+      FOREIGN document. Confusing the two matches nothing, silently
+</pre>
+
+    <table class="tbl">
+      <tr><th>Situation</th><th>Use</th><th>Why</th></tr>
+      <tr><td>Small N, indexed foreign key, need the whole document</td><td><code>$lookup</code> localField/foreignField</td><td>Simplest, and fast enough</td></tr>
+      <tr><td>Need only some joined rows, or only some fields</td><td>Sub-pipeline with <code>let</code></td><td>Filters and bounds inside the join</td></tr>
+      <tr><td>A page of ~20 rows in an application</td><td>Batched <code>$in</code> in the application</td><td>Measured 7 ms versus 2,100 ms — one extra round trip beats 20 server-side joins</td></tr>
+      <tr><td>Small, static reference data</td><td>Uncorrelated sub-pipeline (no <code>let</code>)</td><td>Runs exactly once for the whole aggregation</td></tr>
+      <tr><td>Sharded foreign collection</td><td>Reconsider the schema</td><td>Cross-shard joins broadcast; 2.1 s became 25.4 s in the measured case</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>An unindexed <code>$lookup</code> gives no warning.</strong> It does not fail,
+       it does not log, and the top-level explain shows a normal stage. The only place it is visible is the
+       nested inner plan inside the <code>$lookup</code> stage of an <code>executionStats</code> explain. A
+       <code>COLLSCAN</code> there against a foreign <code>_id</code> field is also diagnostic of something
+       worse: it usually means a type mismatch (a string <code>customerId</code> against an ObjectId
+       <code>_id</code>), which means some joins are already silently returning empty arrays.</div>
+
+    <h2>Part 4 — Memory, Honestly</h2>
+
+<pre>
+  Budget: 100 MB PER BLOCKING STAGE.
+  Not per pipeline. Not per document. Per stage.
+
+  Which stages hold memory, and proportional to what:
+
+    $sort      the whole input, unless coalesced with $limit
+               (then k documents) or served by an index (then none)
+    $group     ONE ENTRY PER DISTINCT KEY, plus each accumulator's
+               state. Document count is almost irrelevant
+    $facet     each branch's blocking stages, all live at once
+    $setWindowFields   one partition at a time
+    $bucket    one entry per bucket -- naturally small
+    $graphLookup   the visited set; capped at 100 MB and
+               allowDiskUse does NOT lift it
+</pre>
+
+<pre>
+MEASURED: cardinality predicts a spill, volume does not
+
+  $group over 41M orders
+
+  _id: "$status"          4 distinct keys        1.2 MB   1.9 s
+  _id: "$customerId"      2.1M distinct keys      410 MB  SPILLED
+  _id: "$orderId"         41M distinct keys       8.2 GB  SPILLED
+                                                          hard
+  Same input size every time. The only variable is how many
+  groups exist.
+
+  Two ways out, in order of preference:
+    1. reduce the input first (a $match, or a coarser key --
+       group by month instead of by day, by customer instead of
+       by order)
+    2. accept the spill, but only in a batch job, on a secondary,
+       with allowDiskUse and maxTimeMS
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr>
+      <tr><td>Exceeded memory limit for <code>$sort</code></td><td>Sorting the whole stream</td><td>Index the sort order, or coalesce with an adjacent <code>$limit</code></td></tr>
+      <tr><td>Exceeded memory limit for <code>$group</code></td><td>Too many distinct keys</td><td>Filter first, or use a coarser grouping key</td></tr>
+      <tr><td><code>BSONObjectTooLarge</code> after <code>$group</code></td><td>An unbounded <code>$push</code>/<code>$addToSet</code></td><td><code>$topN</code>, bounded by construction</td></tr>
+      <tr><td><code>usedDisk: true</code> in explain</td><td>Something spilled</td><td>Find which stage; reduce its input</td></tr>
+      <tr><td>Fine in staging, fails in production</td><td>Cardinality, not volume — staging has 40 customers</td><td>Test against production-shaped cardinality</td></tr>
+    </table>
+
+    <p>The last row is the one that reaches production. A <code>$group</code> by customer over a 5,000-document
+       staging set has 40 groups and 200 KB of state. The same pipeline in production has 2.1 million groups
+       and 410 MB. Nothing about the code changed; the shape of the data did, and no amount of code review
+       catches it.</p>
+
+    <h2>Part 5 — Aggregations on a Sharded Cluster</h2>
+
+<pre>
+  A sharded aggregation is split in two:
+
+    SHARD PART   runs on every targeted shard, in parallel
+    MERGE PART   runs on ONE node -- a random shard, or the
+                 PRIMARY SHARD for some stages
+
+  mongos splits the pipeline at the first stage that cannot be
+  parallelised, and everything from there runs on the merger.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Stage</th><th>Where it runs</th></tr>
+      <tr><td><code>$match</code>, <code>$project</code>, <code>$unwind</code>, <code>$limit</code></td><td>On every shard, in parallel</td></tr>
+      <tr><td><code>$sort</code></td><td>Partially on shards, then a merge-sort on the merger</td></tr>
+      <tr><td><code>$group</code></td><td><strong>Both</strong> — a partial group per shard, then a final group on the merger</td></tr>
+      <tr><td><code>$facet</code>, <code>$graphLookup</code>, <code>$out</code>, <code>$lookup</code> (in most forms)</td><td><strong>Merging node only</strong>, and often forced onto the primary shard</td></tr>
+      <tr><td><code>$merge</code></td><td>Writes distributed, coordinated by the merger</td></tr>
+    </table>
+
+<pre>
+MEASURED: what the summary hides
+
+  12 shards, orders sharded on { customerId: "hashed" }
+
+  db.orders.aggregate([
+    { $match: { createdAt: { $gte: cutoff } } },   // no shard key!
+    { $group: { _id: "$region", revenue: { $sum: "$amount" } } }
+  ])
+
+  shardsTargeted: 12         &lt;- a broadcast
+  Each shard: IXSCAN on createdAt, partial $group, ~40 rows out
+  Merger: final $group over 480 partial rows
+
+  Total 380 ms and it looks fine. It is not fine at scale:
+  every one of these queries occupies all 12 shards. At 200
+  queries/sec that is 2,400 shard operations/sec of pure
+  coordination, and ADDING A SHARD MAKES IT WORSE.
+
+  With the shard key in the $match:
+    { $match: { customerId: cid, createdAt: { $gte: cutoff } } }
+    shardsTargeted: 1     -- 12x less cluster work
+</pre>
+
+    <table class="tbl">
+      <tr><th>Rule</th><th>Reason</th></tr>
+      <tr><td>Include the shard key in the leading <code>$match</code> whenever possible</td><td>Turns a broadcast into a targeted query</td></tr>
+      <tr><td>Do the heavy reduction in shard-parallel stages</td><td><code>$match</code>, <code>$project</code> and the partial <code>$group</code> all scale with shard count; merge stages do not</td></tr>
+      <tr><td>Avoid <code>$facet</code>, <code>$graphLookup</code> and unindexed <code>$lookup</code> on sharded collections</td><td>They collapse the work onto one node, which then becomes the bottleneck for the whole cluster</td></tr>
+      <tr><td>Check <code>shardsTargeted</code> and <code>mergeType</code> in explain</td><td><code>mergeType: "primaryShard"</code> means one node is doing work that could not be distributed</td></tr>
+    </table>
+
+    <h2>Part 6 — The Decision Before the Optimisation</h2>
+
+    <p>Everything above assumes the pipeline should run when it runs. Often the largest available win is
+       deciding that it should not.</p>
+
+    <table class="tbl">
+      <tr><th>Question</th><th>If the answer is…</th><th>Then</th></tr>
+      <tr><td>How fresh must the result be?</td><td>"Within an hour is fine"</td><td>Pre-compute with <code>$merge</code>; the request reads a document</td></tr>
+      <tr><td>How many distinct results exist?</td><td>"A few hundred rows"</td><td>Materialise all of them; do not compute per request</td></tr>
+      <tr><td>Who runs it?</td><td>"Every page load"</td><td>Cache it, even for 60 seconds — that is a 99% reduction at 100 rps</td></tr>
+      <tr><td>Where does it run?</td><td>"The primary"</td><td>Move it to <code>secondaryPreferred</code> or an analytics node at minimum</td></tr>
+      <tr><td>Can the first stage use an index?</td><td>"No"</td><td>It does not belong on a request path at all</td></tr>
+    </table>
+
+<pre>
+MEASURED: the four interventions, same dashboard
+
+  baseline: 6 aggregations per page load, on the primary
+                                                     2.8 s/load
+  1. leading indexed $match on each                  0.9 s/load
+  2. $sort/$limit adjacency + projections            0.6 s/load
+  3. moved to secondaryPreferred                     0.6 s/load
+     (no latency change -- but the primary's cache
+      stopped being churned, and unrelated p99 went
+      from 34 ms to 4 ms)
+  4. pre-computed hourly with $merge; page reads
+     6 documents                                      11 ms/load
+
+  Steps 1-2 are real engineering and gave 4.6x.
+  Step 4 gave another 55x and made the cost independent of
+  traffic. Step 3 fixed a problem nobody had attributed to the
+  dashboard at all.
+</pre>
+
+    <div class="note">🔑 <strong>Monitor aggregations as a distinct class of work.</strong> They show up in the
+       profiler with <code>command.aggregate</code>, and the fields worth alerting on are
+       <code>usedDisk: true</code> (a spill that will get worse), <code>millis</code> above a threshold, and
+       a rising <em>count</em> of a shape you thought was scheduled — the classic regression is a nightly
+       rollup that someone quietly wired into a request handler. Group by <code>queryHash</code> and rank by
+       total time, exactly as in <a href="query-tuning.html">Query Tuning in Production</a>; an aggregation
+       run 10,000 times an hour at 40 ms outranks the report everyone complains about.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Optimising later stages while the first is a <code>COLLSCAN</code></td><td>Nothing downstream can recover the cost of reading 41M documents</td><td>Read <code>$cursor</code> in explain first; fix the opening <code>$match</code></td></tr>
+      <tr><td><code>$group</code> before <code>$match</code></td><td>118 s versus 0.9 s for the same result</td><td>Filter, then group</td></tr>
+      <tr><td>Leaving a mixed <code>$match</code> after a <code>$lookup</code></td><td>The optimiser cannot split it, so nothing moves and everything is joined</td><td>Split it yourself; lead with the join-independent half</td></tr>
+      <tr><td>A stage between <code>$sort</code> and <code>$limit</code></td><td>Coalescence blocked: 3.2 GB and a spill instead of 41 MB</td><td>Keep them adjacent; reshape afterwards</td></tr>
+      <tr><td>No projection before <code>$unwind</code></td><td>Unused fields are multiplied by the array length</td><td><code>$project</code>/<code>$unset</code> first</td></tr>
+      <tr><td>Unindexed <code>$lookup</code></td><td>47 s versus 2.1 s, with no warning anywhere except the nested inner plan</td><td>Index the <code>foreignField</code>; check the inner plan in explain</td></tr>
+      <tr><td>A <code>COLLSCAN</code> on a foreign <code>_id</code></td><td>Type mismatch — and some joins are already silently returning empty</td><td>Fix the data type; treat it as a correctness bug first</td></tr>
+      <tr><td><code>$lookup</code> for a page of 20 rows</td><td>2,100 ms versus 7 ms for a batched <code>$in</code> in the application</td><td>Batch the join client-side for small pages</td></tr>
+      <tr><td>Predicting memory from document count</td><td><code>$group</code> memory tracks <em>distinct keys</em>: 4 keys = 1.2 MB, 2.1M keys = 410 MB, same input</td><td>Estimate cardinality, not volume</td></tr>
+      <tr><td>Testing pipelines against staging data</td><td>40 groups in staging, 2.1M in production — the code is identical and only one spills</td><td>Seed production-shaped cardinality</td></tr>
+      <tr><td><code>allowDiskUse</code> as the response to a memory error</td><td>19× slowdown, and the pipeline still processes data it should have filtered</td><td>Reduce the input; reserve spilling for batch jobs</td></tr>
+      <tr><td>Aggregating without the shard key on a sharded collection</td><td>Every query occupies all 12 shards; adding a shard makes it worse</td><td>Include the shard key in the leading <code>$match</code>; check <code>shardsTargeted</code></td></tr>
+      <tr><td><code>$facet</code>/<code>$graphLookup</code> on a sharded collection</td><td>Collapses the work onto one merging node, often the primary shard</td><td>Restructure, or pre-compute</td></tr>
+      <tr><td>Running rollups on the primary</td><td>Cache churn degrades unrelated queries — p99 34 ms versus 4 ms</td><td><code>secondaryPreferred</code> or an analytics node</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the single most important stage for aggregation performance?</summary>
+      <p>The first one, because only the first stage can use an index to reduce how many documents enter the
+         pipeline, and everything after it is proportional to that number.</p>
+      <p>In one measured case the same result took 118 seconds with <code>$group</code> first and 0.9 seconds
+         with a selective indexed <code>$match</code> first. No later stage can undo the cost of having read
+         41 million documents, so if the <code>$cursor</code> section of the explain shows a
+         <code>COLLSCAN</code>, that is where the work is — not in the stages that look complicated.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why is <code>$lookup</code> sometimes very slow?</summary>
+      <p>Because it performs a lookup against the foreign collection for each input document — an N+1 inside
+         the database. Two things determine the cost: how many documents reach the <code>$lookup</code>, and
+         whether the <code>foreignField</code> is indexed.</p>
+      <p>Unindexed, each input document causes a scan of the foreign collection: 47 seconds versus 2.1
+         indexed, in the case I have measured. And the unindexed version gives no warning — the top-level
+         explain shows a normal stage, and only the nested inner plan reveals the <code>COLLSCAN</code>.</p>
+      <p>The other half is reducing N. Moving a <code>$match</code> before the <code>$lookup</code> so only 3%
+         of documents are joined took the same query from 2.1 seconds to 94 milliseconds.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A <code>$group</code> works in staging and exceeds the memory limit in production. Why?</summary>
+      <p>Because <code>$group</code> memory is proportional to the number of <em>distinct group keys</em>, not
+         to the number of input documents, and staging has different cardinality. The same 41M-document input
+         grouped by <code>status</code> (four keys) used 1.2 MB; grouped by <code>customerId</code> (2.1
+         million keys) it used 410 MB and spilled.</p>
+      <p>Staging with 5,000 documents and 40 customers has 40 groups. The code is identical, the data shape is
+         not, and no code review catches it.</p>
+      <p>The fixes in order: reduce the input with a leading indexed <code>$match</code>; use a coarser
+         grouping key if the fine one is not needed (month rather than day, customer rather than order); and
+         only then consider <code>allowDiskUse</code>, which is legitimate for a batch job on a secondary and
+         is a 19× slowdown rather than a fix.</p>
+      <p>The durable fix is a seeded test dataset with production-like cardinality, because this class of bug
+         is only ever found in production otherwise.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How does an aggregation execute on a sharded cluster?</summary>
+      <p>mongos splits the pipeline into a shard part and a merge part. The shard part runs in parallel on
+         every targeted shard; the merge part runs on a single node — sometimes an arbitrary shard, sometimes
+         the primary shard specifically. The split happens at the first stage that cannot be parallelised.</p>
+      <p><code>$match</code>, <code>$project</code>, <code>$unwind</code> and <code>$limit</code> run on the
+         shards. <code>$group</code> is interesting: it runs in both halves — a partial group per shard, then
+         a final group on the merger, which is why it parallelises well. <code>$facet</code>,
+         <code>$graphLookup</code> and most <code>$lookup</code> forms run only on the merging node, which
+         makes them the stages to avoid on sharded collections.</p>
+      <p>The number I would check first is <code>shardsTargeted</code>. A pipeline whose leading
+         <code>$match</code> omits the shard key broadcasts to every shard — which can look fine at 380 ms
+         and low volume, and does not scale: adding a shard makes each such query more expensive, not less.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Walk me through optimising a 22-second aggregation.</summary>
+      <p><strong>Explain first, and read it in a specific order.</strong> The <code>$cursor</code> section: is the
+         opening stage an <code>IXSCAN</code> and how many documents does it produce? Then <code>usedDisk</code>,
+         to see whether anything spilled. Then, on a sharded collection, <code>shardsTargeted</code> and
+         <code>mergeType</code>. Then the nested plan inside any <code>$lookup</code>.</p>
+      <p><strong>Then the ordering pass</strong>, which is mechanical and usually where the win is: can the
+         opening <code>$match</code> use an index; is there a <code>$match</code> later that could be split so
+         its join-independent half leads; are <code>$sort</code> and <code>$limit</code> adjacent; is there a
+         projection before any <code>$unwind</code> or <code>$lookup</code>; is every accumulator bounded. In
+         a measured case those changes alone took 9.1 seconds to 240 milliseconds with no stage added or
+         removed.</p>
+      <p><strong>Then verify</strong> by re-running the explain and comparing the same numbers — not by
+         impression.</p>
+      <p><strong>But the question I would ask before any of it is why it runs at all.</strong> If it is on a
+         request path, the largest available win is usually not making it faster — it is pre-computing it
+         with <code>$merge</code> so the request reads a document. On the dashboard I have measured, careful
+         tuning gave 4.6× and pre-computation gave another 55×, and the pre-computed version's cost is
+         independent of traffic.</p>
+      <p><strong>And one thing that is easy to miss:</strong> moving the aggregation off the primary changed no
+         latency at all for the aggregation itself, but took unrelated p99 from 34 ms to 4 ms, because the
+         primary's cache had been getting churned. Large scans and low-latency point reads want opposite
+         things from a cache, and that cost lands on queries nobody has connected to the dashboard.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> When should an aggregation not run on the operational database at all?</summary>
+      <p>My test is whether the first stage can use an index to reduce the input to something small. If it
+         cannot — if the pipeline's job is inherently to read a large fraction of a large collection — then it
+         is a batch workload, and running it on the operational cluster means it competes for the same cache
+         and CPU as the writes and point reads the product depends on.</p>
+      <p><strong>The ladder I would walk, cheapest first:</strong> run it on a secondary or hidden analytics
+         member; pre-compute it with <code>$merge</code> so requests read documents; and only then move the
+         workload out entirely, to a warehouse or an analytical store.</p>
+      <p>Most "we need a data warehouse" conversations, at the scale most products actually operate at, are
+         satisfied by the middle rung — a handful of scheduled pipelines writing summary collections. That
+         costs staleness, which is a product decision I would put in front of whoever owns the dashboard with
+         the actual numbers attached rather than deciding on their behalf.</p>
+      <p><strong>The genuine signals to move out:</strong> ad-hoc exploration over full history (no fixed set of
+         materialised views satisfies it), joins across many collections that keep growing, retention
+         requirements measured in years, and analysts who need to write their own queries. Those are not
+         tuning problems, and treating them as tuning problems is how an operational cluster ends up sized
+         for reporting.</p>
+      <p><strong>What I would resist:</strong> moving out prematurely. A warehouse is a pipeline to build, a
+         freshness contract to maintain, and a second copy of the truth to reconcile. If three scheduled
+         <code>$merge</code> jobs solve it, that is a week of work rather than a quarter, and it can be
+         reversed.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Reorder this pipeline and state the expected effect of each
+      move.
+<pre>
+  db.orders.aggregate([
+    { $set:   { year: { $year: "$createdAt" } } },
+    { $sort:  { total: -1 } },
+    { $limit: 50 },
+    { $match: { status: "paid" } }
+  ])
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>First, note that this is also wrong</strong>, not just slow: the <code>$match</code> applies to
+         the 50 highest-value orders of <em>any</em> status, so it returns however many of those happen to be
+         paid — not the 50 highest-value paid orders. A pipeline that filters last usually has this bug.</p>
+<pre>
+  db.orders.aggregate([
+    { $match: { status: "paid" } },      // 1. indexed, and correct
+    { $sort:  { total: -1 } },           // 2. adjacent to...
+    { $limit: 50 },                      //    ...the limit
+    { $set:   { year: { $year: "$createdAt" } } }   // 3. on 50 docs
+  ])
+
+  index: { status: 1, total: -1 }
+</pre>
+      <table class="tbl">
+        <tr><th>Move</th><th>Effect</th></tr>
+        <tr><td><code>$match</code> to the front</td><td>Becomes an <code>IXSCAN</code>; fixes the correctness bug</td></tr>
+        <tr><td><code>$sort</code>+<code>$limit</code> kept adjacent</td><td>Coalesces into a top-50 sort holding 50 documents rather than all matches</td></tr>
+        <tr><td><code>$set</code> moved last</td><td>The <code>$year</code> expression runs 50 times instead of once per order in the collection</td></tr>
+        <tr><td>The index</td><td>With <code>{ status: 1, total: -1 }</code> the sort comes from the index too, so there is no SORT stage at all and the scan stops after 50 keys</td></tr>
+      </table>
+      <p>With that index the pipeline examines roughly 50 index keys and fetches 50 documents, regardless of
+         collection size.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> This explain fragment is from a slow aggregation. What is
+      wrong, and what would you check next?
+<pre>
+  "$cursor": {
+     "queryPlanner": { "winningPlan": { "stage": "COLLSCAN" } },
+     "executionStats": { "nReturned": 4100000,
+                         "totalDocsExamined": 4100000,
+                         "executionTimeMillis": 8200 }
+  },
+  ... later stages ...
+  "usedDisk": true
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>What is wrong:</strong> the pipeline reads all 4.1 million documents before doing anything.
+         Everything else — including the spill — is a consequence. The <code>usedDisk: true</code> is not an
+         independent problem; a blocking stage exceeded 100 MB precisely because 4.1 million documents
+         reached it.</p>
+      <p><strong>The order to investigate:</strong></p>
+      <ol>
+        <li><strong>Is there a <code>$match</code> at all?</strong> If not, does the report genuinely need every
+            document, or has a date/status filter been left out?</li>
+        <li><strong>If there is one, why is it a <code>COLLSCAN</code>?</strong> Likely causes: no index on the
+            predicate field; the <code>$match</code> is not first; it uses <code>$expr</code> or a computed
+            expression (<code>{ $year: "$createdAt" }</code>) that cannot be indexed; or it uses
+            <code>$ne</code>/<code>$nin</code>/an unanchored regex.</li>
+        <li><strong>Can a <code>$match</code> that appears later be split</strong> so a join-independent,
+            indexable half moves to the front?</li>
+      </ol>
+      <p><strong>What I would not do:</strong> add <code>allowDiskUse: true</code>. It would stop the error and
+         make it slower — the measured penalty is around 19×. The spill is a symptom telling you the pipeline
+         is carrying data it should have filtered out.</p>
+      <p><strong>What I would check next in the explain:</strong> which stage spilled (it names the stage in the
+         error or the stage-level stats), because that tells you whether the fix is a filter, a coarser
+         <code>$group</code> key, or an index for a <code>$sort</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> This runs in 240 ms for most customers and 40 seconds for
+      the biggest one. Diagnose and fix.
+<pre>
+  db.customers.aggregate([
+    { $match: { _id: cid } },
+    { $lookup: { from: "orders", localField: "_id",
+                 foreignField: "customerId", as: "orders" } },
+    { $set: { recent: { $slice: [ { $sortArray: {
+                 input: "$orders", sortBy: { createdAt: -1 } } }, 10 ] },
+              ltv: { $sum: "$orders.total" } } },
+    { $unset: "orders" }
+  ])
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Diagnosis:</strong> the <code>$lookup</code> pulls <em>every</em> order for the customer into an
+         array inside a single document, then sorts that array in memory and discards all but 10. For a
+         customer with 50 orders that is trivial. For one with 400,000 it is a 400,000-element array in one
+         document — which is both enormous to build and at risk of the 16 MB document limit, at which point
+         the pipeline does not get slower, it fails.</p>
+      <p>The cost is proportional to the customer's order count, which is exactly the "works for most, fails
+         for the biggest" signature.</p>
+<pre>
+  db.customers.aggregate([
+    { $match: { _id: cid } },
+    { $lookup: {
+        from: "orders",
+        let: { cid: "$_id" },
+        pipeline: [
+          { $match: { $expr: { $eq: ["$customerId", "$$cid"] } } },
+          { $sort:  { createdAt: -1 } },
+          { $limit: 10 },
+          { $project: { total: 1, createdAt: 1, status: 1 } }
+        ],
+        as: "recent" } }
+  ])
+
+  index: { customerId: 1, createdAt: -1 }
+</pre>
+      <p>Now the join returns at most 10 small documents regardless of the customer, the sort is served by the
+         index inside the sub-pipeline, and the 16 MB limit is unreachable by construction.</p>
+      <p><strong>The <code>ltv</code> field needs a different answer</strong>, because it genuinely depends on
+         every order and no bounded join can produce it. Three options:</p>
+      <table class="tbl">
+        <tr><th>Option</th><th>Trade-off</th></tr>
+        <tr><td>A second uncorrelated <code>$lookup</code> doing a <code>$group</code> sum inside the sub-pipeline</td><td>Returns one number instead of 400,000 documents — far better than the original, but still scans all the customer's orders on every request</td></tr>
+        <tr><td>Maintain <code>ltv</code> on the customer document, <code>$inc</code>ed at order time</td><td>Exact and instant; needs a reconciler because counters drift through failed writes and refunds</td></tr>
+        <tr><td>Nightly rollup into a <code>customer_stats</code> collection</td><td>Cheapest to operate; stale by the job interval</td></tr>
+      </table>
+      <p>I would take the second: users notice immediately if their own lifetime total is wrong, so exactness
+         matters here in a way it does not for, say, a percentile rank. The reconciler is a weekly job that
+         recomputes a sample and alerts on mismatches.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> A pipeline is fine on 11 shards and slow on the 12th.
+      What could cause that, and how would you investigate?
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The most likely causes, in order of probability:</strong></p>
+      <table class="tbl">
+        <tr><th>Cause</th><th>How to confirm</th></tr>
+        <tr><td><strong>Data skew</strong> — the shard key concentrates a disproportionate share of matching documents on that shard</td><td>Per-shard <code>nReturned</code> and <code>docsExamined</code> in the explain's <code>shards</code> section; <code>sh.status()</code> chunk distribution</td></tr>
+        <tr><td><strong>It is the primary shard</strong> and the pipeline has a merge-only stage (<code>$facet</code>, <code>$graphLookup</code>, <code>$lookup</code>)</td><td><code>mergeType</code> in the explain; that shard is doing the merge <em>plus</em> its own share</td></tr>
+        <tr><td><strong>A missing or different index on that shard</strong></td><td>Compare <code>getIndexes()</code> across shards — a rolling index build that failed partway leaves exactly this state</td></tr>
+        <tr><td><strong>Hardware or cache difference</strong></td><td><code>serverStatus().wiredTiger.cache</code> on that member; a smaller instance or a colder cache after a restart</td></tr>
+        <tr><td><strong>Another workload on that shard</strong></td><td><code>currentOp</code>; a backup, a resync, or an index build</td></tr>
+      </table>
+      <p><strong>The investigation order:</strong> read the per-shard stats in the explain first, because they
+         separate "this shard has more work" (skew) from "this shard is slower at the same work" (index,
+         hardware, contention). That one distinction eliminates half the list immediately.</p>
+      <p><strong>If it is skew</strong>, the fix is not a pipeline change — it is the shard key, and that is a
+         significant piece of work. The interim mitigations are including the shard key in the leading
+         <code>$match</code> where possible so most queries do not touch that shard at all, and checking
+         whether a jumbo chunk is blocking the balancer.</p>
+      <p><strong>If it is the merge concentrating on the primary shard</strong>, the fix is restructuring the
+         pipeline to avoid merge-only stages, or pre-computing the result so the pipeline runs on a schedule
+         rather than on requests.</p>
+      <p><strong>What I would check before all of this:</strong> whether the pipeline includes the shard key at
+         all. If it broadcasts to 12 shards, the "slow shard" may simply be the one whose latency dominates a
+         scatter-gather — and the real finding is that the query should not be broadcasting.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A reporting pipeline joins four collections and takes 8
+      minutes. Produce a prioritised optimisation plan with expected effects and risks.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Measurement before any change</strong>, because with four joins the cost is almost never evenly
+         distributed and guessing wastes the effort:</p>
+<pre>
+  explain("executionStats"):
+    $cursor      -> opening stage: IXSCAN or COLLSCAN? nReturned?
+    each $lookup -> its NESTED plan. A COLLSCAN there is the
+                    single most likely finding
+    usedDisk     -> which stage spilled
+    shardsTargeted / mergeType, if sharded
+</pre>
+      <table class="tbl">
+        <tr><th>Priority</th><th>Change</th><th>Expected</th><th>Risk</th></tr>
+        <tr><td>1</td><td>Index every <code>foreignField</code> that shows a <code>COLLSCAN</code> in its inner plan</td><td>Often 10–20× on its own</td><td>Low. Index build cost on a large foreign collection; roll it across nodes</td></tr>
+        <tr><td>2</td><td>Move/split the <code>$match</code> so the most selective, join-independent predicate leads and is indexed</td><td>Proportional to selectivity — 97% of the join work removed if the filter keeps 3%</td><td>Low, but verify the result set is unchanged: a filter that was applied after a join may have different semantics before it</td></tr>
+        <tr><td>3</td><td>Convert each <code>$lookup</code> to the sub-pipeline form with an inner <code>$match</code>, <code>$limit</code> and <code>$project</code></td><td>Large where fan-out is high; also removes 16 MB failure risk</td><td>Medium — the <code>let</code>/<code>$$var</code> semantics are easy to get subtly wrong. Compare row counts before and after</td></tr>
+        <tr><td>4</td><td>Reorder: reduce → sort/limit adjacent → join → compute</td><td>Measured 9.1 s → 240 ms on a comparable pipeline</td><td>Low</td></tr>
+        <tr><td>5</td><td>Run it on a secondary or analytics node with <code>maxTimeMS</code></td><td>No latency change; removes the impact on production p99</td><td>Low. Accepts replication-lag staleness, which is irrelevant for a report</td></tr>
+        <tr><td>6</td><td>Pre-compute with <code>$merge</code>, incrementally with a watermark</td><td>Report becomes a read of a small collection; cost proportional to new data</td><td>Higher — needs idempotency (<code>whenMatched: "replace"</code>), a lock, and a staleness alert</td></tr>
+      </table>
+      <p><strong>What I would ship and when:</strong> 1, 2 and 4 immediately — they are low-risk, mechanical, and
+         likely to take 8 minutes to well under one. 5 in the same change, because it costs nothing and fixes
+         a problem nobody has attributed to this report. 3 as a follow-up with careful before/after row
+         comparison. 6 only if the report is run often enough to justify a scheduled job — for something run
+         twice a month, an 8-minute pipeline that becomes a 40-second one on a secondary is finished work,
+         and building a materialised view for it is over-engineering.</p>
+      <p><strong>The structural question I would raise alongside the plan:</strong> four joins in an operational
+         database is a signal. It may mean the schema is modelled relationally and the read pattern is
+         fighting it — see <a href="schema-design.html">Embed vs Reference</a> — or it may mean reporting has
+         grown into the operational cluster without anyone deciding it should. Neither is fixed by
+         optimisation, and both get more expensive to address later. I would put the numbers in front of
+         whoever owns the roadmap rather than absorbing it quietly as a tuning task.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design the monitoring that would have caught every problem
+      in this lesson before a user did.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The design principle: alert on properties that predict future failure, not just on current
+         latency.</strong> Every problem in this lesson had a leading indicator that was visible before it
+         became an incident.</p>
+      <table class="tbl">
+        <tr><th>Signal</th><th>Source</th><th>Catches</th></tr>
+        <tr><td><code>usedDisk: true</code> on any aggregation</td><td>Profiler</td><td>A spill — always a warning that input growth will make it fail or crawl</td></tr>
+        <tr><td>Aggregations with a <code>COLLSCAN</code> opening stage</td><td>Profiler <code>planSummary</code></td><td>The single largest cost driver, before it is slow enough to notice</td></tr>
+        <tr><td>Total time per <code>queryHash</code>, ranked</td><td>Profiler aggregation</td><td>The 40 ms × 10,000/hour pipeline nobody complains about</td></tr>
+        <tr><td><strong>Rising call count</strong> for a shape you believe is scheduled</td><td>Same</td><td>The classic regression: a nightly rollup wired into a request handler</td></tr>
+        <tr><td><code>shardsTargeted &gt; 1</code> rate</td><td>Explain sampling / mongos logs</td><td>Broadcasts, which get worse as the cluster grows</td></tr>
+        <tr><td>Distinct-key cardinality on <code>$group</code> fields</td><td>A weekly scan</td><td>The staging-versus-production spill, <em>before</em> production crosses 100 MB</td></tr>
+        <tr><td>Materialised-view <code>updatedAt</code> staleness</td><td>The view itself</td><td>A rollup job that stopped, or succeeds while producing nothing</td></tr>
+        <tr><td>Rollup reconciliation mismatch</td><td>Scheduled recompute of a random past period</td><td>Silent drift and double-counting — otherwise found by an executive</td></tr>
+        <tr><td>Application-thread cache evictions</td><td><code>serverStatus</code></td><td>Reporting churning the primary's cache and degrading unrelated p99</td></tr>
+      </table>
+      <p><strong>Plus a CI gate</strong>, because the cheapest incident is the one that never ships: run each
+         registered pipeline against a seeded dataset with <em>production-like cardinality</em> and fail the
+         build on a <code>COLLSCAN</code> opening stage, a spill, or an unindexed inner <code>$lookup</code>
+         plan. Cardinality is the part that matters and the part everyone omits — a fixture with 40 customers
+         cannot reproduce a 2.1-million-group spill.</p>
+      <p><strong>What I would deliberately not alert on:</strong> raw aggregation latency thresholds. A batch
+         rollup legitimately takes minutes, and an alert that fires on it every night gets muted, taking the
+         useful alerts with it. Alert on the properties (<code>COLLSCAN</code>, spill, staleness, drift) and
+         let duration be a dashboard.</p>
+      <p><strong>Ordering, if I could only build some of it:</strong> the profiler ranking and the
+         <code>usedDisk</code> alert first — a day's work, and between them they surface most of what this
+         lesson describes. Then view staleness, because a silently dead rollup is the failure that damages
+         trust the most. The cardinality scan and the CI gate last; they are the most work and they prevent
+         rather than detect.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>The first stage decides everything.</strong> Read <code>$cursor</code> in the explain before
+            optimising anything else — 118 s versus 0.9 s for the same result.</li>
+        <li><strong>Only the opening stage can use an index.</strong> After any reshaping, indexes are
+            irrelevant.</li>
+        <li><strong>Reduce before you compute</strong> — reordering six stages went from 9.1 s and a 3.2 GB spill
+            to 240 ms and 41 MB, with nothing added or removed.</li>
+        <li><strong>Split a mixed <code>$match</code> yourself.</strong> The optimiser cannot push it forward if
+            any clause depends on an earlier stage.</li>
+        <li><strong>Keep <code>$sort</code> and <code>$limit</code> adjacent</strong>, and put
+            <code>$limit</code> before <code>$lookup</code>.</li>
+        <li><strong><code>$lookup</code> is an N+1 inside the database.</strong> Cost is (documents reaching it)
+            × (cost of one foreign lookup).</li>
+        <li><strong>An unindexed <code>$lookup</code> is silent</strong> — 47 s versus 2.1 s, visible only in the
+            nested inner plan.</li>
+        <li><strong>A <code>COLLSCAN</code> on a foreign <code>_id</code> means a type mismatch</strong>, which
+            is a correctness bug before it is a performance one.</li>
+        <li><strong>The sub-pipeline form filters, sorts and bounds inside the join</strong>, which also makes
+            the 16 MB limit unreachable by construction.</li>
+        <li><strong>For a page of rows, a batched <code>$in</code> in the application beats
+            <code>$lookup</code></strong> — 7 ms versus 2,100 ms.</li>
+        <li><strong>Memory is 100 MB per blocking stage</strong>, and <code>$group</code> memory tracks
+            <em>distinct keys</em>: 4 keys = 1.2 MB, 2.1M keys = 410 MB, on identical input.</li>
+        <li><strong>Cardinality, not volume, predicts a spill</strong> — which is why staging never reproduces
+            it.</li>
+        <li><strong>On a sharded cluster, <code>$group</code> runs twice</strong> (partial per shard, final on
+            the merger), while <code>$facet</code> and <code>$graphLookup</code> run only on the merging
+            node.</li>
+        <li><strong>Check <code>shardsTargeted</code>.</strong> A broadcast can look fine at 380 ms and gets
+            worse with every shard you add.</li>
+        <li><strong>Moving a rollup off the primary changed its own latency by nothing</strong> and took
+            unrelated p99 from 34 ms to 4 ms.</li>
+        <li><strong>Pre-computation beats tuning.</strong> On one dashboard, tuning gave 4.6× and
+            <code>$merge</code> gave another 55× — with cost independent of traffic.</li>
+        <li><strong>If the first stage cannot use an index to shrink the input, the pipeline is batch
+            work</strong>, whatever the code that calls it looks like.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="aggregation-advanced.html">← Advanced Stages</a>
+      <a href="replication.html">Replica Sets &amp; Read Concerns →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
