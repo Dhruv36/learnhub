@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reading Explain Plans — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Reading Explain Plans <span class="level-badge level-adv">Indexes</span></h1>
+
+    <p><strong>What you'll master:</strong> how to read <code>explain()</code> the way an engineer reads a
+       stack trace — <strong>bottom-up, because the stage tree executes from the leaves inward</strong>, and
+       the top-level summary is the last thing that happens, not the first; the three verbosity levels and
+       why <strong><code>queryPlanner</code> alone has misled more people than any other MongoDB output</strong>
+       (it reports a plan chosen against a trial sample, with no execution numbers at all); the four numbers
+       that diagnose every slow query and the <strong>three ratios</strong> between them that name the defect
+       precisely — <code>docsExamined ≫ nReturned</code> means a missing filter field,
+       <code>keysExamined ≫ nReturned</code> means loose bounds, and a <code>SORT</code> stage means you lost
+       the ordering; how to actually read <code>indexBounds</code>, including the
+       <strong><code>[MinKey, MaxKey]</code> entry that means "this field contributed nothing"</strong> and
+       is the single fastest way to spot a wasted compound field; the plan cache — why a query that was fast
+       for six months went to <strong>4.2 seconds after a deploy that changed nothing</strong>, how the trial
+       period picks a winner from a <strong>101-document sample that is not representative</strong>, and what
+       <code>planCacheKey</code>, <code>works</code> and cache eviction actually mean; and the parts that
+       behave differently — aggregation pipelines, sharded clusters where
+       <strong>the summed <code>docsExamined</code> hid a broadcast to all 12 shards</strong>, and the
+       operations <code>explain</code> silently refuses to model. Prerequisites:
+       <a href="indexes.html">How Indexes Work</a> and
+       <a href="index-types.html">Index Types &amp; Their Traps</a>.</p>
+
+    <h2>Part 1 — Three Verbosity Levels, Three Different Questions</h2>
+
+    <table class="tbl">
+      <tr><th>Mode</th><th>Runs the query?</th><th>Answers</th><th>Use when</th></tr>
+      <tr><td><code>"queryPlanner"</code> (default)</td><td>No</td><td>Which plan <em>would</em> be chosen, and what bounds it would use</td><td>You are designing an index and want to know if it is eligible</td></tr>
+      <tr><td><code>"executionStats"</code></td><td>Yes, the winning plan</td><td>What it actually cost: keys, docs, time, stage-by-stage</td><td><strong>Almost always.</strong> This is the default you should have</td></tr>
+      <tr><td><code>"allPlansExecution"</code></td><td>Yes, all candidates through the trial period</td><td>Why the planner chose <em>this</em> plan over the others</td><td>The planner picked something you disagree with</td></tr>
+    </table>
+
+<pre>
+  db.orders.find({ status: "paid" }).explain("executionStats")
+
+  db.orders.explain("executionStats")
+           .find({ status: "paid" })     // same thing, chainable form
+
+  db.orders.explain("executionStats")
+           .aggregate([ ... ])           // aggregation form
+
+  // and for an update/delete, which you cannot easily test otherwise:
+  db.orders.explain("executionStats")
+           .update({ status: "paid" }, { $set: { x: 1 } })
+  // explain does NOT apply the update. Safe to run in production.
+</pre>
+
+    <div class="note">⚠️ <strong>Default <code>explain()</code> with no argument runs
+       <code>queryPlanner</code>, which executes nothing.</strong> It tells you which index the planner
+       <em>believes</em> is best, based on a trial over a small sample — and it reports no keys examined, no
+       documents examined and no time. Every "the explain looked fine but the query is slow" conversation
+       starts here. Get in the habit of typing <code>explain("executionStats")</code> every time; the extra
+       17 characters are the difference between a plan and a measurement.</div>
+
+    <h2>Part 2 — The Stage Tree, Read Bottom-Up</h2>
+
+    <p>The <code>winningPlan</code> is a tree. Each stage has an <code>inputStage</code> (or
+       <code>inputStages</code>) beneath it. <strong>Data flows upward from the leaves</strong>, so the
+       deepest stage runs first and the outermost stage runs last — the opposite of the reading order.</p>
+
+<pre>
+  "winningPlan": {
+    "stage": "LIMIT",              &lt;- 4th: stop after 20
+      "inputStage": {
+        "stage": "SORT",           &lt;- 3rd: sort them in memory  (BAD)
+          "sortPattern": { createdAt: -1 },
+          "memLimit": 33554432,
+          "inputStage": {
+            "stage": "FETCH",      &lt;- 2nd: read each document
+              "filter": { region: { "$eq": "eu" } },
+              "inputStage": {
+                "stage": "IXSCAN", &lt;- 1st: scan the index
+                  "indexName": "status_1",
+                  "indexBounds": { status: [ "[\"paid\", \"paid\"]" ] }
+              }}}}
+
+  Reading it bottom-up as a sentence:
+    "Scan the status_1 index for status = paid, fetch every matching
+     document, throw away the ones where region is not eu, sort what
+     is left in memory by createdAt, then keep 20."
+
+  Three defects are visible in that sentence:
+    - region is filtered AFTER the fetch  -&gt; not in the index
+    - SORT is a stage             -&gt; the index did not supply order
+    - LIMIT is above SORT         -&gt; the limit saves NOTHING; every
+                                     matching document was read and
+                                     sorted before 20 were kept
+</pre>
+
+    <h3>The stage catalogue</h3>
+
+    <table class="tbl">
+      <tr><th>Stage</th><th>Meaning</th><th>Good sign?</th></tr>
+      <tr><td><code>COLLSCAN</code></td><td>Reading every document in the collection</td><td>Only on tiny collections or deliberate full scans</td></tr>
+      <tr><td><code>IXSCAN</code></td><td>Scanning a contiguous range of index keys</td><td>Yes — but check <code>keysExamined</code>, an IXSCAN can scan the whole index</td></tr>
+      <tr><td><code>FETCH</code></td><td>Reading the full document for a RecordId from the index</td><td>Normal, unless <code>docsExamined ≫ nReturned</code>, or it carries a <code>filter</code></td></tr>
+      <tr><td><code>FETCH</code> with a <code>filter</code></td><td>Documents are being read and then rejected</td><td><strong>No.</strong> That field belongs in the index</td></tr>
+      <tr><td><code>PROJECTION_COVERED</code></td><td>Answered from index keys alone, no document read</td><td>The best possible outcome</td></tr>
+      <tr><td><code>PROJECTION_SIMPLE</code> / <code>_DEFAULT</code></td><td>Fields trimmed after fetching</td><td>Neutral — it is not a covered query</td></tr>
+      <tr><td><code>SORT</code> + <code>SORT_KEY_GENERATOR</code></td><td>Blocking in-memory sort, 32 MB cap (unless <code>allowDiskUse</code>)</td><td><strong>No.</strong> Order should come from the index</td></tr>
+      <tr><td><code>LIMIT</code> / <code>SKIP</code></td><td>Row cutoff</td><td>Only helps if it is <em>below</em> any SORT in the tree</td></tr>
+      <tr><td><code>COUNT_SCAN</code></td><td>Counting from index keys with no fetch</td><td>Excellent — a covered count</td></tr>
+      <tr><td><code>DISTINCT_SCAN</code></td><td>Index seek that skips duplicate keys</td><td>Excellent, and a reason to prefer <code>distinct()</code> over <code>$group</code> where it applies</td></tr>
+      <tr><td><code>AND_SORTED</code> / <code>AND_HASH</code></td><td>Index intersection of two indexes</td><td>Usually means a compound index is missing</td></tr>
+      <tr><td><code>OR</code> / <code>SUBPLAN</code></td><td>A <code>$or</code> planned as separate branches, results deduplicated</td><td>Fine — <em>if every branch is indexed</em>. One unindexed branch scans the collection</td></tr>
+      <tr><td><code>SHARD_MERGE</code> / <code>SHARDING_FILTER</code></td><td>Merging shard results / discarding orphaned documents</td><td>Expected on sharded collections; see Part 6</td></tr>
+      <tr><td><code>EOF</code></td><td>The planner proved the query matches nothing</td><td>Free — e.g. a contradictory predicate</td></tr>
+    </table>
+
+    <h2>Part 3 — Four Numbers and Three Ratios</h2>
+
+<pre>
+  "executionStats": {
+    "nReturned":            20,
+    "totalKeysExamined": 412000,
+    "totalDocsExamined": 412000,
+    "executionTimeMillis": 1840
+  }
+</pre>
+
+    <p>The absolute values matter less than the relationships between them. Three comparisons diagnose almost
+       every slow query, and each names a different defect with a different fix.</p>
+
+    <table class="tbl">
+      <tr><th>Observation</th><th>Diagnosis</th><th>Fix</th></tr>
+      <tr><td><code>keysExamined ≈ docsExamined ≈ nReturned</code></td><td>Ideal. The index found exactly the right rows</td><td>Nothing</td></tr>
+      <tr><td><code>docsExamined == 0</code> with an IXSCAN</td><td>Covered query — the best case</td><td>Nothing</td></tr>
+      <tr><td><code>docsExamined ≫ nReturned</code>, and <code>docsExamined ≈ keysExamined</code></td><td>A filter field is not in the index; every candidate is fetched then rejected</td><td>Add that field to the index (in ESR position)</td></tr>
+      <tr><td><code>keysExamined ≫ docsExamined</code></td><td>The index bounds are loose but the index <em>can</em> reject rows without fetching — usually a non-prefix field, or a multikey range</td><td>Reorder the index so the selective field leads; or <code>$elemMatch</code> for arrays</td></tr>
+      <tr><td><code>keysExamined ≫ nReturned</code> with a <code>SORT</code> stage</td><td>Every match is being read to sort it; <code>limit</code> is saving nothing</td><td>Move the sort field into the index, after equality, before range</td></tr>
+      <tr><td><code>COLLSCAN</code> with a large <code>docsExamined</code></td><td>No usable index — or a predicate that cannot use one (<code>$ne</code>, <code>$nin</code>, unanchored <code>$regex</code>, <code>$where</code>)</td><td>Create an index; or rewrite the predicate as a positive range</td></tr>
+      <tr><td>Low examined counts, high <code>executionTimeMillis</code></td><td>Not a query-shape problem. Disk reads (cold cache), lock contention, or a saturated server</td><td>Check cache hit rate and <code>currentOp</code>, not the index</td></tr>
+    </table>
+
+    <p>That last row is the one people miss, and it changes the whole investigation. A query examining 50
+       keys and taking 900 ms is not badly indexed — it is waiting for something. The distinguishing check:</p>
+
+<pre>
+  // is the query itself slow, or is the SERVER slow?
+  db.orders.find({ ... }).explain("executionStats")
+    .executionStats.executionTimeMillis      -&gt; 900
+
+  Run it twice. If the second run is 3 ms, the first was reading
+  from disk: the working set is not in cache. That is a capacity
+  problem, not an index problem, and adding an index makes it
+  slightly worse.
+
+  Confirm with:
+    db.serverStatus().wiredTiger.cache
+      ["pages read into cache"]                  rising fast
+      ["pages evicted by application threads"]   &gt; 0 = the cliff
+</pre>
+
+    <h3><code>executionTimeMillis</code> is not what you think</h3>
+
+    <p>It measures the query's execution, including the planner's trial period on the first run. It excludes
+       network transfer to the client and it excludes time spent waiting for the client to request more
+       batches. So a query reported at 4 ms can take 900 ms end-to-end if the driver iterates a cursor of
+       200,000 documents in 101-document batches over a slow link. When the explain looks fast and the
+       application does not, measure at the driver, and check <code>nReturned</code> — the fix is usually a
+       <code>limit</code>, a projection, or a larger <code>batchSize</code>, not an index.</p>
+
+    <h2>Part 4 — Reading <code>indexBounds</code></h2>
+
+    <p>This is the most information-dense part of the output and the most skipped. It shows, per indexed
+       field, the exact key range the scan will cover.</p>
+
+<pre>
+  index: { status: 1, region: 1, createdAt: -1 }
+
+  QUERY: { status: "paid", region: "eu",
+           createdAt: { $gte: ISODate("2026-08-01") } }
+
+  "indexBounds": {
+    "status":    [ "[\"paid\", \"paid\"]" ],
+    "region":    [ "[\"eu\", \"eu\"]" ],
+    "createdAt": [ "[new Date(9999999999999), new Date(1754006400000)]" ]
+  }
+
+  Read it as:
+    status    exact point   (equality  -- tightest possible)
+    region    exact point   (equality)
+    createdAt bounded range (descending index, so hi..lo)
+
+  All three fields contribute. This is a fully-bounded scan.
+</pre>
+
+<pre>
+  THE BOUND THAT MEANS "THIS FIELD DID NOTHING"
+
+  QUERY: { status: "paid", createdAt: { $gte: ... } }
+         (region omitted)
+
+  "indexBounds": {
+    "status":    [ "[\"paid\", \"paid\"]" ],
+    "region":    [ "[MinKey, MaxKey]" ],           &lt;&lt;&lt;&lt;&lt;
+    "createdAt": [ "[MinKey, MaxKey]" ]            &lt;&lt;&lt;&lt;&lt;
+  }
+
+  [MinKey, MaxKey] = the entire range of that field. The scan
+  covers EVERY region and EVERY createdAt within status: "paid".
+  The createdAt predicate is applied as a filter DURING the scan,
+  not as a bound -- because region sits between them and was
+  skipped, so matching keys are not contiguous.
+
+  This is the prefix rule, visible in the output. One glance at the
+  bounds tells you which compound fields are earning their place
+  and which are dead weight.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Bound you see</th><th>What it means</th></tr>
+      <tr><td><code>["x", "x"]</code></td><td>Equality — the tightest possible bound</td></tr>
+      <tr><td><code>["x", "z")</code></td><td>Range, inclusive lower / exclusive upper (bracket vs parenthesis)</td></tr>
+      <tr><td><code>[MinKey, MaxKey]</code></td><td><strong>No bound at all</strong> — this field contributed nothing</td></tr>
+      <tr><td>Multiple intervals, e.g. <code>["a","a"], ["c","c"]</code></td><td>An <code>$in</code> — each value gets its own seek, which is efficient</td></tr>
+      <tr><td><code>[MinKey, "x"), ("x", MaxKey]</code></td><td>A <code>$ne</code> — two disjoint ranges covering nearly the whole index. Effectively unbounded</td></tr>
+      <tr><td><code>["", {})</code> on a string field</td><td>A prefix regex like <code>/^abc/</code> — anchored, so it <em>is</em> bounded. Unanchored regexes give <code>[MinKey, MaxKey]</code></td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The 10-second index review: read <code>indexBounds</code> top to bottom and
+       stop at the first <code>[MinKey, MaxKey]</code>.</strong> Every field below it is contributing nothing
+       to the bound — it is being applied as a filter during the scan at best. If that happens on field two
+       of a five-field index, you are paying to maintain three fields that no query bound ever uses, and the
+       index probably wants reordering or splitting.</div>
+
+    <h2>Part 5 — The Plan Cache: Why Fast Queries Become Slow</h2>
+
+    <p>MongoDB does not evaluate plans on every execution. It runs a trial, caches the winner, and reuses it.
+       Understanding that loop explains a whole class of "nothing changed but it got slow" incidents.</p>
+
+<pre>
+  1. First execution of a query SHAPE (fields + operators, not
+     values). The planner enumerates candidate plans.
+
+  2. TRIAL PERIOD: each candidate runs interleaved until one of
+     them either returns 101 results or examines a fixed number
+     of "works" (units of work). The one that gets furthest with
+     the least work wins.
+
+  3. The winner is cached against the planCacheKey.
+
+  4. Every later query of that shape reuses the cached plan --
+     with no trial, and regardless of its VALUES.
+
+  5. The plan is evicted and re-planned when:
+       - performance degrades badly vs the cached expectation
+         (the "replan" trigger)
+       - an index on the collection is created or dropped
+       - the collection is modified (collMod) or dropped
+       - the server restarts
+       - you call db.coll.getPlanCache().clear()
+</pre>
+
+    <p>Step 4 is where the incidents come from. The plan was chosen using one set of values, and is then
+       applied to every other set.</p>
+
+<pre>
+MEASURED: the tenant that broke the plan cache
+
+  Query shape: { tenantId: ?, status: ?, createdAt: { $gte: ? } }
+  Indexes:     { tenantId: 1, createdAt: -1 }
+               { status: 1, createdAt: -1 }
+
+  The first execution after each restart happened to be from a
+  SMALL tenant. For a small tenant, both plans return 101 rows
+  almost immediately, and the status_1 plan won by a hair.
+
+  Cached: status_1.
+
+  For the LARGEST tenant, status: "active" matches 4.1M documents
+  and tenantId matches 90,000. The cached plan scans 4.1M keys.
+
+    small tenant, cached plan:      6 ms
+    large tenant, cached plan:  4,200 ms
+    large tenant, correct plan:    31 ms
+
+  Nothing "changed". The plan was always wrong for that tenant; it
+  only became visible when that tenant grew. And it was
+  intermittent: after a restart, whichever tenant queried first
+  decided the plan for everyone.
+</pre>
+
+<pre>
+  INVESTIGATING IT
+
+  // what shapes are cached, and what won
+  db.orders.aggregate([ { $planCacheStats: {} } ])
+    -&gt; planCacheKey, createdFromQuery, works, isActive,
+       cachedPlan, timeOfCreation
+
+  // the key for THIS query -- shows in explain output too
+  db.orders.find({...}).explain().queryPlanner.planCacheKey
+
+  // force a re-plan for one collection
+  db.orders.getPlanCache().clear()
+
+  // see what the planner rejected and why
+  db.orders.find({...}).explain("allPlansExecution")
+    -&gt; allPlansExecution[].executionStages, each with its own
+       nReturned / works / executionTimeMillisEstimate
+</pre>
+
+    <p><code>works</code> is the planner's own cost unit — roughly "one unit of progress", such as advancing
+       an index cursor or fetching a document. In <code>allPlansExecution</code> it is the number that
+       actually decided the contest, and comparing <code>works</code> across candidate plans tells you what
+       the planner saw that you did not.</p>
+
+    <h3>The three durable fixes</h3>
+
+    <table class="tbl">
+      <tr><th>Fix</th><th>How</th><th>Trade-off</th></tr>
+      <tr><td>Make one plan obviously best</td><td>Build the compound index that serves the whole shape — <code>{ tenantId: 1, status: 1, createdAt: -1 }</code> — so there is no close contest to get wrong</td><td>None. This is the real fix; the plan cache is not the bug, the ambiguity is</td></tr>
+      <tr><td><code>hint()</code></td><td>Pin the index for a specific query</td><td>Bypasses the planner permanently. If the data shifts, nothing adapts, and the hint outlives the person who added it. Use for a genuine emergency, then remove it</td></tr>
+      <tr><td>Differentiate the shapes</td><td>Split into distinct queries so small and large tenants do not share a cache entry</td><td>Application complexity, and it treats a symptom</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>A plan-cache incident is almost always an index-design signal.</strong> The
+       cache only makes the wrong choice when two plans are close enough that a 101-document sample cannot
+       separate them. If one index served the whole query shape — equality fields, then sort, then range —
+       there would be no contest to lose. Reach for <code>hint()</code> to stop the bleeding, then fix the
+       index and remove the hint; a permanent hint is a permanent commitment to today's data distribution.</div>
+
+    <h2>Part 6 — Aggregations, Sharding, and What Explain Refuses to Do</h2>
+
+<pre>
+  db.orders.explain("executionStats").aggregate([
+    { $match:  { status: "paid" } },
+    { $group:  { _id: "$customerId", total: { $sum: "$amount" } } },
+    { $sort:   { total: -1 } },
+    { $limit:  10 }
+  ])
+</pre>
+
+    <p>Aggregation explain output is a <em>list of stages</em>, not a single tree, and the first thing to look
+       for is which stages the optimiser rewrote:</p>
+
+    <table class="tbl">
+      <tr><th>What to check</th><th>Why</th></tr>
+      <tr><td>Did <code>$match</code> move to the front?</td><td>The optimiser pushes filters toward the source. If a <code>$match</code> stayed after a <code>$group</code>, it could not be pushed — usually because it references a computed field</td></tr>
+      <tr><td>Was the first stage absorbed into a query?</td><td>A leading <code>$match</code> becomes a normal indexed query with its own <code>IXSCAN</code>. If you see a <code>COLLSCAN</code> here, the whole pipeline reads the collection</td></tr>
+      <tr><td>Did <code>$sort</code> + <code>$limit</code> coalesce?</td><td>Adjacent, they become a bounded top-<em>k</em> sort that uses far less memory. Separated by another stage, they do not</td></tr>
+      <tr><td>Did <code>$lookup</code> get an indexed inner plan?</td><td>The sub-plan appears nested. An unindexed <code>foreignField</code> is invisible in timings until you look here</td></tr>
+      <tr><td><code>usedDisk: true</code></td><td>A stage exceeded its 100 MB memory limit and spilled. Correct, but orders of magnitude slower</td></tr>
+    </table>
+
+    <h3>Sharded clusters: the summary hides the important thing</h3>
+
+<pre>
+MEASURED: the query that looked fine and was broadcasting
+
+  Sharded on { customerId: "hashed" }, 12 shards.
+
+  db.orders.find({ createdAt: { $gte: cutoff } })
+           .explain("executionStats")
+
+  Top-level summary:
+    nReturned            412
+    totalDocsExamined    412
+    executionTimeMillis  380
+
+  Those numbers look excellent. 412 examined for 412 returned.
+
+  But shards[] had TWELVE entries, each with its own IXSCAN, and
+  the top level SUMS them. The query did not target one shard --
+  it went to all twelve, each did a scan, and the merger combined
+  the results.
+
+  The tells, all of which are above the summary:
+    "shardsTargeted": 12          (vs 1 for a targeted query)
+    winningPlan.stage: "SHARD_MERGE"
+    twelve separate executionStages entries
+
+  At 380 ms and low volume it is invisible. At 8,000 queries/sec
+  it is 96,000 shard operations per second, and the cluster cannot
+  grow its way out -- adding a shard makes every such query
+  MORE expensive, not less.
+</pre>
+
+    <p>So on a sharded collection the first number to read is not <code>docsExamined</code>, it is
+       <code>shardsTargeted</code>. A query that does not include the shard key is a broadcast, and broadcasts
+       are the reason sharded clusters stop scaling. See
+       <a href="sharding.html">Sharding &amp; Shard Keys</a>.</p>
+
+    <h3>What explain will not tell you</h3>
+
+    <table class="tbl">
+      <tr><th>Limitation</th><th>Detail</th></tr>
+      <tr><td>It does not model <code>$out</code> or <code>$merge</code></td><td>Those stages are skipped; the pipeline is explained up to that point</td></tr>
+      <tr><td>It does not perform writes</td><td><code>explain().update()</code> plans the operation without applying it — which makes it safe, and means it cannot report write conflicts or retries</td></tr>
+      <tr><td>It does not include time waiting on locks or the client</td><td>A query slow because of contention looks fast here; check <code>currentOp</code> and the slow-query log instead</td></tr>
+      <tr><td><code>queryPlanner</code> results depend on the current data</td><td>An explain from staging with 5,000 documents predicts nothing about production with 40 million</td></tr>
+      <tr><td>It reflects the plan cache</td><td>Running explain can return the cached plan rather than a fresh contest. Clear the cache if you want a true re-plan</td></tr>
+    </table>
+
+    <p>The complement to explain is the profiler, which reports what actually happened rather than what would
+       happen — including lock waits, response length and the real end-to-end duration:</p>
+
+<pre>
+  db.setProfilingLevel(1, { slowms: 100 })
+
+  db.system.profile.find({ ns: "shop.orders" })
+    .sort({ ts: -1 }).limit(5)
+    -&gt; millis, planSummary, keysExamined, docsExamined,
+       nreturned, responseLength, locks, queryHash, planCacheKey
+
+  planSummary is the fast triage field: "COLLSCAN" or
+  "IXSCAN { status: 1 }" tells you the shape without an explain.
+
+  Group by queryHash to find the shapes worth fixing, ranked by
+  total time rather than by worst single execution -- a 40 ms
+  query run 100,000 times costs more than a 4 s query run twice.
+</pre>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Using bare <code>explain()</code></td><td><code>queryPlanner</code> runs nothing and reports no keys, docs or time</td><td><code>explain("executionStats")</code>, every time</td></tr>
+      <tr><td>Reading the stage tree top-down</td><td>You interpret the last operation as the first and misdiagnose the cost</td><td>Read bottom-up: the deepest <code>inputStage</code> runs first</td></tr>
+      <tr><td>Treating "IXSCAN" as "indexed, therefore fine"</td><td>An IXSCAN can scan the entire index — 412,000 keys for 20 results</td><td>Compare <code>keysExamined</code> to <code>nReturned</code></td></tr>
+      <tr><td>Ignoring a <code>filter</code> inside a <code>FETCH</code></td><td>Documents are read then rejected; the field is missing from the index</td><td>Add the filtered field to the index in ESR position</td></tr>
+      <tr><td>Seeing <code>LIMIT</code> and assuming work is bounded</td><td>If <code>LIMIT</code> sits above <code>SORT</code>, every match was read and sorted first</td><td>Get the sort order from the index so the scan stops early</td></tr>
+      <tr><td>Not reading <code>indexBounds</code></td><td><code>[MinKey, MaxKey]</code> on a compound field means it contributed nothing, and it is invisible in the summary</td><td>Scan the bounds for the first unbounded field</td></tr>
+      <tr><td>Explaining against staging data</td><td>5,000 documents make every plan look identical; the planner's choice there predicts nothing</td><td>Explain against production-shaped data, or a restored snapshot</td></tr>
+      <tr><td>Assuming an explain reflects a fresh plan contest</td><td>It can return the cached plan</td><td><code>getPlanCache().clear()</code>, or use <code>allPlansExecution</code></td></tr>
+      <tr><td>Blaming the index when examined counts are low but time is high</td><td>It is disk reads, lock contention or a saturated server</td><td>Run it twice; check cache eviction and <code>currentOp</code></td></tr>
+      <tr><td>Fixing a plan-cache incident with a permanent <code>hint()</code></td><td>Freezes today's data distribution forever and hides the missing index</td><td>Hint to stop the bleeding, build the compound index, remove the hint</td></tr>
+      <tr><td>Reading only the top-level summary on a sharded collection</td><td>The summary sums all shards and hides a 12-shard broadcast</td><td>Read <code>shardsTargeted</code> first</td></tr>
+      <tr><td>Relying on <code>executionTimeMillis</code> as end-to-end latency</td><td>It excludes network transfer and cursor iteration — 4 ms server, 900 ms in the application</td><td>Measure at the driver; check <code>nReturned</code> and <code>responseLength</code></td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What are the four numbers you look at first in an explain?</summary>
+      <p><code>nReturned</code>, <code>totalKeysExamined</code>, <code>totalDocsExamined</code> and
+         <code>executionTimeMillis</code> — and the first three matter mostly as ratios against each other.</p>
+      <p>The ideal is all three roughly equal: the index found exactly the documents you wanted. Even better
+         is <code>docsExamined: 0</code>, which means the query was covered by the index and never touched
+         the collection. Anything where examined counts are orders of magnitude above
+         <code>nReturned</code> is work being thrown away, and which of the two counts is inflated tells you
+         whether the problem is loose bounds or a missing filter field.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why is a <code>SORT</code> stage in the plan a warning sign?</summary>
+      <p>Because it means the index did not supply the ordering, so MongoDB is doing a blocking in-memory
+         sort. Three consequences: it has a 32 MB limit and fails outright above it (unless
+         <code>allowDiskUse</code>, which is slow); nothing is returned until the last input document has
+         been read; and any <code>limit</code> above it saves no work at all, because every match must be
+         read and sorted before the top N can be identified.</p>
+      <p>The fix is to place the sort field in the index — after the equality fields, before any range field.
+         In one measured case that took a query from 310 ms with 41,000 keys examined to 2 ms with 112.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> An explain shows <code>keysExamined: 412000, docsExamined: 412000, nReturned: 20</code>. Diagnose it.</summary>
+      <p>The equality of keys and docs is the key signal: every index key scanned resulted in a document
+         fetch, and then 411,980 of those documents were discarded. That means the index bounded the scan on
+         something, but a predicate the index does not contain is being applied after the fetch — you would
+         see it as a <code>filter</code> on the <code>FETCH</code> stage.</p>
+      <p>The fix is to add that field to the index so the filtering happens on keys rather than documents. If
+         there is also a <code>SORT</code> stage, the field ordering matters: equality fields, then the sort
+         field, then ranges.</p>
+      <p>Contrast with <code>keysExamined ≫ docsExamined</code>, which is a different defect — there the index
+         <em>is</em> rejecting rows without fetching, so the bounds are loose (often a skipped compound field
+         or a multikey range) and the fix is reordering rather than adding.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is <code>[MinKey, MaxKey]</code> in <code>indexBounds</code> and why does it matter?</summary>
+      <p>It means the scan spans that field's entire range — the field contributed nothing to bounding the
+         scan. It appears when a compound field is skipped by the query, because the prefix rule means every
+         field after the gap is unbounded too.</p>
+      <p>It matters because it is invisible in the summary numbers and it is the fastest way to audit a
+         compound index. Read the bounds top to bottom and stop at the first <code>[MinKey, MaxKey]</code>:
+         every field below it is dead weight for this query. If that happens on field two of a five-field
+         index, you are paying write cost and cache for three fields no query bound uses, and the index wants
+         reordering or splitting.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A query was fast for six months and is now 4 seconds, with no deploy and no schema change. Walk me through it.</summary>
+      <p>My first hypothesis is the plan cache, because "nothing changed" plus a step change in latency is
+         its signature.</p>
+      <p>MongoDB caches one plan per query <em>shape</em>, chosen by a trial period that stops at roughly 101
+         results. If two plans are close on a small sample, the winner is effectively arbitrary — and it is
+         then applied to every set of values, including ones for which it is catastrophically wrong. The case
+         I have seen: a multi-tenant query where the first execution after a restart came from a small
+         tenant, so a <code>status</code> index won; for the largest tenant that index matched 4.1M documents
+         where the <code>tenantId</code> index matched 90,000. Same shape, 6 ms versus 4,200 ms, and
+         intermittent — whichever tenant queried first after a restart decided the plan for everyone.</p>
+      <p>How I would confirm it: <code>$planCacheStats</code> to see what is cached and when it was created;
+         <code>explain("allPlansExecution")</code> to see the rejected plans and their <code>works</code>
+         counts; and the profiler grouped by <code>planCacheKey</code> to see whether latency correlates with
+         a plan change rather than with traffic.</p>
+      <p>What else I would rule out in parallel: data growth crossing the cache boundary (examined counts
+         unchanged but time up, with rising application-thread evictions), an index dropped by a migration,
+         and a distribution shift that made a previously-selective predicate unselective.</p>
+      <p>The fix is not <code>hint()</code>, except as a stopgap. A plan-cache incident means two plans were
+         close enough that a small sample could not separate them, which means no single index serves the
+         whole query shape. I would build the compound index that does — equality, sort, range — so there is
+         no contest to lose, and then remove any hint I added. A permanent hint freezes today's data
+         distribution and outlives the person who wrote it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How would you build a systematic process for finding and fixing slow queries, rather than reacting to complaints?</summary>
+      <p>Explain is a debugging tool for one query; the process has to start somewhere else, because you
+         cannot explain a query you do not know is slow.</p>
+      <p><strong>1. Collect.</strong> Profiler at level 1 with a threshold matched to the workload — 100 ms is
+         a reasonable start, but for a 5 ms API the threshold should be far lower. Cap the profile collection
+         size so it cannot fill a disk.</p>
+      <p><strong>2. Rank by total time, not worst case.</strong> Group by <code>queryHash</code> and sort by
+         count × mean. A 40 ms query run 100,000 times an hour costs far more than a 4-second report run
+         twice a day, and the 4-second one is what gets reported by humans. This inversion is the main value
+         of the process.</p>
+      <p><strong>3. Triage with <code>planSummary</code>.</strong> It is in the profiler output already, so
+         <code>COLLSCAN</code> entries can be found and fixed without opening an explain at all.</p>
+      <p><strong>4. Explain the survivors</strong> with <code>executionStats</code>, apply the ratio
+         diagnosis, and check <code>indexBounds</code> for dead compound fields.</p>
+      <p><strong>5. Close the loop.</strong> An index change that is not verified is a guess: re-run the same
+         profiler aggregation after deploying and compare the same <code>queryHash</code>. And check
+         <code>$indexStats</code> afterwards for indexes the change made redundant — an optimisation that
+         only ever adds indexes eventually becomes a cache problem.</p>
+      <p><strong>The organisational half, which matters more than the technical half:</strong> this needs to be
+         a scheduled review with an owner, not a heroic effort during an incident. I would also put the
+         profiler aggregation in CI against a production-shaped dataset so a new <code>COLLSCAN</code> fails
+         the build rather than being discovered three months later. The cheapest slow query to fix is the one
+         that never ships.</p>
+      <p><strong>What I would be careful about:</strong> profiling at level 2 (all operations) on a busy
+         primary has real overhead and generates a lot of writes. Level 1 with a sensible threshold, or
+         sampling, is almost always the right setting — and I would run the analysis against a secondary
+         where possible.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Read this plan bottom-up and describe in one sentence what
+      the database did. Then name the two defects.
+<pre>
+  { stage: "LIMIT", limitAmount: 10,
+    inputStage: { stage: "SORT", sortPattern: { price: 1 },
+      inputStage: { stage: "FETCH", filter: { inStock: { $eq: true } },
+        inputStage: { stage: "IXSCAN", indexName: "category_1",
+          indexBounds: { category: [ "[\"shoes\", \"shoes\"]" ] } }}}}
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The sentence:</strong> "Scan the <code>category_1</code> index for category = shoes, fetch every
+         one of those documents, discard the ones that are out of stock, sort what remains by price in
+         memory, then return the first 10."</p>
+      <p><strong>Defect 1 — <code>inStock</code> is filtered after the FETCH.</strong> Every shoe document is
+         read from disk or cache just to check a boolean. If shoes are 40,000 documents and 30,000 are in
+         stock, that is 40,000 document reads to eventually return 10.</p>
+      <p><strong>Defect 2 — the SORT is blocking, and the LIMIT is above it.</strong> All 30,000 in-stock shoes
+         must be sorted before the top 10 can be identified. The <code>limitAmount: 10</code> looks like it
+         bounds the work and bounds nothing. It is also at risk of the 32 MB sort limit as the catalogue
+         grows.</p>
+      <p><strong>The fix, applying ESR:</strong></p>
+<pre>
+  db.products.createIndex({ category: 1, inStock: 1, price: 1 })
+
+  category  equality -&gt; bounds the scan
+  inStock   equality -&gt; bounds it further, on KEYS not documents
+  price     sort     -&gt; keys already in price order, no SORT stage
+</pre>
+      <p>Now the scan walks in-stock shoes in price order and stops after 10 keys. Expected:
+         <code>keysExamined: 10</code>, <code>docsExamined: 10</code>, no SORT stage, and the LIMIT stage
+         sitting directly above the IXSCAN where it actually saves work.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Two queries against the same index. Which is better indexed,
+      and what would you do about the other?
+<pre>
+  A: nReturned 1,200  keysExamined 1,200  docsExamined     0  time  8ms
+  B: nReturned 1,200  keysExamined 1,200  docsExamined 1,200  time 94ms
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>A is better and is in fact optimal.</strong> <code>docsExamined: 0</code> means the query was
+         <em>covered</em> — every field it returns was available in the index keys, so the collection was
+         never touched. That is the best outcome available.</p>
+      <p><strong>B is not broken.</strong> Its ratios are healthy: it examined exactly as many keys and
+         documents as it returned, so the index bounds are perfect and nothing is being discarded. The 86 ms
+         difference is 1,200 document fetches — each one a random read into cache.</p>
+      <p><strong>Whether to "fix" B is a judgement call</strong>, and the honest answer is usually no:</p>
+      <table class="tbl">
+        <tr><th>Consider covering B if…</th><th>Leave B alone if…</th></tr>
+        <tr><td>It runs thousands of times a second — 86 ms × high QPS is real capacity</td><td>It runs occasionally; 94 ms is fine</td></tr>
+        <tr><td>It projects a handful of small fields</td><td>It returns whole documents — you cannot cover that</td></tr>
+        <tr><td>The extra index fields are rarely updated</td><td>The fields change on every write, so covering them adds constant index churn</td></tr>
+        <tr><td>Cache headroom exists</td><td>The cluster is already cache-constrained; a wider index makes everything else slower</td></tr>
+      </table>
+      <p>The point worth taking away: <code>docsExamined == nReturned</code> is already a well-indexed query.
+         Covering is an optimisation on top of correctness, not a correction of a defect, and it is not free —
+         it widens the index, which costs cache and write bandwidth on every insert.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Interpret these bounds against the index
+      <code>{ a: 1, b: 1, c: 1, d: 1 }</code>, and say what the query must have been.
+<pre>
+  "indexBounds": {
+    "a": [ "[1, 1]" ],
+    "b": [ "[5, inf.0]" ],
+    "c": [ "[MinKey, MaxKey]" ],
+    "d": [ "[MinKey, MaxKey]" ]
+  }
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Reading the bounds:</strong></p>
+      <ul>
+        <li><code>a: [1, 1]</code> — an equality predicate, <code>a: 1</code>. Tightest possible.</li>
+        <li><code>b: [5, inf.0]</code> — a range, <code>b: { $gte: 5 }</code>. Inclusive lower bound
+            (square bracket), unbounded above.</li>
+        <li><code>c</code> and <code>d</code> — <code>[MinKey, MaxKey]</code>, no bound at all.</li>
+      </ul>
+      <p><strong>The query was something like</strong> <code>{ a: 1, b: { $gte: 5 } }</code>, possibly with
+         predicates on <code>c</code> or <code>d</code> as well — but if there were, they are being applied
+         as <em>filters</em>, not bounds.</p>
+      <p><strong>Why <code>c</code> and <code>d</code> are unbounded even if the query mentions them:</strong>
+         once a <em>range</em> appears in a compound index, every field after it is unbounded. Within
+         <code>a=1, b≥5</code> the keys span many <code>b</code> values, and <code>c</code> restarts its
+         ordering for each distinct <code>b</code>. So matching <code>c</code> values are not contiguous and
+         cannot be bounded. This is the same mechanism as a skipped field, and it is exactly why ESR puts
+         ranges last.</p>
+      <p><strong>What to do about it depends on what the query needs:</strong></p>
+      <table class="tbl">
+        <tr><th>If the query is…</th><th>Then…</th></tr>
+        <tr><td><code>{ a: 1, b: { $gte: 5 } }</code> only</td><td>Nothing is wrong, but <code>c</code> and <code>d</code> are dead weight in this index. Check whether another query needs them; if not, drop them from the key pattern.</td></tr>
+        <tr><td><code>{ a: 1, b: { $gte: 5 }, c: "x" }</code></td><td>Reorder to <code>{ a: 1, c: 1, b: 1 }</code> — equality fields before the range. Then both <code>a</code> and <code>c</code> bound the scan.</td></tr>
+        <tr><td><code>{ a: 1, b: { $gte: 5 } }</code> sorted by <code>c</code></td><td>Reorder to <code>{ a: 1, c: 1, b: 1 }</code> as well — the sort field must precede the range or you get a blocking SORT.</td></tr>
+      </table>
+      <p>In all three cases the diagnosis came from four lines of <code>indexBounds</code>, before looking at a
+         single execution statistic. That is why it is worth reading.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> A query intermittently takes 4 seconds; the same query
+      with different values takes 6 ms. The index set has not changed. Design the investigation.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Hypothesis, from the shape of the symptom:</strong> the plan cache has a single entry for this
+         query shape, and the cached plan is right for some values and wrong for others. "Intermittent, same
+         shape, value-dependent" is close to a signature.</p>
+      <p><strong>Step 1 — confirm the plan is shared.</strong></p>
+<pre>
+  db.coll.find(FAST_VALUES).explain().queryPlanner.planCacheKey
+  db.coll.find(SLOW_VALUES).explain().queryPlanner.planCacheKey
+  // same key = one cached plan serving both = hypothesis alive
+</pre>
+      <p><strong>Step 2 — see what is cached and when it was decided.</strong></p>
+<pre>
+  db.coll.aggregate([{ $planCacheStats: {} }])
+    -&gt; cachedPlan, works, timeOfCreation, isActive
+  // timeOfCreation near a server restart or index change is a
+  // strong tell: the plan was decided by whichever query ran first.
+</pre>
+      <p><strong>Step 3 — see what the planner rejected, for the slow values.</strong></p>
+<pre>
+  db.coll.find(SLOW_VALUES).explain("allPlansExecution")
+    -&gt; compare works / nReturned / executionTimeMillisEstimate
+       across candidates
+</pre>
+      <p>If a rejected plan is dramatically better for the slow values, that is the confirmation.</p>
+      <p><strong>Step 4 — prove it.</strong> <code>db.coll.getPlanCache().clear()</code>, then run the
+         <em>slow</em> query first so it decides the plan, and re-measure both. If slow becomes fast and fast
+         becomes slow, the diagnosis is certain — and it also demonstrates that no single cached plan can
+         serve both, which is the actual finding.</p>
+      <p><strong>The fix.</strong> Not a hint. The cache only mis-chooses when two plans are close on a
+         101-document sample, which means no index serves the whole shape. Build the compound index that does
+         — equality fields, then sort, then range — and the contest disappears. A <code>hint()</code> is
+         acceptable as a stopgap during an incident, but it bypasses the planner permanently and freezes
+         today's data distribution; remove it once the index is in place.</p>
+      <p><strong>What I would rule out in parallel</strong>, because they present similarly: a value that is
+         genuinely far less selective (a skew problem, not a plan problem — check the match counts
+         directly), and cold-cache disk reads (run the slow case twice; if the second is fast, it was I/O).</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> This aggregation takes 22 seconds. Diagnose from the
+      explain and propose fixes in priority order.
+<pre>
+  db.orders.aggregate([
+    { $lookup: { from: "customers", localField: "customerId",
+                 foreignField: "_id", as: "cust" } },
+    { $unwind: "$cust" },
+    { $match: { "cust.region": "eu",
+                createdAt: { $gte: ISODate("2026-08-01") } } },
+    { $group: { _id: "$cust.segment", revenue: { $sum: "$total" } } },
+    { $sort: { revenue: -1 } }
+  ])
+
+  explain shows: first stage COLLSCAN on orders (4.1M docs),
+  $lookup inner plan COLLSCAN on customers, usedDisk: true
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Three separate defects, each multiplying the others.</strong></p>
+      <table class="tbl">
+        <tr><th>#</th><th>Defect</th><th>Cost</th></tr>
+        <tr><td>1</td><td><code>$match</code> is after <code>$lookup</code>, so it cannot be pushed to the front. All 4.1M orders are joined before anything is filtered</td><td>The dominant cost by far</td></tr>
+        <tr><td>2</td><td><code>foreignField: "_id"</code> shows a COLLSCAN on customers — which should be impossible, since <code>_id</code> is always indexed. This means the join is on mismatched types (string customerId vs ObjectId _id), so the index cannot be used</td><td>A full customer scan per input document</td></tr>
+        <tr><td>3</td><td><code>usedDisk: true</code> — a stage exceeded 100 MB and spilled</td><td>Orders of magnitude on the affected stage</td></tr>
+      </table>
+      <p><strong>Fix 1 (largest win): split the <code>$match</code> and put what you can first.</strong></p>
+<pre>
+  { $match: { createdAt: { $gte: ISODate("2026-08-01") } } },  // FIRST
+  { $lookup: { ... } },
+  { $unwind: "$cust" },
+  { $match: { "cust.region": "eu" } },   // must stay after the join
+  ...
+</pre>
+      <p>The <code>createdAt</code> predicate does not depend on the join, so it can run against an index
+         before the join. If August is 3% of orders, this alone removes 97% of the join work. The optimiser
+         could not do this itself because the two predicates were in one <code>$match</code> and one of them
+         referenced a joined field.</p>
+      <p><strong>Fix 2: resolve the type mismatch.</strong> A COLLSCAN on <code>_id</code> is diagnostic — the
+         only way to miss that index is to compare incompatible types. Confirm with
+         <code>db.orders.findOne().customerId</code> versus <code>db.customers.findOne()._id</code>. This is
+         a data-correctness bug as much as a performance one: type bracketing means some joins may already be
+         silently returning empty arrays. Fix it with a migration to a consistent type, not with
+         <code>$toObjectId</code> in the pipeline, which would fix the symptom and leave every other query
+         broken.</p>
+      <p><strong>Fix 3: index for the new shape.</strong> <code>{ createdAt: -1 }</code> at minimum, so the
+         leading <code>$match</code> is an IXSCAN.</p>
+      <p><strong>Fix 4: reduce what crosses the join.</strong> Only <code>region</code> and
+         <code>segment</code> are used from the customer, so a sub-pipeline projection stops whole customer
+         documents being materialised:</p>
+<pre>
+  { $lookup: { from: "customers",
+      let: { cid: "$customerId" },
+      pipeline: [
+        { $match: { $expr: { $eq: ["$_id", "$$cid"] } } },
+        { $match: { region: "eu" } },        // filter INSIDE the join
+        { $project: { segment: 1, region: 1 } }
+      ],
+      as: "cust" } },
+  { $unwind: "$cust" },
+</pre>
+      <p>This also fixes the <code>usedDisk</code> spill, because far less data reaches <code>$group</code>.</p>
+      <p><strong>Priority order:</strong> Fix 1 first — it is a two-line change with the largest effect and no
+         risk. Then Fix 3, then Fix 4. Fix 2 last as a scheduled migration, because it touches data and needs
+         its own plan — but I would open the bug immediately, since a type mismatch on a join key means some
+         results may already be wrong, and a fast wrong answer is worse than a slow one.</p>
+      <p><strong>What I would also question:</strong> this is a monthly revenue rollup. If it runs on a
+         dashboard load, the real fix is a pre-computed rollup collection updated incrementally, not a 22-second
+         (or even 2-second) aggregation on the hot path. See
+         <a href="aggregation-performance.html">Aggregation Performance</a>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> You are given production access to a cluster with no
+      monitoring and a report that "the app is slow". Produce a prioritised list of query problems within two
+      hours, without risking the cluster.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Constraint that shapes everything: no monitoring means no history</strong>, so I have to
+         generate observations rather than query them, and I must do it without adding load to a cluster
+         that is already struggling.</p>
+      <p><strong>0–10 min: is this even a query problem?</strong></p>
+<pre>
+  db.serverStatus().wiredTiger.cache
+    ["bytes currently in the cache"] vs ["maximum bytes configured"]
+    ["pages evicted by application threads"]   &gt; 0 = the cliff
+  db.serverStatus().connections      // saturated pool?
+  db.serverStatus().opcounters       // what kind of load?
+  rs.printSecondaryReplicationInfo() // lag?
+  db.currentOp({ secs_running: { $gt: 3 } })  // what is stuck NOW
+</pre>
+      <p>If application-thread evictions are non-zero, the working set exceeds cache and <em>every</em> query
+         is slow for a reason no index will fix. That reframes the whole investigation, and it is a 30-second
+         check.</p>
+      <p><strong>10–30 min: collect, cheaply.</strong> Enable the profiler at level 1 with a threshold — but
+         set it on a <em>secondary</em> if reads go there, and cap the profile collection size first. Level 2
+         on a struggling primary is how a diagnosis becomes an outage.</p>
+<pre>
+  db.setProfilingLevel(1, { slowms: 200 })   // start conservative
+  // and set a calendar reminder to turn it off
+</pre>
+      <p><strong>30–60 min: rank by total cost, not worst case.</strong></p>
+<pre>
+  db.system.profile.aggregate([
+    { $match: { millis: { $gte: 200 } } },
+    { $group: { _id: { hash: "$queryHash", plan: "$planSummary",
+                       ns: "$ns" },
+                n: { $sum: 1 }, total: { $sum: "$millis" },
+                avg: { $avg: "$millis" }, max: { $max: "$millis" },
+                keys: { $avg: "$keysExamined" },
+                docs: { $avg: "$docsExamined" },
+                ret:  { $avg: "$nreturned" },
+                sample: { $first: "$command" } } },
+    { $sort: { total: -1 } }, { $limit: 20 }
+  ])
+</pre>
+      <p>Sorting by <code>total</code> rather than <code>max</code> is the single most important decision here.
+         The queries humans complain about are the slowest ones; the queries destroying the cluster are the
+         moderately slow ones run constantly.</p>
+      <p><strong>60–90 min: triage without explaining anything.</strong> <code>planSummary</code> is already in
+         the output. Every <code>COLLSCAN</code> on a large namespace goes straight onto the list. So does
+         every entry where average <code>docsExamined</code> is more than ~100× average
+         <code>nreturned</code>. That is usually most of the list, identified with zero additional load.</p>
+      <p><strong>90–120 min: explain the top 5</strong> with <code>executionStats</code>, read
+         <code>indexBounds</code> for dead fields, and write the proposed index for each.</p>
+      <p><strong>The deliverable</strong> is a table: namespace, query shape, calls/hour, total ms/hour, current
+         plan, proposed index, expected effect, and risk. Ranked by total ms. That is a document someone can
+         act on and argue with, which "the app is slow" is not.</p>
+      <p><strong>What I would refuse to do in the first two hours:</strong> create or drop any index. Index
+         builds consume CPU and evict cache on a cluster that may already be at its limit, and a drop is not
+         cheaply reversible. The output of two hours should be a plan, not a change — and if something is
+         urgent enough to change immediately, <code>hint()</code> or a query-side fix in the application is
+         reversible in a way an index build is not.</p>
+      <p><strong>The one exception:</strong> if <code>currentOp</code> shows a runaway operation actively
+         degrading the cluster, kill it. That is triage, not optimisation, and it comes before everything
+         above.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Always <code>explain("executionStats")</code>.</strong> Bare <code>explain()</code> runs
+            nothing and reports no keys, documents or time.</li>
+        <li><strong>Read the stage tree bottom-up.</strong> The deepest <code>inputStage</code> executes first;
+            the outermost stage executes last.</li>
+        <li><strong>Four numbers, three ratios.</strong> <code>docsExamined ≫ nReturned</code> = a missing
+            filter field; <code>keysExamined ≫ docsExamined</code> = loose bounds;
+            <code>SORT</code> present = the index lost the ordering.</li>
+        <li><strong>A <code>filter</code> on a <code>FETCH</code> stage names the field to add to the
+            index.</strong></li>
+        <li><strong><code>LIMIT</code> above <code>SORT</code> saves nothing</strong> — everything was read and
+            sorted before the cutoff applied.</li>
+        <li><strong><code>docsExamined: 0</code> with an IXSCAN is a covered query</strong>, the best possible
+            outcome.</li>
+        <li><strong><code>[MinKey, MaxKey]</code> in <code>indexBounds</code> means that field contributed
+            nothing.</strong> Everything below the first one is dead weight.</li>
+        <li><strong>Low examined counts with high time is not an index problem</strong> — it is disk, locks or a
+            saturated server. Run it twice.</li>
+        <li><strong><code>executionTimeMillis</code> excludes network and cursor iteration.</strong> 4 ms on the
+            server can be 900 ms in the application.</li>
+        <li><strong>The plan cache stores one plan per query <em>shape</em></strong>, chosen from a ~101-result
+            trial, then applied to all values.</li>
+        <li><strong>"Fast for months, now 4 seconds, nothing changed" is the plan cache's signature</strong> —
+            6 ms for a small tenant, 4,200 ms for a large one, same shape.</li>
+        <li><strong>A plan-cache incident means no index serves the whole shape.</strong> Build the compound
+            index; use <code>hint()</code> only as a stopgap and remove it.</li>
+        <li><strong>In aggregations, check whether <code>$match</code> was pushed to the front</strong> and
+            whether <code>$sort</code>+<code>$limit</code> coalesced; <code>usedDisk: true</code> means a
+            stage spilled past 100 MB.</li>
+        <li><strong>On sharded collections read <code>shardsTargeted</code> first</strong> — the summary sums
+            all shards and can hide a 12-shard broadcast behind excellent-looking ratios.</li>
+        <li><strong>Explain does not model <code>$out</code>/<code>$merge</code>, does not perform writes, and
+            excludes lock waits.</strong> The profiler covers what it cannot.</li>
+        <li><strong>Rank slow queries by total time, not worst case.</strong> A 40 ms query run 100,000 times
+            costs more than a 4-second report run twice.</li>
+        <li><strong>A staging explain predicts nothing.</strong> Plan choice depends on data volume and
+            distribution.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="index-types.html">← Index Types &amp; Their Traps</a>
+      <a href="query-tuning.html">Query Tuning in Production →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

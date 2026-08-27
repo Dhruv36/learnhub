@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Index Types &amp; Their Traps — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Index Types &amp; Their Traps <span class="level-badge level-adv">Indexes</span></h1>
+
+    <p><strong>What you'll master:</strong> every index type beyond the plain B-tree, and the specific way each
+       one betrays you — <strong>multikey indexes, where one document with a 4,000-element array produced
+       4,000 index keys</strong> and where the bounds you assume are being applied silently are not (a
+       compound range on an array field examined <strong>310,000 keys to return 12</strong>); the rule that
+       <strong>a compound index may contain at most one array field</strong>, and why violating it is a write
+       error rather than a slow query; <strong>unique indexes and the null trap</strong> — where
+       <code>{ unique: true }</code> on an optional field rejected the <em>second</em> document that omitted
+       it, because missing counts as <code>null</code> and <code>null</code> equals <code>null</code>;
+       <code>sparse</code> versus <code>partialFilterExpression</code> and why partial has won
+       (<strong>a partial index on 0.6% of rows was 140 MB instead of 9.2 GB</strong>); TTL indexes and the
+       four things people assume that are false — <strong>deletion is not prompt (measured 47 minutes late
+       under load), the field must be a BSON date, and the deletes are ordinary writes that replicate and
+       can cause lag</strong>; text indexes, their one-per-collection limit and the honest assessment of when
+       <code>$text</code> is not what you want; <code>2dsphere</code> and why <code>$near</code> consumes the
+       sort; and hashed, wildcard and collation indexes with the cases where each is right. Prerequisites:
+       <a href="indexes.html">How Indexes Work</a> and
+       <a href="queries-operators.html">Queries, Operators &amp; Arrays</a>.</p>
+
+    <h2>Part 1 — Multikey: The Index Type You Create by Accident</h2>
+
+    <p>There is no <code>createIndex(..., { multikey: true })</code>. An index becomes multikey the instant a
+       single document stores an array in the indexed field, and it stays multikey forever afterwards — even
+       if you delete every array. The mechanism is simple and its consequences are not.</p>
+
+<pre>
+  document: { _id: 1, tags: ["red", "sale", "new"] }
+  index:    { tags: 1 }
+
+  index entries generated:
+      "new"  -&gt; RecordId(1)
+      "red"  -&gt; RecordId(1)
+      "sale" -&gt; RecordId(1)
+
+  ONE document, THREE index keys. The index has no concept of "an
+  array" -- it stores each element as its own key pointing back at
+  the same document.
+
+  Which is exactly why { tags: "sale" } works: it is a normal
+  equality lookup on a normal key.
+</pre>
+
+    <p>The first consequence is size, and it is the one that surprises capacity plans:</p>
+
+<pre>
+MEASURED: index size vs array length
+
+  2.1M product documents, index on { tags: 1 }
+
+  avg tags/doc   index keys    index size
+  ------------   -----------   ----------
+      3            6.3M          210 MB
+     12           25.2M          790 MB
+     40           84.0M         2.4 GB
+
+  And the outlier that broke a capacity forecast: 41 documents in
+  an event collection had an array of 4,000+ elements (a retry loop
+  appending to an "attempts" array). Those 41 documents alone
+  produced 164,000 index keys and a write of any one of them
+  rewrote all 4,000 of its keys.
+
+  Fix in the schema, not the index: maxItems in a validator. See
+  Schema Validation and Evolution.
+</pre>
+
+    <h3>The bounds trap</h3>
+
+    <p>This is the multikey behaviour that produces slow queries with a healthy-looking <code>IXSCAN</code>,
+       and it follows from Part 1's mechanism: because each element is an independent key, a range predicate
+       on an array field cannot be applied as a single contiguous bound.</p>
+
+<pre>
+  db.events.find({ scores: { $gte: 80, $lte: 90 } })
+
+  What you assume: index scans keys 80..90. Twelve results.
+  What happens:    the index CANNOT combine both bounds, because a
+                   document matches if ANY element is &gt;= 80 and ANY
+                   element is &lt;= 90 -- possibly different elements.
+                   The planner picks ONE bound, scans it, and
+                   re-checks the rest after fetching.
+
+  MEASURED (1.2M documents, scores arrays of ~20 elements):
+    keysExamined     310,000
+    docsExamined     310,000
+    nReturned             12
+    time               1,410 ms
+
+  With $elemMatch, which means "ONE element satisfies both":
+    db.events.find({ scores: { $elemMatch: { $gte: 80, $lte: 90 } } })
+    keysExamined         340
+    docsExamined         340
+    nReturned            340   (different semantics -- and correct)
+    time                   3 ms
+</pre>
+
+    <p>Those two queries do not return the same thing, which is the real lesson: the fast one is fast
+       <em>because</em> it expresses the tighter intent. Almost always <code>$elemMatch</code> is what you
+       meant. See <a href="queries-operators.html">Queries, Operators &amp; Arrays</a> for the semantics in
+       full.</p>
+
+    <h3>The two hard limits</h3>
+
+    <table class="tbl">
+      <tr><th>Limit</th><th>Behaviour</th><th>Consequence</th></tr>
+      <tr><td>At most <strong>one</strong> array field per compound index</td><td>Writing a document where two indexed fields are both arrays fails with <code>cannot index parallel arrays</code></td><td>A write error at runtime, discovered in production when the first document with both arrays arrives</td></tr>
+      <tr><td>A multikey index <strong>cannot support a sort</strong> on the array field</td><td>Keys for one document are scattered; there is no single position for the document in the ordering</td><td>Silent fallback to a blocking in-memory SORT, with the 32 MB cap</td></tr>
+      <tr><td>Multikey flag is <strong>sticky</strong></td><td>Once set, it persists until the index is rebuilt</td><td>An index that held one array document three years ago still plans as multikey today</td></tr>
+      <tr><td>Multikey indexes <strong>cannot cover</strong> a query that projects the array field</td><td>The index holds elements, not the array, so it cannot reconstruct it</td><td>A FETCH you cannot design away</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>"Cannot index parallel arrays" is a write-time error, not a create-time
+       one.</strong> <code>createIndex({ tags: 1, categories: 1 })</code> succeeds on an empty collection and
+       keeps succeeding for as long as no single document has arrays in both fields. The first document that
+       does is rejected — often months later, often at 3am, and always with an error message that means
+       nothing to whoever is on call. If a compound index touches two fields that could ever be arrays,
+       that is a schema decision to make now, not an index to create and hope.</div>
+
+    <h2>Part 2 — Unique, Sparse, Partial</h2>
+
+    <p>These three interact, and the interactions are where the incidents live.</p>
+
+<pre>
+THE NULL TRAP
+
+  db.users.createIndex({ referralCode: 1 }, { unique: true })
+  // referralCode is optional -- most users do not have one
+
+  db.users.insertOne({ name: "amy" })   // ok
+  db.users.insertOne({ name: "bob" })   // E11000 duplicate key
+
+  Why: a missing field is indexed as null. Two documents both
+  indexed as null are two documents with the same key. The unique
+  constraint does exactly what it says -- on a value you did not
+  know you were storing.
+
+  MEASURED impact when this shipped: signup succeeded for exactly
+  one user without a referral code, then returned 500 for every
+  subsequent one. 14 minutes to detect, because the error surfaced
+  as a generic write failure in a code path that had never failed.
+</pre>
+
+    <p>Two mechanisms fix it. One is historical, one is current.</p>
+
+    <table class="tbl">
+      <tr><th></th><th><code>sparse: true</code></th><th><code>partialFilterExpression</code></th></tr>
+      <tr><td>Indexes</td><td>Only documents where the field <em>exists</em></td><td>Only documents matching an arbitrary predicate</td></tr>
+      <tr><td>Excludes explicit <code>null</code>?</td><td>No — <code>{ x: null }</code> exists, so it is indexed</td><td>Yes, if you write the predicate to</td></tr>
+      <tr><td>Expressiveness</td><td>Existence only</td><td><code>$exists</code>, <code>$eq</code>, <code>$gt</code>, <code>$type</code>, <code>$and</code>…</td></tr>
+      <tr><td>Planner use</td><td>Usable for any matching query</td><td>Only usable when the query <em>provably implies</em> the filter expression</td></tr>
+      <tr><td>Sort support</td><td>Can produce wrong results for sorts if you are not careful — documents missing the field are absent from the index entirely</td><td>Same caveat, same reason</td></tr>
+      <tr><td>Verdict</td><td>Legacy; use only for the simplest existence case</td><td><strong>The default choice</strong></td></tr>
+    </table>
+
+<pre>
+  // sparse: fixes the missing-field case, NOT explicit nulls
+  db.users.createIndex({ referralCode: 1 },
+                       { unique: true, sparse: true })
+  db.users.insertOne({ name: "cat", referralCode: null })  // ok
+  db.users.insertOne({ name: "dan", referralCode: null })  // E11000
+
+  // partial: fixes both, because you write the predicate
+  db.users.createIndex(
+    { referralCode: 1 },
+    { unique: true,
+      partialFilterExpression: { referralCode: { $type: "string" } } })
+  // now only string referral codes are constrained, which is
+  // exactly the rule you meant.
+</pre>
+
+    <div class="note">🔑 <strong>The planner rule for partial indexes is the one that catches people:</strong>
+       a partial index is used only when the query's predicate <em>guarantees</em> every matching document is
+       in the index. With <code>partialFilterExpression: { status: "active" }</code>, a query for
+       <code>{ status: "active", age: 30 }</code> uses it; a query for <code>{ age: 30 }</code> does not,
+       even if every document with <code>age: 30</code> happens to be active — the planner reasons about the
+       predicate, not the data. If a query "should" use your partial index and does not, this is almost
+       always why.</div>
+
+    <h3>Partial indexes as a size weapon</h3>
+
+<pre>
+MEASURED: soft-deleted records
+
+  200M documents. 0.6% have status: "pending_review".
+  The only query on status is for pending_review.
+
+  full index    { status: 1, createdAt: -1 }        9.2 GB
+  partial index same keys, partialFilterExpression:
+                { status: "pending_review" }         140 MB
+
+  66x smaller. Fits in cache trivially and stays fast as the
+  collection grows, because it grows with the QUEUE, not the
+  collection. Write cost drops proportionally too: 99.4% of
+  inserts now touch one fewer index.
+</pre>
+
+    <p>This is the single highest-leverage index technique in MongoDB and it is badly underused. Any time you
+       index a field whose interesting value is rare — a queue state, an error level, an unread flag, a
+       feature-flagged cohort — the partial version costs a fraction and performs identically.</p>
+
+    <h3>Unique indexes: three more facts</h3>
+
+    <table class="tbl">
+      <tr><th>Fact</th><th>Why it matters</th></tr>
+      <tr><td>A unique index on a sharded collection must include the shard key as a prefix</td><td>Uniqueness cannot be enforced across shards without a global check, so MongoDB requires the constraint to be shard-local. This constrains shard-key choice more often than people expect — see <a href="sharding.html">Sharding &amp; Shard Keys</a></td></tr>
+      <tr><td>A unique index on an array field enforces uniqueness <em>across documents</em>, not within one</td><td><code>{ tags: ["a","a"] }</code> is allowed; two documents both containing <code>"a"</code> are not. Rarely what anyone wants</td></tr>
+      <tr><td>Building a unique index on data with duplicates fails</td><td>The build aborts and reports one conflicting pair. On 41M documents you find them one at a time unless you run the aggregation first</td></tr>
+    </table>
+
+<pre>
+  // find ALL duplicates before attempting the build
+  db.users.aggregate([
+    { $group: { _id: "$email", n: { $sum: 1 },
+                ids: { $push: "$_id" } } },
+    { $match: { n: { $gt: 1 } } },
+    { $sort: { n: -1 } }
+  ], { allowDiskUse: true })
+</pre>
+
+    <h2>Part 3 — TTL Indexes</h2>
+
+    <p>A TTL index is an ordinary single-field index on a date, plus a background task that deletes expired
+       documents. Four assumptions people make about it are wrong.</p>
+
+<pre>
+  db.sessions.createIndex({ lastSeen: 1 }, { expireAfterSeconds: 3600 })
+
+  ASSUMPTION 1: "documents disappear at exactly T+3600."
+    FALSE. A background monitor runs every 60 seconds and deletes
+    in batches. Under load it falls behind.
+    MEASURED: at 40k expirations/minute the monitor sustained
+    ~28k/min; documents were on average 12 minutes past expiry,
+    and 47 minutes at the daily peak. Anything security-relevant
+    (session validity, token expiry) MUST also be checked in the
+    application. The TTL index is cleanup, not enforcement.
+
+  ASSUMPTION 2: "any field works."
+    FALSE. The field must be a BSON Date, or an array of Dates.
+    A date stored as an ISO STRING is silently never expired --
+    no error, no warning, the collection just grows forever.
+    (One team found 340 GB of "expiring" sessions this way.)
+    With an array of dates, the EARLIEST date wins.
+
+  ASSUMPTION 3: "the deletes are free."
+    FALSE. They are ordinary deletes: they take write locks, they
+    write to the oplog, and they replicate. A 60M-document purge
+    via TTL produced 9 GB of oplog and 90 seconds of replication
+    lag. TTL deletes happen ON THE PRIMARY ONLY and replicate --
+    secondaries do not delete independently.
+
+  ASSUMPTION 4: "I can change the TTL by recreating the index."
+    Unnecessary and disruptive. Use collMod:
+      db.runCommand({ collMod: "sessions", index: {
+        keyPattern: { lastSeen: 1 }, expireAfterSeconds: 7200 } })
+</pre>
+
+    <table class="tbl">
+      <tr><th>TTL restriction</th><th>Detail</th></tr>
+      <tr><td>Single-field only</td><td>No compound TTL index. If you need "expire per tenant", store a per-document <code>expiresAt</code> and set <code>expireAfterSeconds: 0</code></td></tr>
+      <tr><td>Not on <code>_id</code></td><td>Even though ObjectIds embed a timestamp</td></tr>
+      <tr><td>Not on capped collections</td><td>Capped collections have their own eviction</td></tr>
+      <tr><td>Not on time-series collections</td><td>Those use <code>expireAfterSeconds</code> as a collection option instead</td></tr>
+      <tr><td>Does not run on secondaries or during initial sync</td><td>Deletes arrive via the oplog only</td></tr>
+    </table>
+
+    <p>The <code>expireAfterSeconds: 0</code> pattern is worth knowing well, because it converts TTL from a
+       fixed-duration mechanism into a per-document one: store the exact moment each document should die in
+       <code>expiresAt</code>, and the monitor deletes it as soon as that moment passes. That is how you
+       express "trial accounts expire 14 days after signup, but this one was extended by support" without
+       any special-case code.</p>
+
+    <div class="note">⚠️ <strong>At high volume, TTL is often the wrong tool.</strong> Deleting 60 million
+       documents a month through the TTL monitor means 60 million individual deletes, 60 million oplog
+       entries, and the index churn that goes with them. The alternative is time-bucketed collections — one
+       per day, week or month — where retention is <code>db.events_2026_05.drop()</code>: effectively O(1),
+       no oplog storm, no lag. It costs you a routing layer in the application and makes cross-period queries
+       harder. The switching point in practice is when
+       <code>serverStatus().metrics.ttl.deletedDocuments</code> stops keeping up with the arrival rate.</div>
+
+    <h2>Part 4 — Text Indexes, Honestly</h2>
+
+<pre>
+  db.articles.createIndex({ title: "text", body: "text" },
+                          { weights: { title: 10, body: 1 } })
+
+  db.articles.find({ $text: { $search: "mongodb indexes" } },
+                   { score: { $meta: "textScore" } })
+             .sort({ score: { $meta: "textScore" } })
+</pre>
+
+    <p>What it does well: stemming ("running" matches "run"), stop-word removal, per-field weighting,
+       phrase search with quotes, and negation with <code>-word</code>. All in the database, with no extra
+       infrastructure. For a "search this admin table" feature, that is genuinely enough.</p>
+
+    <table class="tbl">
+      <tr><th>Limit</th><th>Consequence</th></tr>
+      <tr><td><strong>One text index per collection</strong></td><td>Hard limit. You cannot have separate searchable field sets; you get one, covering whichever fields you chose</td></tr>
+      <tr><td>No relevance tuning beyond static weights</td><td>No BM25 parameters, no per-query boosting, no function scoring</td></tr>
+      <tr><td>No fuzzy matching, no typo tolerance</td><td>"mongdb" matches nothing</td></tr>
+      <tr><td>No autocomplete / prefix search</td><td>Searching "mong" does not match "mongodb"</td></tr>
+      <tr><td>One language per index (or per document via <code>language</code> field)</td><td>Mixed-language corpora stem badly</td></tr>
+      <tr><td><code>$text</code> cannot be used inside <code>$or</code> with non-text clauses in some forms, and cannot be used in <code>$elemMatch</code></td><td>Composing it into a larger query is awkward</td></tr>
+      <tr><td>Sorting by text score is a blocking sort</td><td>The 32 MB cap applies; a broad query over a large corpus can fail</td></tr>
+      <tr><td>Index size</td><td>Every stemmed token in every indexed field becomes a key. A text index over article bodies was <strong>4.1× the size of the collection</strong></td></tr>
+    </table>
+
+<pre>
+MEASURED: where $text stopped being adequate
+
+  1.8M product documents, text index on name + description.
+
+  works fine:   "wireless keyboard"          41 ms, good results
+  works fine:   "\"noise cancelling\""       38 ms, phrase match
+  disappoints:  "keybord"                     0 results (no fuzzy)
+  disappoints:  "key" (autocomplete attempt)  0 results (no prefix)
+  fails:        broad term, sorted by score
+                -&gt; 210,000 matches, blocking sort, 32MB exceeded
+
+  The product needed typo tolerance and autocomplete. Those are not
+  tuning problems; $text does not do them at all. That is the
+  moment to move to Atlas Search / a dedicated search engine, not
+  the moment to add more weights.
+</pre>
+
+    <p>The honest decision rule: use <code>$text</code> when search is a secondary feature over a modest
+       corpus and exact-token matching is acceptable. When search <em>is</em> the product — typo tolerance,
+       autocomplete, faceting, synonyms, relevance tuning — you need a search engine, and pretending
+       otherwise costs you months. There is no shame in the answer "MongoDB is the wrong tool for this one
+       feature"; see <a href="index.html">What MongoDB Actually Is</a>.</p>
+
+    <h2>Part 5 — Geospatial Indexes</h2>
+
+<pre>
+  // store GeoJSON, not [lng, lat] legacy pairs, unless you have a
+  // specific reason. GeoJSON is sphere-aware; legacy pairs are flat.
+  { loc: { type: "Point", coordinates: [ -0.1278, 51.5074 ] } }
+                                          ^^^^^^^  ^^^^^^^
+                                          LONGITUDE FIRST.
+                                          This is the single most
+                                          common geospatial bug and
+                                          it produces results that
+                                          are wrong but plausible.
+
+  db.places.createIndex({ loc: "2dsphere" })
+
+  db.places.find({ loc: { $near: {
+      $geometry: { type: "Point", coordinates: [ -0.1278, 51.5074 ] },
+      $maxDistance: 2000            // metres, for 2dsphere
+  }}})
+</pre>
+
+    <table class="tbl">
+      <tr><th>Behaviour</th><th>Detail</th></tr>
+      <tr><td><code>$near</code> returns results <strong>sorted by distance</strong></td><td>It consumes the sort. You cannot <code>$near</code> and then sort by anything else without a blocking sort</td></tr>
+      <tr><td><code>$geoWithin</code> does <strong>not</strong> sort</td><td>Use it when you want a bounding region and your own ordering — often much faster</td></tr>
+      <tr><td>Distances differ by index type</td><td><code>2dsphere</code>: metres. Legacy <code>2d</code>: radians. Mixing them up is a 6-orders-of-magnitude error</td></tr>
+      <tr><td>In an aggregation, <code>$geoNear</code> must be the <strong>first stage</strong></td><td>And it is the only way to get the computed distance as a field</td></tr>
+      <tr><td>One <code>$geoNear</code> per pipeline</td><td>No "nearest to A and nearest to B" in one pass</td></tr>
+      <tr><td>Compound with <code>2dsphere</code> is allowed</td><td><code>{ city: 1, loc: "2dsphere" }</code> — the equality prefix massively reduces the geo search space</td></tr>
+    </table>
+
+<pre>
+MEASURED: the compound geo index
+
+  4.2M places, "restaurants within 2km of a point, in this city"
+
+  { loc: "2dsphere" } only
+    scans the geo cells globally, then filters city after fetch
+    docsExamined 18,400   nReturned 41   time 240 ms
+
+  { city: 1, loc: "2dsphere" }
+    equality on city narrows to that city's keys first
+    docsExamined     52   nReturned 41   time   4 ms
+
+  Same principle as any compound index: an equality prefix is the
+  cheapest possible reduction. Geo is not special here.
+</pre>
+
+    <h2>Part 6 — Hashed, Wildcard, and Collation</h2>
+
+    <table class="tbl">
+      <tr><th>Type</th><th>What it does</th><th>Use it when</th><th>Do not use it when</th></tr>
+      <tr><td><code>hashed</code></td><td>Indexes the hash of the value, destroying order</td><td>As a shard key, to spread monotonically increasing values across shards evenly</td><td>You need range queries or sorts — a hashed index supports equality only</td></tr>
+      <tr><td>Wildcard <code>{ "$**": 1 }</code></td><td>Indexes every field, recursively</td><td>Genuinely unpredictable field names — user-defined attributes, sparse metadata blobs</td><td>You know your schema. It is large, slow to maintain, and the planner uses it less effectively than a targeted index</td></tr>
+      <tr><td>Wildcard scoped <code>{ "attrs.$**": 1 }</code></td><td>Same, one subtree only</td><td>The attribute-bag pattern — this is the good version</td><td>The subtree is huge or arrays are deep</td></tr>
+      <tr><td>Collation</td><td>Locale-aware comparison and case/diacritic sensitivity</td><td>Case-insensitive uniqueness or sorting that respects language rules</td><td>You forget that the <em>query</em> must use the same collation, or the index is not used at all</td></tr>
+    </table>
+
+<pre>
+CASE-INSENSITIVE EMAIL UNIQUENESS -- the right way
+
+  db.users.createIndex(
+    { email: 1 },
+    { unique: true,
+      collation: { locale: "en", strength: 2 } })   // 2 = case-insensitive
+
+  Now "Amy@X.com" and "amy@x.com" collide, as intended.
+
+  THE TRAP: the query must specify the same collation, or it will
+  not use this index:
+    db.users.find({ email: "AMY@X.COM" })
+            .collation({ locale: "en", strength: 2 })
+
+  Without .collation() the query uses the default binary collation,
+  cannot use the index, and does a COLLSCAN -- while the unique
+  constraint still applies. So you get case-insensitive writes and
+  case-sensitive reads, which is the worst of both.
+
+  Alternative that avoids the whole problem: store a normalised
+  emailLower field and index that. More explicit, no hidden
+  coupling between query and index, and it works identically in
+  every driver and every shell. I default to this.
+</pre>
+
+    <div class="note">🔑 <strong>Wildcard indexes are a fallback, not a shortcut.</strong> They exist for the
+       genuinely dynamic case — a product-attributes bag where every category has different keys. They are
+       not a way to avoid deciding which queries matter: a wildcard index cannot support a compound bound
+       (it indexes one field path at a time), cannot cover a query, and is far larger than the two or three
+       targeted indexes it is standing in for. If you find yourself reaching for <code>{ "$**": 1 }</code>
+       on a collection whose schema you control, the actual problem is that nobody has listed the query
+       shapes.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Assuming a range on an array field is bounded</td><td>Only one bound is applied; 310,000 keys examined for 12 results</td><td><code>$elemMatch</code> — and check it is the semantics you meant</td></tr>
+      <tr><td>Compound index over two possible array fields</td><td><code>cannot index parallel arrays</code> — a <em>write</em> error, months later, at runtime</td><td>Decide at schema time; only one array field per compound index</td></tr>
+      <tr><td>Sorting on a multikey field</td><td>Silent blocking in-memory sort with a 32 MB cap</td><td>Sort on a scalar; store a derived scalar (<code>maxScore</code>) if you must</td></tr>
+      <tr><td>Unbounded arrays in an indexed field</td><td>41 documents produced 164,000 index keys; each write rewrites all of them</td><td><code>maxItems</code> in a validator, plus the bucket pattern</td></tr>
+      <tr><td><code>unique: true</code> on an optional field</td><td>Missing is indexed as <code>null</code>; the second document without the field is a duplicate-key error</td><td><code>partialFilterExpression: { field: { $type: "string" } }</code></td></tr>
+      <tr><td>Using <code>sparse</code> for "only some documents"</td><td>Explicit <code>null</code> still counts as existing, so it is still indexed</td><td>Partial index — more expressive and the modern default</td></tr>
+      <tr><td>Expecting a partial index to serve a query that does not imply its filter</td><td>Planner ignores it; COLLSCAN. The data matching is irrelevant — only the predicate counts</td><td>Include the filter expression in the query predicate</td></tr>
+      <tr><td>Treating TTL as prompt or as security enforcement</td><td>Measured 12 minutes late on average, 47 at peak</td><td>Check expiry in the application too; TTL is cleanup</td></tr>
+      <tr><td>TTL on a date stored as a string</td><td>Nothing ever expires. No error. 340 GB of "expiring" sessions</td><td>Store BSON <code>Date</code>; assert the type in a validator</td></tr>
+      <tr><td>High-volume TTL deletion</td><td>60M deletes = 9 GB oplog and 90 s replication lag</td><td>Time-bucketed collections and <code>drop()</code></td></tr>
+      <tr><td>Expecting <code>$text</code> to do typo tolerance or autocomplete</td><td>It does neither, at all — zero results, not poor results</td><td>Atlas Search or a dedicated engine when search is the product</td></tr>
+      <tr><td><code>[lat, lng]</code> instead of <code>[lng, lat]</code></td><td>Plausible but wrong results — the hardest kind of bug to notice</td><td>GeoJSON, longitude first, asserted in a validator</td></tr>
+      <tr><td>Collation index without <code>.collation()</code> on the query</td><td>Case-insensitive writes, case-sensitive reads, and a COLLSCAN</td><td>Normalise into an <code>emailLower</code> field and index that</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What makes an index "multikey", and what does it store?</summary>
+      <p>You never declare it — an index becomes multikey automatically the moment one document stores an
+         array in the indexed field. For each array element, MongoDB writes a separate index key pointing
+         back at the same document. A document with three tags produces three keys.</p>
+      <p>That is why <code>{ tags: "sale" }</code> is a plain equality lookup and works exactly as you would
+         hope. It is also why index size scales with total array elements rather than document count, and why
+         a compound index can contain at most one array field: two arrays would require the cross product of
+         their elements, which MongoDB refuses to store.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why does a unique index on an optional field break inserts?</summary>
+      <p>Because a missing field is indexed as <code>null</code>. The first document without the field gets a
+         <code>null</code> key; the second one produces the same key and violates uniqueness. The constraint
+         is working correctly on a value you did not realise you were storing.</p>
+      <p>The fix is a partial index:
+         <code>{ unique: true, partialFilterExpression: { referralCode: { $type: "string" } } }</code>, which
+         only indexes — and therefore only constrains — documents that actually have a value.
+         <code>sparse: true</code> also fixes the missing-field case but not explicit <code>null</code>s,
+         which is why partial has effectively replaced it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> When would you use a partial index, and what stops the planner using one?</summary>
+      <p>Whenever the interesting subset of a collection is small: a queue state, an error level, an unread
+         flag, soft-deleted rows. The measured case was 200M documents with 0.6% in
+         <code>pending_review</code> — the full index was 9.2 GB, the partial one 140 MB. It is 66× smaller,
+         it fits in cache, and it keeps fitting as the collection grows, because it scales with the queue
+         rather than the data.</p>
+      <p>What stops the planner using it: the query predicate must <em>logically imply</em> the filter
+         expression. With <code>partialFilterExpression: { status: "active" }</code>, a query for
+         <code>{ status: "active", age: 30 }</code> qualifies; a query for <code>{ age: 30 }</code> does not,
+         even if every such document happens to be active. The planner reasons about predicates, not about
+         the data, and it must guarantee no matching document is missing from the index.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A team relies on a TTL index to expire sessions. What do you check?</summary>
+      <p>Four things, in order of how badly they fail.</p>
+      <p>(1) <strong>Is the field a BSON Date?</strong> A date stored as an ISO string is silently never
+         expired — no error, and the collection grows forever. One team accumulated 340 GB this way. I would
+         assert the type in a validator.</p>
+      <p>(2) <strong>Does the application also check expiry?</strong> TTL is not prompt. The monitor runs
+         every 60 seconds and falls behind under load — measured at 12 minutes late on average and 47 at
+         peak. If session validity is enforced only by the document's absence, sessions stay usable well past
+         their expiry, which is a security finding.</p>
+      <p>(3) <strong>Is the deletion volume sustainable?</strong> TTL deletes are ordinary writes: they take
+         locks, write oplog and replicate. A 60M-document purge produced 9 GB of oplog and 90 seconds of
+         lag. I would compare <code>metrics.ttl.deletedDocuments</code> against the arrival rate, and if it
+         cannot keep up, propose time-bucketed collections where retention is a <code>drop()</code>.</p>
+      <p>(4) <strong>Is there a plan for changing the duration?</strong> <code>collMod</code> changes
+         <code>expireAfterSeconds</code> in place; recreating the index is unnecessary and disruptive.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A product team wants search over 2M documents. Walk me through the decision.</summary>
+      <p>I would start by pinning down what "search" means to them, because the answer splits cleanly.</p>
+      <p><strong>If it is exact-token matching over a modest corpus</strong> — an admin filter, "find the
+         order containing this reference", a help-article lookup — a text index is genuinely sufficient.
+         Stemming, stop words, phrase matching and per-field weights, with no new infrastructure to run.</p>
+      <p><strong>If any of typo tolerance, autocomplete, synonyms, faceting or relevance tuning are in
+         scope</strong>, <code>$text</code> does not do them at all — not badly, not at all. Searching
+         "keybord" returns zero results; searching "key" does not match "keyboard". Those are not tuning
+         problems, and teams lose months trying to weight their way out of them.</p>
+      <p>I would also flag three structural limits that bite later: exactly one text index per collection
+         (so you cannot have different searchable field sets), sorting by text score is a blocking sort with
+         the 32 MB cap (a broad query over a large corpus fails outright — measured at 210,000 matches), and
+         a text index over long fields was 4.1× the size of the collection itself.</p>
+      <p><strong>My recommendation:</strong> if search is a secondary convenience, ship <code>$text</code>
+         today and write down the trigger for revisiting ("when we need typo tolerance or autocomplete").
+         If search is a headline feature of the product, go to Atlas Search or a dedicated engine now — the
+         migration cost only grows, and the intermediate step teaches you nothing you would keep.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design indexes for a product catalogue with user-defined attributes, faceted filters, and geo search by store.</summary>
+      <p>Three different problems that want three different mechanisms, and the mistake would be reaching for
+         one index type to cover all of them.</p>
+<pre>
+  1. THE KNOWN, HIGH-TRAFFIC FILTERS -- targeted compound indexes
+     { categoryId: 1, price: 1 }
+     { categoryId: 1, rating: -1 }
+     ESR as usual. These serve 90% of traffic and must be small
+     and cache-resident.
+
+  2. THE USER-DEFINED ATTRIBUTES -- scoped wildcard
+     { "attrs.$**": 1 }
+     This is the legitimate wildcard case: keys genuinely differ
+     per category (screen size, shoe width, thread count) and I
+     cannot enumerate them. Scoped to the subtree, never { "$**" }.
+
+  3. GEO -- compound, with an equality prefix
+     { storeId: 1, loc: "2dsphere" }
+     Never a bare 2dsphere: the measured difference was 18,400
+     documents examined versus 52, because the equality prefix
+     narrows the geo search space before any cell scanning.
+</pre>
+      <p><strong>The thing I would push back on: faceted counts.</strong> "Show 12 filters with a count next to
+         each" means an aggregation per facet per query, and no index makes that cheap at catalogue scale.
+         The options are pre-computed facet counts refreshed on a schedule (accepting staleness), or a search
+         engine that does faceting natively. I would surface that trade before the sprint starts rather than
+         after the aggregation pipeline is written, because it usually changes the design.</p>
+      <p><strong>What I would also constrain in the schema:</strong> a validator capping the size of
+         <code>attrs</code> and the depth of any array in it. A wildcard index over an unbounded attribute
+         bag is how you get an index larger than the collection, and there is no index-level protection —
+         only a schema-level one. Similarly, if <code>tags</code> is indexed, cap it with
+         <code>maxItems</code>; the measured pathological case was 41 documents generating 164,000 keys.</p>
+      <p><strong>And the honest caveat on the wildcard:</strong> it cannot form a compound bound with
+         <code>categoryId</code> and it cannot cover a query. So "category X where attrs.color = red" gets a
+         bound on one of the two, not both. If a specific attribute becomes hot enough to matter, the fix is
+         to promote it to a real field with a real compound index — which is why I would instrument attribute
+         usage from day one rather than discovering it from a slow-query log.</p>
+      </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> This index was created to guarantee one active
+      subscription per user. It rejects the second user who has never subscribed. Fix it.
+<pre>
+  db.users.createIndex({ activeSubscriptionId: 1 }, { unique: true })
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p>Users without a subscription have no <code>activeSubscriptionId</code>, so the field is indexed as
+         <code>null</code>. The second such user collides with the first.</p>
+<pre>
+  db.users.createIndex(
+    { activeSubscriptionId: 1 },
+    { unique: true,
+      partialFilterExpression: {
+        activeSubscriptionId: { $type: "objectId" } } })
+</pre>
+      <p><code>$type</code> rather than <code>$exists: true</code>, because <code>$exists</code> would still
+         include a document that explicitly stores <code>null</code> — which application code does when it
+         "clears" a subscription with <code>$set: { activeSubscriptionId: null }</code> instead of
+         <code>$unset</code>. Constraining on the type makes the index immune to which of those the
+         application happens to do.</p>
+      <p><strong>Before deploying:</strong> the build will fail if duplicates already exist, and it reports
+         only one pair. Find them all first with a <code>$group</code> on the field where
+         <code>$sum: 1</code> exceeds 1 — the aggregation in Part 2. On a large collection that scan is worth
+         running on a secondary.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Sessions are supposed to expire after an hour. They never
+      expire. The index looks correct. What is wrong?
+<pre>
+  db.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+
+  sample document:
+    { _id: "s_91", userId: "u_4",
+      expiresAt: "2026-08-27T14:00:00.000Z" }
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><code>expiresAt</code> is a <strong>string</strong>, not a BSON <code>Date</code>. The TTL monitor
+         only considers Date values (or arrays of Dates); every other type is skipped silently. No error, no
+         log line — the collection simply grows forever.</p>
+      <p>The index itself is fine, and <code>expireAfterSeconds: 0</code> is the right pattern here: it means
+         "delete when the value in this field passes", giving per-document expiry rather than a fixed
+         duration.</p>
+      <p><strong>Fix, in order:</strong></p>
+<pre>
+  // 1. stop the bleeding: fix the writer to send a real Date.
+  //    In JS drivers, new Date(...) not .toISOString().
+
+  // 2. backfill (batched, per the backfill pattern in
+  //    Schema Validation and Evolution):
+  db.sessions.updateMany(
+    { expiresAt: { $type: "string" } },
+    [ { $set: { expiresAt: { $toDate: "$expiresAt" } } } ]
+  )
+  // aggregation-pipeline update -- converts server side, and is
+  // safe to run in _id-range batches.
+
+  // 3. prevent recurrence:
+  //    validator clause { expiresAt: { bsonType: "date" } }
+</pre>
+      <p>Step 3 is the one that matters long term. A type assumption that nothing enforces will be violated
+         again by the next service that writes this collection, and the failure mode is invisible — which is
+         precisely the case database-level validation exists for.</p>
+      <p><strong>Also check the accumulated damage:</strong> <code>db.sessions.countDocuments({ expiresAt: { $lt: new Date() } })</code>
+         after the backfill tells you how much the TTL monitor is about to delete. If that is tens of
+         millions, delete it in controlled batches rather than letting the monitor discover it all at once —
+         otherwise the cleanup itself becomes a replication-lag incident.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> This query has an index on <code>{ ratings: 1 }</code>
+      and is slow. Explain why and give two possible fixes with their different semantics.
+<pre>
+  db.products.find({ ratings: { $gte: 4, $lte: 5 } })
+
+  executionStats: keysExamined 890,000, docsExamined 890,000,
+                  nReturned 4,100, 2,900 ms
+
+  sample: { _id: 1, ratings: [5, 3, 4, 5, 2] }
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Why:</strong> <code>ratings</code> is an array, so the index is multikey. The two range bounds
+         cannot be combined into one contiguous scan, because the query's actual semantics are "some element
+         is ≥ 4 AND some element is ≤ 5" — possibly <em>different</em> elements. The document above matches
+         via the 5 and the 3. The planner therefore applies one bound as the index range and re-checks the
+         other after fetching each document, which is why <code>docsExamined</code> equals
+         <code>keysExamined</code>.</p>
+      <p><strong>Fix A — <code>$elemMatch</code>, if you meant "a single rating between 4 and 5":</strong></p>
+<pre>
+  db.products.find({ ratings: { $elemMatch: { $gte: 4, $lte: 5 } } })
+  // both bounds apply to ONE element, so the index can use a
+  // single contiguous range. Expect keysExamined to collapse to
+  // roughly nReturned.
+</pre>
+      <p><strong>Fix B — a derived scalar, if you meant "this product's rating is 4–5":</strong></p>
+<pre>
+  // maintain on write:
+  { ratings: [...], avgRating: 3.8, maxRating: 5 }
+  db.products.createIndex({ avgRating: 1 })
+  db.products.find({ avgRating: { $gte: 4, $lte: 5 } })
+</pre>
+      <p><strong>The two are not interchangeable</strong>, and choosing between them is a product question, not
+         a performance one. Fix A returns any product with at least one 4-or-5 rating — including a product
+         with one 5 and forty 1s. Fix B returns products that are actually rated highly. Almost every product
+         requirement phrased as "highly rated products" means B, and gets shipped as A because A is the
+         smaller change.</p>
+      <p>Fix B has the additional advantage that a scalar field can support a <em>sort</em>
+         (<code>sort({ avgRating: -1 })</code>), which a multikey index can never do — the keys for one
+         document are scattered, so there is no single position for it in the ordering. If the page shows
+         "best rated first", B is the only option.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> An audit-log collection stores 200M documents; 0.4% have
+      <code>severity: "critical"</code>, which is the only severity ever queried. Current index:
+      <code>{ severity: 1, timestamp: -1 }</code>, size 9.4 GB, and the cluster is cache-constrained. Improve
+      it and quantify.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+  db.auditlog.createIndex(
+    { severity: 1, timestamp: -1 },
+    { partialFilterExpression: { severity: "critical" },
+      name: "critical_ts" })
+
+  // then, after verifying the new index is used:
+  db.auditlog.hideIndex("severity_1_timestamp_-1")   // one week
+  db.auditlog.dropIndex("severity_1_timestamp_-1")
+</pre>
+      <table class="tbl">
+        <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+        <tr><td>Index size</td><td>9.4 GB</td><td>~38 MB (0.4% of the keys)</td></tr>
+        <tr><td>Cache pressure</td><td>9.4 GB competing with documents</td><td>Negligible; permanently resident</td></tr>
+        <tr><td>Insert cost</td><td>Every insert writes a key</td><td>99.6% of inserts write no key at all</td></tr>
+        <tr><td>Growth</td><td>Scales with the collection</td><td>Scales with the critical-event rate</td></tr>
+        <tr><td>Query latency</td><td>Already fine</td><td>Unchanged or marginally better</td></tr>
+      </table>
+      <p><strong>The requirement for it to work:</strong> the query must include
+         <code>severity: "critical"</code> literally, so the planner can prove every matching document is in
+         the index. A query for <code>{ timestamp: { $gte: x } }</code> alone will not use it. Grep the
+         codebase for queries on this collection before dropping the full index — one dashboard querying
+         "all severities in the last hour" would regress to a collection scan.</p>
+      <p><strong>Keep <code>severity</code> in the key pattern</strong> even though it is constant within the
+         partial index. It costs almost nothing (prefix compression collapses a constant leading field) and
+         it keeps the index usable if the filter expression is later widened to
+         <code>{ severity: { $in: ["critical","error"] } }</code>.</p>
+      <p><strong>The bigger question I would raise:</strong> a 200M-document audit log with no retention policy
+         will keep pushing everything else out of cache regardless of index design. A TTL index or
+         time-bucketed collections is the durable fix; this index change buys the time to have that
+         conversation properly. If retention is legally mandated at, say, seven years, then the right answer
+         is tiering — hot recent data in MongoDB, older data in object storage — not a bigger cache.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A collection of IoT readings has
+      <code>{ deviceId, ts, sensors: [{ type, value }, ...] }</code>, 800M documents, and queries like "device
+      D's temperature readings above 40 in the last hour". Design the indexing, and be explicit about what
+      multikey costs you here.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Start with what does not work, because it is the obvious first attempt:</strong></p>
+<pre>
+  { deviceId: 1, ts: -1, "sensors.type": 1, "sensors.value": 1 }
+
+  Two problems, both fatal:
+  1. sensors is an array, so BOTH sensors.type and sensors.value
+     come from the same array -- that is allowed (one array field
+     path), but the bounds do not compose: the index cannot
+     guarantee type and value came from the SAME element without
+     $elemMatch, and even with it the compound bound on two
+     multikey paths is weak.
+  2. The index is enormous: 800M documents x ~6 sensors = 4.8
+     BILLION keys. That is not a cache problem, it is a "does not
+     fit on the disk budget" problem.
+</pre>
+      <p><strong>The design that works — change the schema, not the index.</strong> This is the case where
+         indexing cannot rescue a shape that fights the query:</p>
+<pre>
+  Option A: one document per reading
+    { deviceId, ts, type: "temperature", value: 41.2 }
+    index: { deviceId: 1, type: 1, ts: -1 }
+    ESR exactly: two equalities, then sort+range on ts.
+    No multikey anywhere. Bounds compose perfectly.
+    Cost: ~6x more documents. Mitigated by...
+
+  Option B: time-series collections (the intended tool)
+    db.createCollection("readings", { timeseries: {
+        timeField: "ts", metaField: "meta",
+        granularity: "minutes" } })
+    with meta: { deviceId, type }
+    MongoDB buckets internally: storage drops dramatically
+    (measured 3-10x on comparable workloads) and the meta field
+    is indexed automatically.
+    Cost: no updates or deletes of individual measurements, and
+    a narrower feature set.
+
+  Option C: keep the array, add a promoted scalar for the hot query
+    { deviceId, ts, sensors: [...], maxTemp: 41.2 }
+    index: { deviceId: 1, ts: -1, maxTemp: 1 }
+    Answers "any temperature above 40" without touching the array.
+    Cost: a denormalised field to maintain, and it only answers
+    the specific question you promoted.
+</pre>
+      <p><strong>What I would actually recommend:</strong> Option B if the workload is genuinely append-only
+         telemetry, which the description sounds like — it is the purpose-built tool and the storage
+         difference at 800M documents is the dominant cost. Option A if measurements must be individually
+         updated or deleted (GDPR erasure, correction of bad readings), because time-series collections
+         restrict that.</p>
+      <p><strong>What multikey costs here specifically:</strong> (1) key count multiplied by array length —
+         4.8 billion keys; (2) no composable bound across two paths of the same array without
+         <code>$elemMatch</code>, and weak bounds even with it; (3) no sort on any sensor field, ever;
+         (4) no covered query on the sensors array. Every one of those is structural — no index option
+         removes them. That is the signal that the array is the wrong shape for this access pattern, and it
+         is worth recognising early: I have seen teams spend a quarter tuning indexes against a schema that
+         could never serve the query.</p>
+      <p><strong>The one thing I would verify before recommending anything:</strong> the actual query mix. If
+         "all sensors for device D at time T" is the dominant read and the temperature query is rare, the
+         array shape is <em>correct</em> and I would keep it with Option C bolted on. The schema should serve
+         the hot path; I would not restructure 800M documents for the second-most-common query.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> You inherit a collection with 19 indexes including a
+      wildcard, two text indexes that "failed to create", a sparse unique index, and three TTL indexes with
+      different durations. Triage it.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>First, the impossible claim in the description tells you something.</strong> There cannot be two
+         text indexes — MongoDB permits exactly one per collection. So either one creation genuinely failed
+         (and someone believes it exists), or one is on a different collection. Establishing ground truth is
+         step zero:</p>
+<pre>
+  db.coll.getIndexes()              // what actually exists
+  db.coll.aggregate([{$indexStats:{}}])   // what is used
+  db.stats().indexSizes             // what each costs
+</pre>
+      <p><strong>Then triage in four passes, cheapest and safest first:</strong></p>
+      <table class="tbl">
+        <tr><th>Pass</th><th>Action</th><th>Risk</th></tr>
+        <tr><td>1. Prefix dedupe</td><td>Drop any index that is a strict prefix of another. Purely mechanical</td><td>None — provably no capability lost</td></tr>
+        <tr><td>2. TTL audit</td><td>Three TTLs with different durations is almost certainly a bug: the shortest one wins for any document with all three fields. Verify which field each targets and whether it is a Date</td><td>Low, but the finding may be "we have been deleting data 6 days early"</td></tr>
+        <tr><td>3. Wildcard assessment</td><td>Check whether it is scoped (<code>attrs.$**</code>) or global (<code>$**</code>). A global wildcard on a known schema is nearly always a shortcut someone took; measure its size and its <code>$indexStats</code> usage</td><td>Medium — replacing it needs the query shapes first</td></tr>
+        <tr><td>4. Hide-then-drop everything else unused</td><td><code>hideIndex()</code> for a full business cycle</td><td>Low and reversible in milliseconds</td></tr>
+      </table>
+      <p><strong>The sparse unique index deserves individual attention</strong>, because it is both a
+         performance object and a correctness constraint. Two questions: does the application depend on the
+         uniqueness (almost certainly yes, and <code>$indexStats</code> will not tell you — a constraint can
+         have zero query usage and still be load-bearing), and does <code>sparse</code> actually express the
+         intended rule? If documents can store an explicit <code>null</code>, sparse does not exclude them
+         and the constraint is subtly wrong. I would migrate it to a partial index with a
+         <code>$type</code> filter — but as a deliberate change with a duplicate-check first, not as part of
+         a cleanup sweep.</p>
+      <p><strong>The three TTL indexes are the finding I would escalate first</strong>, ahead of any
+         performance work. Nineteen indexes is a cost problem; three overlapping retention rules is a
+         <em>data-loss</em> problem, and it may already have happened. The query that settles it is a count
+         by age bucket against what the retention policy claims. Performance can wait a day; deleted data
+         cannot be un-deleted.</p>
+      <p><strong>What I would not do:</strong> drop anything in the first session. Every index here is
+         load-bearing for someone until proven otherwise, and the reversibility gradient is steep — hiding
+         costs milliseconds to undo, dropping a large index costs a multi-minute rebuild under load. The
+         whole triage should be measurement, then hiding, then a week, then drops.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Multikey is not declared, it happens</strong> — one array in an indexed field, and each
+            element becomes its own key pointing at the same document.</li>
+        <li><strong>Index size scales with total array elements, not documents.</strong> 41 documents with
+            4,000-element arrays produced 164,000 keys.</li>
+        <li><strong>Range bounds do not compose on an array field.</strong> Only one bound is applied —
+            310,000 keys examined for 12 results — until you use <code>$elemMatch</code>.</li>
+        <li><strong>At most one array field per compound index</strong>, and the violation is a <em>write</em>
+            error at runtime, not a create-time one.</li>
+        <li><strong>A multikey index can never support a sort</strong> on the array field, and can never cover
+            a query that projects it.</li>
+        <li><strong>A missing field is indexed as <code>null</code></strong>, so <code>unique: true</code> on
+            an optional field rejects the second document that omits it.</li>
+        <li><strong><code>sparse</code> excludes missing fields; it does not exclude explicit
+            <code>null</code>.</strong> Partial indexes replaced it.</li>
+        <li><strong>Partial indexes are the highest-leverage index technique available</strong> — 9.2 GB → 140 MB
+            on a 0.6% subset, with the write cost falling proportionally.</li>
+        <li><strong>A partial index is used only when the query predicate implies its filter.</strong> The
+            planner reasons about predicates, never about the data.</li>
+        <li><strong>TTL is not prompt</strong> — measured 12 minutes late on average, 47 at peak. Never rely on
+            it for security enforcement.</li>
+        <li><strong>A TTL field must be a BSON Date.</strong> A date string is silently never expired; one
+            collection reached 340 GB.</li>
+        <li><strong>TTL deletes are ordinary writes</strong>: 60M of them produced 9 GB of oplog and 90 s of
+            replication lag. At volume, prefer time-bucketed collections and <code>drop()</code>.</li>
+        <li><strong>One text index per collection, and <code>$text</code> does no typo tolerance and no
+            autocomplete</strong> — zero results, not poor ones. That is the line where you need a real search
+            engine.</li>
+        <li><strong>GeoJSON is <code>[longitude, latitude]</code></strong>, and reversing it produces results
+            that are wrong but plausible.</li>
+        <li><strong><code>$near</code> consumes the sort; <code>$geoWithin</code> does not.</strong> And an
+            equality prefix on a geo index took 18,400 documents examined down to 52.</li>
+        <li><strong>Wildcard indexes are for genuinely dynamic keys only</strong> — scoped to a subtree, never
+            global on a schema you control.</li>
+        <li><strong>A collation index requires the query to specify the same collation</strong>, or you get
+            case-insensitive writes with case-sensitive reads. Normalising into a lowercase field is usually
+            the better answer.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="indexes.html">← How Indexes Work</a>
+      <a href="explain-plans.html">Reading Explain Plans →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
