@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Advanced Stages — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Advanced Stages <span class="level-badge level-ultra">Aggregation</span></h1>
+
+    <p><strong>What you'll master:</strong> the stages that turn the pipeline from a filter-and-group tool into
+       something that can answer real analytical questions — <code>$facet</code> for computing several
+       aggregations over one scan, with the trap that <strong>every branch is independent and none of them
+       can use an index, so a <code>$facet</code> of six branches scans the input once but plans it six times
+       badly</strong>; <code>$setWindowFields</code>, which brought running totals, rankings and moving
+       averages into MongoDB and made a <strong>self-join that took 41 seconds into a 340 ms single
+       pass</strong>; the bucketing family (<code>$bucket</code>, <code>$bucketAuto</code>,
+       <code>$densify</code>, <code>$fill</code>) and why <strong>a time series with missing days silently
+       produces a wrong moving average</strong> rather than a gap; <code>$unionWith</code> for combining
+       collections and the ordering discipline it needs; <code>$merge</code> as the materialised-view engine —
+       the <code>whenMatched</code> modes, what makes a rollup <strong>idempotent under retry</strong> (and
+       what makes it double-count), and the incremental watermark pattern that keeps a nightly job's cost
+       proportional to <em>new</em> data rather than to history; <code>$replaceRoot</code> and
+       <code>$redact</code>; and the two escape hatches — <code>$function</code> and
+       <code>$accumulator</code> — with an honest account of why reaching for them is nearly always the wrong
+       answer. Prerequisites: <a href="aggregation.html">The Aggregation Pipeline</a> and
+       <a href="relationships.html">Relationships &amp; $lookup</a>.</p>
+
+    <h2>Part 1 — <code>$facet</code>: Many Aggregations, One Scan</h2>
+
+<pre>
+  db.products.aggregate([
+    { $match: { categoryId: "electronics" } },     // ONE scan, shared
+    { $facet: {
+        byBrand:  [ { $sortByCount: "$brand" } ],
+        byPrice:  [ { $bucket: { groupBy: "$price",
+                                 boundaries: [0, 50, 200, 1000],
+                                 default: "1000+",
+                                 output: { n: { $sum: 1 } } } } ],
+        topRated: [ { $sort: { rating: -1 } }, { $limit: 5 } ],
+        total:    [ { $count: "n" } ]
+    }}
+  ])
+
+  Output: ONE document with four array fields.
+    { byBrand: [...], byPrice: [...], topRated: [...], total: [{n: 412}] }
+</pre>
+
+    <p>The value is real — one pass over the input feeds every branch, which is exactly what a faceted search
+       UI needs. But three properties surprise people, and all three follow from "the branches run over the
+       stage's input, not over the collection".</p>
+
+    <table class="tbl">
+      <tr><th>Property</th><th>Consequence</th></tr>
+      <tr><td>Branches see the <code>$facet</code>'s <em>input stream</em>, not the collection</td><td>They cannot use indexes. Only the stages <em>before</em> <code>$facet</code> can</td></tr>
+      <tr><td>Every branch processes the whole input</td><td>Six branches over 4 million documents is six full passes through memory, even though the collection is read once</td></tr>
+      <tr><td>Output is a single document</td><td>Subject to the 16 MB limit — a branch that returns many rows can fail the whole thing</td></tr>
+      <tr><td>Each branch's blocking stages get their own memory budget</td><td>But they are all live at once, so total memory is the sum</td></tr>
+    </table>
+
+<pre>
+MEASURED: the $match that belongs outside
+
+  SLOW -- filter repeated in every branch
+    { $facet: {
+        a: [ { $match: { region: "eu" } }, { $group: ... } ],
+        b: [ { $match: { region: "eu" } }, { $group: ... } ],
+        c: [ { $match: { region: "eu" } }, { $group: ... } ] } }
+      input: 4.1M documents  ->  3 branches x 4.1M filtered in memory
+      9.4 s
+
+  FAST -- filter once, indexed, before the facet
+    { $match: { region: "eu" } },      // IXSCAN, 310k documents
+    { $facet: { a: [...], b: [...], c: [...] } }
+      2.1 s
+
+  The inner $match cannot use an index. The outer one can. That is
+  the entire difference.
+</pre>
+
+    <h3>The pagination-plus-count idiom</h3>
+
+<pre>
+  { $match: query },
+  { $facet: {
+      rows:  [ { $sort: { createdAt: -1 } }, { $skip: n }, { $limit: 20 } ],
+      total: [ { $count: "n" } ]
+  }},
+  { $set: { total: { $ifNull: [ { $arrayElemAt: ["$total.n", 0] }, 0 ] } } }
+
+  One round trip instead of two, and the count is guaranteed
+  consistent with the page. Genuinely useful.
+
+  The honest caveat: the $count branch still walks every matching
+  document. This idiom saves a ROUND TRIP, not the count's cost.
+  On a large result set it is still the expensive half of the
+  request -- see Query Tuning in Production for the alternatives.
+</pre>
+
+    <div class="note">⚠️ <strong><code>$facet</code> is not a performance feature by itself.</strong> It shares
+       one <em>read</em>, but every branch still does its own work in memory, and nothing inside a branch can
+       use an index. It pays off when several aggregations genuinely share an expensive input scan. It is a
+       loss when it lets you avoid writing the filter that would have made each aggregation cheap on its
+       own.</div>
+
+    <h2>Part 2 — Bucketing, Densifying, Filling</h2>
+
+<pre>
+  // fixed boundaries you choose
+  { $bucket: {
+      groupBy: "$price",
+      boundaries: [0, 10, 50, 100, 500],
+      default: "500+",              // REQUIRED, or out-of-range
+                                     // values throw an error
+      output: { count: { $sum: 1 },
+                avgRating: { $avg: "$rating" } } } }
+
+  // boundaries chosen for you, roughly equal counts
+  { $bucketAuto: { groupBy: "$price", buckets: 5,
+                   granularity: "R20" } }
+  // granularity snaps boundaries to a preferred-number series so
+  // they read as 10/20/50 rather than 13.4/28.7/61.2
+
+  // the shorthand everyone actually wants for categories
+  { $sortByCount: "$brand" }
+  //  ==  { $group: { _id: "$brand", count: { $sum: 1 } } },
+  //      { $sort: { count: -1 } }
+</pre>
+
+    <p><code>$bucket</code>'s <code>default</code> is not optional in practice: without it, a single document
+       outside your boundaries aborts the pipeline with an error rather than being ignored. Since boundaries
+       are almost always guesses about a distribution that will change, omitting <code>default</code> is a
+       time bomb.</p>
+
+    <h3>Missing time buckets are the silent bug</h3>
+
+<pre>
+  Daily order counts, grouped by day:
+    2026-08-01  41
+    2026-08-02  38
+    2026-08-05  44        &lt;- the 3rd and 4th are simply ABSENT
+    2026-08-06  40
+
+  A 3-day moving average over those rows averages
+  [01, 02, 05] -- three rows that span five days. The number is
+  wrong and nothing indicates it. Charts draw a straight line
+  across the gap and it looks like data.
+
+  { $densify: {
+      field: "day",
+      range: { step: 1, unit: "day", bounds: "full" },
+      partitionByFields: ["region"] } }
+  -&gt; inserts placeholder documents for 08-03 and 08-04
+
+  { $fill: {
+      sortBy: { day: 1 },
+      partitionBy: "$region",
+      output: { orders: { value: 0 },
+                runningTotal: { method: "locf" } } } }
+  -&gt; 0 for counts (an absent day had zero orders)
+  -&gt; "last observation carried forward" for a level like a
+     balance or a price, where absence means "unchanged"
+</pre>
+
+    <div class="note">🔑 <strong>Choose the fill method by what absence <em>means</em>.</strong> For a count or a
+       sum, a missing bucket means zero — <code>value: 0</code>. For a level (stock price, account balance,
+       sensor reading), it means "unchanged since the last reading" — <code>locf</code>. For a measurement
+       you believe moved smoothly, <code>linear</code> interpolation. Getting this wrong is not a formatting
+       error: filling a missing sales day with the previous day's figure inflates every downstream total, and
+       filling a missing balance with zero reports an account as empty.</div>
+
+    <h2>Part 3 — <code>$setWindowFields</code>: Running Totals and Rankings</h2>
+
+    <p>Before this stage existed, "revenue this month plus the running total" meant a self-join or fetching
+       everything into the application. It is the single largest capability addition to the pipeline in
+       years.</p>
+
+<pre>
+  { $setWindowFields: {
+      partitionBy: "$region",              // like GROUP BY, but rows stay
+      sortBy: { month: 1 },                // order within each partition
+      output: {
+        runningTotal: {
+          $sum: "$revenue",
+          window: { documents: ["unbounded", "current"] } },
+        movingAvg3: {
+          $avg: "$revenue",
+          window: { documents: [-2, "current"] } },
+        rank:      { $rank: {} },
+        denseRank: { $denseRank: {} },
+        rowNumber: { $documentNumber: {} },
+        prevMonth: { $shift: { output: "$revenue", by: -1,
+                               default: 0 } },
+        pctOfTotal: {
+          $sum: "$revenue",
+          window: { documents: ["unbounded", "unbounded"] } }
+      } } }
+</pre>
+
+    <table class="tbl">
+      <tr><th>Window spec</th><th>Covers</th><th>Use for</th></tr>
+      <tr><td><code>["unbounded", "current"]</code></td><td>Start of partition → this row</td><td>Running totals</td></tr>
+      <tr><td><code>[-2, "current"]</code></td><td>The 2 preceding rows and this one</td><td>Moving averages by row count</td></tr>
+      <tr><td><code>["current", "unbounded"]</code></td><td>This row → end of partition</td><td>Remaining totals</td></tr>
+      <tr><td><code>["unbounded", "unbounded"]</code></td><td>The whole partition</td><td>Partition total, for percentages</td></tr>
+      <tr><td><code>range: [-7, 0], unit: "day"</code></td><td>By <em>value</em> of the sort field, not row count</td><td>A true 7-day window that is correct even with missing days</td></tr>
+    </table>
+
+<pre>
+MEASURED: running total, two ways
+
+  Self-join version (the pre-5.0 pattern):
+    $lookup the same collection with a $lte condition on month,
+    then $sum the joined array.
+    4,200 partitions x 24 months        41.2 s
+
+  $setWindowFields:
+                                          340 ms
+
+  121x. And the window version is one stage instead of four, and
+  it does not build an array per row that could hit 16 MB.
+</pre>
+
+    <h3><code>documents</code> versus <code>range</code></h3>
+
+<pre>
+  window: { documents: [-6, "current"] }
+    "the previous 6 ROWS". If a day is missing, this window spans
+    7 rows covering 8 calendar days. Silently wrong.
+
+  window: { range: [-6, 0], unit: "day" }
+    "rows whose sortBy value is within 6 days before this one".
+    Correct regardless of gaps -- it uses the VALUE, not the
+    position.
+
+  For any window that means a duration, use range + unit. Use
+  documents only when you genuinely mean "the last N rows",
+  such as "the previous 5 orders by this customer".
+</pre>
+
+    <p>Two costs to know. <code>$setWindowFields</code> is a blocking stage — it must materialise each
+       partition — and its memory is bounded per partition, so a single enormous partition (one region
+       holding 90% of rows) is the failure mode, not the total row count. And it requires the input sorted
+       by the <code>sortBy</code> key within partitions, so an index matching
+       <code>{ partitionBy, sortBy }</code> avoids an extra sort.</p>
+
+    <h2>Part 4 — <code>$unionWith</code> and <code>$graphLookup</code></h2>
+
+<pre>
+  db.orders_2026.aggregate([
+    { $match: { status: "paid" } },
+    { $unionWith: {
+        coll: "orders_archive",
+        pipeline: [ { $match: { status: "paid" } } ] } },
+    { $group: { _id: "$customerId", total: { $sum: "$amount" } } }
+  ])
+
+  Concatenates two streams. Notes that matter:
+    - NO deduplication (it is UNION ALL, not UNION)
+    - the sub-pipeline CAN use indexes on the other collection
+    - put the $match INSIDE the sub-pipeline, not after the union
+    - the collections need not have the same shape; $project them
+      into a common shape if downstream stages assume one
+</pre>
+
+    <p>This is what makes time-bucketed collections practical: retention becomes
+       <code>drop()</code> instead of a mass delete, and queries that need to span periods use
+       <code>$unionWith</code>. See <a href="index-types.html">Index Types &amp; Their Traps</a> for why that
+       trade beats TTL at high volume.</p>
+
+<pre>
+  { $graphLookup: {
+      from: "employees",
+      startWith: "$managerId",
+      connectFromField: "managerId",
+      connectToField: "_id",
+      as: "chain",
+      maxDepth: 10,                        // ALWAYS set this
+      restrictSearchWithMatch: { active: true } } }
+
+  Three hard facts:
+    - maxDepth is not optional in practice; your data will contain
+      a cycle eventually, and without it the stage walks until it
+      hits the memory cap
+    - the 100 MB limit applies and allowDiskUse does NOT lift it
+    - the foreign collection cannot be sharded
+
+  For hot-path traversal, denormalise instead: an ancestors array
+  read in 8 ms versus 640 ms for $graphLookup. Full treatment in
+  Relationships and $lookup.
+</pre>
+
+    <h2>Part 5 — <code>$merge</code>: The Materialised View Engine</h2>
+
+    <p>This is the stage that changes architecture rather than syntax. <code>$merge</code> writes a pipeline's
+       output into a collection, upserting per document — which turns an expensive aggregation into a small
+       collection that requests can read directly.</p>
+
+<pre>
+  { $merge: {
+      into: "daily_revenue",
+      on: ["day", "region"],            // needs a UNIQUE index
+      whenMatched: "merge",             // merge | replace | keepExisting
+                                        // | fail | [pipeline]
+      whenNotMatched: "insert" } }      // insert | discard | fail
+</pre>
+
+    <table class="tbl">
+      <tr><th><code>whenMatched</code></th><th>Behaviour</th><th>Idempotent on re-run?</th></tr>
+      <tr><td><code>"merge"</code></td><td>Field-by-field merge into the existing document</td><td>Yes for replaced fields</td></tr>
+      <tr><td><code>"replace"</code></td><td>Replaces the whole document</td><td><strong>Yes</strong> — the safest default for a recomputed rollup</td></tr>
+      <tr><td><code>"keepExisting"</code></td><td>Leaves the existing document alone</td><td><strong>Yes</strong> — the right choice for append-only derivations</td></tr>
+      <tr><td><code>"fail"</code></td><td>Errors on any collision</td><td>N/A — use to assert a rollup runs exactly once</td></tr>
+      <tr><td><code>[ pipeline ]</code></td><td>A custom update pipeline with <code>$$new</code> available</td><td><strong>Only if you make it so</strong> — an <code>$add</code> here double-counts on retry</td></tr>
+    </table>
+
+<pre>
+THE IDEMPOTENCY TRAP
+
+  whenMatched: [ { $set: { total: { $add: ["$total", "$$new.total"] } } } ]
+
+  Reads as "accumulate". Behaves as "accumulate EVERY TIME IT
+  RUNS". A retried job, a partially-failed run resumed from the
+  start, or a backfill overlapping the nightly window all
+  double-count -- silently, with plausible-looking numbers.
+
+  MEASURED consequence: a revenue rollup retried after a transient
+  network error reported 2x revenue for one day. It was found
+  eleven days later by an analyst who thought it was a good week.
+
+  RULE: a rollup should RECOMPUTE a period and REPLACE it, not
+  accumulate into it.
+
+    { $match: { day: { $gte: startOfPeriod } } },   // recompute
+    ... group ...
+    { $merge: { into: "daily_revenue", on: ["day","region"],
+                whenMatched: "replace",
+                whenNotMatched: "insert" } }
+
+  Re-running that is harmless however many times it happens. That
+  property is worth more than the efficiency of accumulating.
+</pre>
+
+<pre>
+  THE INCREMENTAL WATERMARK PATTERN
+
+  1. read the watermark
+     const wm = db.job_state.findOne({ _id: "daily_revenue" });
+     const from = wm ? wm.lastProcessed : new Date(0);
+
+  2. recompute affected periods with a deliberate OVERLAP
+     const start = new Date(from.getTime() - 2*24*3600*1000);
+     // 2 days back: late-arriving events, timezone edges, and
+     // clock skew all land inside the re-computed window.
+
+  3. run the pipeline with $merge whenMatched: "replace"
+
+  4. advance the watermark ONLY after $merge succeeded
+     db.job_state.updateOne({ _id: "daily_revenue" },
+       { $set: { lastProcessed: runStart } }, { upsert: true });
+
+  Cost is proportional to NEW data, not to history -- the property
+  that stops a nightly job growing until it cannot finish
+  overnight. The overlap plus "replace" is what makes it safe.
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th><code>$out</code></th><th><code>$merge</code></th></tr>
+      <tr><td>Effect</td><td>Replaces the entire target collection</td><td>Upserts document by document</td></tr>
+      <tr><td>Incremental</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Target may be sharded</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Target may be the source</td><td>No</td><td>Yes (carefully)</td></tr>
+      <tr><td>Existing indexes on the target</td><td>Preserved (4.2+), but the collection is swapped</td><td>Preserved and used</td></tr>
+      <tr><td>Readers during the run</td><td>See the old collection until an atomic swap</td><td>See a partially updated collection</td></tr>
+      <tr><td>Use for</td><td>Full rebuilds where a brief inconsistency is unacceptable</td><td>Everything incremental</td></tr>
+    </table>
+
+    <h2>Part 6 — Reshaping, Redaction, and the Escape Hatches</h2>
+
+<pre>
+  { $replaceWith: "$customer" }        // promote a subdocument to root
+  { $replaceRoot: { newRoot: { $mergeObjects: [ "$$ROOT", "$computed" ] } } }
+
+  // the common $lookup follow-up
+  { $lookup: { ..., as: "u" } },
+  { $unwind: "$u" },
+  { $replaceWith: { $mergeObjects: ["$$ROOT", "$u"] } },
+  { $unset: "u" }
+</pre>
+
+<pre>
+  { $redact: { $cond: {
+      if: { $in: [ "$$USER_CLEARANCE", { $ifNull: ["$acl", ["public"]] } ] },
+      then: "$$DESCEND",     // keep this level, check children
+      else: "$$PRUNE"        // remove this subtree entirely
+  }}}
+  // $$KEEP keeps the subtree without checking children
+
+  Field-level security inside the document tree. Powerful, and
+  worth one warning: it runs per level of every document, and it
+  is easy to write a rule that prunes more than intended. Test it
+  against documents with missing acl fields specifically -- that
+  $ifNull default is doing real work.
+</pre>
+
+<pre>
+  THE ESCAPE HATCHES -- and why to avoid them
+
+  { $function: { body: function(a, b) { return a + b; },
+                 args: ["$a", "$b"], lang: "js" } }
+
+  { $accumulator: { init: ..., accumulate: ..., merge: ...,
+                    lang: "js" } }
+
+  Both run server-side JavaScript. What that costs:
+    - orders of magnitude slower than native operators (a JS
+      interpreter invocation per document)
+    - no index use, ever
+    - a code-injection surface if any part is built from input
+    - not permitted on some managed tiers
+    - invisible to explain: the plan shows a stage, not the cost
+
+  MEASURED: a $function computing a weighted score over 2.1M
+  documents took 94 s. The same logic as $multiply/$add
+  expressions took 3.1 s. 30x, for logic that was expressible
+  natively all along.
+
+  Legitimate uses exist -- a genuinely custom accumulator, a
+  one-off migration where clarity beats speed. "The native
+  expression was awkward to write" is not one of them.
+</pre>
+
+<pre>
+  { $sample: { size: 1000 } }
+
+  Two very different implementations, chosen automatically:
+    - if size &lt; 5% of the collection AND it is the first stage:
+      a random-cursor pseudo-random walk. Fast, and may return
+      DUPLICATES.
+    - otherwise: a full pass with a top-k random sort. Correct,
+      and O(collection).
+
+  So $sample after a $match is the slow form, always. If you need
+  a sample of a filtered set on a large collection, sample first
+  and filter after, and accept the smaller result.
+</pre>
+
+    <div class="note">🔑 <strong><code>$merge</code> is the stage that changes what you can offer.</strong> Most
+       "we need a data warehouse" conversations, at the scale most products actually operate at, are
+       satisfied by a handful of scheduled pipelines writing summary collections that requests read in single
+       digits of milliseconds. It costs you staleness, which is a product decision, and it requires the
+       discipline of recompute-and-replace over accumulate. In exchange, the expensive query stops running on
+       the request path — which is the single highest-leverage change available in this whole track.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Repeating a <code>$match</code> inside every <code>$facet</code> branch</td><td>Inner matches cannot use an index — 9.4 s versus 2.1 s</td><td>One indexed <code>$match</code> before the <code>$facet</code></td></tr>
+      <tr><td>Treating <code>$facet</code> as a performance win by itself</td><td>Shares the read, not the work; each branch processes the whole input</td><td>Use it when branches genuinely share an expensive scan</td></tr>
+      <tr><td>A <code>$facet</code> branch returning many rows</td><td>Output is one document — 16 MB limit fails the whole pipeline</td><td>Bound every branch with <code>$limit</code></td></tr>
+      <tr><td><code>$bucket</code> without <code>default</code></td><td>A single out-of-range value aborts the pipeline</td><td>Always set <code>default</code></td></tr>
+      <tr><td>Windowing over a series with missing periods</td><td>A "7-day" window spans 9 calendar days; charts draw a plausible straight line</td><td><code>$densify</code> + <code>$fill</code>, then <code>range</code> windows with <code>unit</code></td></tr>
+      <tr><td>Filling gaps with the wrong method</td><td><code>locf</code> on a sales count invents revenue; <code>value: 0</code> on a balance reports an empty account</td><td>Choose by what absence means: zero for flows, <code>locf</code> for levels</td></tr>
+      <tr><td><code>documents:</code> windows where a duration is meant</td><td>Position-based, so gaps silently shift the window</td><td><code>range:</code> with <code>unit:</code></td></tr>
+      <tr><td>Self-joining for running totals</td><td>41 s, plus an array per row that can hit 16 MB</td><td><code>$setWindowFields</code> — 340 ms</td></tr>
+      <tr><td><code>$unionWith</code> expecting deduplication</td><td>It is UNION ALL; duplicates pass through</td><td><code>$group</code> afterwards if you need distinct</td></tr>
+      <tr><td><code>$graphLookup</code> without <code>maxDepth</code></td><td>Walks until it hits the 100 MB cap, which <code>allowDiskUse</code> does not lift</td><td>Set <code>maxDepth</code> and <code>restrictSearchWithMatch</code></td></tr>
+      <tr><td><code>$merge</code> with an accumulating <code>whenMatched</code> pipeline</td><td>A retried job double-counts silently — one day reported 2× revenue, found 11 days later</td><td>Recompute the period and <code>"replace"</code></td></tr>
+      <tr><td>Advancing the watermark before <code>$merge</code> succeeds</td><td>A failed run permanently skips a window of data</td><td>Advance only after success, and re-process with an overlap</td></tr>
+      <tr><td><code>$function</code> for logic expressible natively</td><td>94 s versus 3.1 s, no index use, an injection surface</td><td>Native expressions; reserve JS for genuinely custom accumulators</td></tr>
+      <tr><td><code>$sample</code> after a <code>$match</code></td><td>Falls back to the O(collection) implementation</td><td>Sample first when the collection is large</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does <code>$facet</code> do?</summary>
+      <p>It runs several independent sub-pipelines over the same input stream and returns one document whose
+         fields are each sub-pipeline's results. The classic use is a faceted search page: the rows, the
+         total count, and the filter counts by brand and price band, all from one query.</p>
+      <p>The key detail is that the branches operate on the <code>$facet</code> stage's <em>input</em>, not on
+         the collection — so nothing inside a branch can use an index. Any filtering you can do belongs
+         <em>before</em> the <code>$facet</code>, where it can be an indexed query. Repeating the same
+         <code>$match</code> inside each branch instead was measured at 9.4 seconds versus 2.1.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is <code>$setWindowFields</code> for?</summary>
+      <p>Computing values that depend on other rows without collapsing rows the way <code>$group</code> does —
+         running totals, moving averages, rankings, and "compare to the previous row" via
+         <code>$shift</code>. You give it a <code>partitionBy</code> (the grouping), a <code>sortBy</code>
+         (the order within each partition), and a window describing which surrounding rows each output value
+         should see.</p>
+      <p>Before it existed, a running total meant self-joining the collection to itself — measured at 41
+         seconds for a case that <code>$setWindowFields</code> does in 340 ms, in one stage instead of
+         four.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is the difference between a <code>documents</code> window and a <code>range</code> window?</summary>
+      <p><code>documents</code> counts rows: <code>[-6, "current"]</code> means the previous six rows plus this
+         one. <code>range</code> uses the <em>value</em> of the <code>sortBy</code> field:
+         <code>range: [-6, 0], unit: "day"</code> means every row whose date is within six days before this
+         one.</p>
+      <p>They differ exactly when the series has gaps, and that is when it matters. If two days are missing
+         from a daily series, a "7-row" window actually spans nine calendar days and produces a moving
+         average that is wrong with no indication — the chart draws a plausible line straight through it.</p>
+      <p>So: <code>range</code> with a <code>unit</code> whenever the window means a duration;
+         <code>documents</code> only when you genuinely mean "the last N rows", like a customer's previous
+         five orders. And if the gaps themselves are meaningful, <code>$densify</code> and <code>$fill</code>
+         before the window stage so the missing periods exist with the right values.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you make a <code>$merge</code>-based rollup safe to re-run?</summary>
+      <p>Recompute a whole period and <code>whenMatched: "replace"</code>, rather than accumulating into the
+         existing document. Replacing is idempotent by construction: running it once, twice, or five times
+         after failures produces the same result.</p>
+      <p>The trap is the custom pipeline form —
+         <code>whenMatched: [{ $set: { total: { $add: ["$total", "$$new.total"] } } }]</code> — which reads as
+         "accumulate" and behaves as "accumulate on every run". A retry after a transient error double-counts
+         silently. In one case a day showed 2× revenue and was found eleven days later by an analyst who
+         thought it had been a good week.</p>
+      <p>The other half is the watermark: advance it only after <code>$merge</code> succeeds, and re-process
+         with a deliberate overlap of a day or two so late-arriving events and timezone edges land inside a
+         recomputed window. Overlap is only safe <em>because</em> the merge replaces — the two properties
+         work together.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> When would you use <code>$function</code> or <code>$accumulator</code>?</summary>
+      <p>Almost never, and I would treat a proposal to use one as a design review rather than a syntax
+         question.</p>
+      <p>They execute server-side JavaScript, which means an interpreter invocation per document: a weighted
+         score over 2.1M documents took 94 seconds as a <code>$function</code> and 3.1 seconds as native
+         <code>$multiply</code>/<code>$add</code> expressions. They can never use an index, they are a
+         code-injection surface if any part is constructed from user input, they are unavailable on some
+         managed tiers, and their cost is invisible in <code>explain</code> — the plan shows a stage, not
+         what is happening inside it.</p>
+      <p>The legitimate cases are narrow: a genuinely custom accumulator that the built-ins cannot express
+         (some statistical aggregate, a custom merge for a distributed sketch), or a one-off migration where
+         clarity matters more than speed and the volume is small. "The native expression was awkward to
+         write" is not one — that awkwardness is usually a signal that the computation belongs in the
+         application, or that the data should be shaped differently.</p>
+      <p>If someone brings me one, my first question is what the native version would look like, and my second
+         is whether this should be computed at write time and stored instead. Most of the time one of those
+         two answers the need.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a materialised-view layer for an analytics dashboard using <code>$merge</code>. What are the failure modes?</summary>
+      <p><strong>The shape:</strong> a scheduled job per view, each recomputing a bounded recent window and
+         merging into a small summary collection that the dashboard reads with point queries. The dashboard
+         stops running aggregations entirely.</p>
+<pre>
+  job_state:      { _id: viewName, lastProcessed, lastRunStatus }
+  daily_revenue:  { _id: {day, region}, revenue, orders, updatedAt }
+                  unique index on the merge key -- REQUIRED
+
+  each run:
+    from  = lastProcessed - overlap(2 days)
+    pipeline: $match ts >= from -> $group -> $merge replace
+    on success: set lastProcessed = runStartTime
+</pre>
+      <table class="tbl">
+        <tr><th>Failure mode</th><th>Mitigation</th></tr>
+        <tr><td>Job fails midway; some periods merged, some not</td><td><code>"replace"</code> + watermark advanced only on success. The next run redoes the whole window</td></tr>
+        <tr><td>Late-arriving events after a period was rolled up</td><td>The overlap window. Size it from the observed arrival-lag distribution, not from a guess</td></tr>
+        <tr><td>Two runs overlap (a slow run plus the next schedule)</td><td>A lock document with a lease and a TTL, so a crashed run does not block forever</td></tr>
+        <tr><td>The job silently stops running</td><td>Alert on <code>updatedAt</code> staleness in the <em>view</em>, not on job success. A job that succeeds while producing nothing is the case that gets missed</td></tr>
+        <tr><td>Definition changes (revenue now excludes refunds)</td><td>A version field on the view and a full-rebuild path. Never edit history in place with no record</td></tr>
+        <tr><td>The rollup competes with production traffic</td><td>Run on a secondary or analytics node; <code>$merge</code>'s writes still go to the primary, so schedule off-peak</td></tr>
+        <tr><td>Numbers disagree with the source</td><td>A reconciliation job that recomputes a random past period from scratch and compares. Without this, drift is discovered by an executive</td></tr>
+      </table>
+      <p><strong>What I would insist on beyond the mechanics:</strong> every dashboard tile shows "as of HH:MM".
+         A stale number without a timestamp destroys trust in the whole dashboard the first time someone
+         notices, and it is one line of UI.</p>
+      <p><strong>What I would push back on:</strong> making the refresh interval shorter to make people happy.
+         Every reduction multiplies cost and tightens the window for overlapping runs, and the honest question
+         is what decision the number supports. If somebody genuinely needs sub-minute analytics, that is a
+         streaming pipeline into a purpose-built store, not a faster cron — and framing it that way at the
+         start avoids six months of ratcheting the schedule down until the job cannot finish.</p>
+      <p><strong>And the boundary:</strong> this pattern is excellent for a bounded set of known views. If the
+         requirement is genuinely ad-hoc exploration over history, no set of materialised views satisfies it,
+         and I would say so rather than shipping thirty of them.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> This faceted search is slow. Fix it without changing what it
+      returns.
+<pre>
+  db.products.aggregate([
+    { $facet: {
+        rows:   [ { $match: { inStock: true, category: "shoes" } },
+                  { $sort: { rating: -1 } }, { $limit: 20 } ],
+        brands: [ { $match: { inStock: true, category: "shoes" } },
+                  { $sortByCount: "$brand" } ],
+        total:  [ { $match: { inStock: true, category: "shoes" } },
+                  { $count: "n" } ]
+    }}
+  ])
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p>The <code>$facet</code> is the first stage, so its input is the entire collection, and each branch
+         filters it in memory — three full in-memory passes with no index available to any of them.</p>
+<pre>
+  db.products.aggregate([
+    { $match: { inStock: true, category: "shoes" } },   // IXSCAN
+    { $facet: {
+        rows:   [ { $sort: { rating: -1 } }, { $limit: 20 } ],
+        brands: [ { $sortByCount: "$brand" } ],
+        total:  [ { $count: "n" } ]
+    }}
+  ])
+
+  index: { category: 1, inStock: 1, rating: -1 }
+</pre>
+      <p>Now one indexed query reduces the stream once, and the branches operate on that much smaller input.
+         Results are identical.</p>
+      <p><strong>Two further improvements worth mentioning:</strong> a projection after the <code>$match</code>
+         keeping only <code>brand</code>, <code>rating</code> and whatever <code>rows</code> displays would
+         shrink what the branches hold in memory; and the <code>brands</code> branch is unbounded — if a
+         category has 40,000 brands, that array goes into the single output document and counts against the
+         16 MB limit. A <code>$limit</code> after <code>$sortByCount</code> is cheap insurance, and a facet UI
+         never shows more than a few dozen brands anyway.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Add a running total and a rank to monthly revenue per
+      region.
+<pre>
+  [ { $group: { _id: { region: "$region", month: "$month" },
+                revenue: { $sum: "$amount" } } } ]
+</pre>
+      <details class="solution"><summary>Solution</summary>
+<pre>
+  db.orders.aggregate([
+    { $match: { status: "paid" } },
+    { $group: { _id: { region: "$region", month: "$month" },
+                revenue: { $sum: "$amount" } } },
+    { $set: { region: "$_id.region", month: "$_id.month" } },
+    { $setWindowFields: {
+        partitionBy: "$region",
+        sortBy: { month: 1 },
+        output: {
+          runningTotal: { $sum: "$revenue",
+                          window: { documents: ["unbounded","current"] } },
+          rank:         { $rank: {} },
+          prevMonth:    { $shift: { output: "$revenue", by: -1,
+                                    default: null } }
+        } } },
+    { $set: { growth: { $cond: [
+        { $in: ["$prevMonth", [null, 0]] },
+        null,
+        { $divide: [ { $subtract: ["$revenue", "$prevMonth"] },
+                     "$prevMonth" ] } ] } } },
+    { $sort: { region: 1, month: 1 } }
+  ])
+</pre>
+      <table class="tbl">
+        <tr><th>Detail</th><th>Why</th></tr>
+        <tr><td>Promote <code>_id.region</code> to a top-level field first</td><td><code>partitionBy</code> and <code>sortBy</code> read more clearly against flat fields, and downstream stages need them anyway</td></tr>
+        <tr><td><code>$rank</code> ranks within the partition</td><td>Which is what "rank this month within its region" means. <code>$denseRank</code> if you do not want gaps after ties; <code>$documentNumber</code> if you need a unique sequence</td></tr>
+        <tr><td><code>default: null</code> on <code>$shift</code></td><td>The first month has no predecessor. <code>default: 0</code> would make growth infinite rather than absent</td></tr>
+        <tr><td>The <code>$cond</code> guard on the division</td><td>A zero denominator aborts the entire pipeline, not just that row</td></tr>
+        <tr><td>Trailing <code>$sort</code></td><td><code>$setWindowFields</code> does not guarantee output order matches its internal sort</td></tr>
+      </table>
+      <p><strong>What this does not handle:</strong> a region with no orders in a month has no row at all, so its
+         running total simply skips that month and any moving average would be wrong. If that matters,
+         <code>$densify</code> on <code>month</code> partitioned by region, then <code>$fill</code> revenue
+         with <code>value: 0</code>, before the window stage.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Daily active users are charted as a 7-day moving average.
+      The chart looks smooth but the numbers are wrong on weeks containing an outage. Explain and fix.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The cause:</strong> a day with no activity produces no row from <code>$group</code> — it is
+         absent, not zero. A window specified as <code>documents: [-6, "current"]</code> counts <em>rows</em>,
+         so on a week with a one-day outage the "7-day" window covers 7 rows spanning 8 calendar days, and it
+         averages six real days plus one from the previous week. The missing day never depresses the average
+         at all, which is precisely backwards: an outage should show as a dip.</p>
+      <p>It looks smooth because the chart connects the points it has. Absence is invisible.</p>
+<pre>
+  db.events.aggregate([
+    { $match: { ts: { $gte: from, $lt: to } } },
+    { $group: {
+        _id: { $dateTrunc: { date: "$ts", unit: "day",
+                             timezone: "Europe/London" } },
+        dau: { $addToSet: "$userId" } } },
+    { $set: { day: "$_id", dau: { $size: "$dau" } } },
+
+    // 1. materialise the missing days
+    { $densify: { field: "day",
+                  range: { step: 1, unit: "day", bounds: "full" } } },
+
+    // 2. a missing day had ZERO active users -- it is a flow, not a level
+    { $fill: { sortBy: { day: 1 }, output: { dau: { value: 0 } } } },
+
+    // 3. window by TIME, not by row count
+    { $setWindowFields: {
+        sortBy: { day: 1 },
+        output: { ma7: { $avg: "$dau",
+                         window: { range: [-6, 0], unit: "day" } } } } },
+    { $sort: { day: 1 } }
+  ])
+</pre>
+      <p><strong>Both fixes are needed and they are independent.</strong> <code>$densify</code>+<code>$fill</code>
+         makes the outage day exist with a value of 0 so it depresses the average correctly.
+         <code>range</code> instead of <code>documents</code> makes the window robust to any gap that remains
+         — for instance at the very start of the range, where <code>bounds: "full"</code> cannot invent days
+         before the first one.</p>
+      <p><strong>Note the fill method choice:</strong> <code>value: 0</code> because DAU is a flow — no events
+         means no active users. If this were a metric like "current subscribers", absence would mean
+         "unchanged" and <code>method: "locf"</code> would be correct. Filling a subscriber count with zero
+         would report the business as having collapsed.</p>
+      <p><strong>One caveat on <code>$addToSet</code> for DAU:</strong> it holds every distinct user id per day
+         in memory, and the group document is subject to the 16 MB limit. At a few hundred thousand daily
+         users that is fine; at tens of millions it is not, and the answer is a HyperLogLog-style approximate
+         count or a per-day distinct-user rollup maintained on write.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Write an incremental nightly rollup of order revenue by
+      day and region, safe to re-run after any failure. State every property that makes it safe.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+  // 0. one-time setup -- $merge REQUIRES a unique index on the key
+  db.daily_revenue.createIndex({ day: 1, region: 1 }, { unique: true })
+
+  // 1. read the watermark
+  const st = db.job_state.findOne({ _id: "daily_revenue" });
+  const runStart = new Date();
+  const from = new Date(
+    (st ? st.lastProcessed : new Date(0)).getTime()
+    - 2 * 24 * 3600 * 1000);          // 2-day overlap
+
+  // 2. recompute the affected window and REPLACE
+  db.orders.aggregate([
+    { $match: { status: "paid", createdAt: { $gte: from,
+                                             $lt: runStart } } },
+    { $group: {
+        _id: { day: { $dateTrunc: { date: "$createdAt", unit: "day",
+                                    timezone: "Europe/London" } },
+               region: "$region" },
+        revenue: { $sum: "$amount" },
+        orders:  { $sum: 1 } } },
+    { $set: { day: "$_id.day", region: "$_id.region",
+              updatedAt: "$$NOW" } },
+    { $unset: "_id" },
+    { $merge: { into: "daily_revenue",
+                on: ["day", "region"],
+                whenMatched: "replace",
+                whenNotMatched: "insert" } }
+  ], { allowDiskUse: true });
+
+  // 3. advance the watermark ONLY now
+  db.job_state.updateOne({ _id: "daily_revenue" },
+    { $set: { lastProcessed: runStart, lastRunAt: new Date() } },
+    { upsert: true });
+</pre>
+      <table class="tbl">
+        <tr><th>Property</th><th>Why it makes the job safe</th></tr>
+        <tr><td><code>whenMatched: "replace"</code></td><td>Idempotent. Running the same window twice produces the same result — the single most important choice here</td></tr>
+        <tr><td>Watermark advanced <em>after</em> success</td><td>A crash mid-run leaves the watermark where it was, so the next run redoes the window. Advancing first would permanently skip data</td></tr>
+        <tr><td>2-day overlap</td><td>Catches late-arriving events, timezone boundary cases and clock skew. Only safe <em>because</em> of "replace"</td></tr>
+        <tr><td><code>$lt: runStart</code></td><td>A fixed upper bound, so the window is deterministic and does not include rows written during the run</td></tr>
+        <tr><td>Explicit <code>timezone</code></td><td>Otherwise the day boundary is UTC and every evening order lands in the wrong day for local reporting</td></tr>
+        <tr><td>Unique index on the merge key</td><td><code>$merge</code> requires it; without it the stage errors rather than silently duplicating</td></tr>
+        <tr><td><code>updatedAt</code> on each row</td><td>Lets you alert on view staleness rather than on job success — a job that succeeds while producing nothing is the failure that gets missed</td></tr>
+      </table>
+      <p><strong>What I would add before calling it production-ready:</strong> a lease-based lock document with a
+         TTL so a slow run and the next schedule cannot overlap; <code>maxTimeMS</code>; and a reconciliation
+         job that recomputes a random past day from scratch and compares, because silent drift is the failure
+         mode nobody instruments and an executive eventually finds.</p>
+      <p><strong>Overlap sizing is an empirical question</strong>, not a two-day convention — measure the
+         distribution of <code>createdAt</code> versus insert time and pick a value that covers the 99th
+         percentile of arrival lag.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A "customer 360" endpoint returns a customer with their
+      last 10 orders, lifetime value, support ticket count, and rank by spend among all customers. It takes
+      2.8 seconds. Redesign it.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>First, separate the four requirements by what they actually cost</strong>, because they are not
+         alike and lumping them into one pipeline is why it takes 2.8 seconds:</p>
+      <table class="tbl">
+        <tr><th>Field</th><th>Nature</th><th>Right mechanism</th></tr>
+        <tr><td>Last 10 orders</td><td>Bounded, customer-scoped</td><td>An indexed query. Cheap</td></tr>
+        <tr><td>Lifetime value</td><td>Aggregate over one customer's history</td><td>Maintained on the customer document at write time</td></tr>
+        <tr><td>Ticket count</td><td>Aggregate over one customer</td><td>Same — a counter</td></tr>
+        <tr><td><strong>Rank by spend among ALL customers</strong></td><td><strong>Global</strong> — cannot be computed from one customer's data</td><td>Pre-computed. This is the 2.8 seconds</td></tr>
+      </table>
+      <p>The rank is the whole problem. Everything else is customer-scoped and can be indexed; rank requires
+         knowing every other customer's spend, so computing it per request means aggregating the entire
+         customer base on every page load.</p>
+<pre>
+  NIGHTLY (or hourly) -- rank for everyone, once
+  db.orders.aggregate([
+    { $match: { status: "paid" } },
+    { $group: { _id: "$customerId", ltv: { $sum: "$amount" },
+                orderCount: { $sum: 1 },
+                lastOrderAt: { $max: "$createdAt" } } },
+    { $setWindowFields: {
+        sortBy: { ltv: -1 },
+        output: { spendRank: { $denseRank: {} },
+                  pctile: { $percentRank: {} } } } },
+    { $set: { customerId: "$_id", updatedAt: "$$NOW" } },
+    { $unset: "_id" },
+    { $merge: { into: "customer_stats", on: "customerId",
+                whenMatched: "replace", whenNotMatched: "insert" } }
+  ], { allowDiskUse: true })
+
+  REQUEST TIME -- three point reads, no aggregation
+  const [c, stats, orders] = await Promise.all([
+    customers.findOne({ _id: id }),
+    customer_stats.findOne({ customerId: id }),      // rank, ltv
+    orders.find({ customerId: id })
+          .sort({ createdAt: -1 }).limit(10).toArray()
+  ]);
+  // index: { customerId: 1, createdAt: -1 }
+</pre>
+      <p><strong>Expected result:</strong> three indexed point queries in parallel, single-digit milliseconds.</p>
+      <p><strong>The trade-off to state explicitly:</strong> rank is now as stale as the job interval. That is
+         almost certainly fine — a customer's percentile among millions does not change meaningfully hour to
+         hour — but it is a product decision, and the UI should say "as of" if the number is shown
+         prominently.</p>
+      <p><strong>The hybrid I would consider:</strong> keep <code>ltv</code> live by incrementing it on the
+         customer document at order time (exact, instant), and take only the <em>rank</em> from the nightly
+         job. That gives an always-correct lifetime value with a slightly stale rank, which matches what
+         users expect: they notice immediately if their own total is wrong, and never notice if their
+         percentile is a day old.</p>
+      <p><strong>What I would push back on:</strong> whether rank belongs on this screen at all. It is the only
+         requirement that forces a global computation, it is the least actionable of the four, and removing
+         it makes the endpoint trivially fast with no infrastructure. I would ask what decision it supports
+         before building a nightly job to keep it — and if the answer is "it looked good in the mockup", the
+         cheapest fix is deleting it.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design the pipeline and operational plan for a report that
+      must combine live data (last 24h) with archived data (3 years, in monthly collections), returning
+      revenue by product category with month-over-month growth.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The structural fact:</strong> the data lives in two places with different characteristics — a
+         hot collection optimised for writes and point reads, and archive collections optimised for being
+         dropped. Any design that reads all three years live on each request is wrong regardless of how well
+         the pipeline is written.</p>
+<pre>
+  LAYER 1 -- historical months are IMMUTABLE, so roll them up ONCE
+
+    for each archived month collection:
+      db.orders_2026_05.aggregate([
+        { $match: { status: "paid" } },
+        { $unwind: "$items" },
+        { $group: { _id: { month: ..., cat: "$items.categoryId" },
+                    revenue: { $sum: { $multiply: [
+                        "$items.qty", "$items.unitPrice" ] } } } },
+        { $merge: { into: "monthly_category_revenue",
+                    on: "_id", whenMatched: "replace",
+                    whenNotMatched: "insert" } }
+      ], { allowDiskUse: true })
+
+    Runs once per archived month, ever. A closed month cannot
+    change, so there is no reason to recompute it. Guard with a
+    "closed: true" flag so a re-run is a no-op rather than a
+    re-scan.
+
+  LAYER 2 -- the current month is still changing: roll it up hourly
+    Same pipeline against the live collection, restricted to the
+    current month, whenMatched "replace". Cheap because it is one
+    month of data.
+
+  LAYER 3 -- the last 24h, if the report must be fresher than the
+    hourly job. Query it live and $unionWith the rollup:
+
+      db.monthly_category_revenue.aggregate([
+        { $match: { "_id.month": { $gte: from } } },
+        { $unionWith: {
+            coll: "orders",
+            pipeline: [
+              { $match: { status: "paid",
+                          createdAt: { $gte: lastRollupAt } } },
+              { $unwind: "$items" },
+              { $group: { _id: { month: ..., cat: ... },
+                          revenue: { $sum: ... } } } ] } },
+        // the two streams may both contain the current month
+        { $group: { _id: "$_id", revenue: { $sum: "$revenue" } } },
+        { $setWindowFields: {
+            partitionBy: "$_id.cat",
+            sortBy: { "_id.month": 1 },
+            output: { prev: { $shift: { output: "$revenue", by: -1,
+                                        default: null } } } } },
+        { $set: { growth: { $cond: [
+            { $in: ["$prev", [null, 0]] }, null,
+            { $divide: [ { $subtract: ["$revenue","$prev"] },
+                         "$prev" ] } ] } } },
+        { $sort: { "_id.cat": 1, "_id.month": 1 } }
+      ])
+</pre>
+      <table class="tbl">
+        <tr><th>Decision</th><th>Reason</th></tr>
+        <tr><td>Closed months rolled up once</td><td>Immutable data should never be recomputed. This is the difference between a report that scales with history and one that does not</td></tr>
+        <tr><td><code>$unionWith</code> with the <code>$match</code> <em>inside</em></td><td>The sub-pipeline can use indexes on the live collection; a <code>$match</code> after the union cannot</td></tr>
+        <tr><td>A <code>$group</code> after the union</td><td><code>$unionWith</code> is UNION ALL — the current month can appear in both streams and must be summed, not duplicated</td></tr>
+        <tr><td>Growth computed last, on ~36 rows per category</td><td>Window functions on a tiny stream are free</td></tr>
+        <tr><td><code>$shift</code> with <code>default: null</code></td><td>The earliest month has no predecessor; growth must be absent, not zero or infinite</td></tr>
+      </table>
+      <p><strong>Operationally:</strong> the archive rollups run on a secondary; the hourly job needs a lease
+         lock and a staleness alert on <code>updatedAt</code>; and the boundary between "rolled up" and "live"
+         must come from the rollup's own recorded watermark, not from a hardcoded 24 hours — a hardcoded
+         window double-counts or drops data the moment the job runs late.</p>
+      <p><strong>Where I would push back:</strong> layer 3 exists only if the report genuinely needs to be
+         fresher than an hour. It is the most complex and most fragile part of this design — the double-count
+         risk lives entirely in it. For a month-over-month growth report I would strongly argue that hourly
+         freshness is sufficient, drop layer 3 entirely, and show "as of HH:MM". That removes the union, the
+         watermark coordination and the deduplication group, and the report becomes a read of a small
+         collection. Complexity you can delete by asking a product question is the cheapest complexity to
+         remove.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong><code>$facet</code> branches cannot use indexes</strong> — they operate on the stage's input.
+            Filter before the facet, never inside every branch (9.4 s → 2.1 s).</li>
+        <li><strong><code>$facet</code> shares the read, not the work.</strong> Six branches means six passes
+            through memory, and the output is one 16 MB-limited document.</li>
+        <li><strong>The rows-plus-count idiom saves a round trip, not the count's cost.</strong></li>
+        <li><strong><code>$bucket</code> without <code>default</code> aborts on the first out-of-range
+            value.</strong></li>
+        <li><strong>Missing time buckets silently corrupt windows and charts.</strong> Absence is not zero
+            until you make it so with <code>$densify</code> + <code>$fill</code>.</li>
+        <li><strong>Choose the fill method by meaning</strong>: <code>value: 0</code> for flows,
+            <code>locf</code> for levels, <code>linear</code> for smooth measurements.</li>
+        <li><strong><code>$setWindowFields</code> replaced the self-join</strong> — 41 s to 340 ms, one stage
+            instead of four.</li>
+        <li><strong>Use <code>range</code> + <code>unit</code> for windows that mean a duration</strong>;
+            <code>documents</code> only for "the last N rows".</li>
+        <li><strong><code>$setWindowFields</code> is blocking and bounded per partition</strong> — one enormous
+            partition is the failure mode, not total row count.</li>
+        <li><strong><code>$unionWith</code> is UNION ALL.</strong> Put the <code>$match</code> in the
+            sub-pipeline so it can use indexes, and <code>$group</code> afterwards if you need distinct.</li>
+        <li><strong><code>$graphLookup</code> needs <code>maxDepth</code></strong>, and its 100 MB limit ignores
+            <code>allowDiskUse</code>.</li>
+        <li><strong><code>$merge</code> turns an expensive aggregation into a point read.</strong> It is the
+            highest-leverage architectural change in the pipeline toolkit.</li>
+        <li><strong>Recompute and <code>"replace"</code>; never accumulate.</strong> An accumulating
+            <code>whenMatched</code> double-counts on retry — one day reported 2× revenue and went unnoticed
+            for eleven days.</li>
+        <li><strong>Advance the watermark only after <code>$merge</code> succeeds</strong>, and re-process with
+            an overlap sized from the observed arrival-lag distribution.</li>
+        <li><strong>Alert on view staleness, not job success.</strong> A job that succeeds while producing
+            nothing is the failure that gets missed.</li>
+        <li><strong><code>$function</code>/<code>$accumulator</code> are 30× slower, never indexed, and an
+            injection surface.</strong> Reach for them only for genuinely inexpressible logic.</li>
+        <li><strong><code>$sample</code> is fast only as the first stage on under 5% of a collection</strong> —
+            after a <code>$match</code> it is a full pass.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="aggregation.html">← The Aggregation Pipeline</a>
+      <a href="aggregation-performance.html">Aggregation Performance →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
