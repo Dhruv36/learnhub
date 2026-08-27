@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Query Tuning in Production — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Query Tuning in Production <span class="level-badge level-ultra">Indexes</span></h1>
+
+    <p><strong>What you'll master:</strong> the tuning work that happens after the index is right — starting
+       with the ranking mistake almost everyone makes, <strong>optimising the slowest query instead of the
+       most expensive one</strong> (a 4-second report run twice a day costs 8 seconds; a 40 ms query run
+       100,000 times an hour costs 67 minutes, and only the first one gets reported by humans); why
+       <code>skip()</code> pagination is <strong>quadratic and was measured at 4 ms on page 1 and 2,100 ms on
+       page 5,000</strong>, and the keyset rewrite that makes every page cost the same; the counting problem —
+       <strong><code>countDocuments</code> on 41M documents took 6.4 seconds while
+       <code>estimatedDocumentCount</code> took 1 ms</strong>, and the three honest ways to show a total;
+       the predicate rewrites that turn an unindexable query into an indexed one — <code>$ne</code>,
+       <code>$nin</code>, unanchored regex, <code>$where</code>, and the case-insensitive search that
+       <strong>went from a 2.9-second collection scan to 3 ms</strong>; how projection, <code>batchSize</code>
+       and cursor iteration cost you time that <strong><code>explain</code> never reports</strong> (4 ms on the
+       server, 900 ms in the application); what read preference and read concern actually cost, and the
+       staleness you are accepting when you move reads to secondaries; and the guardrails that keep one bad
+       query from taking the cluster down — <code>maxTimeMS</code>, <code>killOp</code>, pool sizing, and the
+       closing-the-loop step teams skip. Prerequisites:
+       <a href="explain-plans.html">Reading Explain Plans</a> and
+       <a href="indexes.html">How Indexes Work</a>.</p>
+
+    <h2>Part 1 — Find the Queries That Actually Cost You</h2>
+
+    <p>Tuning starts with a ranking decision, and the intuitive ranking is wrong. Humans report the query that
+       made them wait. The cluster is being consumed by something else entirely.</p>
+
+<pre>
+MEASURED: one hour of a real workload, ranked two ways
+
+  BY WORST SINGLE EXECUTION (what gets reported)
+    1. monthly revenue report        4,100 ms  x2      =    8 s
+    2. admin export                  2,800 ms  x5      =   14 s
+    3. customer order history          310 ms  x1,400  =  434 s
+    4. session lookup                   41 ms  x98,000 = 4,018 s
+
+  BY TOTAL TIME (what actually matters)
+    1. session lookup                4,018 s   67 minutes of CPU
+    2. customer order history          434 s
+    3. admin export                     14 s
+    4. monthly revenue report            8 s
+
+  Taking the session lookup from 41 ms to 4 ms freed 60 minutes of
+  database time per hour. Taking the report from 4.1 s to 0.4 s
+  freed 7 seconds. Guess which one three engineers had been
+  working on.
+</pre>
+
+<pre>
+  db.setProfilingLevel(1, { slowms: 100 })
+
+  db.system.profile.aggregate([
+    { $group: {
+        _id: { hash: "$queryHash", plan: "$planSummary", ns: "$ns" },
+        n:     { $sum: 1 },
+        total: { $sum: "$millis" },
+        avg:   { $avg: "$millis" },
+        p_keys:{ $avg: "$keysExamined" },
+        p_docs:{ $avg: "$docsExamined" },
+        p_ret: { $avg: "$nreturned" },
+        bytes: { $avg: "$responseLength" },
+        sample:{ $first: "$command" } } },
+    { $sort: { total: -1 } },
+    { $limit: 20 }
+  ])
+</pre>
+
+    <table class="tbl">
+      <tr><th>Field</th><th>What it tells you</th></tr>
+      <tr><td><code>total</code></td><td>The ranking. Everything else is diagnosis</td></tr>
+      <tr><td><code>planSummary</code></td><td>Instant triage: <code>COLLSCAN</code> or the index name, with no explain needed</td></tr>
+      <tr><td><code>p_docs</code> vs <code>p_ret</code></td><td>Documents read per document returned. Above ~100× is a missing index field</td></tr>
+      <tr><td><code>bytes</code> (<code>responseLength</code>)</td><td>The number nobody looks at. A 4 MB average response is a projection problem, and it never shows up in <code>executionTimeMillis</code></td></tr>
+      <tr><td><code>n</code></td><td>Call frequency — often the finding itself: 98,000 session lookups an hour may mean a missing application cache, not a missing index</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>Profiling has a cost; size it deliberately.</strong> Level 1 with a threshold
+       writes one document per slow operation to a capped <code>system.profile</code> collection. Level 2
+       records <em>every</em> operation and on a busy primary can measurably degrade it. Set the capped size
+       before enabling (<code>db.setProfilingLevel(0)</code>, drop, recreate with an explicit size), prefer a
+       secondary where reads allow it, and put a reminder in the calendar to turn it off — a profiler left on
+       at level 2 has caused more incidents than it has diagnosed.</div>
+
+    <h2>Part 2 — Pagination and Counting</h2>
+
+    <h3><code>skip()</code> is quadratic</h3>
+
+<pre>
+  db.orders.find({ customerId: cid })
+           .sort({ createdAt: -1 })
+           .skip(page * 20).limit(20)
+
+  What skip() does: walk the index from the beginning, DISCARDING
+  the first N entries, then return 20. The discarded entries are
+  read. They are just thrown away.
+
+  MEASURED (a customer with 100,000 orders):
+    page      1   skip      0    4 ms
+    page     10   skip    180    5 ms
+    page    100   skip  1,980   28 ms
+    page  1,000   skip 19,980  310 ms
+    page  5,000   skip 99,980 2,100 ms
+
+  Cost grows linearly with page number, so the total cost of
+  paging through everything is quadratic. And this is with a
+  PERFECT index -- skip() is not an indexing problem.
+</pre>
+
+<pre>
+  KEYSET (RANGE) PAGINATION -- every page costs the same
+
+  // page 1
+  db.orders.find({ customerId: cid })
+           .sort({ createdAt: -1, _id: -1 })
+           .limit(20)
+
+  // page N+1: pass the last row's sort key back as a cursor
+  db.orders.find({ customerId: cid,
+                   $or: [
+                     { createdAt: { $lt: lastCreatedAt } },
+                     { createdAt: lastCreatedAt,
+                       _id: { $lt: lastId } }   // tie-break
+                   ]})
+           .sort({ createdAt: -1, _id: -1 })
+           .limit(20)
+
+  index: { customerId: 1, createdAt: -1, _id: -1 }
+
+  MEASURED: 4 ms on page 1, 4 ms on page 5,000.
+</pre>
+
+    <p>The <code>_id</code> tie-break is not optional. Without it, two documents sharing a
+       <code>createdAt</code> timestamp straddling a page boundary will either be shown twice or skipped
+       entirely — a bug that appears only under load, only sometimes, and is nearly impossible to reproduce
+       from a report. Any sort key used for keyset pagination must be made unique by appending
+       <code>_id</code>.</p>
+
+    <table class="tbl">
+      <tr><th></th><th><code>skip</code>/<code>limit</code></th><th>Keyset</th></tr>
+      <tr><td>Cost per page</td><td>Grows with page number</td><td>Constant</td></tr>
+      <tr><td>Jump to page 500</td><td>Yes (slowly)</td><td>No — only next/previous</td></tr>
+      <tr><td>Stable under concurrent writes</td><td>No — an insert shifts every later page</td><td>Yes</td></tr>
+      <tr><td>Total page count</td><td>Needs a separate count</td><td>Same problem</td></tr>
+      <tr><td>Right for</td><td>Small result sets, admin tables where deep paging is rare</td><td>Infinite scroll, APIs, anything user-facing at scale</td></tr>
+    </table>
+
+    <h3>The counting problem</h3>
+
+<pre>
+  db.orders.estimatedDocumentCount()       // 1 ms, metadata read
+  db.orders.countDocuments({})             // 6,400 ms, full scan
+  db.orders.countDocuments({ status: "paid" })   // index scan
+
+  estimatedDocumentCount() reads collection metadata. It is fast,
+  it takes NO filter, and after an unclean shutdown it can be
+  wrong until the counts are corrected.
+
+  countDocuments() runs a real aggregation. With an index it is a
+  COUNT_SCAN over keys -- no documents fetched -- but it still
+  walks every matching key. On 41M matching documents that is
+  seconds, no matter how good the index is.
+</pre>
+
+    <p>There is no fast exact count of a filtered set at scale. That is a real constraint, so the honest
+       options are product decisions, not technical ones:</p>
+
+    <table class="tbl">
+      <tr><th>Option</th><th>How</th><th>Trade-off</th></tr>
+      <tr><td>Don't show a total</td><td>"Load more" / infinite scroll</td><td>Free, and what most modern UIs do. Propose this first</td></tr>
+      <tr><td>Bounded count</td><td><code>countDocuments(q, { limit: 1000 })</code> → "1,000+"</td><td>Fast and honest. Stops counting at the cap</td></tr>
+      <tr><td>Approximate</td><td><code>estimatedDocumentCount()</code> for unfiltered totals</td><td>Instant, but no filter and occasionally stale</td></tr>
+      <tr><td>Maintained counter</td><td><code>$inc</code> a counter document on every write</td><td>Exact and instant to read, but it is a write hotspot and needs a reconciler; see <a href="patterns.html">Schema Design Patterns</a></td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>An exact filtered count on a large collection is the most expensive thing on
+       most pages, and it is usually decoration.</strong> One dashboard spent 6.4 seconds per load computing
+       "41,203,881 orders" — a number no one had ever acted on. Deleting it was the entire optimisation. Ask
+       what decision the number supports before you optimise it.</div>
+
+    <h2>Part 3 — What Explain Does Not Charge You For</h2>
+
+<pre>
+MEASURED: the query that was fast on the server and slow in the app
+
+  explain: executionTimeMillis 4
+  reality: 900 ms measured at the driver
+
+  find({ tenantId: t }) with no projection and no limit
+    nReturned       182,000
+    responseLength  ~740 MB total across batches
+    batchSize       101 (default first batch), then 16MB batches
+
+  The server found the documents in 4 ms. The other 896 ms was
+  BSON serialisation, network transfer, driver deserialisation,
+  and 40 round trips to fetch subsequent batches.
+
+  Fixes, in order of effect:
+    1. limit()          -- do you need 182,000 documents?      -95%
+    2. projection       -- 740 MB -> 31 MB by returning 6 fields
+    3. batchSize        -- fewer round trips for a genuine bulk read
+</pre>
+
+    <table class="tbl">
+      <tr><th>Lever</th><th>Effect</th><th>Watch out for</th></tr>
+      <tr><td><code>project()</code></td><td>Cuts BSON size, network, driver CPU, and can enable a covered query</td><td>Projecting a large array field still materialises it; use <code>$slice</code> or restructure</td></tr>
+      <tr><td><code>limit()</code></td><td>Bounds everything downstream — but only stops the <em>scan</em> early if the sort comes from the index</td><td>A blocking SORT reads everything regardless</td></tr>
+      <tr><td><code>batchSize()</code></td><td>Fewer round trips on large reads</td><td>Larger batches mean more memory held per cursor; the reply is capped at 16 MB per batch regardless</td></tr>
+      <tr><td>Cursor timeouts</td><td>Idle cursors are closed after 10 minutes</td><td>A slow consumer that pauses mid-iteration gets <code>CursorNotFound</code>; process in bounded batches instead</td></tr>
+      <tr><td><code>allowDiskUse</code></td><td>Lets an aggregation stage spill past 100 MB</td><td>It converts a failure into something very slow. Usually a signal to reduce earlier, not to enable</td></tr>
+    </table>
+
+    <p>The general principle: <code>explain</code> measures the database's work, and the database is often not
+       where the time goes. When the server says 4 ms and the user waits 900, stop tuning indexes and start
+       measuring <code>responseLength</code> and document counts.</p>
+
+    <h2>Part 4 — Rewriting Predicates So They Can Use an Index</h2>
+
+    <p>Some predicates cannot use an index no matter what you build, because they do not describe a contiguous
+       key range. Each has a rewrite.</p>
+
+    <table class="tbl">
+      <tr><th>Unindexable</th><th>Why</th><th>Rewrite</th></tr>
+      <tr><td><code>{ status: { $ne: "cancelled" } }</code></td><td>Two disjoint ranges spanning nearly the whole index</td><td><code>{ status: { $in: ["pending","paid","shipped"] } }</code> — each value is its own seek</td></tr>
+      <tr><td><code>{ type: { $nin: [...] } }</code></td><td>Same</td><td>Enumerate the positive set</td></tr>
+      <tr><td><code>{ name: /smith/ }</code></td><td>Unanchored — matches could be anywhere in the key order</td><td><code>/^smith/</code> if prefix matching is acceptable; otherwise a text index or a real search engine</td></tr>
+      <tr><td><code>{ name: /^smith/i }</code></td><td>The <code>i</code> flag defeats the anchor: casing changes ordering</td><td>Store and index a normalised <code>nameLower</code></td></tr>
+      <tr><td><code>{ $where: "this.a &gt; this.b" }</code></td><td>Runs JavaScript per document; no index, and a security surface</td><td><code>{ $expr: { $gt: ["$a","$b"] } }</code> — still unindexed, but no JS; better, store a computed field and index that</td></tr>
+      <tr><td><code>{ $expr: { $gt: [{ $year: "$createdAt" }, 2025] } }</code></td><td>A computed value cannot be indexed</td><td><code>{ createdAt: { $gte: ISODate("2026-01-01") } }</code> — express it as a range on the raw field</td></tr>
+      <tr><td><code>{ tags: { $size: 3 } }</code></td><td><code>$size</code> is not indexable</td><td>Maintain a <code>tagCount</code> field and index it</td></tr>
+      <tr><td><code>$or</code> with one unindexed branch</td><td>The whole <code>$or</code> falls back to a collection scan</td><td>Index <em>every</em> branch; check for a <code>SUBPLAN</code> stage with an IXSCAN under each</td></tr>
+    </table>
+
+<pre>
+MEASURED: case-insensitive search
+
+  db.users.find({ email: /^amy@example\.com$/i })
+    COLLSCAN, 4.2M docs, 2,900 ms
+
+  Option A -- normalised field (what I default to)
+    { email: "Amy@Example.com", emailLower: "amy@example.com" }
+    db.users.createIndex({ emailLower: 1 })
+    db.users.find({ emailLower: q.toLowerCase() })
+    IXSCAN, 1 key, 3 ms
+
+  Option B -- collation index
+    db.users.createIndex({ email: 1 },
+                         { collation: { locale: "en", strength: 2 } })
+    db.users.find({ email: q })
+            .collation({ locale: "en", strength: 2 })
+    IXSCAN, 3 ms -- but ONLY if the query specifies the collation.
+    Omit it and you silently get a COLLSCAN.
+
+  A is more code and no hidden coupling. B is less code and a trap
+  that every new developer and every new driver call can fall into.
+</pre>
+
+    <h3>The <code>$or</code> rule</h3>
+
+<pre>
+  db.orders.find({ $or: [
+    { customerId: cid },        // indexed
+    { email: someEmail }        // NOT indexed
+  ]})
+
+  The planner needs an indexed plan for EVERY branch. One
+  unindexed branch means the whole query becomes a COLLSCAN --
+  the indexed branch buys nothing.
+
+  Check the plan for stage: "SUBPLAN" with an IXSCAN beneath each
+  branch. If you see COLLSCAN at the top, find the branch that
+  lacks an index.
+
+  Also: $or over the SAME field is an $in, and $in is better --
+  one index, one set of seeks, no deduplication step.
+    { $or: [{s:"a"},{s:"b"}] }   ->   { s: { $in: ["a","b"] } }
+</pre>
+
+    <h2>Part 5 — Read Preference, Read Concern, and What They Cost</h2>
+
+    <table class="tbl">
+      <tr><th>Read preference</th><th>Behaviour</th><th>Cost</th></tr>
+      <tr><td><code>primary</code> (default)</td><td>All reads from the primary</td><td>No staleness. Primary is the bottleneck</td></tr>
+      <tr><td><code>primaryPreferred</code></td><td>Primary, falling back to a secondary</td><td>Silently becomes stale during a failover — usually the worst option, because the staleness appears exactly when things are already going wrong</td></tr>
+      <tr><td><code>secondary</code></td><td>Secondaries only</td><td>Replication lag, typically milliseconds but unbounded under load</td></tr>
+      <tr><td><code>secondaryPreferred</code></td><td>Secondaries, falling back to primary</td><td>Good for analytics and reports</td></tr>
+      <tr><td><code>nearest</code></td><td>Lowest network latency, primary or secondary</td><td>Geographically fast, arbitrarily stale</td></tr>
+    </table>
+
+<pre>
+  THE READ-YOUR-OWN-WRITE TRAP
+
+  await orders.insertOne(doc)                       // primary
+  const list = await orders.find({ customerId })     // secondary
+                           .toArray()
+  // the new order is often MISSING. Replication lag is real.
+
+  Three ways out:
+    1. Read from the primary on the path immediately after a write.
+    2. Use causal consistency: one client session, with
+       readConcern "majority" and writeConcern "majority" -- the
+       session carries a cluster time so the read waits for it.
+    3. Do not re-read: return the document you just wrote, or use
+       findOneAndUpdate with returnDocument: "after".
+
+  Option 3 is the cheapest and removes the round trip as well. It
+  is also the one people forget exists.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Read concern</th><th>Guarantee</th><th>Latency cost</th></tr>
+      <tr><td><code>local</code> (default)</td><td>Whatever this node has, possibly not yet replicated — and possibly rolled back later</td><td>Lowest</td></tr>
+      <tr><td><code>majority</code></td><td>Only data acknowledged by a majority; will never be rolled back</td><td>Waits for the majority commit point — measured ~2–15 ms extra under normal lag, far more under stress</td></tr>
+      <tr><td><code>snapshot</code></td><td>A consistent point-in-time view across the whole read</td><td>Highest; used inside transactions</td></tr>
+      <tr><td><code>linearizable</code></td><td>Reflects all majority-acknowledged writes before the read began</td><td>Very high; primary only, single-document reads only, and requires <code>maxTimeMS</code></td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>The default combination is the surprising one.</strong> Writes default to
+       <code>w: "majority"</code> but reads default to <code>readConcern: "local"</code>. So a write can be
+       durably committed while a subsequent read on another node does not see it — and a read can return data
+       that a rollback later removes. That mismatch is fine for most workloads and quietly wrong for money
+       and for anything a user just did. See <a href="crud-semantics.html">CRUD and What It Guarantees</a>
+       and <a href="replication.html">Replica Sets &amp; Read Concerns</a>.</div>
+
+    <h2>Part 6 — Guardrails and Closing the Loop</h2>
+
+<pre>
+  1. maxTimeMS ON EVERY QUERY. Not most. Every one.
+
+     db.orders.find({...}).maxTimeMS(2000)
+
+     Without it, a single pathological query runs until it finishes
+     or the client gives up -- and the client giving up does NOT
+     stop the server. The operation keeps consuming CPU and cache
+     with nobody waiting for the answer.
+
+     MEASURED: an export endpoint whose client timed out at 30 s
+     left 140 abandoned operations running after a traffic spike.
+     Cluster CPU stayed at 100% for 20 minutes after the traffic
+     had gone.
+
+  2. KILL WHAT IS RUNNING AWAY.
+
+     db.currentOp({ secs_running: { $gt: 5 },
+                    op: { $in: ["query","command","getmore"] } })
+     db.killOp(opid)
+
+     killOp is cooperative: the operation stops at its next
+     interrupt point. Fast for a scan, not instant for everything.
+
+  3. SIZE THE CONNECTION POOL DELIBERATELY.
+
+     Default maxPoolSize is 100 PER CLIENT INSTANCE. Forty app
+     pods with one client each is 4,000 possible connections, and
+     each costs ~1 MB of server RAM plus scheduling overhead.
+     A pool larger than the server can usefully run in parallel
+     does not add throughput -- it converts a queue you can see
+     into contention you cannot.
+
+  4. TIER YOUR TIMEOUTS.
+     maxTimeMS  &lt;  application timeout  &lt;  load-balancer timeout
+     Inverted, the client gives up while the server works on.
+</pre>
+
+    <h3>The loop that people leave open</h3>
+
+<pre>
+  1. MEASURE     profiler, ranked by total time
+  2. DIAGNOSE    explain("executionStats") on the top few
+  3. CHANGE      one thing -- index, predicate, or projection
+  4. VERIFY      re-run the SAME profiler aggregation, compare the
+                 SAME queryHash. Not "it feels faster".
+  5. CLEAN UP    $indexStats: did this change make an older index
+                 redundant? An optimisation process that only ever
+                 ADDS indexes eventually becomes a cache problem.
+
+  Step 4 is skipped most often, and step 5 almost always. One team
+  reached 19 indexes on a collection through six months of
+  diligent, individually-correct optimisations, and the resulting
+  cache pressure had made everything slower than when they started.
+</pre>
+
+    <div class="note">🔑 <strong>Before tuning any query, ask whether it should run at all.</strong> The fastest
+       query is the one that is not executed: a cached result, a precomputed rollup, a total nobody reads, a
+       page nobody scrolls to. The three largest wins in the measured examples in this lesson were deleting a
+       count, adding an application-level cache in front of 98,000 session lookups an hour, and returning the
+       document from the write instead of re-reading it. None of them were index changes.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Optimising the slowest query</td><td>A 4-second report costs 8 s/hour; a 41 ms query at 98,000/hour costs 67 minutes</td><td>Rank by <code>count × mean</code>, not by worst case</td></tr>
+      <tr><td>Profiling at level 2 on a busy primary</td><td>Records every operation and measurably degrades the node you are debugging</td><td>Level 1 with a threshold, capped collection, ideally on a secondary</td></tr>
+      <tr><td><code>skip()</code> for deep pagination</td><td>Skipped entries are read and discarded — 4 ms on page 1, 2,100 ms on page 5,000</td><td>Keyset pagination on the sort key</td></tr>
+      <tr><td>Keyset pagination without an <code>_id</code> tie-break</td><td>Rows duplicated or skipped when timestamps collide across a page boundary</td><td>Append <code>_id</code> to both the sort and the cursor predicate</td></tr>
+      <tr><td><code>countDocuments({})</code> for a page total</td><td>6.4 s full scan for a number nobody acts on</td><td><code>estimatedDocumentCount</code>, a capped count, or no total at all</td></tr>
+      <tr><td>Returning whole documents</td><td>740 MB transferred, 896 ms outside the database, invisible in explain</td><td>Project the fields you use; check <code>responseLength</code></td></tr>
+      <tr><td><code>$ne</code> / <code>$nin</code> in a hot query</td><td>Two disjoint ranges; effectively a full index scan</td><td>Enumerate the positive set with <code>$in</code></td></tr>
+      <tr><td>Case-insensitive regex on an indexed field</td><td>The <code>i</code> flag defeats the anchor — 2,900 ms COLLSCAN</td><td>Index a normalised lowercase field</td></tr>
+      <tr><td><code>$or</code> with one unindexed branch</td><td>The entire query becomes a collection scan</td><td>Index every branch; use <code>$in</code> when branches share a field</td></tr>
+      <tr><td>Reading from a secondary right after writing</td><td>The document is often missing — replication lag is real</td><td>Read the primary on that path, use causal consistency, or return the written document</td></tr>
+      <tr><td><code>primaryPreferred</code> as a "safe" default</td><td>Silently serves stale reads during a failover, exactly when things are already wrong</td><td>Choose deliberately: <code>primary</code> or <code>secondaryPreferred</code></td></tr>
+      <tr><td>No <code>maxTimeMS</code></td><td>Client timeouts do not stop the server; 140 abandoned operations held CPU at 100% for 20 minutes</td><td><code>maxTimeMS</code> on every query, tiered below the app timeout</td></tr>
+      <tr><td>Never re-measuring after a change</td><td>"It feels faster"; and six months of additions reach 19 indexes and a cache problem</td><td>Re-run the same profiler aggregation; audit <code>$indexStats</code> for newly redundant indexes</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why is <code>skip()</code> slow for deep pagination?</summary>
+      <p>Because <code>skip(n)</code> does not seek — it walks the index from the start and discards the first
+         <em>n</em> entries. Those entries are read; they are just thrown away. So cost grows linearly with
+         the page number, and paging through a whole result set is quadratic overall.</p>
+      <p>Measured on a customer with 100,000 orders and a perfect index: 4 ms on page 1, 310 ms on page 1,000,
+         2,100 ms on page 5,000. The index was not the problem, which is why this cannot be fixed by
+         indexing.</p>
+      <p>Keyset pagination fixes it: instead of "skip 19,980", pass the last row's sort key and ask for
+         "everything after this", which is a normal indexed seek. Every page then costs the same.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between <code>countDocuments</code> and <code>estimatedDocumentCount</code>?</summary>
+      <p><code>estimatedDocumentCount()</code> reads collection metadata — about 1 ms regardless of size — but
+         takes no filter and can be briefly inaccurate after an unclean shutdown.
+         <code>countDocuments(filter)</code> runs a real query. With a good index it is a
+         <code>COUNT_SCAN</code> over keys with no document fetches, but it still walks every matching key,
+         so on 41 million matches it took 6.4 seconds.</p>
+      <p>The practical consequence is that there is no fast exact count of a filtered set at scale. The
+         options are a bounded count (<code>{ limit: 1000 }</code> → "1,000+"), a maintained counter, or not
+         showing a total. I would ask what decision the number supports first — in the case I measured, the
+         6.4-second count was decoration and deleting it was the entire optimisation.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> An explain says 4 ms but users wait 900 ms. Where is the time?</summary>
+      <p>Outside the database. <code>executionTimeMillis</code> covers finding the documents; it excludes BSON
+         serialisation, network transfer, driver deserialisation, and the round trips to fetch subsequent
+         cursor batches.</p>
+      <p>In the case I measured, the query returned 182,000 documents with no projection — about 740 MB across
+         roughly 40 batches. The server genuinely did its part in 4 ms.</p>
+      <p>The diagnosis is <code>nReturned</code> and <code>responseLength</code> in the profiler, not explain.
+         The fixes in order of effect: a <code>limit</code> (does anything need 182,000 documents?), a
+         projection (740 MB → 31 MB by returning six fields), and only then <code>batchSize</code> for a
+         genuine bulk read. Adding an index would have changed nothing.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you make a case-insensitive search use an index?</summary>
+      <p>A case-insensitive regex like <code>/^amy@example\.com$/i</code> cannot use an index even though it is
+         anchored, because case folding changes the key ordering — measured at 2,900 ms as a collection scan
+         over 4.2M users.</p>
+      <p>Two options. Store a normalised <code>emailLower</code> field, index it, and query it with a
+         lowercased input: 3 ms, and completely explicit. Or create a collation index with
+         <code>strength: 2</code> and specify the same collation on every query — also 3 ms, but if any call
+         site omits <code>.collation()</code> it silently falls back to a collection scan while the unique
+         constraint still applies case-insensitively.</p>
+      <p>I default to the normalised field. It is a little more code and no hidden coupling between the query
+         and the index, and it behaves identically in every driver and in the shell.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a systematic query-tuning process for a team, including the parts people skip.</summary>
+      <p><strong>Collect</strong> with the profiler at level 1 and a threshold matched to the workload — 100 ms
+         is a starting point, but for a 5 ms API it should be far lower. Cap the collection first and prefer
+         a secondary.</p>
+      <p><strong>Rank by total time</strong>, grouped by <code>queryHash</code>. This is the step that changes
+         outcomes: the queries humans report are the slowest ones, and the queries consuming the cluster are
+         moderately slow ones running constantly. In one hour of real workload, the top-reported query cost
+         8 seconds and the unreported one cost 67 minutes.</p>
+      <p><strong>Triage with <code>planSummary</code></strong>, which is already in the profiler output — every
+         <code>COLLSCAN</code> on a large namespace is a finding with no explain needed.</p>
+      <p><strong>Diagnose the survivors</strong> with <code>explain("executionStats")</code>: the ratios of
+         examined to returned, and <code>indexBounds</code> for compound fields contributing nothing.</p>
+      <p><strong>Then the two steps teams skip.</strong> Verify by re-running the same profiler aggregation and
+         comparing the same <code>queryHash</code> — not by impression. And clean up: check
+         <code>$indexStats</code> for indexes the change made redundant, then <code>hideIndex</code> for a
+         business cycle before dropping. A process that only ever adds indexes becomes a cache problem; I
+         have seen a team reach 19 indexes through six months of individually-correct optimisations and end
+         up slower than they started.</p>
+      <p><strong>The organisational part:</strong> this should be a scheduled review with an owner, plus a CI
+         check against production-shaped data that fails the build on a new <code>COLLSCAN</code>. The
+         cheapest slow query to fix is the one that never ships.</p>
+      <p><strong>And the question that comes before all of it:</strong> should this query run at all? The three
+         biggest wins I have measured were deleting a count nobody read, caching 98,000 identical session
+         lookups an hour, and returning the document from the write instead of re-reading it. None were index
+         changes.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your primary is at 100% CPU and the app is timing out. What do you do, in order?</summary>
+      <p><strong>Stabilise before diagnosing.</strong> <code>db.currentOp({ secs_running: { $gt: 5 } })</code>
+         to see what is actually running now. If one operation or one shape dominates, <code>killOp</code> it
+         — that is triage, not optimisation, and it comes first. Note that <code>killOp</code> is
+         cooperative: the operation stops at its next interrupt point, quickly for a scan and less so for
+         other work.</p>
+      <p><strong>Then check whether client timeouts are making it worse.</strong> A client giving up does not
+         stop the server. If the application times out at 30 s and no query sets <code>maxTimeMS</code>,
+         abandoned operations accumulate with nobody waiting for their results — I have seen 140 of them hold
+         CPU at 100% for 20 minutes after the traffic had gone. If so, the immediate mitigation is shedding
+         load at the application, and the follow-up is <code>maxTimeMS</code> everywhere.</p>
+      <p><strong>Rule out the non-query causes</strong>, because they present identically and no index fixes
+         them: an index build running, a backfill or migration, a backup, an initial sync from a new
+         secondary, or the working set exceeding cache (check
+         <code>wiredTiger.cache["pages evicted by application threads"]</code>).</p>
+      <p><strong>Check the plan cache.</strong> A sudden step change with no deploy is its signature — one
+         cached plan, chosen from a ~101-document trial, being applied to values it is wrong for.
+         <code>$planCacheStats</code> and <code>timeOfCreation</code> near a restart make it likely.</p>
+      <p><strong>Only then optimise.</strong> During an incident I would prefer reversible changes: a
+         <code>hint()</code>, a query-side fix, or shedding a non-critical endpoint. I would not start an
+         index build on a cluster at 100% CPU — the build consumes CPU and evicts cache, and it is not
+         cheaply reversible. That goes on the list for a calm window, with the profiler evidence attached.</p>
+      <p><strong>Afterwards:</strong> the guardrails that would have contained it — <code>maxTimeMS</code> on
+         every query, tiered timeouts (<code>maxTimeMS</code> &lt; app &lt; load balancer), a sized connection
+         pool, and an alert on <code>currentOp</code> long-runners. An incident that changes no defaults will
+         recur.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> An infinite-scroll feed uses
+      <code>.skip(page*20).limit(20)</code> with the index <code>{ userId: 1, createdAt: -1 }</code>. Users
+      report that scrolling gets slower and that items occasionally appear twice. Fix both.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Both symptoms are <code>skip()</code>.</strong> It gets slower because skipped entries are read
+         and discarded, so page cost grows with page number. Items appear twice because a new document
+         inserted while the user scrolls shifts every subsequent page by one — an item that was at the top of
+         page 4 moves to the bottom of page 3 and gets shown again.</p>
+<pre>
+  // first page
+  db.feed.find({ userId })
+         .sort({ createdAt: -1, _id: -1 })
+         .limit(20)
+
+  // subsequent pages: cursor = { createdAt, _id } of the last item
+  db.feed.find({ userId,
+    $or: [
+      { createdAt: { $lt: cur.createdAt } },
+      { createdAt: cur.createdAt, _id: { $lt: cur._id } }
+    ]})
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(20)
+
+  index: { userId: 1, createdAt: -1, _id: -1 }
+</pre>
+      <p><strong>Why the <code>$or</code> is shaped that way:</strong> it means "strictly older, or the same
+         instant but a lower <code>_id</code>". Without the tie-break, two items sharing a
+         <code>createdAt</code> across a page boundary are either both shown or both skipped. That bug is
+         load-dependent and effectively unreproducible from a user report, so it is worth writing correctly
+         the first time.</p>
+      <p><strong>What this costs you:</strong> no jumping to an arbitrary page. For an infinite-scroll feed
+         that is not a loss — nobody jumps to page 400 of a feed. If the product genuinely needs page
+         numbers, that is a different conversation, and the honest answer is that deep page numbers are
+         expensive in every database.</p>
+      <p><strong>Encode the cursor opaquely</strong> (base64 of the two values) so clients cannot construct one
+         and you can change the sort key later without breaking them.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Rewrite these three predicates so they can use an index,
+      and say what you gave up in each case.
+<pre>
+  a) { status: { $ne: "archived" } }
+  b) { title: /report/i }
+  c) { $expr: { $gt: [ { $year: "$createdAt" }, 2025 ] } }
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>(a)</strong> <code>$ne</code> describes everything except one value — two disjoint ranges that
+         between them cover almost the whole index, so the scan is effectively unbounded.</p>
+<pre>
+  { status: { $in: ["draft","active","paused","completed"] } }
+</pre>
+      <p><em>Given up:</em> the enumeration must be maintained. Adding a new status without updating the query
+         silently excludes it. Mitigate by generating the list from the same constant the validator's
+         <code>enum</code> uses, so there is one source of truth.</p>
+      <p><strong>(b)</strong> The <code>i</code> flag and the lack of an anchor both defeat the index — an
+         unanchored regex has no contiguous key range, and case folding changes ordering.</p>
+<pre>
+  // if prefix search is acceptable:
+  { titleLower: /^report/ }     with index { titleLower: 1 }
+  // if substring search is required: a text index, or a real
+  // search engine. There is no index that makes /report/ fast.
+</pre>
+      <p><em>Given up:</em> substring matching. This is the honest limit — "contains" is not an indexable
+         operation in a B-tree, and pretending otherwise is how teams end up with a 3-second search box.</p>
+      <p><strong>(c)</strong> <code>$year</code> computes a value per document, and computed values cannot be
+         indexed. But the intent is a plain range.</p>
+<pre>
+  { createdAt: { $gte: ISODate("2026-01-01T00:00:00Z") } }
+</pre>
+      <p><em>Given up:</em> nothing, except that you now have to think about time zones explicitly. That is
+         arguably a gain — <code>$year</code> silently used UTC, which was probably not what the report
+         meant, and the bug was invisible.</p>
+      <p><strong>The pattern across all three:</strong> express the predicate as a contiguous range over a
+         stored value. Anything that negates, computes, or ignores ordering cannot bound an index scan.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> This profiler output is from one hour. Choose what to work
+      on and justify the order.
+<pre>
+  queryHash  plan                    n       avg    docs/ret   bytes
+  A  COLLSCAN                       120   3,400ms   4.1M/12    4KB
+  B  IXSCAN {userId:1}           84,000      38ms   1,200/20   210KB
+  C  IXSCAN {sku:1}                9,400      12ms      1/1     2KB
+  D  COLLSCAN                    2                  9,100ms  4.1M/380K  740MB
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Total cost first:</strong></p>
+      <table class="tbl">
+        <tr><th></th><th>n × avg</th><th>Share</th></tr>
+        <tr><td>B</td><td>84,000 × 38 ms = <strong>53 minutes</strong></td><td>Dominant</td></tr>
+        <tr><td>A</td><td>120 × 3,400 ms = 6.8 min</td><td>Significant</td></tr>
+        <tr><td>C</td><td>9,400 × 12 ms = 1.9 min</td><td>Healthy already</td></tr>
+        <tr><td>D</td><td>2 × 9,100 ms = 18 s</td><td>Negligible in time</td></tr>
+      </table>
+      <p><strong>1. B first.</strong> It is 53 minutes of database time per hour and it has a clear defect:
+         1,200 documents examined per 20 returned means a filter field is missing from
+         <code>{userId: 1}</code>. Add it (ESR order) and the ratio should collapse toward 20/20. Also 210 KB
+         per response for 20 documents suggests whole documents are being returned — a projection is likely a
+         second, independent win.</p>
+      <p><strong>2. A second.</strong> A collection scan over 4.1M documents returning 12 rows is a missing
+         index, and 6.8 minutes/hour is real. Straightforward once the predicate is known.</p>
+      <p><strong>3. D — not for its time, but as a risk.</strong> 18 seconds an hour is nothing, but it returns
+         380,000 documents and 740 MB per execution. That is a memory and network event on both the server
+         and whatever client consumes it, and it will get worse as the collection grows. It also has no
+         <code>maxTimeMS</code> protection implied. I would treat it as a correctness/guardrail item — add a
+         limit or a projection, or move it to a secondary — rather than a latency optimisation.</p>
+      <p><strong>4. C — leave alone.</strong> 1 document examined per 1 returned at 12 ms is already optimal.
+         Any time spent here is wasted.</p>
+      <p><strong>The observation worth raising beyond indexing:</strong> B runs 84,000 times an hour, which is
+         23 per second. Before optimising it from 38 ms to 4 ms, I would ask whether those calls are
+         necessary — an N+1 pattern in the application, or a missing cache, would be a far larger win than a
+         tenfold latency improvement. The profiler's <code>n</code> column is often the finding, not the
+         <code>avg</code> column.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> An endpoint shows a table of results with a total count
+      and page numbers. It takes 6.8 seconds on a 41M-document collection. Give three options with their
+      trade-offs and recommend one.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>First, split the 6.8 seconds</strong>, because there are two independent costs and they need
+         different fixes: the count (measured separately at ~6.4 s) and the page fetch (~0.4 s, and worse on
+         deep pages if it uses <code>skip</code>). Optimising the wrong half wastes the effort.</p>
+      <table class="tbl">
+        <tr><th>Option</th><th>Result</th><th>Trade-off</th></tr>
+        <tr><td><strong>1. Drop the total, keyset pagination</strong></td><td>~5 ms per page, constant</td><td>No page numbers, no "of 41,203,881". Requires a UI change</td></tr>
+        <tr><td><strong>2. Capped count + <code>skip</code></strong><br><code>countDocuments(q, {limit: 10000})</code></td><td>Count ~40 ms, shows "10,000+"; pages still degrade with depth</td><td>Smallest change, keeps page numbers up to a bound. Deep pages remain slow</td></tr>
+        <tr><td><strong>3. Maintained counter</strong></td><td>Count ~1 ms, exact</td><td>Only works for a fixed filter set; a write hotspot on the counter document; needs a reconciler because counters drift</td></tr>
+      </table>
+      <p><strong>Recommendation: option 1</strong>, and it is worth making the product argument rather than the
+         technical one. In the case I measured, the exact total was 6.4 of the 6.8 seconds and no one had
+         ever acted on the number — it was decoration on a page whose users only ever looked at the first two
+         screens. Instrument it if there is doubt: log how often anyone requests a page beyond 3, and how
+         often the total changes any behaviour.</p>
+      <p><strong>If page numbers are genuinely required</strong> (an audit tool where "go to page 400" is a real
+         workflow), option 2 is the pragmatic compromise: a capped count gives an honest "10,000+" quickly,
+         and <code>skip</code> within a bounded range is acceptable. I would still cap the maximum reachable
+         page rather than letting someone request page 500,000.</p>
+      <p><strong>Option 3 only if</strong> the filter set is small and fixed (a handful of statuses, say). A
+         counter per arbitrary filter combination does not scale, and the reconciler is not optional —
+         counters drift through failed writes, retries and manual data fixes, and a total that is wrong is
+         worse than one that is absent.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> An export endpoint streams every order for a customer as
+      JSON. It works for most customers and times out for the largest ones, and while it runs, unrelated
+      queries slow down. Redesign it.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Three distinct problems are stacked here</strong>, and fixing only the visible one leaves the
+         other two.</p>
+      <table class="tbl">
+        <tr><th>Problem</th><th>Evidence</th></tr>
+        <tr><td>Unbounded result set</td><td>Works for small customers, times out for large ones — the size scales with the customer, not with a limit</td></tr>
+        <tr><td>Cache eviction</td><td>"Unrelated queries slow down" — the export pulls millions of documents through the WiredTiger cache, evicting everyone else's working set</td></tr>
+        <tr><td>No timeout containment</td><td>The client giving up does not stop the server; the operation runs on</td></tr>
+      </table>
+      <p><strong>The redesign:</strong></p>
+<pre>
+  1. MOVE IT OFF THE REQUEST PATH
+     POST /exports -> 202 Accepted + job id
+     worker processes it, writes to object storage
+     GET /exports/{id} -> status, then a signed URL
+
+     This alone fixes the timeout, because there is no longer an
+     HTTP request waiting on it.
+
+  2. READ FROM A SECONDARY
+     readPreference: secondaryPreferred (or a dedicated
+     analytics/hidden node)
+     The export's cache eviction now damages a node that is not
+     serving the hot path.
+
+  3. PAGE THE READ, DO NOT STREAM ONE CURSOR
+     Keyset iteration in batches of ~1,000 on { customerId, _id }.
+     Bounded memory, restartable from the last _id, and immune to
+     the 10-minute idle cursor timeout that a slow writer would
+     otherwise hit with CursorNotFound.
+
+  4. PROJECT
+     An export needs specific columns, not whole order documents
+     with their items arrays. In the measured case this was the
+     difference between 740 MB and 31 MB.
+
+  5. GUARDRAILS
+     maxTimeMS per batch (not per export), a total-row cap with an
+     explicit error rather than silent truncation, and one
+     concurrent export per customer.
+</pre>
+      <p><strong>Why keyset batching rather than one cursor with a large <code>batchSize</code>:</strong> a
+         single long-lived cursor holds a snapshot-ish position on the server, is vulnerable to the idle
+         timeout if the consumer is slow (writing to object storage, for instance), and cannot be resumed
+         after a worker restart. Batched keyset reads are individually short, restartable, and let you insert
+         a deliberate pause between batches to limit cache impact.</p>
+      <p><strong>What I would push back on:</strong> if exports are a core workflow rather than an occasional
+         admin action, the durable answer is a separate analytics path — a hidden replica-set member, or
+         periodic extraction to a warehouse — not a better-behaved export endpoint. Large sequential reads
+         and low-latency point queries want opposite things from a cache, and no amount of tuning makes one
+         node good at both. I would ship the redesign above now and open that conversation with the export
+         volume numbers attached.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design a query-performance regression gate for CI: it must
+      catch a bad query before it ships, without a production database and without being so noisy that people
+      disable it.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The two failure modes to design against are opposite</strong>, and most attempts die of the
+         second: a gate that misses real regressions is useless, and a gate that fires on noise gets disabled
+         within a month. So the design principle is <em>assert on plan shape, not on timing</em>. Timings on
+         CI hardware are noise; plans are deterministic.</p>
+<pre>
+  1. A SEEDED DATASET WITH PRODUCTION-LIKE SHAPE
+     Not production data. What matters is cardinality and skew:
+     enough documents that the planner makes real choices (10k
+     minimum, 100k better), a realistic tenant distribution
+     including one large tenant, and realistic array lengths.
+     A 500-document fixture makes every plan look identical --
+     which is exactly why staging explains predict nothing.
+     Seed it deterministically from a script in the repo.
+
+  2. THE ASSERTIONS (plan shape, not milliseconds)
+     For each registered query:
+       - no COLLSCAN on a collection above N documents
+       - docsExamined &lt;= K * nReturned          (K ~ 10)
+       - no blocking SORT stage
+       - no [MinKey, MaxKey] on a field the query filters on
+       - shardsTargeted == 1, where the collection is sharded
+
+  3. HOW QUERIES GET REGISTERED
+     The hard part is coverage, not assertions. Two options:
+       a) explicit: a test file listing the queries that matter
+       b) automatic: run the integration suite with the profiler
+          on, then assert over the profiler output
+     (b) has far better coverage and no maintenance, and it
+     catches queries nobody remembered to register. It is the one
+     I would build.
+
+  4. FAILURE OUTPUT
+     Print the explain, the failing assertion, and a suggested
+     index. A gate that says "query performance regression" and
+     nothing else gets bypassed.
+</pre>
+      <p><strong>What this catches:</strong> a new query with no index, a predicate rewritten into an
+         unindexable form (someone changing <code>$in</code> to <code>$ne</code>), a dropped index, a sort
+         added without an index to support it, and a new field filtered but not indexed. That is the large
+         majority of real regressions.</p>
+      <p><strong>What it cannot catch, and I would say so explicitly rather than implying coverage it does not
+         have:</strong> plan-cache effects (they need production value distributions), cache-pressure cliffs
+         (they need production data volume), lock contention and concurrency, replication lag, and anything
+         where the fixture's skew differs from production. Those need production monitoring; the gate is a
+         complement, not a replacement.</p>
+      <p><strong>The anti-noise rules that keep it alive:</strong> never assert on wall-clock time; make the
+         thresholds explicit constants that a reviewer can change with justification in the diff; allow an
+         inline waiver with a required comment for the legitimate exceptions (a genuinely small collection, a
+         deliberate scan in a batch job); and fail the build only on new violations, reporting existing ones
+         as warnings, so the gate can be adopted on a legacy codebase without a flag day.</p>
+      <p><strong>Effort estimate:</strong> roughly a week for the seeded dataset and the profiler-based harness,
+         which is the honest cost — most of it in the dataset, not the assertions. I would ship it in
+         warning-only mode first and turn on enforcement once the existing violations are triaged, because a
+         gate introduced as a wall of red failures never survives its first sprint.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Rank by total time, not worst case.</strong> A 41 ms query at 98,000/hour costs 67 minutes;
+            the 4-second report everyone complains about costs 8 seconds.</li>
+        <li><strong><code>planSummary</code> in the profiler is free triage</strong> — <code>COLLSCAN</code>
+            findings need no explain at all.</li>
+        <li><strong>Profiler level 2 on a busy primary is an incident risk.</strong> Level 1 with a threshold,
+            capped, ideally on a secondary, and turned off afterwards.</li>
+        <li><strong><code>skip()</code> reads and discards.</strong> 4 ms on page 1, 2,100 ms on page 5,000 —
+            with a perfect index.</li>
+        <li><strong>Keyset pagination makes every page cost the same</strong>, and needs an <code>_id</code>
+            tie-break or rows are duplicated and skipped at page boundaries.</li>
+        <li><strong>There is no fast exact filtered count at scale.</strong> 6.4 s versus 1 ms for the
+            estimate; prefer a cap, a counter, or no total.</li>
+        <li><strong>Explain does not charge you for serialisation, network or cursor round trips</strong> —
+            4 ms on the server, 900 ms at the driver, 740 MB on the wire.</li>
+        <li><strong>Projection is a performance feature</strong>, not just a tidiness one: 740 MB → 31 MB by
+            returning six fields.</li>
+        <li><strong><code>$ne</code> and <code>$nin</code> are two disjoint ranges</strong> — enumerate the
+            positive set with <code>$in</code>.</li>
+        <li><strong>A case-insensitive regex cannot use an index</strong>, anchored or not. Index a normalised
+            lowercase field: 2,900 ms → 3 ms.</li>
+        <li><strong>One unindexed <code>$or</code> branch makes the whole query a collection scan.</strong></li>
+        <li><strong>Computed predicates (<code>$year</code>, <code>$size</code>, <code>$where</code>) cannot be
+            indexed.</strong> Express them as ranges over stored values.</li>
+        <li><strong>Writes default to <code>majority</code>, reads default to <code>local</code></strong> — so
+            a committed write can be invisible to the next read on another node.</li>
+        <li><strong>Reading a secondary right after writing loses your own write.</strong> Read the primary,
+            use causal consistency, or return the written document.</li>
+        <li><strong><code>maxTimeMS</code> on every query.</strong> A client timeout does not stop the server —
+            140 abandoned operations held CPU at 100% for 20 minutes.</li>
+        <li><strong>Tier your timeouts</strong>: <code>maxTimeMS</code> &lt; application &lt; load balancer.</li>
+        <li><strong>Close the loop.</strong> Re-measure the same <code>queryHash</code>, and audit
+            <code>$indexStats</code> for newly redundant indexes — a process that only adds indexes becomes a
+            cache problem.</li>
+        <li><strong>The fastest query is the one that does not run.</strong> The three largest measured wins
+            here were deleting a count, caching repeated lookups, and not re-reading after a write.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="explain-plans.html">← Reading Explain Plans</a>
+      <a href="aggregation.html">The Aggregation Pipeline →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
