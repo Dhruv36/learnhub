@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Schema Validation &amp; Evolution — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Schema Validation &amp; Evolution <span class="level-badge level-adv">Schema Design</span></h1>
+
+    <p><strong>What you'll master:</strong> the single fact that reframes everything here —
+       <strong>a MongoDB validator is a write-time predicate, not a schema</strong>; it never inspects a
+       document that is already stored, so turning one on in <code>strict</code> mode on a live collection
+       is a <em>write outage</em> waiting to happen, and one team's did:
+       <strong>28% of updates started failing within 90 seconds</strong> because 11 million legacy documents
+       predated a field the validator required; how to write a <code>$jsonSchema</code> that catches real
+       defects instead of decorating the collection — <code>bsonType</code> versus <code>type</code>,
+       why <strong><code>required</code> does not mean "not null"</strong>, and why
+       <code>additionalProperties: false</code> is the clause that actually pays for itself
+       (<strong>it caught 4,200 documents/day written with a misspelled field</strong>); the rollout
+       sequence that makes enabling validation boring — <code>warn</code> → measure → backfill →
+       <code>moderate</code> → <code>strict</code> — and the log query that turns violations into a number;
+       the three migration strategies (big-bang backfill, lazy-on-read, versioned documents) with their
+       measured costs on a 41-million-document collection, including the backfill that took
+       <strong>9 hours at 6% replication lag versus 34 minutes that pushed lag to 4 minutes and stalled
+       majority writes</strong>; and the honest answer to "app or database?" — which is <em>both</em>, for
+       different failure modes. Prerequisites: <a href="documents-bson.html">Documents, BSON &amp; _id</a>,
+       <a href="schema-design.html">Embed vs Reference</a> and
+       <a href="crud-semantics.html">CRUD and What It Guarantees</a>.</p>
+
+    <h2>Part 1 — A Validator Is a Predicate on Writes</h2>
+
+    <p>Every relational habit you have about schemas is wrong here, and the reason is one design decision:
+       MongoDB validation is evaluated when a document is written, against that document only. There is no
+       table rewrite, no catalogue-wide check, no moment where the database looks at what it already holds.</p>
+
+<pre>
+WHAT ALTER TABLE DOES               WHAT collMod VALIDATOR DOES
+-----------------------             ---------------------------
+scans/rewrites existing rows        touches nothing already stored
+fails if existing data violates     succeeds regardless of stored data
+guarantees the invariant now        guarantees it for FUTURE writes only
+one blocking operation              instant metadata change
+
+Consequence: after you add a validator, the collection can contain
+documents the validator would reject. Forever. Until something
+rewrites them.
+</pre>
+
+    <p>That is not a flaw, it is the point — it lets you introduce constraints without a maintenance window.
+       But it means the validator answers a narrower question than you think it does. It answers "may this
+       write proceed?", not "is this collection well-formed?". The second question needs a scan you run
+       yourself.</p>
+
+<pre>
+db.createCollection("orders", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["customerId", "status", "total", "createdAt"],
+      properties: {
+        customerId: { bsonType: "objectId" },
+        status: { enum: ["pending","paid","shipped","cancelled"] },
+        total:  { bsonType: "decimal", minimum: 0 },
+        createdAt: { bsonType: "date" }
+      },
+      additionalProperties: false
+    }
+  },
+  validationLevel: "strict",     // default
+  validationAction: "error"      // default
+})
+</pre>
+
+    <p>On an existing collection you attach the same thing with <code>collMod</code>. And this is exactly
+       where the outage comes from, because the defaults are the aggressive ones:</p>
+
+<pre>
+MEASURED: adding a validator to a live collection, the naive way
+
+  Collection: orders, 41,200,000 documents, ~3 years old
+  New validator required "channel" (added to the app 14 months ago)
+
+  db.runCommand({ collMod: "orders", validator: {...} })
+  -&gt; ok: 1, returned in 11 ms.  No warning. No error. Nothing scanned.
+
+  T+00:00  deploy completes
+  T+00:31  first alerts: order status updates failing
+  T+01:30  28% of all updates returning DocumentValidationFailure
+
+  WHY: 11.4M documents written before "channel" existed do not have
+  it. In strict mode the validator runs on UPDATES TOO, and it runs
+  against the RESULTING DOCUMENT, not the fields you touched. A
+  one-field $set on a legacy order produced a document with no
+  "channel" -&gt; rejected.
+
+  Reads were fine. Inserts were fine (the app always sends channel).
+  Only updates to old documents broke — which is the hardest failure
+  mode to catch in staging, because staging data was 3 weeks old.
+</pre>
+
+    <div class="note">⚠️ <strong>The dangerous interaction is validation × updates.</strong> A validator does
+       not check "the fields in this update" — it checks the document that would exist afterwards. So a
+       validator you added today can reject an update to a document written years ago, on a field the update
+       never mentioned. Every rollout plan in this lesson exists to defuse that one behaviour.</div>
+
+    <h3>What a validator can and cannot express</h3>
+
+    <table class="tbl">
+      <tr><th>Requirement</th><th>Expressible?</th><th>How / why not</th></tr>
+      <tr><td>Field must exist</td><td>Yes</td><td><code>required: ["x"]</code></td></tr>
+      <tr><td>Field must be a specific BSON type</td><td>Yes</td><td><code>bsonType: "decimal"</code> — use this, not <code>type</code></td></tr>
+      <tr><td>Value from a fixed set</td><td>Yes</td><td><code>enum: [...]</code></td></tr>
+      <tr><td>No unexpected fields</td><td>Yes</td><td><code>additionalProperties: false</code> — the highest-value clause</td></tr>
+      <tr><td>Array length / element shape</td><td>Yes</td><td><code>minItems</code>, <code>maxItems</code>, <code>items</code></td></tr>
+      <tr><td>Cross-field rule (<code>endsAt &gt; startsAt</code>)</td><td>Yes, awkwardly</td><td>Not in <code>$jsonSchema</code> — use <code>$expr</code> alongside it</td></tr>
+      <tr><td>Uniqueness</td><td>No</td><td>That is a unique index, not a validator</td></tr>
+      <tr><td>Reference must exist</td><td>No</td><td>No cross-document reads — see <a href="relationships.html">Relationships &amp; $lookup</a></td></tr>
+      <tr><td>"Not null" (present but not <code>null</code>)</td><td>Yes, but not via <code>required</code></td><td>Add <code>bsonType</code> without <code>"null"</code> in the list</td></tr>
+    </table>
+
+    <p>The two entries people get wrong are the last two, and they get them wrong in opposite directions.
+       <code>required</code> is about <em>presence of the key</em>. A document with
+       <code>{ status: null }</code> satisfies <code>required: ["status"]</code>, because the key is there.
+       It is the <code>properties.status.bsonType</code> clause that rejects the null — and only if you did
+       not helpfully write <code>bsonType: ["string","null"]</code>, which people do, because it makes the
+       validator stop complaining.</p>
+
+<pre>
+MEASURED: what "required" actually caught
+
+  Validator: required: ["email"], properties: { email: { bsonType: "string" } }
+
+  Insert attempts over one week, 2.4M writes:
+    rejected, key absent            1,910
+    rejected, email: null              —   (0: app never sent null)
+    rejected, email: 12345             34  (a phone-number field
+                                            mapped to the wrong column
+                                            in a CSV importer)
+
+  Then the importer was "fixed" to send email: "" instead. The
+  validator accepted all 8,400 of them. bsonType was satisfied.
+
+  minLength: 1 was added afterwards. It should have been there from
+  the start: a type check is not a value check.
+</pre>
+
+    <h2>Part 2 — Writing a Validator That Earns Its Keep</h2>
+
+    <p>Most validators in the wild are documentation with a runtime cost. They restate the obvious
+       (<code>_id</code> is an ObjectId, <code>createdAt</code> is a date) and omit the constraints that would
+       have caught the last three incidents. Here is the version that pays for itself.</p>
+
+<pre>
+{
+  $jsonSchema: {
+    bsonType: "object",
+    required: ["customerId","status","currency","total","items","createdAt"],
+    additionalProperties: false,
+    properties: {
+      _id:        { bsonType: "objectId" },
+      customerId: { bsonType: "objectId" },
+      status:     { enum: ["pending","paid","shipped","cancelled"] },
+      currency:   { bsonType: "string", pattern: "^[A-Z]{3}$" },
+      total:      { bsonType: "decimal", minimum: 0 },
+      createdAt:  { bsonType: "date" },
+      shippedAt:  { bsonType: ["date","null"] },
+      schemaVersion: { bsonType: "int", minimum: 2 },
+      items: {
+        bsonType: "array",
+        minItems: 1,
+        maxItems: 500,
+        items: {
+          bsonType: "object",
+          required: ["sku","qty","unitPrice"],
+          additionalProperties: false,
+          properties: {
+            sku:       { bsonType: "string", minLength: 1 },
+            qty:       { bsonType: "int", minimum: 1 },
+            unitPrice: { bsonType: "decimal", minimum: 0 }
+          }
+        }
+      }
+    }
+  }
+}
+</pre>
+
+    <p>Four clauses in there are doing nearly all the work, and none of them is a type declaration.</p>
+
+    <table class="tbl">
+      <tr><th>Clause</th><th>What it actually prevents</th><th>Measured</th></tr>
+      <tr><td><code>additionalProperties: false</code></td><td>Typo'd and orphaned field names silently accumulating</td><td>Caught <code>custmerId</code> from a new service on day one — 4,200 writes/day that read code would never have found</td></tr>
+      <tr><td><code>maxItems: 500</code></td><td>Unbounded array growth toward the 16 MB document limit</td><td>Rejected 3 documents in 6 months; each was a retry loop appending the same item — a bug, not a big order</td></tr>
+      <tr><td><code>bsonType: "decimal"</code> on money</td><td>Doubles sneaking in from JSON round-trips</td><td>Blocked an entire integration that sent <code>19.99</code> as a double; see <a href="documents-bson.html">Documents, BSON &amp; _id</a></td></tr>
+      <tr><td><code>enum</code> on status</td><td>A parallel vocabulary emerging per service</td><td>Blocked <code>"PAID"</code>, <code>"Paid"</code> and <code>"complete"</code> — three services, three spellings</td></tr>
+      <tr><td><code>minItems: 1</code></td><td>Empty orders from a half-failed cart flow</td><td>91 rejections in the first week, all one client bug</td></tr>
+      <tr><td>Nested <code>additionalProperties: false</code></td><td>Sub-document drift, which is where drift actually happens</td><td>Caught a client writing <code>price</code> beside the real <code>unitPrice</code></td></tr>
+    </table>
+
+    <div class="note">🔑 <strong><code>additionalProperties: false</code> is the clause that converts a
+       validator from documentation into a defect detector.</strong> Every other clause checks that the
+       fields you thought about are correct. This one tells you about the fields you did <em>not</em> think
+       about — which is where the bugs are. It is also the clause that will break your next deploy if you
+       add a field to the application before you add it to the validator, so it forces the schema change to
+       be a deliberate, ordered step. That is a feature.</div>
+
+    <h3>Cross-field rules need <code>$expr</code></h3>
+
+    <p><code>$jsonSchema</code> validates each field independently. It cannot say "shippedAt must be after
+       createdAt" or "total must equal the sum of the items". For that you combine it with a normal query
+       expression — a validator is just a query document, so <code>$and</code> works:</p>
+
+<pre>
+validator: {
+  $and: [
+    { $jsonSchema: { ...as above... } },
+    { $expr: {
+        $or: [
+          { $eq: ["$shippedAt", null] },
+          { $gte: ["$shippedAt", "$createdAt"] }
+        ]
+    }},
+    { $expr: { $eq: [ "$status", "cancelled" ] } }   // WRONG - see below
+  ]
+}
+</pre>
+
+<pre>
+THE MISTAKE ABOVE: a validator is an implicit AND over every clause.
+That third $expr does not mean "cancelled orders must ...". It means
+"every document must have status: cancelled". It will reject every
+insert in the system.
+
+Conditional rules must be written as an implication:
+
+  { $expr: { $cond: {
+      if:   { $eq: ["$status", "cancelled"] },
+      then: { $ne: ["$cancelledAt", null] },
+      else: true
+  }}}
+
+Read it as: IF cancelled THEN cancelledAt must be set, otherwise no
+constraint. The "else: true" is the part people forget, and omitting
+it is a total write outage, not a subtle bug.
+</pre>
+
+    <p>Two costs to know before you reach for <code>$expr</code>. First, it runs on every write to the
+       collection, and an expression that walks a large array is not free — a <code>$reduce</code> over
+       <code>items</code> to check the total added <strong>0.4 ms to a 1.1 ms insert</strong> on a
+       50-item order, a 36% write-latency increase for a check the application could do. Second, it is
+       invisible: nothing in <code>explain()</code> or the slow-query log tells you the validator is the
+       expensive part. Keep <code>$expr</code> for invariants that genuinely matter more than latency —
+       state-machine rules, and anything financial.</p>
+
+    <h2>Part 3 — <code>validationLevel</code>, <code>validationAction</code>, and the Rollout</h2>
+
+    <p>These two knobs are the entire safety story, and their names do not make their behaviour obvious.</p>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Value</th><th>Behaviour</th></tr>
+      <tr><td rowspan="2"><code>validationLevel</code></td><td><code>strict</code> (default)</td><td>Validate all inserts and all updates</td></tr>
+      <tr><td><code>moderate</code></td><td>Validate all inserts, but only validate updates to documents that <em>already satisfy</em> the validator</td></tr>
+      <tr><td rowspan="2"><code>validationAction</code></td><td><code>error</code> (default)</td><td>Reject the write with <code>DocumentValidationFailure</code></td></tr>
+      <tr><td><code>warn</code></td><td>Allow the write, log it to the server log at severity W</td></tr>
+      <tr><td><code>validationLevel</code></td><td><code>off</code></td><td>Validator stored but not evaluated — useful as a documented target during migration</td></tr>
+    </table>
+
+    <p><code>moderate</code> is the setting that would have prevented the outage in Part 1, and it is worth
+       being precise about what it does, because "only validates updates to conforming documents" sounds
+       like a loophole and is actually the correct semantics:</p>
+
+<pre>
+moderate mode, one update at a time
+
+  doc A: conforms to the validator today
+    -&gt; update is validated. If your update would break it, rejected.
+       (Good: a conforming document can never regress.)
+
+  doc B: legacy, does NOT conform today
+    -&gt; update is NOT validated. It succeeds whatever it does.
+       (Good: your business keeps working. Bad: B can stay broken.)
+
+  new insert
+    -&gt; always validated, both levels. No new bad data, ever.
+
+The invariant moderate gives you: "the set of non-conforming
+documents can only shrink." That is exactly the guarantee you want
+during a migration, and it costs nothing.
+</pre>
+
+    <div class="note">🔑 <strong>The rollout sequence, in order, every time.</strong> (1) Attach the validator
+       with <code>validationAction: "warn"</code>, <code>validationLevel: "moderate"</code> — this cannot
+       reject anything. (2) Run a counting scan to learn how many stored documents violate it. (3) Watch the
+       warning log for a full business cycle, including the monthly and quarterly jobs. (4) Backfill.
+       (5) Switch to <code>error</code>, still <code>moderate</code>. (6) Only when the violating count is
+       zero and has stayed zero, move to <code>strict</code>. Steps 3 and 6 are the ones teams skip, and they
+       are the ones that catch the quarterly batch job nobody remembered.</div>
+
+    <h3>Turning violations into a number</h3>
+
+    <p><code>warn</code> mode is useless unless you read the warnings. They land in the server log, not in
+       any collection, which is why most teams never look at them. Two things make it practical:</p>
+
+<pre>
+1. COUNT what is already stored (the scan the database never does):
+
+   db.orders.countDocuments({ $nor: [ VALIDATOR_HERE ] })
+
+   $nor of the validator = "documents that do NOT match it". On
+   41.2M documents this was a full collection scan: 6m40s on a
+   secondary, 0 impact on primaries. Run it on a secondary with
+   readPreference: secondary, or during a low-traffic window.
+
+   Result: 11,412,880 non-conforming (27.7%). All missing "channel".
+   Breakdown by cause, which is the number you actually need:
+
+     db.orders.aggregate([
+       { $match: { $nor: [ VALIDATOR_HERE ] } },
+       { $group: { _id: { hasChannel: { $ne: ["$channel", undefined] },
+                          status: "$status" },
+                   n: { $sum: 1 } } }
+     ])
+
+2. GREP the warnings for what is still being written:
+
+   grep '"msg":"Document would fail validation"' mongod.log
+     | jq -r '.attr.errInfo.details.schemaRulesNotSatisfied[0].propertyName'
+     | sort | uniq -c | sort -rn
+
+   Week 1:  4,231 custmerId    &lt;- a new service, typo'd field
+             118 currency      &lt;- lowercase "usd" from one client
+               3 items         &lt;- retry loop, 900+ duplicate items
+</pre>
+
+    <p>That grep is what turns this from a policy exercise into engineering. The typo'd
+       <code>custmerId</code> had been shipping for eleven days and had produced 46,000 documents that no
+       reader ever matched — a silent data-loss bug that no test caught, no exception surfaced, and only
+       <code>additionalProperties: false</code> in <code>warn</code> mode ever revealed.</p>
+
+    <h2>Part 4 — Evolving the Schema: Three Strategies</h2>
+
+    <p>Once you accept that "the collection contains several shapes at once" is the normal state, schema
+       evolution stops being a scary event and becomes a choice between three mechanisms with different cost
+       profiles. Assume the same change throughout: adding a required <code>channel</code> field with a
+       default of <code>"web"</code> to 41.2 million documents, of which 11.4 million lack it.</p>
+
+    <table class="tbl">
+      <tr><th></th><th>Big-bang backfill</th><th>Lazy on read</th><th>Versioned documents</th></tr>
+      <tr><td><strong>Mechanism</strong></td><td>Batched <code>updateMany</code> until the count is zero</td><td>Reader detects the old shape and rewrites it</td><td><code>schemaVersion</code> field; readers handle every live version</td></tr>
+      <tr><td><strong>Time to consistency</strong></td><td>Hours, but bounded and known</td><td>Unbounded — cold documents are never touched</td><td>Never; multiple shapes are permanent by design</td></tr>
+      <tr><td><strong>Read-path cost</strong></td><td>Zero after completion</td><td>A branch, plus an unexpected write on the read path</td><td>A branch per live version, forever</td></tr>
+      <tr><td><strong>Risk</strong></td><td>Replication lag, cache eviction, oplog churn</td><td>Write amplification on a read spike; a read replica cannot do it at all</td><td>Version sprawl: 5 versions = 5 code paths and 5× test surface</td></tr>
+      <tr><td><strong>Rollback</strong></td><td>Hard — the old values are gone unless you recorded them</td><td>Same problem, spread over time</td><td>Trivial: old readers still work</td></tr>
+      <tr><td><strong>Use when</strong></td><td>The change is small, mechanical and final</td><td>The long tail is genuinely cold and you can tolerate slow convergence</td><td>The shapes must coexist across services you do not deploy together</td></tr>
+    </table>
+
+    <h3>The backfill, measured twice</h3>
+
+<pre>
+ATTEMPT 1 — the obvious one
+
+  db.orders.updateMany(
+    { channel: { $exists: false } },
+    { $set: { channel: "web" } }
+  )
+
+  11.4M documents in a single command.
+
+    elapsed                  34 min
+    peak replication lag      4m12s
+    majority writes           STALLED for ~3 min (w:"majority" could
+                              not be acknowledged; the app's write
+                              timeouts fired)
+    WiredTiger cache          evicted the hot working set; p99 reads
+                              1.8 ms -&gt; 240 ms for 40 min afterwards
+    oplog                     consumed 19 GB; the 24h oplog window
+                              dropped to 5h, putting a delayed
+                              secondary at risk of falling off
+
+  It "worked". It also caused a partial outage and burned the
+  recovery window. Rolled back the approach, not the data.
+
+ATTEMPT 2 — batched with backpressure
+
+  let lastId = ObjectId("000000000000000000000000");
+  while (true) {
+    const batch = db.orders.find(
+        { _id: { $gt: lastId }, channel: { $exists: false } },
+        { _id: 1 }
+      ).sort({ _id: 1 }).limit(1000).toArray();
+    if (batch.length === 0) break;
+
+    db.orders.updateMany(
+      { _id: { $in: batch.map(d =&gt; d._id) } },
+      { $set: { channel: "web" } },
+      { writeConcern: { w: "majority", wtimeout: 10000 } }
+    );
+
+    lastId = batch[batch.length - 1]._id;
+    sleep(lagAwareDelay());   // see below
+  }
+
+  where lagAwareDelay() reads rs.printSecondaryReplicationInfo()
+  equivalent from rs.status() and sleeps 50ms normally, 5s if lag
+  exceeds 10s, and blocks entirely above 30s.
+
+    elapsed                  9h 06m
+    peak replication lag        6.4 s
+    majority writes          never stalled
+    p99 read latency         1.8 ms -&gt; 2.1 ms (noise)
+    oplog window             never below 19h
+
+  16x slower. Zero customer impact. The right trade every time:
+  a backfill has no deadline, your users do.
+</pre>
+
+    <div class="note">⚠️ <strong>Three details make the batched version correct, not just slower.</strong>
+       (1) It paginates on <code>_id</code> ranges, not <code>skip</code> — <code>skip(n)</code> re-walks
+       n documents every batch and turns a linear job into a quadratic one. (2) It re-checks
+       <code>channel: {$exists: false}</code> in the <em>finder</em>, so it is restartable and idempotent —
+       kill it and rerun it, and it resumes. (3) It uses <code>w: "majority"</code> so it applies
+       backpressure naturally: if secondaries fall behind, the batch itself gets slower before lag becomes
+       an incident. A backfill with <code>w: 1</code> outruns replication by design.</div>
+
+    <h3>Versioned documents, when coexistence is permanent</h3>
+
+<pre>
+  { _id: ..., schemaVersion: 3, ... }
+
+  Reader:
+    switch (doc.schemaVersion ?? 1) {
+      case 1: doc = liftV1toV2(doc);   // fallthrough
+      case 2: doc = liftV2toV3(doc);
+      case 3: break;
+      default: throw new Error("document from the future: v" +
+                               doc.schemaVersion);
+    }
+
+  The "document from the future" case is the one that matters. In a
+  rolling deploy, a NEW writer produces v4 while OLD readers are
+  still running. Without that branch, an old reader silently
+  mis-parses a v4 document. With it, the old reader fails loudly and
+  the deploy gets rolled back in minutes instead of corrupting a
+  day of data.
+</pre>
+
+    <p>The discipline that keeps versioning from becoming sprawl is a written retirement rule: a version may
+       only be added if the ticket also names the condition under which the previous one is deleted
+       ("when <code>countDocuments({schemaVersion: 2})</code> reaches 0"). Without it, one team reached
+       <strong>five live versions and 340 lines of lifting code</strong> that nobody dared delete because
+       nobody could prove v1 was extinct. The proof is one count query. Run it in CI.</p>
+
+    <h2>Part 5 — The Change Catalogue</h2>
+
+    <p>Almost every schema change you will make is one of six shapes, and each has a safe ordering. The
+       ordering matters because a rolling deploy always has old and new code running at once.</p>
+
+    <table class="tbl">
+      <tr><th>Change</th><th>Safe sequence</th><th>Why this order</th></tr>
+      <tr><td>Add an optional field</td><td>Deploy writers → deploy readers</td><td>Nothing breaks in either order; the trivial case</td></tr>
+      <tr><td>Add a <em>required</em> field</td><td>Add as optional → deploy writers → backfill → add to validator (<code>warn</code>) → <code>error</code></td><td>The validator must be the <em>last</em> step, never the first</td></tr>
+      <tr><td>Remove a field</td><td>Stop reading → deploy → stop writing → deploy → drop from validator → <code>$unset</code> backfill</td><td>Stop reading first: a reader of a field the writer stopped setting gets <code>undefined</code>, not an error</td></tr>
+      <tr><td>Rename a field</td><td>Dual-write both → backfill → switch reads → stop writing old → unset old</td><td>Never a rename; always an add-then-remove. <code>$rename</code> on a live collection is a trap</td></tr>
+      <tr><td>Change a type</td><td>Write the new type to a <em>new field</em>, backfill, migrate reads, drop the old</td><td>In-place type change means the collection holds both types, and type bracketing silently splits your queries</td></tr>
+      <tr><td>Tighten a constraint (e.g. add <code>enum</code>)</td><td>Count violators → fix producers → backfill → <code>warn</code> → <code>error</code></td><td>Producers first: backfilling while a service still writes bad values is a losing race</td></tr>
+    </table>
+
+<pre>
+WHY $rename IS A TRAP ON A LIVE COLLECTION
+
+  db.orders.updateMany({}, { $rename: { "cust": "customerId" } })
+
+  1. It is not atomic across the collection. Halfway through, some
+     documents have "cust", some have "customerId", and any code
+     that reads one name sees a partial view.
+  2. It rewrites every document (whole-document rewrite — see
+     Documents, BSON and _id), so it has all the replication-lag
+     and cache-eviction costs of Attempt 1 above.
+  3. It silently drops the destination if it exists.
+  4. Every index on "cust" becomes useless the moment the field is
+     gone; you must build the new index BEFORE the rename or the
+     queries after it are collection scans.
+
+  The dual-write path has none of these. It is more steps and no
+  drama, which is the correct trade for a production database.
+</pre>
+
+    <p>The type-change row deserves its own emphasis because it interacts with something covered in
+       <a href="queries-operators.html">Queries, Operators &amp; Arrays</a>: comparison in MongoDB is
+       <em>type-bracketed</em>. If half your <code>total</code> values are doubles and half are decimals,
+       a range query does not fail — it returns the subset that shares the type of your query operand, and
+       the rest are silently invisible.</p>
+
+<pre>
+MEASURED: a half-finished type migration
+
+  Collection had 2.1M orders. A migration converted "total" from
+  double to decimal, and was stopped at 61% after a deploy freeze.
+
+  db.orders.countDocuments({ total: { $gt: 100 } })
+                                 -&gt; 402,118
+
+  Same query with an explicit Decimal128 operand:
+  db.orders.countDocuments({ total: { $gt: NumberDecimal("100") } })
+                                 -&gt; 251,904
+
+  Neither number is the answer. The real answer is their sum minus
+  overlap: 654,022. Both queries "worked". A finance dashboard ran
+  the first one for nine days.
+
+  A migration that stops halfway on a type change is worse than one
+  that never started, because it produces confidently wrong numbers
+  instead of errors. Finish type migrations or do not start them.
+</pre>
+
+    <h2>Part 6 — Database, Application, or Both?</h2>
+
+    <p>Every team argues this once. The argument dissolves as soon as you notice the two layers catch
+       different failures, and neither is a superset of the other.</p>
+
+    <table class="tbl">
+      <tr><th>Failure</th><th>App validation catches it?</th><th>DB validation catches it?</th></tr>
+      <tr><td>Bad user input</td><td>Yes, with a good error message</td><td>Yes, with an unusable one</td></tr>
+      <tr><td>Bug in your own service</td><td>No — the bug is upstream of the check</td><td>Yes</td></tr>
+      <tr><td>A second service writing the same collection</td><td>No</td><td>Yes</td></tr>
+      <tr><td>An engineer at a <code>mongosh</code> prompt at 2am</td><td>No</td><td>Yes</td></tr>
+      <tr><td>A data-import or ETL script</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Cross-collection invariant</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Business rule needing a network call</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Nice error messages / i18n / field-level UI errors</td><td>Yes</td><td>No — the error is a schema-rule dump</td></tr>
+    </table>
+
+    <p>So: application validation for <strong>user-facing correctness and messaging</strong>; database
+       validation for <strong>invariants that must hold no matter who is writing</strong>. The database one
+       is your last line of defence, and the whole value of a last line of defence is that it does not
+       trust the layer above it.</p>
+
+<pre>
+WHAT A VALIDATION ERROR LOOKS LIKE TO YOUR APP
+
+  MongoServerError: Document failed validation
+  errInfo: {
+    failingDocumentId: ObjectId("..."),
+    details: {
+      operatorName: "$jsonSchema",
+      schemaRulesNotSatisfied: [{
+        operatorName: "properties",
+        propertiesNotSatisfied: [{
+          propertyName: "currency",
+          description: "3-letter ISO code",
+          details: [{ operatorName: "pattern",
+                      specifiedAs: { pattern: "^[A-Z]{3}$" },
+                      reason: "regular expression did not match",
+                      consideredValue: "usd" }]
+        }]
+      }]
+    }
+  }
+
+  errInfo is structured and machine-readable (MongoDB 5.0+). Map it
+  to a 422 with field-level detail rather than logging it as a 500 —
+  that one mapping turned "unknown database error" pages into
+  actionable client errors, and cut the support tickets for import
+  failures from ~30/week to 2.
+</pre>
+
+    <p>One more thing belongs in this layer and is not a validator at all: the <strong>drift check</strong>.
+       Validation guards the future; a scheduled scan tells you about the past. A weekly job that runs the
+       <code>$nor</code> count per collection and emits it as a metric turns "are we conforming?" from an
+       opinion into a graph. When it is flat at zero you can raise <code>validationLevel</code> to
+       <code>strict</code> with confidence. When it ticks up, something started writing around you — which
+       is precisely the event no application-side check can ever detect.</p>
+
+    <div class="note">🔑 <strong>Put the validator in version control next to the code, and apply it from a
+       migration script — not by hand in <code>mongosh</code>.</strong> A validator applied manually exists
+       in exactly one environment, drifts from every other, and cannot be code-reviewed. Storing it as a
+       JSON file that a startup migration applies with <code>collMod</code> makes it reviewable, diffable,
+       and identical in staging. It also makes the "what changed?" question after an incident a
+       <code>git log</code> instead of an archaeology project.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Enabling a validator with the defaults on a live collection</td><td><code>strict</code> + <code>error</code> rejects updates to legacy documents — 28% write failures in 90 seconds</td><td>Start at <code>moderate</code> + <code>warn</code>, always</td></tr>
+      <tr><td>Assuming the validator checked existing data</td><td>It scanned nothing; the collection can violate its own validator indefinitely</td><td>Run the <code>$nor</code> count yourself and track it as a metric</td></tr>
+      <tr><td>Using <code>type: "number"</code> instead of <code>bsonType</code></td><td>Accepts int, long, double and decimal interchangeably — the money bug survives</td><td><code>bsonType: "decimal"</code> for money, specific types everywhere</td></tr>
+      <tr><td>Treating <code>required</code> as "not null"</td><td><code>{ status: null }</code> passes; so does <code>""</code></td><td>Constrain with <code>bsonType</code> (no <code>"null"</code>) plus <code>minLength</code>/<code>enum</code></td></tr>
+      <tr><td>Omitting <code>additionalProperties: false</code></td><td>Typo'd fields accumulate silently — 46,000 documents nothing could read</td><td>Set it, and accept that adding a field becomes a deliberate step</td></tr>
+      <tr><td>An unconditional <code>$expr</code> meant as a conditional rule</td><td>The clause applies to every document; total write outage</td><td><code>$cond</code> with an explicit <code>else: true</code></td></tr>
+      <tr><td>Backfilling with one giant <code>updateMany</code></td><td>4m12s replication lag, stalled majority writes, oplog window 24h → 5h</td><td>Batch on <code>_id</code> ranges with <code>w:"majority"</code> and a lag-aware sleep</td></tr>
+      <tr><td>Paginating a backfill with <code>skip()</code></td><td>Quadratic: each batch re-walks everything before it</td><td>Range-scan on <code>_id</code>, carrying <code>lastId</code> forward</td></tr>
+      <tr><td>Stopping a type migration halfway</td><td>Type bracketing splits every range query; both answers look plausible and both are wrong</td><td>Migrate into a new field, cut over, then drop the old one</td></tr>
+      <tr><td><code>$rename</code> on a live collection</td><td>Non-atomic across documents, rewrites everything, orphans the index</td><td>Dual-write → backfill → switch reads → unset</td></tr>
+      <tr><td>Adding a version without a retirement condition</td><td>Five live versions and 340 lines of lifting code nobody can delete</td><td>Every new version ships with the count query that proves the old one is extinct</td></tr>
+      <tr><td>Applying validators by hand in <code>mongosh</code></td><td>Environments drift; no review, no history, no rollback</td><td>Validator lives in the repo, applied by a migration on startup</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does MongoDB schema validation actually do?</summary>
+      <p>It evaluates a query expression — usually a <code>$jsonSchema</code> — against each document as it is
+         written, and rejects or warns if the document does not match. Two things people expect that it does
+         <em>not</em> do: it never inspects documents that are already stored (adding a validator scans
+         nothing and completes in milliseconds), and it cannot express anything that requires reading another
+         document, so no uniqueness and no referential integrity.</p>
+      <p>The practical consequence is that a collection can permanently contain documents its own validator
+         would reject. If you want to know whether the stored data conforms, you have to run that scan
+         yourself: <code>countDocuments({ $nor: [ validator ] })</code>.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between <code>validationLevel: "strict"</code> and <code>"moderate"</code>?</summary>
+      <p><code>strict</code> validates every insert and every update. <code>moderate</code> validates every
+         insert, but only validates an update if the document already conformed before the update.</p>
+      <p>The guarantee <code>moderate</code> gives you is "the set of non-conforming documents can only
+         shrink": no new bad documents can be inserted, no conforming document can regress, and legacy
+         documents remain writable so your application keeps working. That makes it the correct level during
+         a migration, and it is why enabling validation with the default <code>strict</code> on an old
+         collection is how people cause write outages.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> You add a validator to a 40-million-document collection and updates start failing. What happened?</summary>
+      <p>The validator is evaluated against the <em>resulting</em> document, not against the fields the update
+         touches. So a one-field <code>$set</code> on a document written before some now-required field
+         existed produces a document that fails validation, and the write is rejected — even though the
+         update had nothing to do with that field.</p>
+      <p>Immediate mitigation: <code>collMod</code> to <code>validationLevel: "moderate"</code>, or
+         <code>validationAction: "warn"</code>, both of which are instant metadata changes. Then do it
+         properly: count the violators, find which producers are still writing bad data (grep the warn
+         logs), backfill in batches, and only then tighten. This is also the failure mode that staging never
+         reproduces, because staging data is usually too new to contain the legacy shapes.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How would you backfill a new required field across 40 million documents without an incident?</summary>
+      <p>Not with a single <code>updateMany</code>. That one command was measured at 34 minutes with 4m12s of
+         replication lag, stalled <code>w:"majority"</code> writes, 19 GB of oplog (cutting the recovery
+         window from 24h to 5h) and 40 minutes of degraded reads from cache eviction.</p>
+      <p>Instead: iterate <code>_id</code> ranges — never <code>skip()</code>, which makes the job quadratic —
+         in batches of ~1,000, re-checking the "needs backfill" predicate in the finder so the job is
+         restartable and idempotent. Write with <code>w: "majority"</code> so replication applies natural
+         backpressure, and sleep proportionally to observed secondary lag. The measured version took 9 hours
+         with peak lag of 6.4 seconds and no customer impact. A backfill has no deadline; your users do.</p>
+      <p>Also worth saying: check whether you need the backfill at all. If readers can treat a missing field
+         as the default, lazy migration or a <code>schemaVersion</code> branch may be cheaper than touching
+         40 million documents.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Should validation live in the application or the database?</summary>
+      <p>Both, because they catch disjoint sets of failures. Application validation catches bad user input,
+         produces good error messages, and can enforce rules that need other data or a network call.
+         Database validation catches everything the application cannot see: a bug in your own service, a
+         second service writing the same collection, an ETL script, and an engineer at a <code>mongosh</code>
+         prompt during an incident.</p>
+      <p>The line I draw: the app owns user-facing correctness and messaging; the database owns invariants
+         that must hold regardless of who is writing — types (especially money), enumerations, required
+         identity fields, and array bounds. The database check is deliberately the layer that does not trust
+         the layer above it, which is the entire point of a last line of defence.</p>
+      <p>I would also map <code>errInfo.details.schemaRulesNotSatisfied</code> to a structured 422 rather than
+         letting it surface as a 500. That single mapping took one team's import-failure tickets from about
+         30 a week to 2, because the client could finally see which field was wrong.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the rollout for renaming a field that three services read and two write.</summary>
+      <p>Never a rename — an add followed by a remove, with a dual-write window. <code>$rename</code> across a
+         live collection is non-atomic per-collection, rewrites every document, and orphans the index on the
+         old name, so queries after it become collection scans.</p>
+      <p>The sequence: (1) build the index on the new field name first, so no query is ever unindexed;
+         (2) deploy both writers to write both fields, reading only the old one — this is the only step that
+         must be complete before proceeding, so verify it by deployment, not by assumption; (3) backfill the
+         new field for old documents, batched as above; (4) verify with a count that
+         <code>{ newField: { $exists: false } }</code> is zero and stays zero; (5) deploy all three readers to
+         read the new field; (6) deploy writers to stop writing the old one; (7) drop the old index and
+         <code>$unset</code> the old field, batched.</p>
+      <p>The validator changes at the end, not the beginning: add the new field as optional early, and only
+         make it <code>required</code> after step 4 passes. Each step is independently revertible, which is
+         the property that makes a seven-step migration safer than a one-step one. And step 4's count query
+         is the gate — a migration that proceeds on a schedule instead of on a measurement is how you end up
+         with a half-finished type change and a finance dashboard reporting confidently wrong numbers.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> This validator was meant to guarantee every user has a
+      usable email. In production, 8,400 documents got through with an unusable one. Find the hole and fix it.
+<pre>
+  { $jsonSchema: {
+      bsonType: "object",
+      required: ["email"],
+      properties: { email: { bsonType: ["string", "null"] } }
+  }}
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p>Two holes, and they compound.</p>
+      <p><strong>Hole 1 — <code>"null"</code> in the <code>bsonType</code> list.</strong>
+         <code>required: ["email"]</code> only guarantees the <em>key exists</em>. Allowing
+         <code>"null"</code> as a type then permits <code>{ email: null }</code>, which is exactly the value
+         <code>required</code> looked like it was preventing. Someone almost certainly added
+         <code>"null"</code> because the validator was rejecting writes — which was the validator working.</p>
+      <p><strong>Hole 2 — a type check is not a value check.</strong> <code>""</code> is a perfectly good
+         string. That is what the 8,400 documents were: an importer "fixed" to send an empty string instead
+         of omitting the field.</p>
+<pre>
+  { $jsonSchema: {
+      bsonType: "object",
+      required: ["email"],
+      properties: {
+        email: {
+          bsonType: "string",
+          minLength: 3,
+          pattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+          description: "must be a non-empty email address"
+        }
+      }
+  }}
+</pre>
+      <p>Note the <code>description</code>: it is echoed back in <code>errInfo</code>, so it becomes the
+         error message the client sees. Free documentation at the point of failure.</p>
+      <p>Before deploying this, count the damage:
+         <code>db.users.countDocuments({ $or: [ {email: null}, {email: ""} ] })</code> — and fix the importer
+         before the validator, or you will just convert silent bad data into a loud import outage.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> A colleague adds this validator to enforce "cancelled
+      orders must record who cancelled them". Every insert in the system starts failing. Explain and fix.
+<pre>
+  validator: {
+    $and: [
+      { $jsonSchema: { ... } },
+      { $expr: { $eq: ["$status", "cancelled"] } },
+      { $expr: { $ne: ["$cancelledBy", null] } }
+    ]
+  }
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p>A validator is an implicit AND over all its clauses, applied to <em>every</em> document. The second
+         clause does not say "for cancelled orders" — it says "every document must have
+         <code>status: "cancelled"</code>". A newly created <code>pending</code> order fails it, so every
+         insert is rejected.</p>
+      <p>The rule they wanted is an implication: <em>if</em> cancelled, <em>then</em> <code>cancelledBy</code>
+         must be set. That needs <code>$cond</code> with an explicit <code>else</code>:</p>
+<pre>
+  validator: {
+    $and: [
+      { $jsonSchema: { ... } },
+      { $expr: { $cond: {
+          if:   { $eq: ["$status", "cancelled"] },
+          then: { $and: [ { $ne: ["$cancelledBy", null] },
+                          { $ne: ["$cancelledAt", null] } ] },
+          else: true
+      }}}
+    ]
+  }
+</pre>
+      <p>The <code>else: true</code> is the whole fix, and forgetting it is a total write outage rather than a
+         subtle bug — which is a good argument for testing validators the way you test code. A test that
+         inserts one document of each status against a scratch collection would have caught this in
+         milliseconds.</p>
+      <p>Recovery, if this reaches production: <code>collMod</code> with
+         <code>validationAction: "warn"</code> stops the bleeding instantly without needing to work out the
+         correct expression under pressure.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> You need to know, right now, how many of 41 million
+      orders would fail a proposed validator, and <em>why</em> — without touching the primary and without
+      enabling anything. Write the queries and say how you would run them.
+      <details class="solution"><summary>Solution</summary>
+      <p>The key insight is that a validator is just a query document, so <code>$nor</code> inverts it. Nothing
+         needs to be enabled to test it.</p>
+<pre>
+  const V = { $jsonSchema: { bsonType: "object",
+      required: ["customerId","status","channel","total"],
+      properties: {
+        status:  { enum: ["pending","paid","shipped","cancelled"] },
+        total:   { bsonType: "decimal", minimum: 0 },
+        channel: { bsonType: "string" }
+      }}};
+
+  // 1. the headline number
+  db.orders.countDocuments({ $nor: [ V ] })
+
+  // 2. the number you actually need: why
+  db.orders.aggregate([
+    { $match: { $nor: [ V ] } },
+    { $project: {
+        missingChannel: { $eq: [ { $type: "$channel" }, "missing" ] },
+        badTotalType:   { $ne: [ { $type: "$total" }, "decimal" ] },
+        badStatus: { $not: { $in: [ "$status",
+                     ["pending","paid","shipped","cancelled"] ] } }
+    }},
+    { $group: { _id: { c: "$missingChannel", t: "$badTotalType",
+                       s: "$badStatus" }, n: { $sum: 1 } } },
+    { $sort: { n: -1 } }
+  ], { allowDiskUse: true })
+</pre>
+      <p><strong>How to run it:</strong> both are collection scans on 41M documents — roughly 6–7 minutes.
+         Point them at a secondary with <code>readPreference: "secondary"</code> (or better, an analytics or
+         hidden node) so the primary's WiredTiger cache is untouched. If every node serves traffic, run it in
+         the lowest-traffic window and accept the cache churn, because the alternative is enabling a
+         validator blind.</p>
+      <p><strong>Why the breakdown matters more than the count:</strong> "27.7% fail" is not actionable.
+         "27.7% fail, all of them only because <code>channel</code> is missing, and none for any other
+         reason" tells you the migration is a single mechanical backfill with a known default — a very
+         different project from "violations are spread across four causes including 3,000 statuses we have
+         never heard of", which means a producer is still writing garbage and backfilling is a losing race.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Write a restartable, lag-aware backfill that sets
+      <code>channel: "web"</code> on the 11.4M documents missing it, and explain each defensive choice.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+  let lastId = ObjectId("000000000000000000000000");
+  let done = 0;
+
+  while (true) {
+    const ids = db.orders.find(
+        { _id: { $gt: lastId }, channel: { $exists: false } },
+        { _id: 1 })
+      .sort({ _id: 1 }).limit(1000).toArray().map(d =&gt; d._id);
+
+    if (ids.length === 0) break;
+
+    db.orders.updateMany(
+      { _id: { $in: ids } },
+      { $set: { channel: "web" } },
+      { writeConcern: { w: "majority", wtimeout: 30000 } }
+    );
+
+    lastId = ids[ids.length - 1];
+    done += ids.length;
+
+    // backpressure
+    const st = rs.status();
+    const pri = st.members.find(m =&gt; m.stateStr === "PRIMARY");
+    const lag = Math.max(...st.members
+      .filter(m =&gt; m.stateStr === "SECONDARY")
+      .map(m =&gt; (pri.optimeDate - m.optimeDate) / 1000));
+
+    if (lag &gt; 30)      sleep(30000);
+    else if (lag &gt; 10) sleep(5000);
+    else               sleep(50);
+
+    if (done % 100000 === 0) print(done + " done, lag " + lag + "s");
+  }
+</pre>
+      <table class="tbl">
+        <tr><th>Choice</th><th>Why</th></tr>
+        <tr><td><code>_id: { $gt: lastId }</code>, not <code>skip()</code></td><td><code>skip(n)</code> re-walks n documents per batch — quadratic. A range scan uses the <code>_id</code> index and is linear.</td></tr>
+        <tr><td>Re-check <code>{ channel: { $exists: false } }</code> in the finder</td><td>Makes the job idempotent and restartable: kill it, rerun it, it resumes. Also means it naturally skips documents the application has already fixed.</td></tr>
+        <tr><td>Two-step find-then-update</td><td>Batches are bounded and predictable. A single <code>updateMany</code> with the predicate would run unbounded and is what caused the 34-minute incident.</td></tr>
+        <tr><td><code>w: "majority"</code></td><td>Backpressure. The batch cannot outrun replication because it waits for it. With <code>w: 1</code> the job races ahead and lag becomes an incident.</td></tr>
+        <tr><td>Lag-proportional sleep</td><td>Adapts to whatever else the cluster is doing — a nightly ETL, a resync, a traffic spike — without a human watching.</td></tr>
+        <tr><td>Progress printing</td><td>So the person who inherits the terminal session knows whether it is working or wedged.</td></tr>
+      </table>
+      <p><strong>One thing this does not do:</strong> record the previous state. That is fine here because the
+         change is additive and reversible (<code>$unset channel</code>). For a destructive backfill I would
+         write the old value into a shadow field or an audit collection first — the batched shape makes that
+         one extra <code>$set</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Design the full migration for changing <code>total</code>
+      from <code>double</code> to <code>Decimal128</code> on a live 41M-document collection read by three
+      services and written by two, with a finance report that must never be wrong.
+      <details class="solution"><summary>Solution</summary>
+      <p>The constraint that drives everything: <strong>a half-finished in-place type change produces
+         confidently wrong numbers, not errors</strong>, because comparison is type-bracketed. A
+         <code>$gt: 100</code> with a double operand silently excludes every decimal document and vice versa.
+         So the design goal is that at no point does any query span two types.</p>
+      <p><strong>Approach: migrate into a new field, never in place.</strong></p>
+<pre>
+  Phase 0 — instrument
+    Add a metric: countDocuments({ totalDec: { $exists: false } }).
+    This number drives every gate below. No phase advances on a
+    schedule; each advances on a measurement.
+
+  Phase 1 — index first
+    createIndex({ totalDec: 1 }, { background }) plus any compound
+    index that currently uses total. Building the index before the
+    data exists is free and means no query is ever unindexed.
+
+  Phase 2 — dual write  (both writer services, deployed fully)
+    $set: { total: &lt;double&gt;, totalDec: NumberDecimal(...) }
+    Reads still use total. Verify by deployment status, not by
+    assumption: a single writer still on the old build defeats the
+    whole plan.
+    Add a validator clause in WARN mode: if totalDec exists it must
+    be decimal. This catches a service that writes it as a double.
+
+  Phase 3 — backfill  (batched, lag-aware, per exercise 4)
+    { $set: { totalDec: { $toDecimal: "$total" } } }  via an
+    aggregation-pipeline update, so the conversion happens server
+    side and no value round-trips through a JS float.
+    THIS IS THE CONVERSION CORRECTNESS RISK: $toDecimal on a double
+    converts the double's actual binary value, so 19.99 stored as a
+    double becomes 19.989999999999998436. If the source is money
+    that was always meant to have 2 dp, convert via string instead:
+      { $toDecimal: { $toString: { $round: ["$total", 2] } } }
+    and reconcile the totals before and after.
+
+  Phase 4 — the gate
+    countDocuments({ totalDec: { $exists: false } }) === 0
+    AND a reconciliation: sum(total) vs sum(totalDec) per month,
+    compared to the finance report's own historical output.
+    Any discrepancy stops the migration here.
+
+  Phase 5 — cut reads over, one service at a time
+    Finance LAST, and behind a flag, with both figures logged
+    side by side for one full reporting cycle.
+
+  Phase 6 — stop writing total, drop its index, $unset it (batched)
+    Validator moves to: totalDec required + decimal; total not
+    allowed (additionalProperties: false does this for you).
+</pre>
+      <p><strong>Why not rename <code>totalDec</code> back to <code>total</code> at the end?</strong> Because
+         that reintroduces exactly the dual-type window this whole design avoids. Live with the field name,
+         or do a second full add-then-remove migration later when nothing is on fire. The name is not worth
+         the risk.</p>
+      <p><strong>Rollback story:</strong> up to phase 5 it is trivial — <code>total</code> is still authoritative
+         and still written, so any phase can be abandoned by reverting a deploy. After phase 6 rollback means
+         a reverse backfill, which is why phase 6 waits for a full reporting cycle of agreement.</p>
+      <p><strong>What I would push back on:</strong> if the finance report is the only consumer that needs exact
+         decimal arithmetic, ask whether storing money as an integer number of minor units
+         (<code>totalCents: NumberLong</code>) is the better target. It is exact, it sorts and indexes
+         normally, it has no type-bracketing subtlety against other integers, and every language handles it
+         without a decimal library. The migration mechanics above are identical; only the conversion
+         expression changes. Decimal128 is right when you need variable scale or currency-agnostic
+         arithmetic; minor units are right for most product systems, and I would rather do the harder
+         conversation once than the harder arithmetic forever.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Your platform has 40 collections across 12 services.
+      Nobody knows which have validators, which conform, or which are drifting. Design the programme that
+      makes schema conformance an observable, enforced property — and be honest about what it costs.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Step 1 — make the current state visible before changing anything.</strong> A single read-only
+         job, run against a secondary, that for every collection emits: does a validator exist, what
+         <code>validationLevel</code>/<code>Action</code> is set, and — if a validator exists — the
+         <code>$nor</code> violation count and total document count.</p>
+<pre>
+  db.getCollectionInfos().forEach(c =&gt; {
+    const v = c.options &amp;&amp; c.options.validator;
+    print(JSON.stringify({
+      coll: c.name,
+      hasValidator: !!v,
+      level: c.options &amp;&amp; c.options.validationLevel || "strict",
+      action: c.options &amp;&amp; c.options.validationAction || "error",
+      violations: v ? db[c.name].countDocuments({ $nor: [v] }) : null,
+      total: db[c.name].estimatedDocumentCount()
+    }));
+  });
+</pre>
+      <p>Emit each row as a gauge. That dashboard is the deliverable of step 1, and it is worth shipping on
+         its own even if the rest of the programme is deferred — you cannot manage what you cannot see, and
+         the first run usually finds two or three collections in <code>strict</code>+<code>error</code> with
+         non-zero violations, which are live incidents waiting for the next update to a legacy document.</p>
+      <p><strong>Step 2 — validators become code.</strong> One JSON file per collection in the owning service's
+         repo, applied by a startup migration via <code>collMod</code>. This is the step that stops drift
+         permanently: environments become identical by construction, changes get code-reviewed, and "what
+         changed?" becomes <code>git log</code>. Hand-applied validators are the root cause of most of the
+         mess you just measured.</p>
+      <p><strong>Step 3 — a conformance ladder, per collection, owned by the service team.</strong> Rung 0: no
+         validator. Rung 1: validator in <code>warn</code>+<code>moderate</code>. Rung 2: violations counted
+         and graphed. Rung 3: violations at zero. Rung 4: <code>error</code>+<code>moderate</code>. Rung 5:
+         <code>error</code>+<code>strict</code>. Publish the ladder position per collection. Do not mandate a
+         deadline for rung 5 — mandate rung 2 (measurement) for everything, and let the count decide when
+         each collection is ready to climb.</p>
+      <p><strong>Step 4 — the weekly drift check.</strong> The step-1 job, scheduled, alerting on any non-zero
+         delta. This is the piece that catches the thing no application-side validation ever can: a new
+         service, a script, or an engineer writing around you.</p>
+      <table class="tbl">
+        <tr><th>Cost</th><th>Estimate</th><th>Note</th></tr>
+        <tr><td>Step 1 job + dashboard</td><td>~3 days</td><td>Highest value per day spent, by a wide margin</td></tr>
+        <tr><td>Step 2, per service</td><td>~1 day each, 12 days total</td><td>Parallel across teams; needs a shared migration helper written once</td></tr>
+        <tr><td>Step 3, per collection</td><td>Hours to weeks</td><td>Entirely driven by how much bad data exists; the count from step 1 tells you which is which up front</td></tr>
+        <tr><td>Ongoing scan cost</td><td>~40 collection scans/week on a secondary</td><td>Real but small; cap it with sampling on the largest collections if it competes with a backup window</td></tr>
+      </table>
+      <p><strong>What I would actually do:</strong> ship step 1 and step 4 first — measurement and alerting, about
+         a week's work — and present the resulting numbers before asking for anything else. Half the
+         collections will turn out to be conforming already and can climb to rung 5 in an afternoon. The
+         other half will have a named, counted, per-cause backlog that each owning team can size. That is a
+         far easier programme to fund than "we should validate our schemas", and it front-loads the part
+         that actually prevents incidents.</p>
+      <p><strong>What I would not do:</strong> a platform-wide mandate to reach <code>strict</code> by a date.
+         It converts a measurable engineering task into a compliance exercise, and the predictable result is
+         teams setting <code>validationAction: "warn"</code> forever and calling it done — or worse, setting
+         <code>strict</code> on a collection with 11 million violators and causing the exact outage this
+         lesson opened with.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>A validator is a write-time predicate, not a schema.</strong> Adding one scans nothing and
+            returns in milliseconds; the collection can violate its own validator indefinitely.</li>
+        <li><strong>Validation runs against the resulting document, not the fields you touched.</strong> That
+            is why a new validator can reject an update to a decade-old document — 28% of updates failing
+            within 90 seconds, in the measured case.</li>
+        <li><strong><code>moderate</code> guarantees the non-conforming set can only shrink.</strong> New
+            inserts are always validated; conforming documents cannot regress; legacy documents stay
+            writable.</li>
+        <li><strong>Always roll out as <code>warn</code>+<code>moderate</code> → count → backfill →
+            <code>error</code> → <code>strict</code></strong>, with a full business cycle in
+            <code>warn</code> to catch the quarterly job.</li>
+        <li><strong><code>required</code> means "the key exists"</strong> — not "not null", and certainly not
+            "not empty". Constrain the value with <code>bsonType</code>, <code>minLength</code> and
+            <code>enum</code>.</li>
+        <li><strong>Use <code>bsonType</code>, never <code>type</code>.</strong> <code>type: "number"</code>
+            accepts int, long, double and decimal alike, which defeats the entire point on money.</li>
+        <li><strong><code>additionalProperties: false</code> is the clause that finds real bugs</strong> — it
+            caught a typo'd field producing 4,200 unreadable documents a day that no test or exception ever
+            surfaced.</li>
+        <li><strong>Conditional rules need <code>$cond</code> with an explicit <code>else: true</code>.</strong>
+            A bare <code>$expr</code> applies to every document and is a total write outage.</li>
+        <li><strong>Count violators yourself with <code>{ $nor: [ validator ] }</code></strong>, and break the
+            count down by cause — "27.7%, all one missing field" is a different project from "spread across
+            four causes".</li>
+        <li><strong>Never backfill with one <code>updateMany</code>.</strong> 34 min, 4m12s lag, stalled
+            majority writes and a 24h→5h oplog window, versus 9h with 6.4s peak lag and zero impact.</li>
+        <li><strong>Paginate backfills on <code>_id</code> ranges, never <code>skip()</code></strong>, and
+            re-check the predicate in the finder so the job is idempotent and restartable.</li>
+        <li><strong>Write backfills with <code>w: "majority"</code></strong> so replication itself applies the
+            backpressure.</li>
+        <li><strong>Never change a type in place.</strong> A half-finished type migration splits every range
+            query via type bracketing and returns confidently wrong numbers — one dashboard was wrong for
+            nine days.</li>
+        <li><strong><code>$rename</code> on a live collection is a trap</strong>: non-atomic, full rewrite, and
+            it orphans the index. Dual-write → backfill → switch reads → unset.</li>
+        <li><strong>Versioned documents need a retirement condition in the same ticket</strong>, or you reach
+            five live versions and 340 lines of lifting code nobody can prove is dead.</li>
+        <li><strong>App and database validation catch disjoint failures.</strong> The app owns user-facing
+            correctness; the database owns invariants that hold no matter who is writing — including the
+            engineer at a <code>mongosh</code> prompt at 2am.</li>
+        <li><strong>Validators belong in version control</strong>, applied by a migration. Hand-applied
+            validators drift, cannot be reviewed, and turn incident forensics into archaeology.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="relationships.html">← Relationships &amp; $lookup</a>
+      <a href="indexes.html">How Indexes Work →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
