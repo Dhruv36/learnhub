@@ -6,6 +6,11 @@ Exits non-zero if any ERROR is found.
 import sys, os, re, html
 from html.parser import HTMLParser
 
+# Minimum size for a v4 lesson. The tracks built to the mature recipe land at
+# 50-65KB; anything well under that is a lesson that looks structurally complete
+# (det=12 ex=6) while being half the depth. 45 is the floor, not the target.
+V4_MIN_KB = 45
+
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
         "param","source","track","wbr"}
 # Tags we require to nest correctly. <p> is omitted: HTML allows implicit
@@ -95,8 +100,8 @@ def check_file(path):
         "pager":     src.count('class="pager"'),
     }
     if name != "quiz.html" and not is_stub:
-        if stats["kb"] < 20:
-            warnings.append(f"only {stats['kb']}KB (v4 target 20KB+)")
+        if stats["kb"] < V4_MIN_KB:
+            warnings.append(f"only {stats['kb']}KB (v4 target {V4_MIN_KB}KB+)")
         if stats["solution"] < 12:
             warnings.append(f"{stats['solution']} details blocks (expect 12)")
         if stats["exercise"] < 6:
