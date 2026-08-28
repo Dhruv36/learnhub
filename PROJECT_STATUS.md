@@ -8,7 +8,7 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ## ▶️ RESUME HERE (last updated 2026-08-27)
 
-**Last completed:** ✅ **MongoDB v4 (track 19) — COMPLETE**, and it was the last v3 track — **the v4 rebuild programme is finished.** All 22 lessons, both end-of-track chores, quiz bank rewritten; 0 errors and 0 warnings across 27 files. Full per-lesson detail is in the "MongoDB v4 COMPLETE" section below.
+**Last completed:** ✅ **Site-wide cleanup — all 23 quiz banks de-skewed and de-duplicated, and every track passing validate.py with 0 errors AND 0 warnings.** Detail in the "SITE-WIDE CLEANUP COMPLETE" section below. Before that in the same session: ✅ **MongoDB v4 (track 19) — COMPLETE**, and it was the last v3 track — **the v4 rebuild programme is finished.** All 22 lessons, both end-of-track chores, quiz bank rewritten; 0 errors and 0 warnings across 27 files. Full per-lesson detail is in the "MongoDB v4 COMPLETE" section below.
 
 **Previously:** ✅ **CI/CD v4 (track 18) — COMPLETE** (21 lessons, 7 redirect stubs, bank rewritten; 0 errors and 0 warnings across 29 files) — detail below.
 
@@ -364,15 +364,57 @@ validating), and one duplicated closing details tag that validate.py caught as a
 **🎉 THE v4 REBUILD PROGRAMME IS COMPLETE.** Every track on the site is now at v4 depth with a v4-aligned
 200-question bank. MongoDB was the last v3 track.
 
-**Site-wide audit finding, STILL UNFIXED and awaiting the user's go-ahead:** **18 of 23 quiz banks** have
-the correct answer at index 1 for ~100% of questions. Clean: `aws`, `cicd`, `docker`, `kubernetes`,
-`leetcode`, `mongodb`, `redis`. Fix is one command per track:
-`node tools/quizshuffle.js tutorials/<track>` then `python tools/quizcheck.py tutorials/<track>`.
+**✅ SITE-WIDE CLEANUP COMPLETE (2026-08-27, same session).** The three items listed as "suggested next
+work" were all done. **The site is now green on every automated check it has.**
 
-**Suggested next work, in the absence of a new user directive:** (1) the answer-position de-skew above —
-about 20 minutes for all remaining tracks, and it materially improves the quizzes; (2) a site-wide link
-and structure audit now that every track is v4; (3) new tracks, or depth passes on the oldest v4 tracks
-(HTML/CSS/JavaScript were rebuilt first, to a slightly earlier version of the recipe).
+**1. Quiz answer-position de-skew — DONE, all 23 tracks.** The long-standing finding (correct answer at
+index 1 for 84–100% of questions, which made every quiz answerable without reading it) is closed.
+`node tools/quizshuffle.js` run against the 16 skewed banks; 3,200 questions verified against `HEAD`
+afterwards — stem, explanation, option set and **correct option** all unchanged, only positions moved.
+
+**2. Duplicate quiz stems — DONE, 12 questions rewritten.** Every set-10 mock exam that had repeated a
+question verbatim from an earlier topic set: java ×7, angular/aspnet/dotnet/springboot ×1 each, plus one
+collision the first pass introduced. Replaced with fresh interview-difficulty questions on the same topic
+(signals & change detection · middleware ordering · sync-over-async deadlock · parallel streams ·
+`BigDecimal.equals` vs `compareTo` · virtual threads and carrier pinning · the generational hypothesis ·
+JMH and why naive microbenchmarks lie · the real cost of a flaky test · catching `Exception` broadly ·
+`@SpringBootTest` versus slices), then re-shuffled.
+
+**Every bank now reports `10 200 0`, `duplicate stems: 0`, `OK`.**
+
+**3. Site-wide structure and link audit — DONE.** `validate.py` across all 23 tracks:
+**0 errors AND 0 warnings, 613 files.** Two real defects found and fixed:
+
+- **`<details name="solution">` instead of `class="solution"`** — 6 occurrences across
+  `html/accessibility.html`, `html/responsive-images.html` and `html/production-patterns.html`. Not just a
+  validation nit: the solutions rendered **unstyled**, and because `name` on `<details>` creates an
+  *exclusive accordion group*, opening one solution **closed all the others on the page**. Worth grepping
+  for after any bulk edit: `grep -rn 'details name=' tutorials/`.
+- **`react/jsx.html` and `react/rendering.html` were under the 20KB v4 floor** (the two oldest v4 lessons,
+  written to an earlier version of the recipe). Each gained a substantive Part 7 rather than padding:
+  *what JSX compiles to* — the `jsx()` call and the plain element object, which is what actually explains
+  the capitalisation rule, why an `if` statement cannot go in braces, why `children` is an ordinary prop
+  and why `key`/`ref` never reach the component; and *what reconciliation costs* — measured reorder and
+  prepend numbers for index-vs-stable keys, the four comparison rules in order, and the type-change trap
+  (`<div><Form/></div>` → `<section><Form/></section>` silently remounts and discards the user's input).
+
+**Also checked and clean:** no broken internal links anywhere, including the root `index.html` (24 track
+cards, all resolving); no stale `← CSS Track` nav links left; no double-encoded UTF-8. Five files match a
+mojibake grep (`dotnet/strings.html`, `java/io.html`, `python/strings-io.html`, `html/quiz-bank-1.js`,
+`python/quiz-bank-2.js`) — **all intentional**, they are the lessons and questions *about* encoding bugs
+and deliberately display `cafÃ©`/`JosÃ©` as the worked example. Do not "fix" these.
+
+**Definition of done, now satisfied for the whole site:** every lesson `det=12 ex=6` with 0 validate
+errors · every track 0 errors and 0 warnings · every bank `10 200 0`, no duplicates, no skew · no broken
+links · PROJECT_STATUS.md current.
+
+**There is no known outstanding defect on the site.** Genuine next options, in rough value order:
+(1) new tracks — the site has no Go, Rust, TypeScript-as-its-own-track, GraphQL, Terraform, or
+observability/SRE track, and the infra and interview-prep sections are the strongest argument that another
+would land well; (2) a **content** depth pass on HTML/CSS/JavaScript, which are structurally v4 but were
+written first and are visibly thinner per lesson (~20–35KB) than the later tracks (~50–65KB); (3) product
+work on the site itself — search across lessons, a progress tracker, or dark mode — none of which exists
+today.
 
 **Tooling is committed in `tools/` — see `tools/README.md`. Nothing lives in a scratchpad.**
 ```
