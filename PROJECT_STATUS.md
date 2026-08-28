@@ -6,9 +6,13 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-21)
+## ▶️ RESUME HERE (last updated 2026-08-27)
 
-**Last completed:** ✅ **AWS v4 (track 17) — COMPLETE.** All **20 lessons** at v4 depth (54–90KB, every
+**Last completed:** ✅ **MongoDB v4 (track 19) — COMPLETE**, and it was the last v3 track — **the v4 rebuild programme is finished.** All 22 lessons, both end-of-track chores, quiz bank rewritten; 0 errors and 0 warnings across 27 files. Full per-lesson detail is in the "MongoDB v4 COMPLETE" section below.
+
+**Previously:** ✅ **CI/CD v4 (track 18) — COMPLETE** (21 lessons, 7 redirect stubs, bank rewritten; 0 errors and 0 warnings across 29 files) — detail below.
+
+**And before that:** ✅ **AWS v4 (track 17) — COMPLETE.** All **20 lessons** at v4 depth (54–90KB, every
 one `det=12 ex=6`) across 6 sections, both end-of-track chores done, and the **quiz bank rewritten to the
 v4 curriculum** (200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed 65/66/69). Whole track
 passes `python validate.py tutorials/aws` with **0 errors and 0 warnings** (23 files); pushed & live.
@@ -32,7 +36,7 @@ became a **4.1M backlog** that aged out of retention; backlog-per-instance = tar
 310 ms and goodput at 94%** vs 14.2 s and 61%; connections, replica lag, TTL jitter and single-flight,
 the 1,000 WCU per-partition ceiling at 6% utilisation; quotas, cells, and the known-spike playbook).
 
-**Previously:** ✅ **Kubernetes v4 (track 16) — COMPLETE.** All **22 lessons** rebuilt from 12 v3
+**Earlier:** ✅ **Kubernetes v4 (track 16) — COMPLETE.** All **22 lessons** rebuilt from 12 v3
 lessons (~10KB) to v4 depth (49–57KB, every one `det=12 ex=6`) across 6 sections, + **quiz bank
 rewritten to the v4 curriculum** (200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed
 69/78/53). Whole track passes `python validate.py tutorials/kubernetes` with **0 errors** (28 files);
@@ -282,39 +286,93 @@ were platform defects**; honest funding case with the shortfall stated)
 Also: the 7 orphaned v3 files (`what-is-ci`, `github-actions`, `testing-gates`, `artifacts-versioning`,
 `secrets-oidc`, `docker-in-ci`, `feature-flags`) are now **redirect stubs**.
 
-**🚧 IN PROGRESS: MongoDB v4 (track 19)** — `tutorials/mongodb/`, the **last v3 track**: rebuilding 12 v3
-lessons (~9KB) into **22 lessons at v4 depth**. New `nav.js` written: 6 sections — Foundations 4 ·
-Schema Design 4 · Indexes & Query Performance 4 · Aggregation 3 · Distribution & Durability 4 ·
-Production 3, + Practice. **1 of 22 done:**
+**✅ MongoDB v4 (track 19) COMPLETE — and with it the entire v4 rebuild programme.** All **22 lessons**
+rebuilt from 12 v3 lessons (~9KB) to v4 depth (48–63KB, every one `det=12 ex=6`) across 6 sections, **both
+end-of-track chores done** (the 4 v3 orphans converted to redirect stubs; quiz bank rewritten to the v4
+curriculum: 200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed 57/76/67). Whole track:
+**0 validate.py errors AND 0 warnings** (27 files). All pushed & live.
 
-*§1 Foundations 1/4* — ✅ `index.html` (59KB, `det=12 ex=6`): **the atomic single document is the core
-primitive** and every design rule follows from it; model around what one request needs; snapshot-vs-live-
-reference before calling duplication a problem; **"schemaless" describes the database, not your data** —
-2.1M users in 6 shapes with defensive branches in 14 call sites, and dates-as-strings silently excluded
-from range queries; **WiredTiger working-set cliff: p99 1.4 ms → 340 ms at 12% over cache**, alert on
-`pages evicted by application threads` &gt; 0, and dropping 2 unused indexes recovered 6.2 GB; write concern
-vs read concern (majority default writes, **local default reads** = the read-your-writes trap;
-`wtimeout` is not a rollback); **index-or-scan** — 8.4M docs examined for 50 returned in 41 s → 50/50 in
-9 ms; honest fit assessment and the "both" answer with a dated ADR revisit trigger.
+*§1 Foundations ×4* — `index.html` (**the atomic single document is the core primitive**; schemaless
+describes the database not your data — 2.1M users in 6 shapes; **WiredTiger cliff p99 1.4 ms → 340 ms at
+12% over cache**; write vs read concern default mismatch; index-or-scan 8.4M examined → 50) ·
+`documents-bson.html` (BSON typed/length-prefixed; **type bracketing as silent data loss**; decimal vs
+double for money; ObjectId anatomy; whole-doc rewrite amplification; JSON round-trip retyping) ·
+`crud-semantics.html` (**filter guard = compare-and-swap**; replaceOne data loss; upsert race + unique
+index; findOneAndUpdate claim pattern; bulkWrite ordering; **wtimeout is not a rollback**) ·
+`queries-operators.html` (query-as-document; negation kills indexes; **array conditions match independently
+→ $elemMatch**; blocking sorts + 32MB; skip vs range pagination; regex anchoring; honest $text)
 
-**NEXT: `documents-bson.html`**, then `crud-semantics.html` and `queries-operators.html` to close §1.
-**End-of-track chores (as always):** (1) the v3 orphans after the nav split — `crud.html`, `queries.html`,
-`change-streams.html`, `performance.html` — become redirect stubs; (2) retune the MongoDB quiz bank to the
-v4 curriculum, then `node tools/quizshuffle.js tutorials/mongodb` + `python tools/quizcheck.py tutorials/mongodb`.
+*§2 Schema Design ×4* — `schema-design.html` (embed vs reference: 5 decision inputs, 3 killers incl.
+single-doc write contention; extended reference; **snapshot vs live reference**) · `patterns.html`
+(subset, bucket, computed, attribute, polymorphic, outlier — each with its trigger) · `relationships.html`
+(**no foreign keys — 3,100 orphaned orders in one audit**; $lookup returns an array; **47 s unindexed vs
+2.1 s**; BSONObjectTooLarge on fan-out; sub-pipeline let 2.1 s → 180 ms; $unwind coalescence;
+**batched $in beat $lookup 300×**) · `schema-validation.html` (**a validator is a write-time predicate,
+not a schema** — 28% of updates failing in 90 s; moderate shrinks the non-conforming set;
+additionalProperties:false caught 4,200 typo'd writes/day; **backfill 34 min/4m12s lag vs 9 h/6.4 s lag**)
 
-**Authoring gotcha carried over from CI/CD:** inside a `<pre>` block, never write an escaped
-`&amp;lt;a href=…&amp;gt;` — it renders as literal tag text. Write the plain lesson name instead; the assembly
-step strips any that slip through with a regex. Also still watch for a stray `&lt;/p&gt;` closing a
-`.note` div.
+*§3 Indexes & Query Performance ×4* — `indexes.html` (B-tree mechanics; **bound / sort / cover** —
+1,910 ms → 4 ms → 0.9 ms; **ESR measured 41,000 keys vs 112**; prefix rule; intersection is real and
+almost never chosen; **a boolean index slower than a COLLSCAN**; 14,200 → 7,400 inserts/s at nine indexes;
+hideIndex before dropIndex) · `index-types.html` (multikey is created by accident — 164,000 keys from
+41 documents; **the parallel-array error is a WRITE-time error**; the null trap on unique; **partial index
+9.2 GB → 140 MB**; TTL is 12–47 min late and needs a real Date; honest $text limits; [lng, lat]) ·
+`explain-plans.html` (read bottom-up; **four numbers, three ratios**; `[MinKey, MaxKey]` = a dead compound
+field; **the plan cache: 6 ms for a small tenant, 4,200 ms for a large one, same shape**; shardsTargeted
+first on sharded collections) · `query-tuning.html` (**rank by total time — 41 ms × 98,000 = 67 min/hour**;
+skip() 4 ms → 2,100 ms and the keyset rewrite; counting honestly; **4 ms server / 900 ms driver**;
+predicate rewrites; read preference costs; maxTimeMS and tiered timeouts)
 
-**Track-wide note (2026-08-21 audit, still open):** 19 of 23 quiz banks are answer-skewed (correct answer at
-index 1 for ~100% of questions); `cicd`, `docker`, `kubernetes`, `leetcode` and `redis` are clean. Fix per
-track with `node tools/quizshuffle.js tutorials/<track>` then `python tools/quizcheck.py tutorials/<track>` —
-awaiting the user's go-ahead.
+*§4 Aggregation ×3* — `aggregation.html` (**streaming vs blocking is the whole model**; $push blew 16 MB
+after 14 months; the three sigils; **one stage between $sort and $limit cost 3.2 GB vs 40 MB**;
+allowDiskUse = a 19× slowdown, not a fix) · `aggregation-advanced.html` ($facet branches cannot use
+indexes — 9.4 s vs 2.1 s; $densify/$fill and the silently-wrong moving average; **$setWindowFields
+41 s → 340 ms**; $merge as the materialised-view engine and **the accumulating merge that reported 2×
+revenue for eleven days**) · `aggregation-performance.html` (**the first stage decides everything** —
+118 s vs 0.9 s; reordering six stages 9.1 s → 240 ms; $lookup economics; **$group memory tracks
+cardinality, not volume** — 1.2 MB vs 410 MB on identical input; sharded merge behaviour)
 
+*§5 Distribution & Durability ×4* — `replication.html` (oplog tailing, idempotent and per-document;
+**the oplog window is a duration that moves with write rate**; 4-node sets survive one failure;
+**an arbiter leaves zero redundancy AND stalls majority writes**; **failover: 11 s to elect, 7m12s to
+recovered service**; rollback lost 2,140 acknowledged orders) · `transactions.html` (**ask first whether
+you need one**; withTransaction handles two different error classes; **a missing session option is
+silent**; **write skew is not prevented by snapshot isolation**; 0.9 → 4.8 ms, 2 → 31 ms cross-shard;
+**a 44 s transaction took unrelated p99 from 2.1 ms to 180 ms**; the outbox pattern) · `sharding.html`
+(**shard for working set or write throughput, nothing else**; targeting is everything — 2 ms vs 380 ms;
+**a monotonic key gave 8 shards the throughput of one**; jumbo chunks at 340 GB; the unique-index
+constraint; **resharding 900 GB = 26 h and +100% disk**) · `durability-backup.html` (four durability
+layers; **replication is not a backup — a deleteMany reached all three nodes in 11 ms**; mongodump 14 h/26 h
+vs snapshots; the sharded-consistency problem; **retention is set by DETECTION time**; **RTO designed 4 h,
+measured 9h47m, then 52 min**; "restored" is not "serving")
 
+*§6 Production ×3* — `operations.html` (**alert on pages-evicted-by-application-threads > 0** — the cliff
+is 180× over a small range; size from the working set; the five-step triage order; **binary upgrade and FCV
+must be separate steps**; the timeout inversion; **pool exhaustion presents as 503s with a healthy
+database**) · `security-ops.html` (exposure-to-compromise in hours; **one shared root credential is the
+commonest finding**; readWrite is not least privilege; **three encryption layers, three different
+threats**; operator injection — a $ne operator in a password field logs in as any user; preserve before you
+fix) · `anti-patterns.html` (capstone: the unbounded array; the relational schema in a document costume;
+**40,000 collections = 18 GB of catalogue RAM**; hot documents; index sprawl built from good intentions;
+workload placement; the smell → cost → fix catalogue)
 
-**Then the remaining infra two:** CI/CD → MongoDB, each 12 v3 → ~20 at v4.
+Also: the 4 orphaned v3 files (`crud`, `queries`, `performance`, `change-streams`) are now **redirect
+stubs**. **MongoDB-specific gotchas hit this track:** unescaped `<` inside a pre block for
+angle-bracket placeholders, a stray closing paragraph tag ending a `.note` div (grep for it before
+validating), and one duplicated closing details tag that validate.py caught as a tag-nesting error.
+
+**🎉 THE v4 REBUILD PROGRAMME IS COMPLETE.** Every track on the site is now at v4 depth with a v4-aligned
+200-question bank. MongoDB was the last v3 track.
+
+**Site-wide audit finding, STILL UNFIXED and awaiting the user's go-ahead:** **18 of 23 quiz banks** have
+the correct answer at index 1 for ~100% of questions. Clean: `aws`, `cicd`, `docker`, `kubernetes`,
+`leetcode`, `mongodb`, `redis`. Fix is one command per track:
+`node tools/quizshuffle.js tutorials/<track>` then `python tools/quizcheck.py tutorials/<track>`.
+
+**Suggested next work, in the absence of a new user directive:** (1) the answer-position de-skew above —
+about 20 minutes for all remaining tracks, and it materially improves the quizzes; (2) a site-wide link
+and structure audit now that every track is v4; (3) new tracks, or depth passes on the oldest v4 tracks
+(HTML/CSS/JavaScript were rebuilt first, to a slightly earlier version of the recipe).
 
 **Tooling is committed in `tools/` — see `tools/README.md`. Nothing lives in a scratchpad.**
 ```
@@ -323,15 +381,16 @@ python tools/quizcheck.py tutorials/<track>                   # bank: 10 200 0, 
 node tools/quizshuffle.js tutorials/<track>                   # de-skew (idempotent)
 ```
 
-**The remaining infra tracks, in the user's order:** AWS → CI/CD → MongoDB.
+**The infra six — all complete.**
 
 | Track | Dir | Now | Target |
 |-------|-----|-----|--------|
-| Docker | `tutorials/docker/` | ✅ **21 at v4** | done |
-| Kubernetes | `tutorials/kubernetes/` | ✅ **22 at v4** | done |
+| Redis | `tutorials/redis/` | ✅ **21 at v4 + bank** | done |
+| Docker | `tutorials/docker/` | ✅ **21 at v4 + bank** | done |
+| Kubernetes | `tutorials/kubernetes/` | ✅ **22 at v4 + bank** | done |
 | AWS | `tutorials/aws/` | ✅ **20 at v4 + bank** | done |
-| CI/CD | `tutorials/cicd/` | 🚧 **12 — NEXT** | ~20 |
-| MongoDB | `tutorials/mongodb/` | 12 | ~20 |
+| CI/CD | `tutorials/cicd/` | ✅ **21 at v4 + bank** | done |
+| MongoDB | `tutorials/mongodb/` | ✅ **22 at v4 + bank** | done |
 
 Each track: write `nav.js` first, then lessons (commit every 1–2), then retune the quiz bank to
 `10 200 0` with de-skewed answer positions, then a whole-track validate.
@@ -369,8 +428,8 @@ must report `det=12 ex=6`, 0 errors. Commit per lesson or per pair. A forward li
 not-yet-written next lesson shows as a "broken link" error — that is expected and clears when the
 next file lands; re-run the whole-track validate at the end to confirm 0 errors.
 
-**Then:** the infra six (~70 lessons: Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis) — the last
-remaining v3 tracks.
+**Done:** the infra six (Docker 21, Kubernetes 22, AWS 20, CI/CD 21, MongoDB 22, Redis 21) — they were the
+last remaining v3 tracks, and all six are now at v4 with rewritten banks.
 
 **Quiz-bank recipe (per the 2026-08-05 decision — a track is not done without it):**
 sets are `{title:"Quiz N · Topic", desc, questions:[{q, options:[3], answer:<idx>, explain}×20]}`,
@@ -395,12 +454,12 @@ Validate with the node one-liner at the bottom of this file → must print `10 2
 | 6 | Python | 12 | 200 | ✅ **v4 DONE 12/12** (2026-08-04) |
 | 7 | Java | 12 | 200 | ✅ DONE |
 | 8 | SQL | 12 | 200 | ✅ **v4 DONE 12/12 + quiz retuned** (2026-08-05) |
-| 9 | MongoDB | 12 | 200 | ✅ DONE |
+| 9 | MongoDB | 12 → **22 (v4)** | 200 | ✅ **v4 COMPLETE** — 22/22 lessons, 4 redirect stubs, bank rewritten, 0 errors / 0 warnings (2026-08-27) |
 | 10 | Redis | 11 → **21 (v4)** | 200 | ✅ **v4 COMPLETE** — 21/21 lessons, quiz retuned, 0 validate errors 
-| 11 | Docker | 12 | 200 | ✅ DONE |
-| 12 | Kubernetes | 12 | 200 | ✅ DONE |
-| 13 | AWS | 12 | 200 | ✅ DONE |
-| 14 | CI/CD | 12 | 200 | ✅ DONE |
+| 11 | Docker | 12 → **21 (v4)** | 200 | ✅ **v4 COMPLETE** — 21/21 lessons + bank (2026-08-19) |
+| 12 | Kubernetes | 12 → **22 (v4)** | 200 | ✅ **v4 COMPLETE** — 22/22 lessons + bank (2026-08-20) |
+| 13 | AWS | 12 → **20 (v4)** | 200 | ✅ **v4 COMPLETE** — 20/20 lessons + bank (2026-08-21) |
+| 14 | CI/CD | 12 → **21 (v4)** | 200 | ✅ **v4 COMPLETE** — 21/21 lessons, 7 redirect stubs, bank rewritten (2026-08-26) |
 | 15 | Angular | 12 | 200 | ✅ DONE |
 | 16 | .NET (C#) | 23 (v4) | 200 | ✅ DONE |
 | 17 | ASP.NET Core | 23 (v4) | 200 | ✅ **v4 DONE 23/23** (2026-08-04) |
@@ -481,9 +540,11 @@ Strict site order 1→19 polished 8 tracks while the highest-value ones stayed a
 7. ~~**Unix & Linux**~~ ✅ **COMPLETE 2026-08-10** — new track, 20/20 lessons (44–59KB) + quiz bank `10 200 0`
 8. ~~🆕 **Vector Databases & RAG**~~ ✅ **COMPLETE 2026-08-11** — new track, 15/15 lessons (51–68KB) + quiz bank `10 200 0`
 9. ~~**LeetCode**~~ ✅ **COMPLETE 2026-08-13** — 21/21 lessons (48–59KB, all `det=12 ex=6`) + quiz bank retuned (27 swaps, answer positions de-skewed). Whole track validates 0 errors, 0 warnings.
-10. **Infra six** — Docker, Kubernetes, AWS, CI/CD, MongoDB, Redis (9–12KB, all 3 `<details>`)
+10. ~~**Infra six**~~ ✅ **COMPLETE 2026-08-27** — Redis 21, Docker 21, Kubernetes 22, AWS 20, CI/CD 21,
+    MongoDB 22 (127 lessons, every one `det=12 ex=6`), each with its quiz bank rewritten to the v4
+    curriculum. MongoDB was the last v3 track on the site.
 
-**Remaining: ~70 lessons across 6 tracks** (the infra six, under the approved full expansion).
+**Remaining: none.** Every track is at v4 depth with a v4-aligned 200-question bank.
 
 #### SQL v4 — per-lesson status (as of 2026-08-05)
 Rebuilt in place, no redirect stubs needed. Every done lesson `det=12 ex=6`, 0 validation errors.
