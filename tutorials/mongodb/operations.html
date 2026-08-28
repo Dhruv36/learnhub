@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Operating MongoDB — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Operating MongoDB <span class="level-badge level-ultra">Production</span></h1>
+
+    <p><strong>What you'll master:</strong> the small set of numbers that actually predict trouble, and the
+       much larger set that does not — starting with the one most dashboards omit,
+       <strong><code>pages evicted by application threads</code>, which is the difference between a database
+       that is fine and one that is about to fall off a cliff</strong> (p99 measured at 1.4 ms below the line
+       and 340 ms just above it, with no gradual slope in between); how to size a cluster from the
+       <strong>working set rather than the data size</strong>, and why a 4 TB collection can be perfectly
+       happy on a 64 GB machine while a 200 GB one is not; the triage sequence for a live incident, in the
+       order that eliminates the most possibilities per minute — <strong>and the check that takes 30 seconds
+       and reframes the entire investigation</strong>; upgrades, where the mechanism people miss is
+       <strong>feature compatibility version, the one-way-ish switch that decides whether you can roll
+       back</strong>; the change-management discipline for the operations that have bitten every team in this
+       track — index builds, backfills, validator changes, shard-key decisions; and the client side, which
+       causes more production incidents than the server does: <strong>connection pools, and the timeout
+       inversion where an application gave up at 10 s while <code>serverSelectionTimeoutMS</code> was still
+       waiting 30</strong>. Prerequisites: <a href="query-tuning.html">Query Tuning in Production</a> and
+       <a href="replication.html">Replica Sets &amp; Read Concerns</a>.</p>
+
+    <h2>Part 1 — The Numbers That Predict Trouble</h2>
+
+    <table class="tbl">
+      <tr><th>Signal</th><th>Where</th><th>Why it matters</th></tr>
+      <tr><td><strong>Application-thread evictions</strong></td><td><code>serverStatus().wiredTiger.cache["pages evicted by application threads"]</code></td><td><strong>The single best early warning.</strong> Non-zero means user queries are being made to do eviction work — the working set no longer fits</td></tr>
+      <tr><td>Cache used vs configured</td><td>Same section</td><td>Context for the above. On its own it is nearly useless — a healthy cache is always ~80% full</td></tr>
+      <tr><td>Replication lag</td><td><code>rs.status()</code></td><td>Not just staleness: majority writes stall when a majority cannot keep up, so lag becomes a write outage</td></tr>
+      <tr><td>Oplog window</td><td><code>getReplicationInfo().timeDiff</code></td><td>How long a node can be down before needing a full resync. Collapses silently during migrations</td></tr>
+      <tr><td>Slow-query total time by shape</td><td>Profiler, grouped by <code>queryHash</code></td><td>Ranks work by actual cost rather than by worst case</td></tr>
+      <tr><td>Connection count vs pool limits</td><td><code>serverStatus().connections</code></td><td>Pool exhaustion presents as application 5xx with a healthy database</td></tr>
+      <tr><td>Long-running operations</td><td><code>currentOp({ secs_running: { $gt: 5 } })</code></td><td>The first thing to look at in any live incident</td></tr>
+      <tr><td>Queued read/write tickets</td><td><code>wiredTiger.concurrentTransactions</code></td><td>Available tickets hitting zero means requests are queueing inside the storage engine</td></tr>
+    </table>
+
+<pre>
+MEASURED: the cache cliff, which is not a slope
+
+  Working set relative to WiredTiger cache, same workload:
+
+    88% of cache    p99  1.4 ms   app-thread evictions       0
+    97% of cache    p99  1.9 ms   app-thread evictions       0
+   103% of cache    p99  6.2 ms   app-thread evictions   1,204/s
+   112% of cache    p99  340 ms   app-thread evictions  22,900/s
+
+  Between 97% and 112% the latency changes by 180x. There is no
+  useful warning in the latency graph itself -- by the time p99
+  moves, you are already over.
+
+  The eviction counter moves FIRST, and it moves from exactly
+  zero, which makes it an unusually clean alert: alert on > 0
+  sustained, not on a threshold.
+</pre>
+
+    <div class="note">🔑 <strong>Alert on <code>pages evicted by application threads &gt; 0</code>.</strong> In
+       normal operation background eviction threads keep the cache clean and this counter stays at zero.
+       Non-zero means a user's query had to evict pages before it could proceed — the storage engine telling
+       you the working set no longer fits. It is the only MongoDB metric I know of where "any value above
+       zero" is a meaningful alert, and it fires before latency does.</div>
+
+    <h2>Part 2 — Sizing From the Working Set</h2>
+
+<pre>
+  WiredTiger cache default = max(50% of (RAM - 1GB), 256MB)
+  A 64 GB machine therefore gets ~31.5 GB of cache.
+
+  The remaining RAM is NOT wasted -- the filesystem cache uses it
+  for compressed data. WiredTiger cache holds UNCOMPRESSED pages;
+  the OS cache holds compressed blocks. Both matter.
+
+  WHAT MUST FIT IN CACHE:
+    indexes you actually use          + hot documents
+                                      + a little headroom
+
+  NOT: the whole collection. A 4 TB collection whose queries only
+  ever touch the last 30 days can be entirely comfortable on a
+  64 GB machine. A 200 GB collection scanned randomly cannot.
+</pre>
+
+<pre>
+  ESTIMATING THE WORKING SET, practically
+
+  1. Total index size -- this is the floor, and it is the number
+     people forget:
+       db.stats().indexSize
+       db.coll.stats().indexSizes    // per index
+
+  2. Hot document estimate: the documents touched in a
+     representative window. Derive it from the access pattern,
+     not from the collection size --
+       (documents read per day) x (avg doc size) x overlap factor
+
+  3. Compare against cache. If indexes alone approach cache size,
+     that is the finding: dedupe indexes by prefix before buying
+     RAM. One team recovered 4.1 GB of cache by dropping eight
+     redundant indexes -- cheaper and faster than a resize.
+
+  4. Verify empirically: the eviction counter is the truth. Any
+     model that says you fit while that counter is climbing is
+     wrong.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Resource</th><th>Rule of thumb</th><th>Failure mode when short</th></tr>
+      <tr><td>RAM</td><td>Working set + indexes fit in cache, with headroom for growth</td><td>The cliff: 180× latency change over a small range</td></tr>
+      <tr><td>Disk IOPS</td><td>Provision for the <em>miss</em> rate, not the request rate</td><td>Everything slows once you are reading from disk</td></tr>
+      <tr><td>Disk space</td><td>Data + indexes + oplog + 20–30% for compaction and growth</td><td>A full disk on a primary is an immediate outage</td></tr>
+      <tr><td>CPU</td><td>Usually not the constraint; index builds, aggregation and compression are the exceptions</td><td>Queueing on tickets</td></tr>
+      <tr><td>Connections</td><td>~1 MB each; total across all app instances</td><td>Memory pressure and scheduling overhead</td></tr>
+    </table>
+
+    <h2>Part 3 — Triage: The First Five Minutes</h2>
+
+<pre>
+  ORDER MATTERS. Each step eliminates the most possibilities per
+  second spent.
+
+  1. WHAT IS RUNNING RIGHT NOW?            (10 seconds)
+     db.currentOp({ secs_running: { $gt: 3 },
+                    op: { $in: ["query","command","getmore",
+                                "update","remove"] } })
+     One runaway operation explains a surprising share of
+     incidents. If you find it: killOp, then investigate.
+
+  2. IS THE WORKING SET STILL FITTING?     (30 seconds)
+     serverStatus().wiredTiger.cache
+       ["pages evicted by application threads"]
+     Non-zero and climbing REFRAMES EVERYTHING: every query is
+     slow for one reason and no index change will fix it.
+
+  3. IS ANYTHING ELSE RUNNING?             (30 seconds)
+     An index build, a backfill, a backup, an initial sync, a
+     balancer migration. These present exactly like a query
+     problem and are not one.
+       db.currentOp({ $or: [ { "command.createIndexes":
+                                { $exists: true } } ] })
+       sh.isBalancerRunning()      // sharded
+       rs.status()                 // any member in STARTUP2?
+
+  4. REPLICATION AND WRITE AVAILABILITY    (30 seconds)
+     rs.status() lag. If a majority cannot acknowledge, majority
+     writes are stalling -- which looks like an application bug.
+
+  5. CONNECTIONS                            (30 seconds)
+     serverStatus().connections
+     Near the limit? Then the database may be healthy and the
+     POOL is the problem.
+
+  6. ONLY NOW: the slow query log.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Most likely causes, in order</th></tr>
+      <tr><td>Everything is slow at once</td><td>Cache cliff · a concurrent operation (index build, backfill, backup) · disk saturation · CPU steal on a noisy neighbour</td></tr>
+      <tr><td>One endpoint is slow</td><td>Missing index · plan-cache change · data growth on one tenant · a broadcast query on a sharded cluster</td></tr>
+      <tr><td>App 5xx, database healthy</td><td>Connection pool exhausted · timeout inversion · <code>withTransaction</code> retry storms · DNS/failover recovery</td></tr>
+      <tr><td>Writes failing or hanging</td><td>Replication lag stalling majority writes · disk full · a validator added in strict mode · flow control</td></tr>
+      <tr><td>Latency stepped up with no deploy</td><td>Plan cache · a crossed cache threshold · a growing tenant · an index dropped by a migration</td></tr>
+    </table>
+
+    <div class="note">⚠️ <strong>During an incident, prefer reversible interventions.</strong>
+       <code>killOp</code> on a runaway operation, a <code>hint()</code> deployed in the application, shedding
+       a non-critical endpoint, or <code>hideIndex</code> — all reversible in seconds. What I would not do on
+       a struggling cluster is start an index build: it consumes CPU, evicts cache, and cannot be cheaply
+       undone. Optimisations belong in the calm window afterwards, with the evidence attached.</div>
+
+    <h2>Part 4 — Upgrades and Feature Compatibility Version</h2>
+
+<pre>
+  THE MECHANISM PEOPLE MISS
+
+  Upgrading binaries and enabling new features are SEPARATE steps.
+
+    1. Upgrade binaries, one node at a time (rolling).
+       FCV stays at the old version. New on-disk formats and
+       features are NOT used.
+       -> you can still downgrade the binaries. This is the
+          reversible window, and it is the whole point.
+
+    2. Soak. Days, not minutes. Run a full business cycle.
+
+    3. setFeatureCompatibilityVersion: "8.0"
+       -> new features and formats become active
+       -> downgrading now requires setting FCV back down FIRST,
+          and that can fail if incompatible data or index types
+          already exist
+
+  Teams that upgrade binaries and set FCV in the same maintenance
+  window have given up their rollback path for no benefit.
+</pre>
+
+<pre>
+  ROLLING UPGRADE ORDER
+
+  Replica set:  secondaries one at a time -> verify each has
+                caught up -> rs.stepDown() the primary -> upgrade
+                the former primary last
+
+  Sharded:      1. mongos routers?  NO -- config servers first
+                Order: config servers -> shards (each as a replica
+                set, by the rule above) -> mongos LAST
+
+  Always: check driver compatibility BEFORE the server upgrade.
+  An old driver against a new server usually works; a new driver
+  against an old server often does not, and the two are upgraded
+  by different teams on different schedules.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Step</th><th>Verify before proceeding</th></tr>
+      <tr><td>Before starting</td><td>Backups exist and have been restored recently; oplog window exceeds the time a node will be out; driver versions checked</td></tr>
+      <tr><td>After each secondary</td><td><code>rs.status()</code> shows SECONDARY and lag near zero</td></tr>
+      <tr><td>Before stepping down</td><td>All other members are upgraded and healthy; a step-down during peak is an unnecessary failover</td></tr>
+      <tr><td>Before setting FCV</td><td>A full business cycle has passed, including month-end jobs</td></tr>
+      <tr><td>After FCV</td><td>Nothing — this is the point of no easy return. Which is why step 2 matters</td></tr>
+    </table>
+
+    <h2>Part 5 — Change Management for the Dangerous Operations</h2>
+
+    <table class="tbl">
+      <tr><th>Operation</th><th>Risk</th><th>Discipline</th></tr>
+      <tr><td>Index build</td><td>CPU, cache eviction, runs on all members simultaneously by default</td><td>Rolling build on large collections; before the code that needs it ships; never during an incident</td></tr>
+      <tr><td>Index drop</td><td>Not cheaply reversible — a 41M-document rebuild took 22 minutes under load</td><td><code>hideIndex</code> for a full business cycle first</td></tr>
+      <tr><td>Backfill / migration</td><td>Replication lag, oplog window collapse, cache eviction</td><td>Batched on <code>_id</code> ranges, <code>w: "majority"</code> for backpressure, lag-aware sleep, restartable</td></tr>
+      <tr><td>Adding a validator</td><td><code>strict</code>+<code>error</code> on legacy data is a write outage</td><td><code>warn</code>+<code>moderate</code>, count violators, backfill, then tighten</td></tr>
+      <tr><td>Sharding a collection</td><td>The key is expensive to change — 26 h to reshard 900 GB</td><td>Measure the key's distribution on production data first; verify unique-index requirements</td></tr>
+      <tr><td>Config change (cache size, flow control, FCV)</td><td>Often global and immediate</td><td>One node first; know the rollback command before running the change</td></tr>
+    </table>
+
+<pre>
+  THE PRE-CHANGE CHECKLIST, which is short on purpose
+
+  1. What is the blast radius? One collection, one node, or the
+     cluster?
+  2. What is the EXACT rollback command, and have I run it in a
+     non-production environment?
+  3. How will I know it is going wrong -- which metric, within
+     how long?
+  4. Is anything else changing at the same time? (Concurrent
+     changes make attribution impossible)
+  5. Is the oplog window long enough to survive this?
+  6. Who else is awake?
+
+  Items 2 and 3 are the ones that turn a bad change into a
+  five-minute event instead of an outage.
+</pre>
+
+    <h2>Part 6 — The Client Side, Which Causes More Incidents Than the Server</h2>
+
+<pre>
+  THE TIMEOUT INVERSION
+
+  serverSelectionTimeoutMS   30000   (driver default)
+  application request timeout 10000
+  load balancer timeout        5000
+
+  Read it from the bottom: the load balancer gives up at 5 s, the
+  app at 10 s, and the driver is STILL waiting until 30 s -- for
+  a request nobody is listening to any more. Meanwhile the
+  connection is held and the server keeps working.
+
+  CORRECT ORDERING, each layer strictly inside the one outside it:
+    maxTimeMS (2s) < serverSelectionTimeoutMS (5s)
+                   < app timeout (10s)
+                   < load balancer (30s)
+
+  And maxTimeMS on EVERY query, because a client giving up does
+  not stop the server: 140 abandoned operations held CPU at 100%
+  for 20 minutes after the traffic had gone.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>Guidance</th></tr>
+      <tr><td><code>maxPoolSize</code></td><td>100 <em>per client instance</em></td><td>Multiply by instance count: 40 pods = 4,000 possible connections at ~1 MB each. Size it to what the server can usefully run in parallel</td></tr>
+      <tr><td><code>minPoolSize</code></td><td>0</td><td>A small floor avoids connection-storm latency after an idle period</td></tr>
+      <tr><td><code>serverSelectionTimeoutMS</code></td><td>30000</td><td>Lower than the application timeout, always</td></tr>
+      <tr><td><code>retryWrites</code> / <code>retryReads</code></td><td>true</td><td>Leave on. They absorb a failover transparently for retryable operations</td></tr>
+      <tr><td><code>heartbeatFrequencyMS</code></td><td>10000</td><td>Lower speeds up failover detection at the cost of more chatter</td></tr>
+      <tr><td>One client instance per process</td><td>—</td><td>Creating a client per request is the most expensive mistake available: each brings its own pool and its own topology monitoring</td></tr>
+    </table>
+
+<pre>
+MEASURED: pool exhaustion with a healthy database
+
+  Symptom: 503s from the API. Database CPU 12%, no slow queries.
+
+  Cause chain:
+    a hot document caused write conflicts inside transactions
+      -> withTransaction retried for up to its ~120s budget
+      -> each retrying request held a pooled connection
+      -> pool (100) fully occupied by requests that were sleeping
+      -> new requests could not check out a connection
+      -> API returned 503 while the database was nearly idle
+
+  The database was never the problem, and every database metric
+  said so.
+
+  Two fixes: bound the retry with an application timeout so a
+  request fails fast, and remove the contention -- which was a
+  single global counter document written by every request.
+</pre>
+
+    <div class="note">🔑 <strong>Instrument the client, not just the server.</strong> The metrics that would
+       have diagnosed the incident above are all driver-side: connection checkout wait time, pool
+       utilisation, and how long a request holds a connection. Most teams monitor the database thoroughly and
+       the driver not at all, which is why "the database looks fine but the app is down" is such a common and
+       such a slow-to-diagnose class of incident.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Watching cache utilisation instead of evictions</td><td>A healthy cache is always ~80% full; the number tells you nothing</td><td>Alert on <code>pages evicted by application threads &gt; 0</code></td></tr>
+      <tr><td>Sizing RAM from collection size</td><td>A 4 TB collection may need very little; a 200 GB one may need all of it</td><td>Size from indexes + hot documents, and verify with the eviction counter</td></tr>
+      <tr><td>Buying RAM before deduping indexes</td><td>One team recovered 4.1 GB of cache by dropping eight redundant indexes</td><td>Prefix-dedupe first; it is free and mechanical</td></tr>
+      <tr><td>Starting an incident by reading the slow-query log</td><td>Misses the runaway operation, the index build, and the cache cliff — all of which make every query slow</td><td>The five-step triage: <code>currentOp</code>, evictions, concurrent work, replication, connections</td></tr>
+      <tr><td>Building an index during an incident</td><td>Consumes CPU, evicts cache, not cheaply reversible</td><td>Reversible interventions only; optimise afterwards</td></tr>
+      <tr><td>Upgrading binaries and setting FCV together</td><td>Gives up the rollback path for no benefit</td><td>Upgrade, soak for a full business cycle, then set FCV</td></tr>
+      <tr><td>Upgrading mongos before config servers</td><td>Wrong order for a sharded cluster</td><td>Config servers → shards → mongos</td></tr>
+      <tr><td>Upgrading the driver and server independently</td><td>A new driver against an old server frequently breaks; different teams, different schedules</td><td>Check the compatibility matrix before either</td></tr>
+      <tr><td>Making two changes at once</td><td>Attribution becomes impossible when something goes wrong</td><td>One change, one metric, one rollback command</td></tr>
+      <tr><td>Timeout inversion</td><td>The client gives up while the driver waits 30 s and the server keeps working</td><td>Strictly nested: <code>maxTimeMS</code> &lt; server selection &lt; app &lt; load balancer</td></tr>
+      <tr><td>Default <code>maxPoolSize</code> across many instances</td><td>40 pods × 100 = 4,000 connections at ~1 MB each</td><td>Size the pool to useful server parallelism, not to the default</td></tr>
+      <tr><td>Monitoring only the server</td><td>Pool exhaustion presents as 503s with every database metric healthy</td><td>Instrument checkout wait time and pool utilisation</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Which single metric would you alert on first?</summary>
+      <p><code>pages evicted by application threads</code> from
+         <code>serverStatus().wiredTiger.cache</code>. In normal operation background threads handle eviction
+         and this counter is exactly zero. Any sustained non-zero value means user queries are being made to
+         evict pages themselves — the working set no longer fits in cache.</p>
+      <p>It matters because the failure it predicts is a cliff, not a slope. Measured on the same workload:
+         97% of cache gave p99 of 1.9 ms with zero evictions; 112% gave p99 of 340 ms. By the time the latency
+         graph moves you are already over, and this counter moves first.</p>
+      <p>It is also unusually easy to alert on, because the healthy value is zero rather than "some threshold
+         we tuned".</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How much RAM does a MongoDB server need?</summary>
+      <p>Enough for the working set — the indexes you actually use plus the documents actually being touched —
+         not for the whole collection. A 4 TB collection whose queries only ever touch the last 30 days can
+         run comfortably on a 64 GB machine; a 200 GB collection accessed randomly cannot.</p>
+      <p>The floor is total index size, which is the part people forget: <code>db.stats().indexSize</code>. If
+         indexes alone approach the cache size, the finding is usually that there are redundant indexes —
+         prefix-deduping is free and mechanical, and one team recovered 4.1 GB of cache that way instead of
+         resizing.</p>
+      <p>WiredTiger's cache defaults to about half of RAM minus 1 GB; the rest is not wasted, because the OS
+         filesystem cache holds compressed blocks. And whatever the model says, the eviction counter is the
+         truth.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Walk me through the first five minutes of a "the database is slow" incident.</summary>
+      <p>In an order chosen to eliminate the most possibilities per second.</p>
+      <p><strong>(1) <code>currentOp</code> for operations running over a few seconds.</strong> One runaway query
+         explains a surprising share of incidents, and if I find it I can kill it immediately — triage before
+         diagnosis.</p>
+      <p><strong>(2) The eviction counter.</strong> Thirty seconds, and if it is climbing the entire
+         investigation changes: every query is slow for one reason, and no index change fixes it.</p>
+      <p><strong>(3) Is anything else running?</strong> An index build, a backfill, a backup, an initial sync, a
+         balancer migration. These present exactly like a query problem and are not one.</p>
+      <p><strong>(4) Replication lag</strong>, because if a majority cannot acknowledge then majority writes are
+         stalling, which reaches the application as write failures that look like a bug.</p>
+      <p><strong>(5) Connections.</strong> If the pool is exhausted, the database may be entirely healthy and the
+         problem is client-side.</p>
+      <p><strong>Only then the slow-query log.</strong> Starting there is the common mistake: it is the right
+         tool for a specific slow endpoint and the wrong one when everything is slow, because it shows you
+         symptoms of a cause that is not in the log.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why should binary upgrade and FCV be separate steps?</summary>
+      <p>Because the gap between them is your rollback window. Upgrading binaries with FCV still at the old
+         version means new on-disk formats and features are not used, so you can downgrade the binaries if
+         something is wrong. Once you set the feature compatibility version, new formats become active, and
+         downgrading requires setting FCV back down first — which can fail outright if data or index types
+         that the old version cannot understand already exist.</p>
+      <p>So a team that upgrades binaries and sets FCV in the same maintenance window has given up the
+         reversible path for no benefit at all. The soak between them should cover a full business cycle,
+         including the monthly and quarterly jobs, because those exercise code paths that daily traffic does
+         not.</p>
+      <p>The other ordering people get wrong is sharded clusters: config servers first, then shards, then
+         mongos last. And driver compatibility should be checked before any of it, since a new driver against
+         an old server often breaks and drivers are usually upgraded by a different team on a different
+         schedule.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> The application is returning 503s and every database metric looks healthy. What is happening?</summary>
+      <p>Almost certainly the connection pool, and the reason it is hard to diagnose is that all the
+         instrumentation people have is on the wrong side.</p>
+      <p>The mechanism I have seen: a hot document caused write conflicts inside transactions;
+         <code>withTransaction</code> retried for up to its ~120-second budget; each retrying request held a
+         pooled connection while mostly sleeping; the pool of 100 filled with requests that were doing
+         nothing; new requests could not check out a connection and the API returned 503 — with the database
+         at 12% CPU and no slow queries, because the database genuinely was not the problem.</p>
+      <p><strong>How I would confirm it:</strong> driver-side metrics — connection checkout wait time, pool
+         utilisation, and how long requests hold connections. Then <code>serverStatus().connections</code> to
+         see it from the other end, and <code>metrics.operation.writeConflicts</code> to localise the
+         contention.</p>
+      <p><strong>The other candidates with the same signature:</strong> a timeout inversion where the driver
+         waits longer than the application does, so connections are held for requests nobody is waiting on;
+         and the aftermath of a failover, where stale DNS or a runtime DNS cache leaves some instances unable
+         to reconnect.</p>
+      <p><strong>The fixes are in two layers.</strong> Immediately, bound the retry with an application timeout so
+         a request fails fast rather than occupying a connection, and check the timeout nesting. Durably,
+         remove the contention — in that case a single global counter document written by every request,
+         which no retry policy or pool size can rescue.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the operational readiness checklist for taking a MongoDB deployment to production.</summary>
+      <p>I would organise it by the question each item answers, because a checklist people understand gets
+         used and one they do not gets copied forward unread.</p>
+      <table class="tbl">
+        <tr><th>Question</th><th>Items</th></tr>
+        <tr><td><strong>Will we know?</strong></td><td>Alerts on application-thread evictions, replication lag, oplog window, disk space, connection saturation, long-running operations. Profiler enabled at level 1 with a sensible threshold. Driver-side pool metrics — the ones most teams lack</td></tr>
+        <tr><td><strong>Can we recover?</strong></td><td>Backups exist, are immutable and in a separate account, retention set from detection time, and <strong>have been restored</strong> with a measured RTO. A failover drill measuring time to <em>recovered service</em></td></tr>
+        <tr><td><strong>Will one bad query take us down?</strong></td><td><code>maxTimeMS</code> on every query, strictly nested timeouts, a sized connection pool, one client per process</td></tr>
+        <tr><td><strong>Is the data correct?</strong></td><td>Validators on the collections that matter, with a drift count as a metric. Unique indexes for real constraints</td></tr>
+        <tr><td><strong>Can we change things safely?</strong></td><td>A written change procedure for index builds, backfills and validator changes; rollback commands documented and tested</td></tr>
+        <tr><td><strong>Is it secured?</strong></td><td>Authentication and TLS enforced, least-privilege roles, no application account with admin rights, auditing where required</td></tr>
+      </table>
+      <p><strong>The two items I would refuse to sign off without</strong> are a completed restore drill and
+         <code>maxTimeMS</code> everywhere. Everything else can be added while running; those two are the
+         difference between an incident and a catastrophe, and both are much harder to retrofit under
+         pressure.</p>
+      <p><strong>What I would deliberately keep off the list:</strong> anything aspirational. A checklist with
+         forty items becomes a formality; one with fifteen that are all genuinely blocking stays real. And
+         each item should name the command or dashboard that demonstrates it, so "done" is observable rather
+         than asserted.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> A dashboard shows WiredTiger cache at 82% and the team wants
+      to add RAM. Advise them.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>82% cache utilisation is normal and healthy, and on its own is not a reason for anything.</strong>
+         WiredTiger fills the cache with useful pages and evicts as needed; a cache sitting at 30% just means
+         you are paying for RAM you are not using.</p>
+      <p><strong>The number that would justify the spend:</strong></p>
+<pre>
+  serverStatus().wiredTiger.cache["pages evicted by application threads"]
+</pre>
+      <p>Zero means background eviction is keeping up and the working set fits — no matter what the utilisation
+         percentage says. Sustained non-zero means user queries are doing eviction work themselves, and that
+         is the cliff: measured p99 of 1.9 ms at 97% of cache versus 340 ms at 112%.</p>
+      <p><strong>What I would check before buying RAM, in order:</strong></p>
+      <ol>
+        <li><strong>Index size versus cache.</strong> <code>db.stats().indexSize</code>. If indexes are a large
+            fraction of cache, prefix-dedupe them first — mechanical, free, and one team recovered 4.1 GB
+            that way.</li>
+        <li><strong>Unused indexes.</strong> <code>$indexStats</code> across a full business cycle, then
+            <code>hideIndex</code> for a week before dropping.</li>
+        <li><strong>Retention.</strong> Is cache being consumed by data nobody queries? A TTL or archival policy
+            is cheaper than RAM and keeps being cheaper.</li>
+        <li><strong>Whether the load is one bad query</strong> doing a repeated collection scan and churning the
+            cache for everyone.</li>
+      </ol>
+      <p>If all four are addressed and the eviction counter is still climbing, then RAM is the right answer —
+         and now it is justified by a measurement rather than a percentage that was always going to look
+         like that.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Order these timeouts correctly and explain what goes wrong if
+      they are inverted.
+<pre>
+  application request timeout
+  load balancer timeout
+  maxTimeMS
+  serverSelectionTimeoutMS
+</pre>
+      <details class="solution"><summary>Solution</summary>
+<pre>
+  maxTimeMS                 2s     innermost
+  serverSelectionTimeoutMS  5s
+  application timeout      10s
+  load balancer timeout    30s     outermost
+
+  Each layer strictly inside the one outside it.
+</pre>
+      <p><strong>What goes wrong when inverted:</strong></p>
+      <table class="tbl">
+        <tr><th>Inversion</th><th>Consequence</th></tr>
+        <tr><td>Load balancer shorter than the app</td><td>The client sees a 504 while the application is still working and will eventually succeed. Work is done and thrown away, and retries multiply the load</td></tr>
+        <tr><td><code>serverSelectionTimeoutMS</code> longer than the app timeout</td><td>The driver waits 30 s for a server while the app gave up at 10 — holding a connection for a request nobody is waiting on. This is a common default, since 30 s is the driver's out-of-the-box value</td></tr>
+        <tr><td>No <code>maxTimeMS</code></td><td>The worst one. A client giving up does <em>not</em> stop the server: in one case 140 abandoned operations held CPU at 100% for 20 minutes after the traffic had stopped</td></tr>
+      </table>
+      <p><strong>The principle:</strong> the innermost layer should always be the first to give up, so failures
+         are attributed correctly and no layer keeps working on something the layer above has abandoned. When
+         the outer layer times out first, you get work without a consumer — which under load becomes a
+         feedback loop, because the retries arrive while the abandoned work is still running.</p>
+      <p><strong>Note that <code>maxTimeMS</code> is per operation, not per request.</strong> A request making
+         four database calls needs its budget divided among them, or the sum can exceed the application
+         timeout even though each call is within its own limit.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Latency stepped up 4× at 03:00 with no deploy and no
+      traffic change. Produce a differential diagnosis with the check for each.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>"Step change, no deploy" narrows this considerably, and 03:00 strongly suggests something
+         scheduled.</strong></p>
+      <table class="tbl">
+        <tr><th>Hypothesis</th><th>Check</th><th>Distinguishing evidence</th></tr>
+        <tr><td><strong>A scheduled job</strong> — backup, backfill, TTL purge, analytics</td><td><code>currentOp</code>; cron inventory; <code>metrics.ttl.deletedDocuments</code></td><td>Most likely, given the time. Latency should recover when it ends</td></tr>
+        <tr><td><strong>Crossed the cache threshold</strong></td><td>Eviction counter; cache stats</td><td>Evictions went from 0 to non-zero at 03:00. If a job pulled a large volume through cache, this is the mechanism <em>by which</em> the job hurt</td></tr>
+        <tr><td><strong>Plan cache change</strong></td><td><code>$planCacheStats</code> <code>timeOfCreation</code>; compare <code>planCacheKey</code> for fast and slow cases</td><td>A server restart or index change at 03:00 would re-plan, and the first query after decides the plan for everyone</td></tr>
+        <tr><td><strong>Index build</strong></td><td><code>currentOp</code> for <code>createIndexes</code></td><td>All members affected simultaneously</td></tr>
+        <tr><td><strong>Replication lag / flow control</strong></td><td><code>rs.status()</code>; flow-control metrics</td><td>Writes slowed but reads did not — flow control deliberately throttling</td></tr>
+        <tr><td><strong>Balancer migrations</strong> (sharded)</td><td><code>config.changelog</code>; <code>sh.isBalancerRunning()</code></td><td>A balancing window that opens at 03:00 is a very common configuration</td></tr>
+        <tr><td><strong>Infrastructure</strong></td><td>Disk I/O metrics, CPU steal, host events</td><td>A noisy neighbour or a burst-credit exhaustion has exactly this shape</td></tr>
+      </table>
+      <p><strong>The order I would actually check:</strong> <code>currentOp</code> first (it covers the top four
+         at once), then the eviction counter, then whether latency recovered on its own — because "it
+         recovered at 04:10" identifies a job far faster than any metric does.</p>
+      <p><strong>The trap:</strong> assuming the scheduled job is the problem when it is only the trigger. If the
+         job pushed the working set past cache, the durable fix is not "move the job" — the cluster is one
+         growth increment away from the same cliff during normal traffic. Moving the job buys time; capacity
+         or index reduction fixes it.</p>
+      <p><strong>What makes this diagnosable at all</strong> is having the eviction counter and
+         <code>currentOp</code> sampled historically. Without history you can only observe the current state,
+         and by morning the job has finished and the evidence is gone — which is why a low-frequency sampler
+         writing these to a time series is worth more than most dashboards.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Plan a 6.0 → 7.0 upgrade for a 3-node replica set serving
+      production traffic.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+  PRE-FLIGHT (days before)
+    - read the release notes for BREAKING changes and removed
+      features; grep the codebase for anything deprecated
+    - driver compatibility matrix: does the current driver
+      support 7.0? Upgrade the driver FIRST if not -- old driver
+      against new server is usually fine, the reverse often is not
+    - verify backups exist AND have been restored recently
+    - check the oplog window exceeds the time one node will be
+      out (upgrade + restart + catch-up). If not, grow the oplog
+      before starting
+    - confirm current FCV is 6.0: db.adminCommand(
+        { getParameter: 1, featureCompatibilityVersion: 1 })
+      You cannot jump FCV versions; it must be at 6.0 to go to 7.0
+    - rehearse the whole sequence on a restored copy
+
+  EXECUTION -- one node at a time, off-peak
+    1. secondary A: stop, upgrade binaries, start
+       VERIFY: rs.status() shows SECONDARY, lag ~0
+    2. secondary B: same
+       VERIFY: same
+    3. rs.stepDown() the primary (a controlled failover; with
+       retryWrites the application should barely notice)
+       VERIFY: new primary elected, writes succeeding
+    4. former primary: stop, upgrade, start
+       VERIFY: rejoined, caught up
+
+    Binaries are now 7.0. FCV is still 6.0 -- and this is the
+    REVERSIBLE state.
+
+  SOAK -- days, not minutes
+    Run a full business cycle including month-end jobs. Watch
+    latency, error rates, replication. If anything is wrong,
+    downgrade the binaries the same way, in reverse.
+
+  COMMIT
+    db.adminCommand({ setFeatureCompatibilityVersion: "7.0",
+                      confirm: true })
+    New features and on-disk formats become active. Downgrading
+    now requires setting FCV back first, which can fail if
+    incompatible data already exists.
+</pre>
+      <table class="tbl">
+        <tr><th>Risk</th><th>Mitigation</th></tr>
+        <tr><td>Step-down causes a user-visible blip</td><td>Off-peak, <code>retryWrites</code> enabled, and confirm the client stack recovers — the failover drill is the same exercise</td></tr>
+        <tr><td>Reduced redundancy while a node is out</td><td>One node at a time, verified between each; do not run other changes concurrently</td><td></td></tr>
+        <tr><td>A node needs a full resync</td><td>Oplog window checked in advance</td></tr>
+        <tr><td>An application incompatibility only appears at month-end</td><td>That is precisely what the soak is for — this is why the gap should be days</td></tr>
+      </table>
+      <p><strong>The decision I would push back on</strong> is setting FCV in the same window "to be done with
+         it". The soak is the entire value of the two-step design, and skipping it converts a reversible
+         change into an irreversible one for no benefit.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Design the monitoring and alerting for a production MongoDB
+      deployment. Be explicit about what you would <em>not</em> alert on.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Design principle: alert on things that are (a) actionable, (b) predictive rather than
+         coincident, and (c) not already covered by a broader alert.</strong> The most common failure of
+         database monitoring is not missing alerts — it is so many alerts that the meaningful ones are
+         muted.</p>
+      <table class="tbl">
+        <tr><th>Page (wake someone)</th><th>Threshold</th><th>Why it earns a page</th></tr>
+        <tr><td>No primary</td><td>Any duration &gt; 30 s</td><td>Writes are failing</td></tr>
+        <tr><td>Disk space</td><td>&lt; 20% free</td><td>A full disk on a primary is an immediate outage and takes time to fix</td></tr>
+        <tr><td>App-thread evictions</td><td>&gt; 0 sustained 5 min</td><td>The cliff. Predictive — it fires before latency moves</td></tr>
+        <tr><td>Replication lag</td><td>&gt; 60 s</td><td>Majority writes are at risk of stalling</td></tr>
+        <tr><td>Connection saturation</td><td>&gt; 80% of limit</td><td>Predicts 5xx before they happen</td></tr>
+        <tr><td>Backup verification failed</td><td>Any</td><td>The recovery path is broken and nobody would otherwise know</td></tr>
+      </table>
+      <table class="tbl">
+        <tr><th>Ticket (do not page)</th><th>Why</th></tr>
+        <tr><td>Oplog window below the maintenance threshold</td><td>Important, not urgent — hours of headroom</td></tr>
+        <tr><td>Any jumbo chunk</td><td>A future incident, not a current one</td></tr>
+        <tr><td>Targeted-query fraction declining</td><td>Architectural drift, addressed in a review</td></tr>
+        <tr><td>New <code>COLLSCAN</code> shape in the profiler</td><td>Belongs in a weekly review, or better, in CI</td></tr>
+        <tr><td>Index unused for a full business cycle</td><td>Cleanup candidate</td></tr>
+      </table>
+      <p><strong>What I would deliberately not alert on:</strong></p>
+      <ul>
+        <li><strong>Cache utilisation percentage.</strong> Healthy is ~80%. Alerting on it teaches people to
+            ignore cache alerts, which is exactly what you cannot afford when the eviction alert fires.</li>
+        <li><strong>CPU.</strong> Rarely the binding constraint, and high CPU during a legitimate index build or
+            backup produces noise.</li>
+        <li><strong>Raw query latency thresholds.</strong> A batch rollup legitimately takes minutes. Alert on
+            <em>properties</em> (a spill, a collection scan, a broadcast) and let duration be a
+            dashboard.</li>
+        <li><strong>Connection count in absolute terms</strong> rather than against the limit — meaningless
+            without the denominator.</li>
+        <li><strong>Every slow query.</strong> That is a report, not an alert.</li>
+      </ul>
+      <p><strong>The gap most teams have, which I would fix first:</strong> driver-side metrics. Connection
+         checkout wait time and pool utilisation are what diagnose the "database healthy, app returning 503s"
+         class of incident, and almost nobody collects them. Server monitoring alone cannot see that
+         failure.</p>
+      <p><strong>And one meta-alert:</strong> alert when the monitoring itself stops reporting. A silent
+         dashboard reads exactly like a healthy one.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> You are handed a production cluster with no documentation.
+      Produce a one-week plan to reach operational confidence.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Day 1–2 — inventory and read-only assessment. Change nothing.</strong></p>
+<pre>
+  Topology       rs.status(), sh.status(), member types,
+                 priorities, votes, hidden/delayed members
+  Version        db.version(), FCV, driver versions in the apps
+  Data           db.stats() per database; collection sizes;
+                 index sizes vs cache
+  Indexes        getIndexes() + $indexStats per large collection
+  Config         cache size, flow control, profiling level,
+                 balancer state and window
+  Security       auth enabled? TLS? role assignments? any account
+                 with root that an application uses?
+  Backups        what exists, when it last succeeded, retention,
+                 whether it is reachable with prod credentials
+  Health now     eviction counter, lag, oplog window, connections
+</pre>
+      <p><strong>Day 3 — the workload.</strong> Profiler at level 1 with a conservative threshold, grouped by
+         <code>queryHash</code> and ranked by <em>total</em> time. This produces the list of what the cluster
+         actually spends its time on, which is almost never what people believe. On a sharded cluster, also
+         the targeted-query fraction.</p>
+      <p><strong>Day 4 — the two questions that matter most.</strong> Can we recover, and will we know? A restore
+         of the most important database into an isolated environment, timed and data-verified; and an audit
+         of what is alerted on today. In my experience these two produce the largest findings of the week —
+         usually a backup nobody has restored and an alert set that omits the eviction counter.</p>
+      <p><strong>Day 5 — write it down and rank it.</strong> A single document: topology diagram, versions, the
+         top ten query shapes by cost, current known risks ranked by expected harm, and the measured RTO
+         against whatever RTO anyone believes they have.</p>
+      <p><strong>What I would fix during the week rather than waiting:</strong> only things that are both urgent
+         and reversible — a missing <code>maxTimeMS</code>, an alert that does not exist, a backup that is not
+         running at all. Everything else goes on the ranked list, because changing an unfamiliar production
+         system before understanding it is how a handover becomes an incident.</p>
+      <p><strong>What I would escalate immediately if found:</strong> no backups at all; backups deletable with
+         production credentials; authentication disabled; an even-numbered replica set or a P+S+A topology; or
+         a primary above 90% disk. Each of those is a fix-this-week item regardless of the plan.</p>
+      <p><strong>What I would resist:</strong> starting with a tooling or version upgrade. It is the most
+         satisfying-feeling first move and it defers every question that actually determines whether this
+         cluster survives its next bad day.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Alert on <code>pages evicted by application threads &gt; 0</code></strong> — the healthy
+            value is exactly zero, and it moves before latency does.</li>
+        <li><strong>The cache boundary is a cliff, not a slope</strong>: p99 1.9 ms at 97% of cache, 340 ms at
+            112%.</li>
+        <li><strong>Cache utilisation percentage is not a signal.</strong> A healthy cache is always nearly
+            full.</li>
+        <li><strong>Size RAM from the working set — indexes plus hot documents — not from collection
+            size.</strong></li>
+        <li><strong>Dedupe indexes before buying RAM.</strong> One team recovered 4.1 GB of cache mechanically.</li>
+        <li><strong>Triage in order:</strong> <code>currentOp</code> → evictions → concurrent operations →
+            replication → connections → <em>then</em> the slow-query log.</li>
+        <li><strong>During an incident, prefer reversible interventions.</strong> Never start an index build on
+            a struggling cluster.</li>
+        <li><strong>Upgrade binaries and set FCV as separate steps.</strong> The gap between them is your
+            rollback window.</li>
+        <li><strong>Sharded upgrade order: config servers → shards → mongos.</strong></li>
+        <li><strong>Check driver compatibility first</strong> — a new driver against an old server frequently
+            breaks.</li>
+        <li><strong>One change at a time</strong>, with the rollback command known and tested before you
+            start.</li>
+        <li><strong>Nest timeouts strictly:</strong> <code>maxTimeMS</code> &lt; server selection &lt;
+            application &lt; load balancer.</li>
+        <li><strong>A client giving up does not stop the server</strong> — 140 abandoned operations held CPU at
+            100% for 20 minutes.</li>
+        <li><strong><code>maxPoolSize</code> is per client instance.</strong> 40 pods × 100 = 4,000 connections
+            at ~1 MB each.</li>
+        <li><strong>Pool exhaustion presents as application 5xx with every database metric healthy.</strong></li>
+        <li><strong>Instrument the driver, not just the server</strong> — checkout wait time and pool
+            utilisation are what diagnose that class of incident.</li>
+        <li><strong>Alert on what is actionable and predictive</strong>, and put the rest in a weekly review. An
+            alert set people mute is worse than a smaller one.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="durability-backup.html">← Durability, Backup &amp; Recovery</a>
+      <a href="security-ops.html">Security &amp; Encryption →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

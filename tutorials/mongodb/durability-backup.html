@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Durability, Backup &amp; Recovery — MongoDB — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../sql/index.html">SQL Track</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Durability, Backup &amp; Recovery <span class="level-badge level-ultra">Distribution</span></h1>
+
+    <p><strong>What you'll master:</strong> what "durable" actually means at each layer — the WiredTiger
+       journal, the 60-second checkpoint, and the majority commit point — and which failure each one survives,
+       because <strong><code>w: "majority"</code> without <code>j: true</code> survives any single node dying
+       but not a simultaneous power loss</strong>; the distinction that reframes the whole topic —
+       <strong>replication is not a backup</strong>, since it faithfully replicates an accidental
+       <code>deleteMany</code> in milliseconds (measured at <strong>11 ms to all three nodes</strong>); the
+       backup methods and their honest trade-offs, including why <strong><code>mongodump</code> on a 900 GB
+       cluster is not a backup strategy</strong> (14 hours to dump, 26 to restore, and no consistency across
+       shards); why <strong>a backup you have not restored is a hypothesis, not a backup</strong> — one team's
+       first real restore of a 2 TB snapshot took <strong>9h47m against a designed RTO of 4 hours</strong>,
+       then 52 minutes after three engineer-days of work; the difference between RTO and RPO and how to derive
+       both from the cost of downtime rather than from a round number; point-in-time recovery and the oplog
+       window that silently bounds it; and the part everyone omits — <strong>"restored" is not "serving"</strong>,
+       because a restored cluster came back with cold cache, missing alarms, no Multi-AZ and a different
+       endpoint. Prerequisites: <a href="replication.html">Replica Sets &amp; Read Concerns</a> and
+       <a href="sharding.html">Sharding &amp; Shard Keys</a>.</p>
+
+    <h2>Part 1 — The Layers of Durability</h2>
+
+<pre>
+  A write travels through four states. Each survives a different
+  failure.
+
+  1. IN THE PRIMARY'S MEMORY          w: 1 acknowledged here
+       survives: nothing. A crash loses it.
+
+  2. IN THE JOURNAL (on disk)          j: true waits for this
+       survives: a process crash or power loss on THIS node.
+       WiredTiger fsyncs the journal every 100 ms by default, or
+       immediately when j: true is requested.
+
+  3. REPLICATED TO A MAJORITY          w: "majority" waits for this
+       survives: the loss of any single node, and cannot be
+       rolled back -- because any new primary must contain it.
+       NOTE: majority means "in memory on a majority" unless
+       j: true is also set.
+
+  4. IN A CHECKPOINT (every 60s)
+       survives: everything above; this is the point recovery
+       starts from. Between checkpoints, recovery replays the
+       journal.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Failure</th><th><code>w:1</code></th><th><code>w:1,j:true</code></th><th><code>w:"majority"</code></th><th><code>w:"majority",j:true</code></th></tr>
+      <tr><td>Process crash on primary</td><td>Lost</td><td>Safe</td><td>Safe</td><td>Safe</td></tr>
+      <tr><td>Primary dies permanently</td><td><strong>Lost</strong></td><td><strong>Lost</strong></td><td>Safe</td><td>Safe</td></tr>
+      <tr><td>Network partition + failover</td><td><strong>Rolled back</strong></td><td><strong>Rolled back</strong></td><td>Safe</td><td>Safe</td></tr>
+      <tr><td>Simultaneous power loss, whole rack</td><td>Lost</td><td>Safe on that node</td><td><strong>Possibly lost</strong></td><td>Safe</td></tr>
+      <tr><td>Accidental <code>deleteMany</code></td><td colspan="4"><strong>Lost in every case.</strong> Durability is not the mechanism that protects you from this</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The fourth row is the one people get wrong.</strong>
+       <code>w: "majority"</code> means a majority of nodes have the write <em>in memory</em>, journalled
+       according to their own schedule. If every node in that majority loses power at the same instant — a
+       single-rack or single-AZ deployment — the write can be lost despite having been acknowledged. Adding
+       <code>j: true</code> closes it, at a measured cost of about 1.3 ms. For financial records that is the
+       right trade; the more durable fix is spreading the majority across failure domains so a simultaneous
+       power loss cannot take all of them.</div>
+
+    <h2>Part 2 — Replication Is Not a Backup</h2>
+
+<pre>
+MEASURED: how fast a mistake propagates
+
+  db.orders.deleteMany({})     -- run against prod, believing it
+                                  was staging
+
+  t+0 ms     primary deletes 4.1M documents
+  t+11 ms    both secondaries have applied it
+  t+11 ms    every copy of the data is now identical, and empty
+
+  A three-node replica set did exactly what it is designed to do.
+  Replication protects against a NODE failing. It offers no
+  protection whatever against a valid operation you did not mean
+  to run -- and that is the most common cause of data loss.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Threat</th><th>Replication</th><th>Delayed member</th><th>Backup</th></tr>
+      <tr><td>A node dies</td><td><strong>Yes</strong></td><td>Yes</td><td>Yes, slowly</td></tr>
+      <tr><td>A disk corrupts</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Accidental delete/drop</td><td><strong>No</strong></td><td>Yes, within the delay</td><td><strong>Yes</strong></td></tr>
+      <tr><td>A bad migration corrupting data</td><td>No</td><td>Yes, within the delay</td><td><strong>Yes</strong></td></tr>
+      <tr><td>Corruption discovered weeks later</td><td>No</td><td>No</td><td><strong>Yes, if retention covers it</strong></td></tr>
+      <tr><td>Ransomware / credential compromise</td><td>No</td><td>No — reachable with the same credentials</td><td>Only if <strong>immutable and in a separate account</strong></td></tr>
+      <tr><td>Region loss</td><td>Only with a cross-region member</td><td>No</td><td>Yes, if stored cross-region</td></tr>
+    </table>
+
+    <p>The last row of that table is the one that fails audits. A backup stored in the same cloud account, with
+       credentials the application can reach, is not protection against a compromise of that account — the
+       attacker deletes the backups first. <strong>Immutability (object lock / vault lock) in a separate
+       account with separate credentials</strong> is what converts a backup into a control.</p>
+
+    <h2>Part 3 — The Backup Methods</h2>
+
+    <table class="tbl">
+      <tr><th>Method</th><th>How</th><th>Good</th><th>Bad</th></tr>
+      <tr><td><code>mongodump</code></td><td>Logical export of documents via the query layer</td><td>Portable, selective, human-readable metadata</td><td>Slow, no cross-shard consistency, must rebuild indexes on restore, competes with production traffic</td></tr>
+      <tr><td>Filesystem / volume snapshot</td><td>Block-level snapshot of the data volume</td><td>Fast, index-inclusive, minimal load</td><td>Requires journal on the same volume, or <code>fsyncLock</code>; sharded clusters need coordination</td></tr>
+      <tr><td>Hidden-member snapshot</td><td>Snapshot a dedicated non-serving member</td><td>Zero production impact; the practical default</td><td>One more node to run</td></tr>
+      <tr><td>Continuous / oplog-based (Ops Manager, Atlas, Percona)</td><td>Snapshot plus a continuous oplog tail</td><td><strong>Point-in-time recovery</strong>, low RPO</td><td>Cost; another system to operate</td></tr>
+      <tr><td>Cloud provider managed</td><td>Atlas backups, provider snapshots</td><td>Tested restore paths, less to build</td><td>You still own testing it, and the RTO is theirs, not yours</td></tr>
+    </table>
+
+<pre>
+MEASURED: why mongodump stops being a strategy
+
+  900 GB sharded cluster, 6 shards
+
+    mongodump (parallel, from hidden members)     14h 10m
+    mongorestore (including index builds)         26h 40m
+    consistency across shards                     NONE -- each
+      shard was dumped at a different moment, so referential
+      state between shards is arbitrary
+
+  Same cluster, coordinated volume snapshots
+    snapshot                                       ~4 min
+    restore + start + catch-up                     1h 20m
+    consistency                                    yes, if the
+      balancer is stopped and the snapshots are taken together
+</pre>
+
+<pre>
+  THE SHARDED CONSISTENCY PROBLEM, precisely
+
+  Shard A snapshot at 02:00:00
+  Shard B snapshot at 02:04:00
+
+  A chunk migrated from A to B at 02:02.
+  -> Snapshot A still contains it (as an orphan is fine)
+  -> Snapshot B also contains it
+  -> But the CONFIG SERVER snapshot decides who owns it, and it
+     was taken at some third moment.
+
+  Restoring these together can produce documents that belong to
+  a shard that does not have them -- silent data loss on read.
+
+  Requirements for a consistent sharded backup:
+    1. stop the balancer     sh.stopBalancer()
+    2. snapshot config servers AND every shard at the same
+       cluster time
+    3. restart the balancer
+  Managed tools do this for you. Hand-rolled scripts usually
+  do not, and the gap is invisible until a restore.
+</pre>
+
+    <h2>Part 4 — RTO, RPO, and Deriving Them Honestly</h2>
+
+<pre>
+  RPO -- Recovery Point Objective
+       How much data may we lose? Measured in TIME.
+       Determined by: backup frequency, or oplog retention for
+       point-in-time recovery.
+
+  RTO -- Recovery Time Objective
+       How long may we be down? Measured in TIME.
+       Determined by: restore speed, and everything after it.
+
+  These are not aspirations. They are derived:
+
+    cost of one hour down     = revenue/hr + SLA credits +
+                                support cost + reputational
+    cost of losing one hour
+      of writes               = re-entry effort + lost orders +
+                                regulatory exposure
+
+  Then: spend up to that, and no more. A team that cannot state
+  the cost of an hour of downtime cannot justify an RTO, and will
+  either overspend on a hot standby or discover the number during
+  the incident.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Tier</th><th>Typical RPO/RTO</th><th>Mechanism</th><th>Relative cost</th></tr>
+      <tr><td>Tier 1 — payments, core transactions</td><td>RPO ~0, RTO minutes</td><td>Multi-region replica set, continuous oplog backup, automated failover</td><td>Highest</td></tr>
+      <tr><td>Tier 2 — main product data</td><td>RPO 15 min, RTO 1–4 h</td><td>Continuous backup, snapshot restore, rehearsed runbook</td><td>Moderate</td></tr>
+      <tr><td>Tier 3 — analytics, derived data</td><td>RPO 24 h, RTO 24 h</td><td>Daily snapshot — or rebuild from source, which may be cheaper than backing it up at all</td><td>Low</td></tr>
+    </table>
+
+    <p>Tiering matters because a uniform policy is always wrong in both directions: it over-protects derived
+       data that could simply be recomputed, and under-protects the ledger. The question that sorts a
+       collection into a tier is <em>"if we lost this entirely, what would we do?"</em> — and for a
+       surprising amount of data the honest answer is "recompute it", which is cheaper than any backup.</p>
+
+    <h2>Part 5 — Point-in-Time Recovery and the Oplog Window</h2>
+
+<pre>
+  PITR = a snapshot + the oplog from that snapshot forward,
+         replayed to a chosen moment.
+
+  "Restore to 14:22:59, one second before the bad migration
+   started."
+
+  What bounds it: the OPLOG RETENTION of the backup system, not
+  the oplog window of the live cluster. Those are different
+  things and confusing them is a common gap:
+
+    live oplog window     how far a SECONDARY can fall behind
+                          and still catch up
+    backup oplog store    how far BACK IN TIME you can recover
+</pre>
+
+<pre>
+MEASURED: the recovery that could not go back far enough
+
+  A bad migration silently corrupted a field. It was noticed
+  9 days later during a quarterly report.
+
+    daily snapshots, 7-day retention
+    -> the oldest available snapshot was 7 days old
+    -> the corruption began on day 9
+    -> EVERY snapshot contained the corruption
+
+  Recovery became a bespoke data-repair project (3 weeks) rather
+  than a restore.
+
+  The gap was not technical. Retention had been set to 7 days
+  because that was the default, and nobody had asked "how long
+  might it take us to NOTICE a problem?" -- which is the actual
+  question retention answers.
+</pre>
+
+    <div class="note">⚠️ <strong>Retention is set by detection time, not by recovery time.</strong> Seven days
+       of backups protects you against problems you notice within seven days. Silent corruption — a bad
+       migration, a subtly wrong calculation, a field quietly written in the wrong type — is routinely found
+       during a monthly or quarterly process. If your retention is shorter than your slowest detection
+       mechanism, your backups cannot help with exactly the class of incident that most needs them. A monthly
+       archival snapshot with long retention is cheap insurance against this.</div>
+
+    <h2>Part 6 — "Restored" Is Not "Serving"</h2>
+
+<pre>
+MEASURED: the first real restore drill
+
+  2 TB cluster, designed RTO 4 hours.
+
+    t+0        decision to restore
+    t+18m      snapshot located, permissions resolved
+               (the on-call engineer did not have restore rights)
+    t+1h05m    volumes provisioned and attached
+    t+2h40m    mongod started; initial recovery replayed journal
+    t+3h10m    replica set reconfigured, secondaries syncing
+    t+6h20m    secondaries caught up
+    t+7h50m    application connected -- WRONG ENDPOINT, the
+               restored cluster had a new DNS name
+    t+8h30m    application serving, p99 18x normal (cold cache)
+    t+9h10m    cache warm enough for acceptable latency
+    t+9h47m    monitoring and alarms recreated; declared recovered
+
+  Designed RTO 4h. Measured 9h47m.
+
+  After three engineer-days of work -- pre-provisioned
+  infrastructure as code, a documented endpoint switch, pre-warmed
+  instance sizing, restore permissions granted in advance, and a
+  written runbook -- the next drill measured 52 minutes.
+</pre>
+
+    <table class="tbl">
+      <tr><th>What a restore does <em>not</em> bring back</th><th>Consequence</th></tr>
+      <tr><td>A warm cache</td><td>Measured 18× latency for 40 minutes. "Available" is not "usable"</td></tr>
+      <tr><td>The original endpoint / DNS name</td><td>The application connects to nothing until someone changes it</td></tr>
+      <tr><td>Monitoring, alarms, dashboards</td><td>You are flying blind immediately after an incident</td></tr>
+      <tr><td>Replica set topology and Multi-AZ placement</td><td>Restored as a single node unless the runbook rebuilds it — zero redundancy during the most fragile hour</td></tr>
+      <tr><td>Users, roles, and TLS configuration</td><td>Often stored separately; the app authenticates against nothing</td></tr>
+      <tr><td>TTL and index settings changed since the snapshot</td><td>Silent behavioural differences</td></tr>
+      <tr><td>Whatever happened <em>after</em> the snapshot</td><td>The RPO gap, which someone must reconcile by hand</td></tr>
+    </table>
+
+<pre>
+  THE DRILL THAT ACTUALLY TESTS SOMETHING
+
+  1. Unannounced, or at least unrehearsed on the day.
+  2. Performed by someone who did NOT build the backup system --
+     that is who will be on call.
+  3. Restore to a SEPARATE environment, then point a real client
+     at it and run real queries.
+  4. VERIFY THE DATA, not just that mongod started:
+       - document counts per collection vs expected
+       - a checksum or sampled comparison against the source
+       - the newest document's timestamp -> your real RPO
+  5. Measure time to SERVING, not time to started.
+  6. Write down every manual step and every permission that was
+     missing. Those are the deliverables.
+
+  Quarterly. And after any change to the backup system, the
+  infrastructure, or the on-call rota.
+</pre>
+
+    <div class="note">🔑 <strong>A backup you have never restored is a hypothesis.</strong> The most common
+       findings in a first drill are not corrupt backups — they are missing permissions, undocumented steps,
+       an endpoint nobody thought about, and a restore that produces a single node where a three-node set is
+       required. All of those are cheap to fix once known and catastrophic to discover during a real
+       incident. The drill's output is a shorter runbook, not a green tick.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Treating replication as a backup</td><td>An accidental <code>deleteMany</code> reached all three nodes in 11 ms</td><td>Backups are a separate control; replication protects against node failure only</td></tr>
+      <tr><td>Assuming <code>w: "majority"</code> survives everything</td><td>It means "in memory on a majority" — a simultaneous rack power loss can still lose it</td><td><code>j: true</code> for financial writes; spread the majority across failure domains</td></tr>
+      <tr><td>Backups in the same cloud account as production</td><td>A credential compromise deletes the backups first</td><td>Immutable storage (object lock) in a separate account</td></tr>
+      <tr><td><code>mongodump</code> as the strategy at scale</td><td>14 h to dump, 26 h to restore, no cross-shard consistency</td><td>Volume snapshots from a hidden member; coordinated for sharded clusters</td></tr>
+      <tr><td>Per-shard backups taken independently</td><td>Chunk migrations between snapshots produce documents no shard claims — silent loss on read</td><td>Stop the balancer; snapshot config servers and all shards at one cluster time</td></tr>
+      <tr><td>Running <code>mongodump</code> against the primary</td><td>Reads the whole collection through the cache, evicting the working set</td><td>A hidden member</td></tr>
+      <tr><td>Retention set to the default</td><td>Corruption found on day 9 with 7 days of backups — every snapshot contained it</td><td>Set retention from your slowest <em>detection</em> mechanism; keep long-retention monthly archives</td></tr>
+      <tr><td>An RTO chosen as a round number</td><td>Cannot be justified, so it is either overspent or discovered during the incident</td><td>Derive it from the cost of an hour of downtime, and tier by collection</td></tr>
+      <tr><td>Never restoring</td><td>First real restore took 9h47m against a designed 4 h</td><td>Quarterly drills, run by someone who did not build it</td></tr>
+      <tr><td>Measuring RTO as time-to-mongod-started</td><td>Missed the endpoint switch, the cold cache (18× latency) and the missing alarms</td><td>Measure time to <em>serving acceptably</em></td></tr>
+      <tr><td>Restoring a single node and calling it done</td><td>Zero redundancy during the most fragile hour of the incident</td><td>The runbook must rebuild the replica set and its placement</td></tr>
+      <tr><td>Not verifying restored data</td><td>A restore that starts is not a restore that is correct</td><td>Count documents, sample-compare, and check the newest timestamp to learn your real RPO</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Is replication a backup?</summary>
+      <p>No. Replication protects against a node failing; it offers no protection against a valid operation you
+         did not mean to run, which is the most common cause of data loss. An accidental
+         <code>deleteMany</code> reached all three members of a replica set in 11 milliseconds — the system
+         working exactly as designed.</p>
+      <p>The threats split cleanly: replication covers hardware and node failure; backups cover human error,
+         bad migrations, and corruption discovered later; and only <em>immutable backups in a separate
+         account</em> cover credential compromise, because an attacker with production credentials deletes
+         reachable backups first.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between RTO and RPO?</summary>
+      <p>RPO is how much data you can afford to lose, measured in time — determined by backup frequency, or by
+         oplog retention if you have point-in-time recovery. RTO is how long you can afford to be down —
+         determined by how fast you can restore <em>and serve</em>.</p>
+      <p>The part that matters is that both should be derived rather than chosen. If an hour of downtime costs
+         a known amount in revenue, SLA credits and support load, that number bounds what the recovery
+         capability is worth. A team that cannot state the cost of an hour down cannot justify its RTO, and
+         will either overspend on a hot standby or discover the number during an incident.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why is <code>mongodump</code> a poor backup strategy at scale?</summary>
+      <p>Three reasons. It is slow, because it exports documents through the query layer and the restore has to
+         rebuild every index — measured at 14 hours to dump and 26 to restore a 900 GB cluster, against about
+         4 minutes to snapshot and 1h20m to restore. It competes with production, because reading the whole
+         collection evicts the working set from cache. And on a sharded cluster it produces no consistent
+         point in time: each shard is dumped at a different moment, so the cross-shard state is arbitrary.</p>
+      <p>Volume snapshots taken from a hidden member avoid all three. For a sharded cluster the snapshots must
+         be coordinated — balancer stopped, config servers and all shards captured at the same cluster time —
+         or a chunk migration between snapshots can leave documents that no shard claims after a restore.</p>
+      <p><code>mongodump</code> still has a place: selective exports, moving a collection between environments,
+         small datasets, and a portable format you can read in ten years. It is a tool, just not the
+         strategy.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How long should backup retention be?</summary>
+      <p>Long enough to cover your slowest <em>detection</em> mechanism, which is usually much longer than
+         people set it to.</p>
+      <p>The failure I have seen: a bad migration silently corrupted a field, and it was noticed nine days
+         later during a quarterly report. Retention was seven days — the default — so every available
+         snapshot already contained the corruption, and recovery became a three-week bespoke data-repair
+         project instead of a restore.</p>
+      <p>So the question to ask is not "how far back might we want to go?" but "what is the longest plausible
+         gap between something going wrong and someone noticing?". Anything found by a monthly or quarterly
+         process sets the floor. A cheap way to cover it is a tiered policy: dense recent retention for
+         operational recovery, plus monthly archival snapshots kept for a year, which cost very little and
+         cover exactly the silent-corruption case.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your designed RTO is 4 hours. How do you know it is real?</summary>
+      <p>You do not, until you have restored. In the case I have measured, a designed 4-hour RTO came in at
+         9h47m on the first genuine drill — and almost none of the extra time was the restore itself.</p>
+      <p>The breakdown: 18 minutes because the on-call engineer lacked restore permissions; over an hour
+         provisioning volumes that had not been pre-defined; three hours for secondaries to sync because the
+         runbook restored a single node; 90 minutes lost to the restored cluster having a different DNS name
+         that nobody had thought about; and 40 minutes of 18× latency from a cold cache after the application
+         connected. Monitoring and alarms had to be recreated by hand at the end.</p>
+      <p>Every one of those is cheap to fix once known — infrastructure as code for the restore target,
+         permissions granted in advance, a documented endpoint switch, larger instances during warm-up, and a
+         written runbook. Three engineer-days took the next drill to 52 minutes.</p>
+      <p><strong>How I would design the drill:</strong> unannounced, performed by someone who did not build the
+         backup system, restoring to a separate environment, with a real client pointed at it and real
+         queries run. The measurement is time to <em>serving acceptably</em>, not time to <code>mongod</code>
+         started. And it must verify the data — document counts, a sampled comparison, and the newest
+         document's timestamp, which is the only way to learn your real RPO rather than your intended
+         one.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a backup and recovery strategy for a multi-tenant SaaS with a compliance requirement to restore a single customer's data.</summary>
+      <p><strong>The single-tenant restore requirement is the one that shapes everything</strong>, because
+         standard cluster backups do not do it. A snapshot restores everything, and restoring the whole
+         cluster to recover one customer is both disproportionate and impossible if other tenants must keep
+         serving.</p>
+<pre>
+  LAYER 1 -- cluster recovery (the ordinary disaster case)
+    Coordinated volume snapshots from hidden members, plus
+    continuous oplog capture for PITR.
+    RPO minutes, RTO from a rehearsed runbook.
+    Immutable, in a separate account, cross-region.
+
+  LAYER 2 -- per-tenant logical export (the compliance case)
+    A scheduled job exporting each tenant's documents, keyed by
+    tenantId, to per-tenant objects in object storage.
+    This is what makes single-tenant restore tractable, and it
+    only works if tenantId is on every document -- which is a
+    SCHEMA requirement driven by the backup requirement.
+
+  LAYER 3 -- restore path for one tenant
+    Restore that tenant's export into a staging collection,
+    verify counts and checksums, then merge into production with
+    an idempotent upsert keyed on _id.
+    NEVER a blind insert: the tenant may have written new data
+    since, and a restore must not silently overwrite it.
+</pre>
+      <p><strong>The design decisions I would call out explicitly:</strong></p>
+      <table class="tbl">
+        <tr><th>Decision</th><th>Reasoning</th></tr>
+        <tr><td><code>tenantId</code> on every document, no exceptions</td><td>Without it, per-tenant export is impossible and the compliance requirement cannot be met at any price</td></tr>
+        <tr><td>Exports encrypted per tenant</td><td>A single compromised export should not expose every customer</td></tr>
+        <tr><td>Restore is upsert, not insert</td><td>Partial restores into a live system are the normal case, not the exception</td></tr>
+        <tr><td>A documented, tested "restore one tenant" runbook</td><td>The compliance requirement is the <em>ability</em>, and an untested ability does not exist</td></tr>
+      </table>
+      <p><strong>What I would clarify with whoever owns the requirement</strong>, because the answers change the
+         design substantially: does "restore a customer" mean recovering deleted data, or exporting it for
+         portability, or erasing it (which is the opposite operation and also touches backups)? And must the
+         restore be to a point in time, or is the latest export sufficient? A GDPR erasure request that must
+         also cover backups is a very different problem — it usually forces a crypto-shredding design, where
+         each tenant's data is encrypted with a tenant key that can be destroyed, because rewriting immutable
+         backups is not possible by construction.</p>
+      <p><strong>And the operational commitment:</strong> the per-tenant restore path must be drilled like the
+         cluster one. It is the path most likely to be needed and least likely to have been used.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> A team says "we have a three-node replica set across three
+      availability zones, so we don't need backups". Respond.
+      <details class="solution"><summary>Solution</summary>
+      <p>They have excellent protection against <em>infrastructure</em> failure and none at all against the more
+         common cause of data loss.</p>
+      <p><strong>What their setup does cover:</strong> a node dying, a disk failing, an availability zone going
+         down. Genuinely good, and worth having.</p>
+      <p><strong>What it does not cover:</strong></p>
+      <table class="tbl">
+        <tr><th>Threat</th><th>Outcome with replication alone</th></tr>
+        <tr><td>Accidental <code>deleteMany</code> or <code>drop</code></td><td>Replicated to all three nodes in ~11 ms. Total loss</td></tr>
+        <tr><td>A bad migration corrupting a field</td><td>Faithfully replicated</td></tr>
+        <tr><td>An application bug writing wrong data for a week</td><td>Faithfully replicated</td></tr>
+        <tr><td>Corruption noticed a month later</td><td>Nothing to go back to</td></tr>
+        <tr><td>Compromised credentials</td><td>The attacker has all three copies</td></tr>
+        <tr><td>Region loss</td><td>All three AZs are in one region</td></tr>
+      </table>
+      <p><strong>The framing I would use:</strong> replication answers "what if a machine fails?"; backups answer
+         "what if we were wrong?". Those are different questions, and the second one has a much higher base
+         rate — most data-loss incidents are a valid command run against the wrong environment, not a
+         hardware failure.</p>
+      <p><strong>The minimum I would ask for:</strong> daily snapshots from a hidden member, stored immutably in
+         a separate account and a separate region, with retention set from how long it might take to
+         <em>notice</em> a problem rather than from a default. Plus one restore drill, because until then it
+         is a hypothesis. A delayed member is a useful cheap addition for the "we noticed within an hour"
+         case, but it is not a substitute — it shares the same credentials and the same region.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> For each write, choose a write concern and justify it
+      against a specific failure.
+<pre>
+  a) a bank transfer
+  b) a user's UI theme preference
+  c) an IoT sensor reading, 50,000/sec
+  d) an audit record of a permission change
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <table class="tbl">
+        <tr><th></th><th>Choice</th><th>Failure it must survive</th></tr>
+        <tr><td>a) transfer</td><td><code>w: "majority", j: true</code></td><td>Simultaneous power loss across the majority. Majority alone means "in memory on a majority" — recoverable in almost every scenario, but not that one. ~1.3 ms extra against a financial record is not a trade worth thinking about</td></tr>
+        <tr><td>b) theme</td><td><code>w: 1</code></td><td>Nothing much. If it is lost the user reselects it in two seconds. Latency matters more</td></tr>
+        <tr><td>c) sensor at 50k/s</td><td><code>w: 1</code>, and question the design</td><td>Individual readings are statistically redundant. But at this rate I would ask whether these should be batched writes, a time-series collection, or a streaming pipeline — 50,000 durable writes per second is a different architecture, not a write-concern setting</td></tr>
+        <tr><td>d) audit record</td><td><code>w: "majority", j: true</code></td><td>Its whole purpose is to be trustworthy afterwards. An audit log that can silently roll back is worse than no audit log, because it is believed. This is also the case where <code>j: true</code> is easiest to justify: the volume is low</td></tr>
+      </table>
+      <p><strong>The general test:</strong> what happens if this write is acknowledged and then silently reverted?
+         If the answer involves a person having been told something untrue — money moved, a permission
+         granted — use majority. If the data regenerates itself, <code>w: 1</code> is a legitimate
+         optimisation.</p>
+      <p><strong>Worth stating:</strong> in a single region, majority costs about 0.9 ms extra at p50. That is
+         small enough that <code>w: 1</code> should be a deliberate exception for a specific high-volume path
+         rather than a global default — which is how (a) and (d) end up at <code>w: 1</code> in real
+         systems.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> A migration corrupted a field at 14:23. You have hourly
+      snapshots and continuous oplog backup. Plan the recovery.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Stop the bleeding before recovering anything.</strong> If the migration is still running, kill
+         it. If the corrupting code is still deployed, roll it back. A recovery performed while the cause is
+         active re-corrupts the restored data.</p>
+<pre>
+  1. ESTABLISH THE BLAST RADIUS -- before touching backups
+     - which collections and fields?
+     - how many documents?  countDocuments on the corrupt shape
+     - is it detectable? (a wrong TYPE is detectable; a wrong
+       VALUE of the right type may not be)
+     - did anything downstream consume the corrupt data --
+       exports, webhooks, derived collections, caches?
+     This determines whether recovery is "restore the field" or
+     "restore and re-derive everything downstream".
+
+  2. PIN THE EXACT MOMENT
+     Find the first corrupt write in the oplog backup or the
+     migration's own logs. Target the second BEFORE it.
+
+  3. RESTORE TO A SEPARATE CLUSTER, NOT OVER PRODUCTION
+     13:00 snapshot + oplog replayed to 14:22:59.
+     Never restore in place: production has
+     legitimate writes since 14:23 that must not be lost.
+
+  4. RECONCILE, do not overwrite
+     For each affected document, take the good field value from
+     the restored copy and apply it to production with a
+     targeted, idempotent update -- leaving every field the
+     migration did not touch alone.
+
+       for each doc in restored:
+         prod.updateOne({ _id: doc._id },
+                        { $set: { theField: doc.theField } })
+
+     Batched, with w: "majority", restartable. Same discipline
+     as any backfill.
+
+  5. VERIFY
+     Count of documents still matching the corrupt shape -> 0.
+     Spot-check a sample against the restored copy.
+     Re-run whatever detected the problem originally.
+</pre>
+      <p><strong>The judgement call, which I would escalate rather than decide alone:</strong> what to do about
+         documents that were legitimately written <em>after</em> 14:23 and are also corrupt because the
+         migration was still running. Those have no good version anywhere. Depending on the field, the
+         options are recompute from another source, mark them for manual review, or accept the loss — and
+         that is a business decision.</p>
+      <p><strong>What makes this recoverable at all</strong> is the continuous oplog backup. With hourly
+         snapshots alone the best available point would be 14:00, losing 23 minutes of legitimate writes
+         across every collection — which is the difference between a targeted field repair and a much uglier
+         conversation.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Design a backup verification job that proves backups are
+      restorable without a human running a drill.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The principle: the only proof that a backup is restorable is restoring it.</strong> Everything
+         short of that — checking the snapshot exists, checking its size, checking the job exited 0 — verifies
+         the backup <em>system</em>, not the backup. So the job must actually restore.</p>
+<pre>
+  NIGHTLY, automated:
+
+  1. Pick the most recent snapshot.
+  2. Provision an isolated environment from infrastructure-as-
+     code (the SAME definition the real runbook uses -- so this
+     job also tests the runbook).
+  3. Restore. Time every phase separately:
+       provision / attach / mongod start / recovery /
+       replica set formation / ready
+  4. VERIFY THE DATA, which is the part that distinguishes this
+     from a smoke test:
+       - document count per collection vs a recorded expectation
+       - index count and definitions per collection
+       - the newest document's timestamp  -> REAL RPO, measured
+       - a sampled checksum: hash N documents by _id from the
+         restore and compare against production
+       - run the application's three most important read queries
+         and assert they return plausible results
+  5. Publish as metrics: restore_duration_seconds by phase,
+     measured_rpo_seconds, verification_pass.
+  6. Tear down.
+</pre>
+      <table class="tbl">
+        <tr><th>Metric</th><th>Alert when</th></tr>
+        <tr><td><code>verification_pass</code></td><td>False, ever</td></tr>
+        <tr><td><code>restore_duration_seconds</code></td><td>Exceeds 50% of the RTO budget — a trend line here is an early warning that data growth is eating the RTO</td></tr>
+        <tr><td><code>measured_rpo_seconds</code></td><td>Exceeds the stated RPO</td></tr>
+        <tr><td>Job did not run</td><td>Always. A verification job that silently stops is worse than none, because it produces false confidence</td></tr>
+      </table>
+      <p><strong>What this catches:</strong> a corrupt or incomplete snapshot, a backup job that has been
+         silently failing, restore duration creeping past the RTO as data grows, an RPO gap larger than
+         believed, and drift between the runbook's infrastructure definition and reality.</p>
+      <p><strong>What it deliberately does not replace:</strong> the human drill. This job proves the data is
+         restorable; it does not prove that a person on call at 3am can find the snapshot, has the
+         permissions, knows to change the DNS endpoint, and remembers to rebuild the replica set. In the
+         measured 9h47m restore, almost all of the excess was human and procedural, and none of it would have
+         been caught by an automated job. Both are needed, and they test different things.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Write the disaster-recovery plan for a 2 TB sharded cluster
+      with an RTO of 1 hour and an RPO of 5 minutes. Be explicit about what is expensive.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Start by testing whether the numbers are achievable at all</strong>, because a 1-hour RTO on
+         2 TB rules out restore-from-backup as the primary mechanism. The measured restore of a comparable
+         cluster, after three engineer-days of optimisation, was 52 minutes — with no margin, and that
+         assumed everything went right. So the plan cannot depend on it.</p>
+<pre>
+  PRIMARY MECHANISM: a warm standby, not a restore
+    Cross-region replica set members (priority 0) for every shard,
+    plus config servers.
+    -> RPO = replication lag, typically well under 5 minutes
+    -> RTO = reconfiguration + endpoint switch, not a data copy
+
+  RECOVERY PROCEDURE (the 1-hour path)
+    t+0    detect and decide (the decision is often the longest
+           step -- pre-agree the trigger conditions)
+    t+5    rs.reconfig() to promote the DR region members
+    t+10   config servers reconfigured
+    t+15   endpoint switch (DNS with a 30s TTL, pre-created)
+    t+20   application connected, verify writes succeed
+    t+40   cache warming; expect degraded latency, which is
+           EXPECTED and should be communicated, not treated as a
+           failed recovery
+    t+60   declared recovered
+
+  SECONDARY MECHANISM: backups, for what standby cannot cover
+    Coordinated snapshots (balancer stopped) + continuous oplog,
+    immutable, separate account, 35-day retention plus monthly
+    archives for a year.
+    -> covers human error, corruption, and compromise, which the
+       standby faithfully replicates
+</pre>
+      <table class="tbl">
+        <tr><th>What is expensive, honestly</th><th>Why</th></tr>
+        <tr><td>The warm standby</td><td>A full second copy of the cluster's compute and storage. Roughly doubles infrastructure cost — this is the price of a 1-hour RTO on 2 TB and should be stated as such to whoever set the number</td></tr>
+        <tr><td>Cross-region replication bandwidth</td><td>Continuous, proportional to write volume</td></tr>
+        <tr><td>Write latency, if the majority spans regions</td><td>Measured ~84 ms p50. Keeping the majority in-region avoids this but means DR promotion needs a manual reconfiguration — which is the trade to decide deliberately</td></tr>
+        <tr><td>Drill time</td><td>Quarterly, and a real one costs a day of several people</td></tr>
+      </table>
+      <p><strong>The trade I would put in front of the business:</strong> keeping the majority in the primary
+         region gives fast writes and a DR promotion that requires a reconfiguration step; spanning the
+         majority across regions gives automatic failover and adds ~84 ms to every write. Both can meet a
+         1-hour RTO. Only one meets it without a human, and only one keeps writes fast. That is their choice
+         to make with the numbers in front of them, not mine to make silently.</p>
+      <p><strong>What I would also insist on:</strong> pre-agreed trigger conditions for declaring a disaster.
+         In every drill I have seen, the longest single step was deciding to fail over — and an hour of RTO
+         does not survive twenty minutes of deliberation.</p>
+      <p><strong>And the sharded-specific requirement:</strong> the config servers are part of the DR plan.
+         Restoring shards without a consistent config server snapshot produces documents no shard claims. Any
+         backup procedure here must stop the balancer and capture config servers and shards at one cluster
+         time — the failure is silent and only appears on read.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> You join a company where nobody knows whether the backups
+      work. Produce a 30-day plan.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Week 1 — establish the facts, change nothing.</strong> Almost all the value is here, and it is
+         cheap.</p>
+      <table class="tbl">
+        <tr><th>Question</th><th>How to answer it</th></tr>
+        <tr><td>What backups exist?</td><td>Inventory: what, where, how often, what retention, when did each last succeed</td></tr>
+        <tr><td>Is anything <em>not</em> backed up?</td><td>Compare against the list of databases and collections. This is where the finding usually is</td></tr>
+        <tr><td>Are they reachable with production credentials?</td><td>If yes, they are not protection against compromise</td></tr>
+        <tr><td>What is the stated RTO/RPO, and who stated it?</td><td>Often nobody. That is a finding, not a gap to fill silently</td></tr>
+        <tr><td>Has anyone ever restored?</td><td>Ask. The answer is usually "not this cluster"</td></tr>
+      </table>
+      <p><strong>Week 2 — one restore.</strong> Not a programme, one restore of the most important database into
+         an isolated environment, timed by phase and data-verified. Done by me, documenting every step and
+         every permission I did not have. The output is a measured RTO and a first runbook, and it converts
+         every subsequent conversation from opinion to evidence.</p>
+      <p><strong>Week 3 — fix what the restore found, in this order:</strong></p>
+      <ol>
+        <li>Anything not backed up at all.</li>
+        <li>Backups deletable with production credentials → immutable storage in a separate account. This is
+            the highest-value change and it is usually a configuration, not a project.</li>
+        <li>Retention shorter than plausible detection time → add long-retention monthly archives. Cheap.</li>
+        <li>Missing permissions and undocumented steps in the runbook.</li>
+      </ol>
+      <p><strong>Week 4 — make it hold.</strong> The automated nightly restore-and-verify job with metrics; an
+         alert when it does not run; a quarterly human drill scheduled with a named owner; and a written
+         RTO/RPO per data tier, taken to whoever owns the business risk for confirmation.</p>
+      <p><strong>What I would present at the end</strong> is one page: measured RTO versus stated RTO, measured
+         RPO versus stated RPO, the list of what is not backed up, and the cost of closing each gap. Numbers,
+         not a maturity assessment.</p>
+      <p><strong>What I would resist:</strong> starting with a tooling migration. "We should move to a better
+         backup product" is the most common first instinct and it defers the only question that matters —
+         whether what exists today can be restored. The restore in week 2 usually changes what tooling is
+         even needed, and occasionally reveals that the existing system was fine and the problem was that
+         nobody had permissions.</p>
+      <p><strong>The one thing I would escalate immediately, before week 1 ends:</strong> if any critical
+         database has no backup at all, that is not a 30-day-plan item. That is a fix-this-week item, even
+         with a crude daily <code>mongodump</code> to immutable storage as a stopgap while the proper
+         mechanism is built.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Durability has four layers</strong>: memory, journal, majority replication, checkpoint. Each
+            survives a different failure.</li>
+        <li><strong><code>w: "majority"</code> means "in memory on a majority"</strong> — a simultaneous power
+            loss across those nodes can still lose it. <code>j: true</code> closes that, for ~1.3 ms.</li>
+        <li><strong>Replication is not a backup.</strong> An accidental <code>deleteMany</code> reached all
+            three nodes in 11 ms.</li>
+        <li><strong>Backups reachable with production credentials do not protect against compromise.</strong>
+            Immutable, separate account, separate region.</li>
+        <li><strong><code>mongodump</code> is not a strategy at scale</strong> — 14 h to dump and 26 h to restore
+            900 GB, with no cross-shard consistency.</li>
+        <li><strong>Sharded backups must be coordinated</strong>: balancer stopped, config servers and all
+            shards at one cluster time, or a migration between snapshots leaves documents no shard claims.</li>
+        <li><strong>Take backups from a hidden member</strong> so they do not evict the production working
+            set.</li>
+        <li><strong>Retention is set by detection time, not recovery time.</strong> Corruption found on day 9
+            with 7-day retention meant every snapshot was already corrupt.</li>
+        <li><strong>Derive RTO and RPO from the cost of downtime</strong>, and tier them per collection —
+            derived data is often cheaper to recompute than to back up.</li>
+        <li><strong>Point-in-time recovery is bounded by the backup system's oplog retention</strong>, which is
+            not the live cluster's oplog window.</li>
+        <li><strong>A backup you have not restored is a hypothesis.</strong></li>
+        <li><strong>Measure time to <em>serving</em>, not time to started</strong>: a designed 4-hour RTO
+            measured 9h47m, then 52 minutes after three engineer-days.</li>
+        <li><strong>A restore does not bring back the cache, the endpoint, the alarms, the replica set
+            topology, or the users and roles.</strong></li>
+        <li><strong>"Available" is not "usable"</strong> — a cold restored cluster served 18× latency for 40
+            minutes.</li>
+        <li><strong>Verify restored data</strong>: document counts, sampled checksums, and the newest timestamp,
+            which is your <em>real</em> RPO.</li>
+        <li><strong>Drills should be run by someone who did not build the system</strong>, because that is who
+            will be on call.</li>
+        <li><strong>Automate a nightly restore-and-verify</strong> for the data, and keep the human drill for
+            the procedure — they test different failures.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="sharding.html">← Sharding &amp; Shard Keys</a>
+      <a href="operations.html">Operating MongoDB →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
