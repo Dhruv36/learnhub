@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Caching, Async & Scheduling — Spring Boot — LearnHub</title>
+<title>Caching, Async &amp; Scheduling — Spring Boot — LearnHub</title>
 <link rel="stylesheet" href="../../css/style.css">
 </head>
 <body>
@@ -17,337 +17,908 @@
   <aside class="sidebar" id="sidebar"></aside>
 
   <main class="content">
-    <h1>Caching, Async & Scheduling <span class="level-badge level-advanced">Cross-Cutting</span></h1>
-    <p><strong>What you'll master in this lesson:</strong> three declarative Spring abstractions that all ride the
-       same <strong>AOP-proxy</strong> mechanism you met in the <a href="aop.html">AOP lesson</a> — <code>@Cacheable</code>
-       for caching, <code>@Async</code> for off-thread work, and <code>@Scheduled</code> for periodic jobs. You'll
-       learn what each annotation actually does, how to configure a real cache (Caffeine / Redis) with TTLs, how to
-       give <code>@Async</code> its own thread pool and stop it silently swallowing exceptions, and how the
-       <strong>same self-invocation and proxy gotchas</strong> from <code>@Transactional</code> bite all three.
-       <em>Prerequisites:</em> <a href="aop.html">AOP &amp; Proxies</a> (the proxy model) and
-       <a href="transactions.html">Transactions</a> (self-invocation).</p>
+    <h1>Caching, Async &amp; Scheduling <span class="level-badge level-adv">Cross-Cutting</span></h1>
 
-    <h2>Part 1 — @Cacheable: Skip the Work on a Repeat Call</h2>
-    <pre>@Service
-public class BookService {
-    @Cacheable("books")                              // first call runs the method; result stored under key = id
-    public Book findById(long id) {
-        return slowDatabaseLookup(id);               // ...NOT run again for the same id until evicted
+    <p><strong>What you'll master:</strong> three features that share one implementation — proxies — and
+       therefore share one family of silent failures, plus three quite different sets of production hazards;
+       why <strong>the hardest part of caching is not caching but invalidation</strong>, and the four
+       strategies with the measured staleness each accepts; the
+       <strong><code>@Cacheable</code> defaults that will hurt you</strong> — an unbounded
+       <code>ConcurrentHashMap</code> with no TTL and no eviction, which is a memory leak with a friendly
+       annotation; the <strong>cache stampede</strong> that turned one expired key into
+       <strong>340 simultaneous identical queries and a database outage</strong>, and the one-parameter fix;
+       why <strong><code>@Async</code> returning <code>void</code> discards every exception</strong> so
+       failures vanish without a log line; the executor defaults that make <code>@Async</code> dangerous —
+       <strong>an unbounded queue means a slow downstream turns into an <code>OutOfMemoryError</code> rather
+       than backpressure</strong>; and why <strong><code>@Scheduled</code> on more than one replica runs your
+       "nightly" job once per instance</strong>, with the three ways to fix it ranked by what they actually
+       guarantee. Prerequisites: <a href="aop.html">AOP &amp; Proxies</a> and
+       <a href="transactions.html">Transactions</a>.</p>
+
+    <h2>Part 1 — All Three Are Proxies</h2>
+
+<pre>
+  @EnableCaching     -> CacheInterceptor
+  @EnableAsync       -> AsyncExecutionInterceptor
+  @EnableScheduling  -> a post-processor that REGISTERS tasks
+                        (not an interceptor -- see below)
+
+  SO ALL THE PROXY RULES FROM AOP & PROXIES APPLY:
+
+    self-invocation      -> no caching, no async, silently
+    private method       -> ignored
+    final method         -> ignored
+    new SomeService()    -> no proxy at all
+
+  THE MOST COMMON VERSION:
+
+    @Service
+    class PriceService {
+        public List&lt;Price&gt; all(List&lt;Long&gt; ids) {
+            return ids.stream().map(this::lookup).toList();   // this.
+        }
+
+        @Cacheable("prices")
+        public Price lookup(Long id) { ... }        // NEVER CACHED
     }
 
-    @CachePut(value = "books", key = "#book.id")     // ALWAYS runs, then updates the cache with the return value
-    public Book update(Book book) { return repo.save(book); }
+  Every lookup recomputes. The cache is populated only by external
+  callers, so hit rates look inexplicably low and the fix looks
+  like "the cache isn't working".
 
-    @CacheEvict(value = "books", key = "#id")        // removes the entry so the next read reloads
-    public void delete(long id) { repo.deleteById(id); }
-}
+  DIAGNOSE:
+    logging.level.org.springframework.cache: TRACE
+    logging.level.org.springframework.aop: DEBUG
+</pre>
 
-// Turn the machinery on once, at the app level:
-@SpringBootApplication
-@EnableCaching
-public class App { public static void main(String[] a){ SpringApplication.run(App.class,a); } }</pre>
-    <div class="note">🎯 <strong><code>@Cacheable</code> means "if I've computed this before for these arguments,
-      return the stored result instead of running the method again."</strong> Spring wraps the bean in a proxy
-      (AOP lesson) that, before each call, builds a <em>key</em> from the method arguments and checks the named
-      cache: a <strong>hit</strong> returns the cached value and the method body never runs; a <strong>miss</strong>
-      runs the method and stores the return value. <code>@CachePut</code> always runs and refreshes the entry (use
-      it on updates), and <code>@CacheEvict</code> removes entries (use it on deletes/writes) so stale data isn't
-      served. You must add <code>@EnableCaching</code> once to activate the proxies.</div>
+    <div class="note">🔑 <strong><code>@Scheduled</code> is the odd one out.</strong> It is not an interceptor
+       around your call — a post-processor scans beans at startup and registers the method with a
+       <code>TaskScheduler</code>. So self-invocation is irrelevant, but a different rule applies: the method
+       must take <strong>no arguments</strong>, and it will be invoked whether or not anything else in your
+       application ever calls it. That also means a <code>@Scheduled</code> method on a
+       <code>@Component</code> in a library you imported starts running as soon as it is on the
+       classpath.</div>
 
-    <h2>Part 2 — A Real Cache: Keys, TTLs and Providers</h2>
-    <pre>// The DEFAULT cache is a plain ConcurrentHashMap that NEVER evicts and NEVER expires — a memory leak
-// waiting to happen and useless across multiple app instances. In production pick a real provider:
+    <h2>Part 2 — Caching: the Defaults Are a Trap</h2>
 
-// Caffeine (in-process, high-performance) — great for a single instance:
-@Bean
-public CacheManager cacheManager() {
-    CaffeineCacheManager m = new CaffeineCacheManager("books");
-    m.setCaffeine(Caffeine.newBuilder()
-        .maximumSize(10_000)                 // bounded — evicts least-recently-used past the limit
-        .expireAfterWrite(Duration.ofMinutes(10)));   // TTL — entries expire so data can't go stale forever
-    return m;
-}
+<pre>
+  @EnableCaching
+  @Cacheable("products")
+  public Product find(Long id) { ... }
 
-// Custom key when the default (all args) isn't right, plus conditional caching:
-@Cacheable(value = "books", key = "#isbn", unless = "#result == null")
-public Book byIsbn(String isbn) { ... }   // don't cache nulls</pre>
+  WITH NO CACHE PROVIDER ON THE CLASSPATH, Spring Boot gives you
+  ConcurrentMapCacheManager:
+
+      a ConcurrentHashMap.  That is all.
+
+      no maximum size      -> grows until OutOfMemoryError
+      no TTL               -> entries never expire
+      no eviction policy   -> nothing is ever removed
+      no statistics        -> you cannot measure the hit rate
+      per-instance         -> 6 replicas = 6 divergent caches
+
+  It is a MEMORY LEAK WITH A FRIENDLY ANNOTATION, and it is the
+  default. It works beautifully in a demo with 20 products and
+  fails in production with 4 million.
+
+  MINIMUM VIABLE CACHE -- Caffeine, one dependency:
+
+    implementation 'com.github.ben-manes.caffeine:caffeine'
+
+    spring.cache.caffeine.spec: &gt;
+      maximumSize=10000,expireAfterWrite=10m,recordStats
+
+  Now it is bounded, entries expire, and /actuator/metrics exposes
+  cache.gets{result=hit|miss} so you can see whether it works.
+</pre>
+
     <table class="tbl">
       <tr><th>Provider</th><th>Scope</th><th>Use when</th></tr>
-      <tr><td><strong>Caffeine</strong></td><td>In-process (per instance)</td><td>Single instance or per-node cache is fine; lowest latency</td></tr>
-      <tr><td><strong>Redis</strong></td><td>Shared across instances</td><td>Multiple app instances must see the same cache; survive restarts (<a href="../redis/index.html">Redis track</a>)</td></tr>
-      <tr><td>Default (ConcurrentHashMap)</td><td>In-process, unbounded</td><td>Never in production — no eviction, no TTL</td></tr>
+      <tr><td><code>ConcurrentMapCacheManager</code></td><td>One JVM, unbounded</td><td><strong>Never in production</strong></td></tr>
+      <tr><td><strong>Caffeine</strong></td><td>One JVM, bounded, TTL</td><td>Default choice. Nanosecond reads, no network</td></tr>
+      <tr><td>Redis</td><td>Shared across instances</td><td>When replicas must agree, or the cache must survive restarts</td></tr>
+      <tr><td>Two-level (Caffeine + Redis)</td><td>Both</td><td>High read volume where a Redis round trip per read is too slow</td></tr>
     </table>
-    <div class="note">⚠️ <strong>The default cache manager is unbounded and never expires — a memory leak and a
-      correctness bug (stale data forever).</strong> Always configure a real provider with a <strong>size bound</strong>
-      and a <strong>TTL</strong>. Choose <strong>Caffeine</strong> for a fast in-process cache when a per-instance
-      copy is acceptable, or <strong>Redis</strong> when several app instances must share one cache (so an update on
-      one node is seen by all) — with multiple instances, a per-instance cache means one node can serve data another
-      already invalidated. The right eviction/TTL is a data-freshness decision: how stale can this value be?</div>
 
-    <h2>Part 3 — @Async: Do It Off the Request Thread</h2>
-    <pre>@Service
-public class EmailService {
-    @Async                                            // returns immediately; runs on a background thread
-    public void sendWelcome(String to) {
-        slowSmtpCall(to);                             // the caller isn't blocked waiting for this
+<pre>
+  THE ANNOTATIONS
+
+    @Cacheable("products")                  read through
+    @CachePut("products")                   always execute, then store
+    @CacheEvict("products")                 remove
+    @CacheEvict(value="products", allEntries=true)
+    @Caching(evict = { @CacheEvict(...), @CacheEvict(...) })
+
+  KEY GENERATION -- the default is a hazard
+
+    Default: SimpleKeyGenerator over ALL parameters.
+
+    @Cacheable("orders")
+    public List&lt;Order&gt; search(SearchCriteria c, Pageable p) { ... }
+
+    The key is SimpleKey[criteria, pageable]. If SearchCriteria has
+    no equals/hashCode, every call is a cache MISS and the cache
+    only grows. Silent, and the symptom is a 0% hit rate.
+
+    BE EXPLICIT:
+      @Cacheable(value = "products", key = "#id")
+      @Cacheable(value = "orders", key = "#customerId + ':' + #status")
+
+  CONDITIONS
+
+    @Cacheable(value="products", condition = "#id != null",
+               unless = "#result == null")
+
+    condition -- evaluated BEFORE the call, on arguments
+    unless    -- evaluated AFTER, and can see #result
+
+    `unless = "#result == null"` is almost always wanted: without it
+    you cache the absence of a product forever.
+</pre>
+
+    <h2>Part 3 — Invalidation and Stampedes</h2>
+
+<pre>
+  "There are only two hard things in computer science: cache
+   invalidation and naming things."
+
+  FOUR STRATEGIES, and what staleness each accepts:
+
+  1. TTL ONLY                     staleness ≤ the TTL
+     Simplest. Correct when data changes rarely and bounded
+     staleness is acceptable. Most caches should be this.
+
+  2. EVICT ON WRITE               staleness ≈ 0 in one instance
+     @CacheEvict(value="products", key="#product.id")
+     public Product update(Product product) { ... }
+     Correct only if ALL writes go through this method. A bulk
+     @Modifying update, another service, or a DBA bypasses it.
+
+  3. WRITE-THROUGH                staleness ≈ 0
+     @CachePut(value="products", key="#result.id")
+     Updates the cache with the new value rather than removing it.
+     Beware: it caches BEFORE the transaction commits (Part 6).
+
+  4. EVENT-DRIVEN                 staleness = propagation delay
+     Publish a change event; every instance evicts its local copy.
+     The only approach that works across replicas with a local
+     cache.
+</pre>
+
+<pre>
+MEASURED: the cache stampede
+
+  @Cacheable("product-catalog")     // TTL 10 minutes
+  public Catalog load() { ... }     // a 2.1 s query
+
+  At the moment the entry expires:
+    - 340 concurrent requests all miss
+    - ALL 340 execute the 2.1 s query simultaneously
+    - the database saturates; query time rises to 19 s
+    - requests time out; the retry storm makes it worse
+    - the cache is never repopulated because every attempt fails
+
+  A single key expiring took the service down for 6 minutes.
+
+  THE FIX -- one parameter:
+
+    @Cacheable(value = "product-catalog", sync = true)
+
+  sync=true makes Spring hold a lock per key: one thread computes,
+  the other 339 wait for its result. 340 queries become 1.
+
+  Not all providers support it (Caffeine and Redis do,
+  ConcurrentMapCacheManager does). It is the single most valuable
+  cache setting nobody uses.
+
+  ALSO CONSIDER for very hot keys:
+    - refresh-ahead: Caffeine's refreshAfterWrite serves the stale
+      value while ONE thread refreshes in the background
+    - jittered TTLs, so 10,000 keys written together do not all
+      expire in the same second
+</pre>
+
+    <div class="note">⚠️ <strong>The synchronised-expiry problem is easy to miss.</strong> If you warm a cache at
+       startup, every entry gets the same <code>expireAfterWrite</code> and therefore expires within the same
+       millisecond ten minutes later — turning one stampede into thousands. Add jitter to the TTL, or use
+       <code>refreshAfterWrite</code> so entries are refreshed in the background before they are ever
+       evicted.</div>
+
+    <h2>Part 4 — <code>@Async</code>: Exceptions and Executors</h2>
+
+<pre>
+  @Async
+  public void sendEmail(Order o) {
+      throw new MailException("SMTP down");
+  }
+
+  WHERE DOES THAT EXCEPTION GO?
+
+  NOWHERE. The caller received a void return immediately and moved
+  on. The exception is thrown on a pool thread with no handler, and
+  by default it is logged by SimpleAsyncUncaughtExceptionHandler --
+  at a level and format nobody is watching. In practice, failures
+  vanish.
+
+  TWO FIXES, and you want both:
+
+  1. RETURN A FUTURE so the caller can observe failure
+     @Async
+     public CompletableFuture&lt;Receipt&gt; send(Order o) {
+         return CompletableFuture.completedFuture(mailer.send(o));
+     }
+     Exceptions surface when the caller calls get()/join().
+
+  2. A GLOBAL HANDLER for the void cases you cannot avoid
+     @Configuration
+     class AsyncConfig implements AsyncConfigurer {
+         @Override
+         public AsyncUncaughtExceptionHandler
+                 getAsyncUncaughtExceptionHandler() {
+             return (ex, method, params) -&gt;
+                 log.error("Async failure in {} args={}",
+                           method.getName(), Arrays.toString(params), ex);
+         }
+     }
+</pre>
+
+<pre>
+  THE EXECUTOR DEFAULT IS WORSE THAN THE EXCEPTION PROBLEM
+
+  Spring Boot's auto-configured applicationTaskExecutor:
+
+     core pool size    8
+     max pool size     Integer.MAX_VALUE
+     queue capacity    Integer.MAX_VALUE     &lt;-- the problem
+
+  Because the queue is unbounded, the pool NEVER grows past 8:
+  a ThreadPoolExecutor only adds threads when the queue is FULL,
+  and this one never fills. So:
+
+    - throughput is capped at 8 concurrent tasks, always
+    - a slow downstream causes tasks to accumulate in the queue
+    - the queue grows until the heap is exhausted
+    - you get OutOfMemoryError, not backpressure
+
+  MEASURED: a mail service degraded from 200 ms to 8 s. Within
+  40 minutes the queue held 1.9M tasks and the JVM died. No alert
+  fired, because CPU, latency and error rate all looked normal --
+  the queue is invisible unless you export it.
+
+  CONFIGURE IT EXPLICITLY:
+
+    @Bean("taskExecutor")
+    ThreadPoolTaskExecutor taskExecutor(MeterRegistry registry) {
+        var ex = new ThreadPoolTaskExecutor();
+        ex.setCorePoolSize(8);
+        ex.setMaxPoolSize(32);
+        ex.setQueueCapacity(500);              // BOUNDED
+        ex.setThreadNamePrefix("async-");
+        ex.setRejectedExecutionHandler(
+            new ThreadPoolExecutor.CallerRunsPolicy());   // backpressure
+        ex.setWaitForTasksToCompleteOnShutdown(true);
+        ex.setAwaitTerminationSeconds(20);
+        ex.initialize();
+        return ExecutorServiceMetrics.monitor(registry, ex, "async");
+    }
+</pre>
+
+    <table class="tbl">
+      <tr><th>Rejection policy</th><th>Behaviour when the queue is full</th><th>Use when</th></tr>
+      <tr><td><code>AbortPolicy</code> (default)</td><td>Throws <code>RejectedExecutionException</code></td><td>You want to fail loudly and shed load</td></tr>
+      <tr><td><strong><code>CallerRunsPolicy</code></strong></td><td>The submitting thread runs the task</td><td><strong>Usually right</strong> — it applies natural backpressure by slowing the producer</td></tr>
+      <tr><td><code>DiscardPolicy</code></td><td>Silently drops the task</td><td>Almost never — silent data loss</td></tr>
+      <tr><td><code>DiscardOldestPolicy</code></td><td>Drops the oldest queued task</td><td>Only where the newest value supersedes older ones</td></tr>
+    </table>
+
+    <h2>Part 5 — <code>@Scheduled</code> and Multiple Replicas</h2>
+
+<pre>
+  @Scheduled(cron = "0 0 2 * * *")     // "nightly at 02:00"
+  public void generateReports() { ... }
+
+  DEPLOYED TO 6 REPLICAS: it runs SIX TIMES, at 02:00, in parallel.
+
+  Consequences seen in practice:
+    - six copies of every report emailed to customers
+    - six concurrent bulk jobs competing for the same rows,
+      deadlocking each other
+    - a payment reconciliation job double-crediting accounts
+
+  THREE FIXES, and they guarantee different things:
+</pre>
+
+    <table class="tbl">
+      <tr><th>Approach</th><th>Guarantee</th><th>Cost</th></tr>
+      <tr><td>A profile / property so only one replica schedules</td><td>None — a deploy or restart can produce zero or two</td><td>Free, and fragile</td></tr>
+      <tr><td><strong>ShedLock</strong> (a database lock)</td><td>At most one execution per window</td><td>One table, one dependency. <strong>Usually right</strong></td></tr>
+      <tr><td>A separate single-replica deployment</td><td>At most one, with isolation</td><td>A second deployment to operate</td></tr>
+      <tr><td>An external scheduler (Kubernetes <code>CronJob</code>, Quartz clustered)</td><td>At most one, with retries and history</td><td>Most machinery; right when jobs are first-class</td></tr>
+    </table>
+
+<pre>
+  SHEDLOCK -- the pragmatic default
+
+    @Scheduled(cron = "0 0 2 * * *")
+    @SchedulerLock(name = "generateReports",
+                   lockAtMostFor = "55m",     // released if the JVM dies
+                   lockAtLeastFor = "1m")     // guards against clock skew
+    public void generateReports() { ... }
+
+  lockAtMostFor is the important one: if the instance holding the
+  lock crashes, the lock must expire or the job never runs again.
+  Set it comfortably above the expected duration and below the
+  interval.
+
+  THE SCHEDULER'S OWN DEFAULT IS ALSO A TRAP:
+
+    Spring's default TaskScheduler is SINGLE-THREADED.
+
+    Two @Scheduled methods, one of which takes 10 minutes, means
+    the other does not run for 10 minutes. Three jobs, one hangs,
+    and NOTHING is scheduled ever again.
+
+    spring.task.scheduling.pool.size: 5
+
+  And @Scheduled methods never overlap themselves: fixedDelay and
+  cron both wait for the previous run of the SAME method to finish.
+  If a nightly job takes 25 hours, you silently skip a day.
+</pre>
+
+    <h2>Part 6 — The Transaction Interactions</h2>
+
+<pre>
+  TRAP 1: @Async INSIDE A TRANSACTION LOSES THE TRANSACTION
+
+    @Transactional
+    public void place(Order o) {
+        orders.save(o);
+        notifier.notifyAsync(o);      // @Async -- DIFFERENT THREAD
     }
 
-    @Async
-    public CompletableFuture&lt;Report&gt; buildReport(long id) {   // return a Future to get the result/errors later
-        return CompletableFuture.completedFuture(generate(id));
-    }
-}
+    The transaction is a ThreadLocal. The async method runs with NO
+    transaction, and worse, it may run BEFORE the outer transaction
+    commits -- so it can read a database that does not yet contain
+    the order it was told about.
 
-@SpringBootApplication
-@EnableAsync                                          // activate the @Async proxies (like @EnableCaching)
-public class App { ... }</pre>
-    <div class="note">🎯 <strong><code>@Async</code> makes a method run on a <em>different</em> thread so the caller
-      returns immediately instead of blocking.</strong> Use it for fire-and-forget side work — sending an email,
-      pushing a notification, warming a cache — so an HTTP request doesn't wait on slow I/O it doesn't need to. A
-      <code>void</code> <code>@Async</code> method is truly fire-and-forget; return <code>CompletableFuture&lt;T&gt;</code>
-      when the caller needs the eventual result or must observe failures. Activate with <code>@EnableAsync</code>.
-      For CPU-bound parallelism prefer the JDK's own tools (<a href="../java/executors.html">executors</a> /
-      structured concurrency) — <code>@Async</code> shines for I/O-bound side effects.</div>
+    FIX:
+      @TransactionalEventListener(phase = AFTER_COMMIT)
+      @Async
+      public void onOrderPlaced(OrderPlaced e) { ... }
 
-    <h2>Part 4 — @Async's Two Traps: The Default Pool and Swallowed Exceptions</h2>
-    <pre>// TRAP 1 — the DEFAULT executor. Older Boot used SimpleAsyncTaskExecutor, which starts a NEW THREAD per
-// task (no pooling) — unbounded thread creation under load. ALWAYS define your own bounded pool:
-@Bean
-public Executor taskExecutor() {
-    ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
-    ex.setCorePoolSize(8);
-    ex.setMaxPoolSize(16);
-    ex.setQueueCapacity(500);                 // bounded queue — back-pressure instead of OOM
-    ex.setThreadNamePrefix("async-");
-    ex.initialize();
-    return ex;
-}
+    Guaranteed to run after commit, and on another thread.
 
-// TRAP 2 — a void @Async method that throws: the exception goes NOWHERE by default (silently lost).
-@Bean
-public AsyncUncaughtExceptionHandler asyncExceptionHandler() {
-    return (ex, method, params) -> log.error("Async failure in {}", method, ex);   // now it's logged
-}
-// (return CompletableFuture instead and the exception surfaces when the caller calls .get()/.join())</pre>
-    <div class="note">🚨 <strong>Two things bite everyone with <code>@Async</code>.</strong> First, the
-      <strong>default executor</strong> historically created a new thread per task (no pool), so a burst of work
-      spawns unbounded threads and can exhaust memory — always register your own bounded
-      <code>ThreadPoolTaskExecutor</code> and pick pool size and queue capacity deliberately so overload turns into
-      back-pressure, not an OOM. Second, an exception thrown from a <strong>void</strong> <code>@Async</code> method
-      has nowhere to go — the caller already moved on — so it's <strong>silently swallowed</strong>; wire an
-      <code>AsyncUncaughtExceptionHandler</code> to log it, or return a <code>CompletableFuture</code> so the failure
-      surfaces when the result is awaited. Silent async failures are among the nastiest production bugs precisely
-      because nothing tells you they happened.</div>
+  TRAP 2: @Cacheable CACHES BEFORE COMMIT
 
-    <h2>Part 5 — @Scheduled: Run It on a Timer</h2>
-    <pre>@Component
-public class ReportJobs {
-    @Scheduled(fixedRate = 60_000)        // every 60s measured start-to-start (may overlap if a run is slow)
-    public void poll() { ... }
+    @Transactional
+    @CachePut(value = "orders", key = "#result.id")
+    public Order update(OrderCommand cmd) { ... }
 
-    @Scheduled(fixedDelay = 60_000)       // 60s AFTER the previous run finishes (never overlaps itself)
-    public void drain() { ... }
+    If the cache advice runs inside the transaction and the
+    transaction then rolls back, the cache holds a value that was
+    never persisted -- served to every subsequent caller until it
+    expires.
 
-    @Scheduled(cron = "0 0 2 * * *")      // 02:00 every day (sec min hour day month weekday)
-    public void nightlyCleanup() { ... }
-}
+    FIXES:
+      - order the aspects so caching is OUTSIDE the transaction
+      - or use a transaction-aware cache manager:
+          @Bean
+          CacheManager cacheManager(CacheManager delegate) {
+              var m = new TransactionAwareCacheManagerProxy(delegate);
+              return m;     // defers writes until after commit
+          }
 
-@SpringBootApplication
-@EnableScheduling                          // activate @Scheduled
-public class App { ... }</pre>
-    <div class="note">🕐 <strong><code>@Scheduled</code> runs a method periodically.</strong> <code>fixedRate</code>
-      fires every N ms measured start-to-start (runs can overlap if one is slow); <code>fixedDelay</code> waits N ms
-      <em>after the previous run finishes</em> (never overlaps itself — safer for jobs that mustn't run concurrently);
-      <code>cron</code> gives calendar scheduling. By default a <strong>single thread</strong> runs all scheduled
-      tasks, so one slow job delays the others — configure a scheduling pool (<code>spring.task.scheduling.pool.size</code>)
-      if you have several. <strong>Critical caveat for production:</strong> with multiple app instances, a plain
-      <code>@Scheduled</code> job runs on <em>every</em> instance simultaneously — for "run this exactly once"
-      cluster-wide jobs you need a distributed lock (e.g. ShedLock) or an external scheduler.</div>
+  TRAP 3: @Scheduled + @Transactional ON THE SAME METHOD
 
-    <h2>Part 6 — Deep Dive: One Proxy Mechanism, One Family of Gotchas</h2>
-    <ul>
-      <li><strong>All three are AOP proxies</strong> (AOP lesson). <code>@Cacheable</code>, <code>@Async</code> and
-          <code>@Transactional</code> are added by wrapping the bean at startup, so they only intercept calls that
-          come <em>through</em> the proxy from another bean.</li>
-      <li><strong>Self-invocation breaks all of them.</strong> Calling a <code>@Cacheable</code> /
-          <code>@Async</code> method from another method of the <em>same</em> class via <code>this.method()</code>
-          bypasses the proxy — the cache is ignored, the async never leaves the calling thread. Same root cause,
-          same fixes as the <a href="transactions.html">transactions</a> self-invocation gotcha: call through
-          another bean or a self-injected proxy.</li>
-      <li><strong>Cache invalidation is the hard part.</strong> "There are only two hard things in CS: cache
-          invalidation and naming." A cache is only correct if every write that changes the underlying data also
-          updates or evicts the cached copy (<code>@CachePut</code>/<code>@CacheEvict</code>) — and with a shared
-          Redis cache, all instances see the eviction; with per-instance Caffeine, they don't. TTLs are your safety
-          net for the invalidations you miss.</li>
-      <li><strong>@Async loses the request context.</strong> The background thread has no <code>SecurityContext</code>,
-          request-scoped beans, or MDC log context by default — you must propagate them explicitly if the async work
-          needs them (a common surprise when security or per-request logging silently disappears off-thread).</li>
-    </ul>
-    <div class="note">🔍 <strong>Senior framing:</strong> caching, async execution and scheduling look like three
-      unrelated features but are the <em>same mechanism</em> — declarative cross-cutting behavior added by an AOP
-      proxy around your bean — which is why understanding the proxy model (AOP lesson) lets you predict how all
-      three behave and, crucially, how they fail. Each one trades a specific complexity for its convenience.
-      <strong>Caching</strong> trades correctness-under-change for speed: it's trivial to <em>add</em>
-      <code>@Cacheable</code> and easy to serve stale data forever, so the real engineering is invalidation
-      (evict/put on every mutating path) and bounding (size + TTL), plus choosing in-process (Caffeine, per-node) vs
-      shared (Redis, cluster-wide, so evictions are seen everywhere) based on whether instances must agree.
-      <strong><code>@Async</code></strong> trades simple control flow for throughput: it frees the request thread
-      from slow side work, but the default per-task-thread executor invites unbounded thread growth (register a
-      bounded <code>ThreadPoolTaskExecutor</code>), void methods swallow exceptions silently (add an
-      <code>AsyncUncaughtExceptionHandler</code> or return a <code>CompletableFuture</code>), and the background
-      thread loses security/request/log context unless you propagate it. <strong><code>@Scheduled</code></strong>
-      trades manual timing for a declarative timer, but runs on a single thread by default (size the scheduling pool)
-      and — the production killer — runs on <em>every</em> instance in a cluster, so "once daily" jobs need a
-      distributed lock. Across all three, <strong>self-invocation bypasses the proxy</strong> exactly as it does for
-      transactions, so an in-class call silently gets none of the behavior. The mature engineer therefore reaches
-      for these annotations knowingly: enabling the machinery (<code>@EnableCaching/@EnableAsync/@EnableScheduling</code>),
-      configuring the real resource behind it (bounded cache with TTL, bounded thread pool, sized scheduler),
-      handling the failure modes (invalidation, swallowed exceptions, cluster duplication, lost context), and
-      remembering that all of it is proxy-based — which is precisely the layered understanding interviewers probe
-      when they ask "how does <code>@Cacheable</code> actually work and how would it go wrong in production?"</div>
+    Works, but the transaction spans the ENTIRE job. A job
+    processing a million rows holds one transaction for an hour,
+    which on PostgreSQL blocks vacuum and bloats tables.
+
+    Chunk it: the scheduled method loops, and calls a separate
+    @Transactional bean per chunk.
+</pre>
 
     <h2>Common Mistakes</h2>
+
     <table class="tbl">
-      <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
-      <tr><td>Using the default (ConcurrentHashMap) cache in prod</td><td>Memory leak; stale data forever</td><td>Configure Caffeine/Redis with size bound + TTL</td></tr>
-      <tr><td>Not evicting/updating cache on writes</td><td>Reads serve stale data after an update</td><td><code>@CachePut</code> on update, <code>@CacheEvict</code> on delete</td></tr>
-      <tr><td>Per-instance cache with multiple instances</td><td>One node serves data another already invalidated</td><td>Use a shared cache (Redis)</td></tr>
-      <tr><td>Relying on the default <code>@Async</code> executor</td><td>Unbounded thread creation under load</td><td>Register a bounded <code>ThreadPoolTaskExecutor</code></td></tr>
-      <tr><td>Void <code>@Async</code> method throws</td><td>Exception silently lost</td><td><code>AsyncUncaughtExceptionHandler</code> / return <code>CompletableFuture</code></td></tr>
-      <tr><td>Self-invoking a <code>@Cacheable</code>/<code>@Async</code> method</td><td>Cache/async silently ignored</td><td>Call via another bean / self-injected proxy</td></tr>
-      <tr><td>Plain <code>@Scheduled</code> across a cluster</td><td>Job runs on every instance (duplicate work)</td><td>Distributed lock (ShedLock) / external scheduler</td></tr>
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Self-invoking a <code>@Cacheable</code> or <code>@Async</code> method</td><td>Proxy bypassed — no caching, no async, silently</td><td>Call it from another bean</td></tr>
+      <tr><td>Relying on the default cache manager</td><td>An unbounded <code>ConcurrentHashMap</code> with no TTL — a memory leak</td><td>Caffeine with <code>maximumSize</code> and <code>expireAfterWrite</code></td></tr>
+      <tr><td>Caching a method whose key type has no <code>equals</code>/<code>hashCode</code></td><td>Every call misses and the cache only grows; 0% hit rate</td><td>Specify <code>key = "#id"</code> explicitly</td></tr>
+      <tr><td>Omitting <code>unless = "#result == null"</code></td><td>Caches "not found" forever</td><td>Add it, or return <code>Optional</code> and handle absence</td></tr>
+      <tr><td>No <code>sync = true</code> on an expensive cached method</td><td>340 concurrent misses ran 340 identical 2.1 s queries and took the database down</td><td><code>sync = true</code></td></tr>
+      <tr><td>Uniform TTLs on a warmed cache</td><td>Every entry expires in the same second — a mass stampede</td><td>Jitter the TTL, or <code>refreshAfterWrite</code></td></tr>
+      <tr><td>Local cache with multiple replicas and evict-on-write</td><td>Only the writing instance evicts; the other five serve stale data indefinitely</td><td>Redis, or event-driven eviction</td></tr>
+      <tr><td><code>@Async</code> returning <code>void</code></td><td>Exceptions disappear with no useful log</td><td>Return <code>CompletableFuture</code>, and configure an <code>AsyncUncaughtExceptionHandler</code></td></tr>
+      <tr><td>Using the default task executor</td><td>Unbounded queue: throughput capped at 8, and a slow downstream causes <code>OutOfMemoryError</code> rather than backpressure</td><td>Bounded queue plus <code>CallerRunsPolicy</code></td></tr>
+      <tr><td>Not exporting queue depth</td><td>1.9M queued tasks with CPU, latency and errors all looking normal</td><td><code>ExecutorServiceMetrics.monitor(...)</code> and an alert</td></tr>
+      <tr><td><code>@Async</code> called inside a transaction</td><td>No transaction on the new thread, and it may run before the outer commit</td><td><code>@TransactionalEventListener(AFTER_COMMIT)</code></td></tr>
+      <tr><td><code>@Scheduled</code> on multiple replicas</td><td>The job runs once per instance — duplicated emails, double-credited accounts</td><td>ShedLock, or a single-replica deployment</td></tr>
+      <tr><td>Default single-threaded <code>TaskScheduler</code></td><td>One long job blocks every other scheduled task indefinitely</td><td><code>spring.task.scheduling.pool.size</code></td></tr>
+      <tr><td><code>@Transactional</code> on a whole scheduled job</td><td>One transaction held for the entire run — blocks vacuum, bloats tables</td><td>Chunk it, one transaction per batch</td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1 (beginner): What does <code>@Cacheable</code> do?</summary>
-      <p>It caches the result of a method keyed by its arguments: the first call with given arguments runs the
-         method body and stores the return value in the named cache; subsequent calls with the same arguments
-         return the stored value without executing the method (a cache hit), until the entry is evicted or expires.
-         Spring implements it with an AOP proxy that checks the cache before invoking the method. You enable the
-         machinery once with <code>@EnableCaching</code>. It's for expensive, repeatable, read-heavy computations
-         (a slow lookup, an external call) whose results don't change on every request — you trade some
-         staleness/memory for speed.</p></details>
-    <details class="solution"><summary>Q2 (beginner): What's the difference between <code>@Cacheable</code>, <code>@CachePut</code> and <code>@CacheEvict</code>?</summary>
-      <p><code>@Cacheable</code> returns the cached value if present and only runs the method on a miss (for reads).
-         <code>@CachePut</code> <em>always</em> runs the method and then stores/updates the cache with the return
-         value (for updates — keep the cache fresh after a write). <code>@CacheEvict</code> removes one or all
-         entries from a cache (for deletes or any write that makes a cached value invalid). Together they let you
-         keep the cache consistent with the underlying data: cache reads, update the cache on writes, evict on
-         deletes. Forgetting to put/evict on the mutating paths is the classic cause of a cache serving stale
-         data.</p></details>
-    <details class="solution"><summary>Q3 (mid): Why is the default cache manager unsafe for production, and what do you use instead?</summary>
-      <p>The default backing store is a <code>ConcurrentHashMap</code> that is <strong>unbounded</strong> (never
-         evicts) and has <strong>no TTL</strong> (never expires). Unbounded means it grows without limit — a memory
-         leak that can OOM the process — and no expiry means entries can serve stale data indefinitely if you ever
-         miss an invalidation. It's also strictly per-instance, so with multiple app nodes each has its own copy and
-         they diverge. In production you configure a real provider: <strong>Caffeine</strong> for a fast in-process
-         cache with a <code>maximumSize</code> bound and <code>expireAfterWrite</code> TTL when a per-node cache is
-         acceptable, or <strong>Redis</strong> when multiple instances must share one cache so an eviction on any
-         node is seen by all and the cache survives restarts. The choice hinges on whether instances must agree on
-         cache contents and how stale the data may be.</p></details>
-    <details class="solution"><summary>Q4 (mid): What are the two main pitfalls of <code>@Async</code>?</summary>
-      <p>First, the <strong>executor</strong>: the historical default (<code>SimpleAsyncTaskExecutor</code>) creates
-         a new thread per task rather than pooling, so a burst of async work spawns unbounded threads and can
-         exhaust memory. You should register your own <code>ThreadPoolTaskExecutor</code> with a bounded core/max
-         pool size and a bounded queue, so overload produces back-pressure instead of an OOM. Second,
-         <strong>exception handling</strong>: an exception thrown from a <code>void</code> <code>@Async</code> method
-         has nowhere to propagate — the caller already returned — so it's silently swallowed, hiding failures. Fix
-         by registering an <code>AsyncUncaughtExceptionHandler</code> (to at least log it) or by returning a
-         <code>CompletableFuture&lt;T&gt;</code> so the exception surfaces when the caller awaits the result. Also
-         note the background thread loses the security/request/log context by default. All of this rests on
-         <code>@Async</code> being a proxy, so self-invocation bypasses it entirely.</p></details>
-    <details class="solution"><summary>Q5 (senior): Explain <code>fixedRate</code> vs <code>fixedDelay</code>, and what breaks with <code>@Scheduled</code> in a clustered deployment.</summary>
-      <p><code>fixedRate</code> schedules the next execution a fixed interval after the <em>start</em> of the
-         previous one, so if a run takes longer than the interval, executions can overlap (or queue up on the single
-         scheduler thread). <code>fixedDelay</code> schedules the next execution a fixed interval after the previous
-         run <em>completes</em>, guaranteeing no overlap — the right choice for jobs that must not run concurrently
-         with themselves (draining a queue, a batch that isn't idempotent under overlap). <code>cron</code> gives
-         calendar-based scheduling. The clustering problem: a plain <code>@Scheduled</code> method runs on
-         <em>every</em> application instance independently, because each instance has its own scheduler — so a
-         "nightly cleanup" or "send monthly invoices" job runs N times, once per node, causing duplicate work,
-         duplicate emails, or data corruption. Solutions are a <strong>distributed lock</strong> so only one
-         instance actually runs each fire (e.g. ShedLock, which records a lock row/key the winning node holds for
-         the job's duration), leader election, or delegating to an external scheduler/queue that dispatches the job
-         to exactly one worker. This is one of the most common real-world Spring scheduling bugs, and it only
-         appears once you scale past a single instance — so it must be designed for up front. Also remember all
-         scheduled tasks share one thread by default, so size the scheduling pool if you have several.</p></details>
-    <details class="solution"><summary>Q6 (senior): These three annotations share a mechanism and a family of gotchas — explain.</summary>
-      <p><code>@Cacheable</code>, <code>@Async</code> and <code>@Transactional</code> are all implemented the same
-         way: Spring wraps the bean in an <strong>AOP proxy</strong> at startup that intercepts calls and adds the
-         cross-cutting behavior (check the cache / dispatch to another thread / open a transaction) around the
-         method invocation. Because the behavior lives in the proxy, it only applies to calls that arrive
-         <em>through</em> the proxy from another bean — so <strong>self-invocation</strong> (an in-class
-         <code>this.method()</code> call to an annotated method) bypasses the proxy and silently gets none of the
-         behavior: no caching, no async, no transaction. That's a single root cause producing the same confusing
-         "the annotation does nothing" symptom across all three, with the same fixes (call through another bean or a
-         self-injected proxy). Beyond that shared gotcha, each has its own: caching needs correct invalidation and
-         bounding (and shared vs per-instance semantics); async needs a bounded pool, exception handling, and
-         context propagation; scheduling needs cluster-safety. The senior insight is to see them as one
-         declarative-AOP family — understand the proxy and you understand how all of them work, compose, and fail,
-         rather than memorizing three separate feature sets. This is also why they can be enabled independently
-         (<code>@EnableCaching/@EnableAsync/@EnableScheduling</code>): each installs its own proxy advice.</p></details>
 
-    <h2>🏋️ Exercises (attempt before opening solutions)</h2>
-    <div class="exercise"><strong>1 (easy): Cache a slow lookup.</strong> Add <code>@Cacheable("books")</code> to a
-      method with an artificial delay and <code>@EnableCaching</code>; call it twice with the same argument and
-      confirm the second call is instant.
-      <details class="solution"><summary>Solution</summary>
-        <p>The first call runs the method (and the delay); the second with the same argument is a cache hit and
-           returns immediately without entering the body — proving the proxy short-circuits repeat calls. Without
-           <code>@EnableCaching</code>, nothing is cached because the caching proxy is never installed.</p></details></div>
-    <div class="exercise"><strong>2 (easy): Keep the cache fresh.</strong> Add an <code>update</code> method and make
-      a stale read appear; then fix it with <code>@CachePut</code> or <code>@CacheEvict</code>.
-      <details class="solution"><summary>Solution</summary>
-        <p>After caching a read, updating the entity in the DB without touching the cache makes subsequent reads
-           serve the old value. <code>@CachePut(key="#book.id")</code> on the update refreshes the cached entry with
-           the new value, or <code>@CacheEvict</code> removes it so the next read reloads. This is cache
-           invalidation — the hard part of caching.</p></details></div>
-    <div class="exercise"><strong>3 (medium): Bound the async pool.</strong> Add <code>@Async</code> plus
-      <code>@EnableAsync</code>, then register a <code>ThreadPoolTaskExecutor</code> with small core/max sizes and a
-      bounded queue; explain why the default is dangerous.
-      <details class="solution"><summary>Solution</summary>
-        <p>Defining a bounded <code>ThreadPoolTaskExecutor</code> (core, max, queue capacity, thread name prefix)
-           caps concurrency and turns overload into back-pressure. The historical default created a new thread per
-           task with no pooling, so a burst of async calls spawns unbounded threads and can OOM the process — hence
-           always supply your own bounded executor.</p></details></div>
-    <div class="exercise"><strong>4 (medium): Catch a swallowed async exception.</strong> Make a void
-      <code>@Async</code> method throw, observe nothing is logged, then wire an
-      <code>AsyncUncaughtExceptionHandler</code>.
-      <details class="solution"><summary>Solution</summary>
-        <p>A void <code>@Async</code> method that throws loses the exception — the caller already returned, so it
-           goes nowhere and no stack trace appears. Providing an <code>AsyncUncaughtExceptionHandler</code> (via
-           <code>AsyncConfigurer</code>) logs it; alternatively returning a <code>CompletableFuture</code> makes the
-           exception surface when <code>.get()/.join()</code> is called. Silent async failures are a classic
-           production trap.</p></details></div>
-    <div class="exercise"><strong>5 (hard): Cluster-safe schedule.</strong> Describe what happens when a
-      <code>@Scheduled</code> "send daily digest" job runs on 3 instances, and design a fix.
-      <details class="solution"><summary>Solution</summary>
-        <p>Each instance's scheduler fires the job independently, so the digest is sent three times — duplicate
-           emails and wasted work. Fix with a distributed lock so only one instance actually runs each fire: e.g.
-           ShedLock records a lock (a DB row / Redis key) that the winning node holds for the job's duration and the
-           others skip; alternatives are leader election or dispatching the job to a single worker via a queue. The
-           duplication only shows up once you scale past one instance, so design for it up front.</p></details></div>
-    <div class="exercise"><strong>6 (hard): Explain-it test.</strong> Out loud: (a) how <code>@Cacheable</code> works
-      and how a cache goes stale/leaks; (b) the two <code>@Async</code> traps; (c) why self-invocation breaks all
-      three annotations.
-      <details class="solution"><summary>Self-check rubric</summary>
-        <p>Pass (a) if you said proxy checks a keyed cache — hit skips the method — and named invalidation
-           (evict/put on writes) + bounding (size/TTL). Pass (b) if you named the unbounded default executor and
-           swallowed void exceptions with their fixes. Pass (c) if you explained all three are AOP proxies so an
-           in-class call bypasses the proxy and silently gets no behavior. That completes the cross-cutting
-           section.</p></details></div>
+    <details class="solution"><summary><strong>Beginner:</strong> How does <code>@Cacheable</code> work?</summary>
+      <p>A proxy intercepts the call, builds a key from the method arguments, and looks it up in the named
+         cache. On a hit it returns the cached value without invoking your method at all; on a miss it invokes
+         the method and stores the result.</p>
+      <p>Because it is a proxy, it has the usual limitation: calling the method from within the same class
+         bypasses it entirely, so the cache is silently never used.</p>
+      <p>The thing to know beyond the mechanism is that Spring Boot's default cache manager is an unbounded
+         <code>ConcurrentHashMap</code> — no size limit, no TTL, no eviction. It is fine for a demo and a
+         memory leak in production, so a real cache provider such as Caffeine is effectively mandatory.</p>
+    </details>
 
-    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li><code>@Cacheable</code> returns a stored result on repeat calls (miss runs the method, hit skips it); enable with <code>@EnableCaching</code>.</li>
-      <li>The default cache is unbounded with no TTL — use <strong>Caffeine</strong> (per-instance) or <strong>Redis</strong> (shared) with a size bound and TTL, and evict/put on every write.</li>
-      <li><code>@Async</code> runs work off the caller's thread — but supply a <strong>bounded <code>ThreadPoolTaskExecutor</code></strong> and handle swallowed exceptions on void methods.</li>
-      <li><code>@Scheduled</code> gives <code>fixedRate</code>/<code>fixedDelay</code>/<code>cron</code> — but a plain job runs on <strong>every clustered instance</strong> (needs a distributed lock).</li>
-      <li>All three are <strong>AOP proxies</strong> — <strong>self-invocation bypasses them</strong>, exactly like <code>@Transactional</code>.</li>
-    </ul></div>
+    <details class="solution"><summary><strong>Beginner:</strong> What happens to an exception thrown in an <code>@Async void</code> method?</summary>
+      <p>It is lost, for practical purposes. The caller got its void return the moment the task was submitted,
+         so there is nothing to propagate to. The exception surfaces on a pool thread and is passed to
+         <code>SimpleAsyncUncaughtExceptionHandler</code>, which logs it in a form nobody is monitoring.</p>
+      <p>The fix is to return a <code>CompletableFuture</code> so the caller can observe the failure when it
+         joins, and to configure an <code>AsyncUncaughtExceptionHandler</code> via
+         <code>AsyncConfigurer</code> for the void cases that genuinely cannot return anything. I would do
+         both — the handler is the safety net for code you did not write.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is a cache stampede and how do you prevent it?</summary>
+      <p>When a hot cache entry expires, every concurrent request misses simultaneously and they all execute the
+         expensive operation at once. I have seen a 2.1-second catalogue query run by 340 threads in the same
+         instant; the database saturated, query time rose to 19 seconds, requests timed out, and because every
+         attempt failed the cache was never repopulated. One key expiring took the service down for six
+         minutes.</p>
+      <p>The direct fix is <code>@Cacheable(sync = true)</code>, which makes Spring hold a per-key lock so one
+         thread computes and the rest wait for its result. Caffeine and Redis support it. It is one parameter
+         and almost nobody sets it.</p>
+      <p>Two related measures matter at scale. Uniform TTLs are dangerous — if you warm a cache at startup,
+         every entry expires in the same millisecond later, turning one stampede into thousands, so TTLs want
+         jitter. And Caffeine's <code>refreshAfterWrite</code> serves the stale value while a single thread
+         refreshes in the background, which avoids the miss entirely for keys that are read continuously.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is wrong with Spring Boot's default task executor?</summary>
+      <p>Its queue is unbounded, and that has two consequences people do not expect.</p>
+      <p>First, the pool never grows. A <code>ThreadPoolExecutor</code> only creates threads beyond the core
+         size when the queue is <em>full</em>, and an unbounded queue never fills — so despite a maximum pool
+         size of <code>Integer.MAX_VALUE</code>, you permanently have 8 threads.</p>
+      <p>Second, and worse, there is no backpressure. If a downstream dependency slows down, tasks accumulate
+         in memory until the heap is exhausted. I have seen a mail service degrade from 200 ms to 8 seconds
+         and the queue reach 1.9 million tasks in forty minutes before the JVM died — with no alert firing,
+         because CPU, latency and error rate all looked normal. Queue depth is invisible unless you export
+         it.</p>
+      <p>So I would always define the executor explicitly with a bounded queue, and use
+         <code>CallerRunsPolicy</code> so that when it fills, the submitting thread runs the task and the
+         producer slows down. That converts a memory leak into natural backpressure. And I would register the
+         executor with Micrometer so queue depth is a metric with an alert on it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do you run a scheduled job exactly once across six replicas?</summary>
+      <p>The first thing to say is that "exactly once" is not achievable — the honest target is "at most once
+         per window, with the job itself idempotent". Any lock can be lost to a crash or a clock problem, so
+         the job must tolerate being re-run.</p>
+      <p>My default is ShedLock: a shared database table where the instance acquires a named lock before
+         running. It needs one table and one dependency, and the parameter that matters is
+         <code>lockAtMostFor</code> — if the instance holding the lock dies, the lock must expire or the job
+         never runs again. I set it comfortably above the expected duration and below the interval.</p>
+      <p>The alternatives: a profile or property so only one replica schedules is free and fragile, because a
+         rolling deploy can leave you with zero or two. A separate single-replica deployment gives real
+         isolation and is worth it when the job is heavy enough to disturb request serving. An external
+         scheduler — a Kubernetes <code>CronJob</code> or clustered Quartz — is the right answer when jobs
+         need retries, history and alerting, at the cost of more machinery.</p>
+      <p>Two adjacent defaults I would check at the same time. Spring's <code>TaskScheduler</code> is
+         single-threaded, so one long job blocks every other scheduled task — and if it hangs, nothing is
+         scheduled ever again. And a <code>@Scheduled</code> method never overlaps itself, so a nightly job
+         that takes 25 hours silently skips a day rather than running twice.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do caching and async interact with transactions?</summary>
+      <p>Three interactions, and all three produce wrong data rather than errors.</p>
+      <p><strong><code>@Async</code> inside a transaction loses the transaction</strong>, because it is a
+         <code>ThreadLocal</code>. Worse than having no transaction, the async task can run <em>before</em> the
+         outer transaction commits, so it queries a database that does not yet contain the row it was told
+         about. The symptom is an intermittent "record not found" that only appears under load. The fix is
+         <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code> combined with <code>@Async</code>,
+         which guarantees ordering and still moves the work off the request thread.</p>
+      <p><strong>Caching can store a value that is then rolled back.</strong> If the cache advice runs inside
+         the transaction, a <code>@CachePut</code> writes the new value and a subsequent rollback leaves the
+         cache holding something that was never persisted — served to every caller until it expires. Either
+         order the aspects so caching is outermost, or use
+         <code>TransactionAwareCacheManagerProxy</code>, which defers cache writes until after commit.</p>
+      <p><strong><code>@Transactional</code> on a whole scheduled job</strong> holds one transaction for the
+         entire run. On PostgreSQL an hour-long transaction blocks vacuum and bloats tables, which is a
+         database-wide problem caused by one job. Chunking — the scheduled method loops and calls a separate
+         transactional bean per batch — is the fix, and it also makes the job restartable.</p>
+      <p>The common thread is that all three come from combining declarative features whose boundaries are
+         invisible at the call site. That is an argument for keeping them on separate methods in separate
+         beans, where the ordering is explicit in the call graph.</p>
+    </details>
+
+    <h2>🏋️ Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> The cache hit rate is 0%. Find both reasons.
+<pre>
+  @Service
+  public class PriceService {
+
+      public Map&lt;Long, Price&gt; priceAll(List&lt;Long&gt; ids) {
+          return ids.stream().collect(toMap(id -&gt; id, this::price));
+      }
+
+      @Cacheable("prices")
+      public Price price(Long id) { ... }
+  }
+
+  // no cache dependency on the classpath
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <table class="tbl">
+        <tr><th>Reason</th><th>Effect</th></tr>
+        <tr><td><strong>Self-invocation</strong> — <code>this::price</code></td><td>The method reference binds to the raw instance, not the proxy, so the cache interceptor never runs. The cache is only populated by external callers of <code>price()</code></td></tr>
+        <tr><td><strong>No cache provider</strong></td><td>The default <code>ConcurrentMapCacheManager</code> does work, but is unbounded with no TTL and no statistics — so even when it caches, you cannot measure it, and it grows forever</td></tr>
+      </table>
+<pre>
+  // 1. split the responsibility
+  @Service
+  public class PriceService {
+      private final PriceLookup lookup;
+
+      public Map&lt;Long, Price&gt; priceAll(List&lt;Long&gt; ids) {
+          return ids.stream().collect(toMap(id -&gt; id, lookup::price));
+      }
+  }
+
+  @Service
+  public class PriceLookup {
+      @Cacheable(value = "prices", key = "#id", sync = true)
+      public Price price(Long id) { ... }
+  }
+
+  // 2. a real cache provider
+  //    implementation 'com.github.ben-manes.caffeine:caffeine'
+  spring.cache.caffeine.spec: maximumSize=50000,expireAfterWrite=15m,recordStats
+</pre>
+      <p><strong>Verify rather than assume:</strong> <code>recordStats</code> plus Actuator exposes
+         <code>cache.gets{result=hit}</code> and <code>{result=miss}</code>, so the hit rate becomes a
+         dashboard number. A cache you cannot measure is a cache you cannot tune, and "we added caching" with
+         no hit-rate metric is a very common way to add memory pressure for no benefit.</p>
+      <p><strong>Also worth noting:</strong> <code>sync = true</code> matters here because a batch call for 500
+         ids on a cold cache would otherwise issue 500 concurrent lookups.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Emails silently stop sending. No errors anywhere. Explain.
+<pre>
+  @Async
+  public void sendConfirmation(Order order) {
+      mailClient.send(buildMessage(order));    // throws MailException
+  }
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>An <code>@Async void</code> method has nowhere to report failure.</strong> The caller received
+         its void return the instant the task was submitted and moved on. The exception is thrown on a pool
+         thread with no caller to propagate to, and Spring's default
+         <code>SimpleAsyncUncaughtExceptionHandler</code> logs it in a form that is easy to miss and not
+         attributable to a request.</p>
+      <p>So the mail fails, the order flow reports success, and nothing correlates the two.</p>
+<pre>
+  // 1. return a future so failure is observable
+  @Async
+  public CompletableFuture&lt;Void&gt; sendConfirmation(Order order) {
+      return CompletableFuture.runAsync(() -&gt; mailClient.send(buildMessage(order)));
+  }
+
+  // 2. a global handler for the void cases you cannot avoid
+  @Configuration
+  @EnableAsync
+  class AsyncConfig implements AsyncConfigurer {
+      @Override
+      public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+          return (ex, method, params) -&gt; {
+              log.error("Async failure in {}.{} args={}",
+                        method.getDeclaringClass().getSimpleName(),
+                        method.getName(), Arrays.toString(params), ex);
+              failureCounter.increment();     // and a metric
+          };
+      }
+  }
+</pre>
+      <p><strong>The metric matters as much as the log.</strong> A log line for a failure nobody is looking for is
+         barely better than silence; a counter with an alert on it turns "emails stopped three weeks ago" into
+         a page within minutes.</p>
+      <p><strong>The design question underneath:</strong> if sending the confirmation genuinely must not be lost,
+         <code>@Async</code> is the wrong mechanism entirely — an in-memory task queue disappears on restart.
+         That is a job for the transactional outbox from <a href="transactions.html">Transactions</a>, where
+         the intent is committed with the order and a separate process retries it. <code>@Async</code> is
+         appropriate for work that is genuinely best-effort.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> A nightly job runs six times and double-credits accounts.
+      Fix it and say what your fix does and does not guarantee.
+<pre>
+  @Component
+  public class ReconciliationJob {
+      @Scheduled(cron = "0 0 2 * * *")
+      @Transactional
+      public void reconcile() {
+          List&lt;Payment&gt; pending = payments.findUnreconciled();  // 400k rows
+          for (Payment p : pending) accounts.credit(p);
+      }
+  }
+</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Three separate problems.</strong></p>
+      <table class="tbl">
+        <tr><th>Problem</th><th>Effect</th></tr>
+        <tr><td>Six replicas all schedule it</td><td>Six concurrent runs, each crediting the same payments — accounts credited up to six times</td></tr>
+        <tr><td><code>@Transactional</code> over 400k rows</td><td>One transaction for the whole run: on PostgreSQL it blocks vacuum for the duration and bloats tables. It is also all-or-nothing, so an hour of work is lost on any failure</td></tr>
+        <tr><td>No idempotency</td><td>Even with one runner, a retry after a partial failure re-credits</td></tr>
+      </table>
+<pre>
+  @Component
+  public class ReconciliationJob {
+      private final ReconciliationChunk chunk;      // separate bean
+
+      @Scheduled(cron = "0 0 2 * * *")
+      @SchedulerLock(name = "reconcile",
+                     lockAtMostFor = "55m", lockAtLeastFor = "1m")
+      public void reconcile() {
+          List&lt;Long&gt; ids;
+          while (!(ids = payments.findUnreconciledIds(500)).isEmpty())
+              chunk.process(ids);                   // own transaction each
+      }
+  }
+
+  @Service
+  public class ReconciliationChunk {
+      @Transactional
+      public void process(List&lt;Long&gt; ids) {
+          for (Payment p : payments.findAllById(ids)) {
+              if (p.isReconciled()) continue;             // idempotent
+              accounts.credit(p);
+              p.markReconciled();                          // same tx
+          }
+      }
+  }
+</pre>
+      <table class="tbl">
+        <tr><th>Fix</th><th>Guarantees</th><th>Does <em>not</em> guarantee</th></tr>
+        <tr><td>ShedLock</td><td>At most one runner per window</td><td>That it runs at all — if the holder crashes, the run is skipped until <code>lockAtMostFor</code> expires</td></tr>
+        <tr><td>Chunked transactions</td><td>Restartable; bounded transaction age</td><td>All-or-nothing — a mid-run failure leaves some chunks committed</td></tr>
+        <tr><td><code>markReconciled</code> in the same transaction</td><td><strong>Idempotency</strong> — the real safety net</td><td>Nothing further; this is what makes re-runs safe</td></tr>
+      </table>
+      <p><strong>The idempotency check is the part that actually protects the money.</strong> Locks can be lost —
+         to a crash, a clock skew, a network partition — so a design whose correctness depends on the lock
+         holding is fragile. Marking each payment reconciled in the same transaction as the credit means a
+         second run is a no-op regardless of how many runners there are.</p>
+      <p>I would also add <code>spring.task.scheduling.pool.size: 5</code>, because the default scheduler is
+         single-threaded and a 55-minute job would otherwise block every other scheduled task in the
+         application.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> After a downstream slowdown, the service died with
+      <code>OutOfMemoryError</code> while CPU, latency and error rate all looked normal. Explain and fix.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>An unbounded async queue.</strong> Spring Boot's auto-configured executor has core size 8 and an
+         effectively unbounded queue. When the downstream slowed, tasks arrived faster than they completed and
+         accumulated in that queue — in memory, invisibly.</p>
+      <p>The monitoring looked healthy because every metric being watched was about <em>requests</em>: the
+         controller returned immediately after submitting the task, so latency and error rate were unaffected,
+         and 8 busy threads generate little CPU. Queue depth is the only signal that would have shown it, and
+         it was not exported.</p>
+      <p>There is a second, subtler consequence: because the queue never fills, the pool never grows past its
+         core size of 8, so <code>maxPoolSize</code> is meaningless and throughput is capped no matter how many
+         cores the machine has.</p>
+<pre>
+  @Bean("taskExecutor")
+  ThreadPoolTaskExecutor taskExecutor(MeterRegistry registry) {
+      var ex = new ThreadPoolTaskExecutor();
+      ex.setCorePoolSize(8);
+      ex.setMaxPoolSize(32);
+      ex.setQueueCapacity(500);                       // BOUNDED
+      ex.setThreadNamePrefix("async-");
+      ex.setRejectedExecutionHandler(
+          new ThreadPoolExecutor.CallerRunsPolicy()); // backpressure
+      ex.setWaitForTasksToCompleteOnShutdown(true);
+      ex.setAwaitTerminationSeconds(20);
+      ex.initialize();
+      return ExecutorServiceMetrics.monitor(registry, ex, "async");
+  }
+</pre>
+      <table class="tbl">
+        <tr><th>Setting</th><th>What it changes</th></tr>
+        <tr><td><code>queueCapacity(500)</code></td><td>Memory is bounded, and the pool can now grow to 32 when the queue fills</td></tr>
+        <tr><td><code>CallerRunsPolicy</code></td><td>When the queue is full, the submitting thread runs the task. The producer slows down — genuine backpressure rather than a crash</td></tr>
+        <tr><td><code>ExecutorServiceMetrics.monitor</code></td><td>Exports queue depth, active threads and completed tasks to Micrometer</td></tr>
+        <tr><td><code>waitForTasksToCompleteOnShutdown</code></td><td>Queued work is not silently discarded on a rolling deploy</td></tr>
+      </table>
+      <p><strong>The alert that matters:</strong> <code>executor.queued</code> above roughly half of capacity for
+         several minutes. That fires long before memory becomes a problem and points directly at the slow
+         downstream.</p>
+      <p><strong>The trade-off <code>CallerRunsPolicy</code> makes explicit:</strong> under sustained overload, the
+         request thread does the async work, so request latency rises. That is the correct failure mode — the
+         system slows down visibly instead of accumulating invisible debt and then dying — but it should be a
+         conscious choice, because it turns an async path into a synchronous one exactly when the system is
+         under stress.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Design caching for a product catalogue: 2 million products,
+      50,000 reads/sec, updates from an admin UI and a nightly import, six replicas, staleness tolerance of one
+      minute.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The numbers decide the architecture.</strong> 50,000 reads/sec against Redis alone would be
+         50,000 network round trips per second — feasible but costly in latency and Redis CPU. Two million
+         products will not fit comfortably in each replica's heap. So neither a purely local nor a purely
+         remote cache is right.</p>
+<pre>
+  TWO-LEVEL CACHE
+
+    L1  Caffeine, per replica
+        maximumSize = 20,000            (hot subset, ~1% of catalogue)
+        expireAfterWrite = 60s          (matches the staleness budget)
+        refreshAfterWrite = 45s         (background refresh, no miss)
+
+    L2  Redis, shared
+        TTL = 10 minutes
+        holds the full working set; survives replica restarts
+
+    read:  L1 -> L2 -> database
+    write: update DB, then invalidate BOTH levels
+</pre>
+      <table class="tbl">
+        <tr><th>Decision</th><th>Reason</th></tr>
+        <tr><td>L1 sized at ~1% of the catalogue</td><td>Product access is heavily skewed; a small hot set absorbs most reads at nanosecond latency and near-zero cost</td></tr>
+        <tr><td>L1 TTL = 60s</td><td>The staleness budget <em>is</em> the invalidation mechanism for L1 — no cross-replica messaging needed for correctness</td></tr>
+        <tr><td><code>refreshAfterWrite</code> below the TTL</td><td>Hot keys are refreshed in the background and never miss, which eliminates stampedes on exactly the keys that would cause them</td></tr>
+        <tr><td>Redis as L2</td><td>Shared across replicas, survives restarts, and absorbs the L1 misses so the database sees very little</td></tr>
+        <tr><td><code>sync = true</code></td><td>Protects the database on a cold start or a mass eviction</td></tr>
+      </table>
+<pre>
+  INVALIDATION -- different for the two write paths
+
+  1. ADMIN UI (single product)
+       @Transactional
+       public Product update(ProductCommand cmd) { ... }
+
+       @TransactionalEventListener(AFTER_COMMIT)
+       void onProductChanged(ProductChanged e) {
+           redisCache.evict(e.id());              // L2, immediate
+           events.publish(e);                     // fan out to replicas
+       }
+       // each replica evicts its own L1 on receiving the event
+
+     AFTER_COMMIT matters: evicting before commit lets a concurrent
+     read repopulate the cache with the OLD value.
+
+  2. NIGHTLY IMPORT (bulk, ~2M rows)
+       Do NOT evict 2 million keys individually.
+       Bump a version prefix instead:
+
+         key = "products:v" + currentVersion + ":" + id
+
+       Incrementing currentVersion invalidates the entire cache in
+       one operation, and old entries expire naturally by TTL.
+</pre>
+      <p><strong>Why the version-prefix trick for the import:</strong> two million individual evictions would take
+         minutes, saturate Redis, and leave the cache in a half-updated state during the run. A version bump is
+         atomic and O(1) — at the cost of a cold cache afterwards, which is why I would run the import before
+         the traffic peak and warm the top few thousand products immediately after.</p>
+      <p><strong>The honest limitation:</strong> L1 gives up to 60 seconds of staleness per replica, so two users
+         hitting different replicas can briefly see different prices. That is exactly the stated tolerance, but
+         it is the kind of thing that must be confirmed with the business rather than assumed — for prices
+         specifically, "briefly showing an old price" can have contractual implications, and if so the answer
+         is to skip L1 for price fields and accept the Redis round trip.</p>
+      <p><strong>What I would measure from day one:</strong> hit rate per level. If L1 is below about 80% the
+         sizing is wrong; if L2 is low the TTL is too short or the key space is fragmented. Without those two
+         numbers, tuning is guesswork.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> An order-placed flow needs to send an email, update a search
+      index, and notify a partner API. Design it, and justify what is synchronous, asynchronous, or neither.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Start by classifying each side effect by what happens if it is lost</strong>, because that
+         determines the mechanism far more than latency does.</p>
+      <table class="tbl">
+        <tr><th>Side effect</th><th>If lost</th><th>Mechanism</th></tr>
+        <tr><td>Email confirmation</td><td>Customer is confused; recoverable by resend</td><td>Async, best-effort, with a failure metric</td></tr>
+        <tr><td>Search index update</td><td>Stale search results; self-heals on the next reindex</td><td>Async, best-effort</td></tr>
+        <tr><td><strong>Partner notification</strong></td><td><strong>Contractual breach; the partner never ships the order</strong></td><td><strong>Outbox — must not be lost</strong></td></tr>
+      </table>
+<pre>
+  @Transactional
+  public Order place(PlaceOrderCommand cmd) {
+      Order o = orders.save(Order.from(cmd));
+
+      // MUST NOT BE LOST -> committed with the order
+      outbox.save(OutboxMessage.of("PARTNER_NOTIFY", o.getId()));
+
+      // best-effort -> after commit
+      events.publish(new OrderPlaced(o.getId()));
+      return o;                                    // commits in ~5 ms
+  }
+
+  @TransactionalEventListener(phase = AFTER_COMMIT)
+  @Async("notificationExecutor")
+  public void onOrderPlaced(OrderPlaced e) {
+      mailer.sendConfirmation(e.orderId());
+      searchIndexer.index(e.orderId());
+  }
+
+  @Scheduled(fixedDelay = 500)
+  @SchedulerLock(name = "outboxDispatch", lockAtMostFor = "2m")
+  public void dispatchOutbox() {
+      for (OutboxMessage m : outbox.claimBatch(50)) {
+          try { partnerClient.notify(m); outbox.markDone(m); }
+          catch (Exception ex) { outbox.markForRetry(m, backoff(m.attempts())); }
+      }
+  }
+</pre>
+      <table class="tbl">
+        <tr><th>Decision</th><th>Reason</th></tr>
+        <tr><td>No remote call inside the transaction</td><td>A slow partner would hold a database connection and exhaust the pool — see <a href="transactions.html">Transactions</a></td></tr>
+        <tr><td><code>AFTER_COMMIT</code> for the async work</td><td>A plain <code>@Async</code> call inside the transaction can run <em>before</em> commit and query a database without the order</td></tr>
+        <tr><td>Outbox for the partner only</td><td>It is the only effect that must survive a crash. Applying the outbox to all three would be more machinery for no benefit</td></tr>
+        <tr><td>ShedLock on the dispatcher</td><td>Six replicas would otherwise each poll and double-notify. Combined with an idempotency key on the partner call</td></tr>
+        <tr><td>A dedicated executor</td><td>A bounded queue with <code>CallerRunsPolicy</code>, so a mail outage cannot exhaust the heap</td></tr>
+      </table>
+      <p><strong>The distinction I would emphasise:</strong> <code>@Async</code> is an in-memory queue. It
+         disappears on restart, on OOM, on a rolling deploy. That is perfectly acceptable for an email that a
+         customer can request again, and unacceptable for a partner notification with a contract behind it.
+         Teams get into trouble by using one mechanism for both and discovering the difference during an
+         incident.</p>
+      <p><strong>What I would push back on:</strong> a request to make the partner notification synchronous "so we
+         know it worked". It couples order placement to a third party's availability — the order would fail
+         because the partner is down, which is precisely backwards. If the business needs confirmation, the
+         answer is an order status that reflects partner acknowledgement, updated when the outbox dispatch
+         succeeds, not a synchronous call in the request path.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Caching and async are proxies</strong>, so self-invocation silently disables both.
+            <code>@Scheduled</code> is registered at startup instead, and needs a no-argument method.</li>
+        <li><strong>Boot's default cache manager is an unbounded <code>ConcurrentHashMap</code></strong> — no
+            size limit, no TTL, no statistics. A memory leak with a friendly annotation.</li>
+        <li><strong>Use Caffeine with <code>maximumSize</code>, <code>expireAfterWrite</code> and
+            <code>recordStats</code></strong> as the minimum viable cache.</li>
+        <li><strong>Specify <code>key</code> explicitly.</strong> The default generator over argument objects
+            without <code>equals</code>/<code>hashCode</code> gives a 0% hit rate, silently.</li>
+        <li><strong>Add <code>unless = "#result == null"</code></strong> or you cache "not found" forever.</li>
+        <li><strong><code>sync = true</code> prevents cache stampedes</strong> — 340 concurrent misses ran 340
+            identical 2.1 s queries and took a database down for six minutes.</li>
+        <li><strong>Jitter TTLs or use <code>refreshAfterWrite</code></strong>, or a warmed cache expires
+            entirely within one millisecond.</li>
+        <li><strong>A local cache with evict-on-write serves stale data on every other replica.</strong></li>
+        <li><strong><code>@Async void</code> discards exceptions.</strong> Return
+            <code>CompletableFuture</code> and configure an <code>AsyncUncaughtExceptionHandler</code>.</li>
+        <li><strong>The default executor's unbounded queue means the pool never grows past 8</strong> and a slow
+            downstream causes <code>OutOfMemoryError</code> rather than backpressure.</li>
+        <li><strong>Use a bounded queue with <code>CallerRunsPolicy</code></strong> so the producer slows down
+            instead of the heap filling.</li>
+        <li><strong>Export queue depth.</strong> 1.9M queued tasks accumulated with CPU, latency and error rate
+            all looking normal.</li>
+        <li><strong><code>@Async</code> loses the transaction and can run before commit</strong> — use
+            <code>@TransactionalEventListener(AFTER_COMMIT)</code>.</li>
+        <li><strong>Caching inside a transaction can store a value that then rolls back.</strong> Use
+            <code>TransactionAwareCacheManagerProxy</code> or order caching outermost.</li>
+        <li><strong><code>@Scheduled</code> runs once per replica.</strong> ShedLock is the pragmatic fix; job
+            idempotency is what actually protects you.</li>
+        <li><strong>The default <code>TaskScheduler</code> is single-threaded</strong>, so one long or hung job
+            blocks every other scheduled task.</li>
+        <li><strong>Never wrap a whole scheduled job in one transaction</strong> — chunk it, one transaction per
+            batch.</li>
+        <li><strong><code>@Async</code> is an in-memory queue that disappears on restart.</strong> Anything that
+            must not be lost needs an outbox.</li>
+      </ul>
+    </div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="security.html">← Spring Security</a>
-      <a class="btn" href="testing.html">Next: Testing Spring Boot →</a>
+      <a href="security.html">← Spring Security</a>
+      <a href="testing.html">Testing Spring Boot →</a>
     </div>
   </main>
 </div>
