@@ -18,6 +18,35 @@ A v4 lesson must report `det=12 ex=6` with 0 errors. While a track is mid-build,
 forward links to unwritten lessons appear as "broken link" — that is expected and
 clears as each file lands. Re-run the whole-track validate at the end.
 
+## The depth baseline (validate.py)
+
+`V4_MIN_KB = 45` flags lessons written to the earlier, thinner recipe. It is a
+**review flag, not a target**:
+
+```
+[warn ] jsx.html   28KB  below the v4 depth baseline, review (a flag, not a size target)
+```
+
+The question for a flagged lesson is *"does this teach the mechanism, the
+failure modes, and what a senior interview answer sounds like?"* — not *"how do
+I get it to 45KB?"* Padding a lesson to clear the threshold defeats the point.
+
+Tracks at the mature recipe land at 50–65KB because of what they contain:
+mechanism over API surface, measured failure modes with real numbers, trade-off
+tables, and tiered interview answers. Size is a *consequence* of that content.
+
+Some narrow topics are genuinely complete below the baseline. After reading such
+a lesson and concluding it has no further interview-relevant depth to give, add
+it to `REVIEWED_THIN` in `validate.py` so it stops being flagged:
+
+```python
+REVIEWED_THIN = {
+    "css/specificity.html",   # focused topic, fully covered at 33KB
+}
+```
+
+Never add an entry to silence a warning you have not investigated.
+
 ## tools/quizcheck.py
 
 Validates a track's quiz bank and **detects answer-position skew**.

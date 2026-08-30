@@ -6,10 +6,25 @@ Exits non-zero if any ERROR is found.
 import sys, os, re, html
 from html.parser import HTMLParser
 
-# Minimum size for a v4 lesson. The tracks built to the mature recipe land at
-# 50-65KB; anything well under that is a lesson that looks structurally complete
-# (det=12 ex=6) while being half the depth. 45 is the floor, not the target.
+# Size below which a lesson is FLAGGED FOR REVIEW -- not a target to pad to.
+#
+# Tracks built to the mature recipe land at 50-65KB because of what they
+# contain: the mechanism rather than the API, measured failure modes, trade-off
+# tables, and tiered interview answers. A lesson well under that was usually
+# written to the earlier, thinner recipe and is worth re-reading.
+#
+# It is NOT a quota. The question for a flagged lesson is "does this teach the
+# mechanism, the failure modes, and what a senior answer sounds like?" Some
+# genuinely narrow topics answer yes at 35KB and should be left alone -- record
+# those in REVIEWED_THIN below so they stop being flagged.
 V4_MIN_KB = 45
+
+# Lessons judged complete despite being under V4_MIN_KB, as "track/file.html".
+# Add an entry only after reading the lesson and concluding the topic has no
+# further interview-relevant depth to give -- never to silence the warning.
+REVIEWED_THIN = {
+    # "css/specificity.html",   # example: focused topic, fully covered at 33KB
+}
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
         "param","source","track","wbr"}
@@ -100,8 +115,10 @@ def check_file(path):
         "pager":     src.count('class="pager"'),
     }
     if name != "quiz.html" and not is_stub:
-        if stats["kb"] < V4_MIN_KB:
-            warnings.append(f"only {stats['kb']}KB (v4 target {V4_MIN_KB}KB+)")
+        track_file = f"{os.path.basename(os.path.dirname(os.path.abspath(path)))}/{name}"
+        if stats["kb"] < V4_MIN_KB and track_file not in REVIEWED_THIN:
+            warnings.append("below the v4 depth baseline, review "
+                            "(a flag, not a size target)")
         if stats["solution"] < 12:
             warnings.append(f"{stats['solution']} details blocks (expect 12)")
         if stats["exercise"] < 6:
