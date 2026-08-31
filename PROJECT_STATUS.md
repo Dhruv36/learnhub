@@ -6,9 +6,90 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-27)
+## ▶️ RESUME HERE (last updated 2026-08-31)
 
-**Last completed:** ✅ **Site-wide cleanup — all 23 quiz banks de-skewed and de-duplicated, and every track passing validate.py with 0 errors AND 0 warnings.** Detail in the "SITE-WIDE CLEANUP COMPLETE" section below. Before that in the same session: ✅ **MongoDB v4 (track 19) — COMPLETE**, and it was the last v3 track — **the v4 rebuild programme is finished.** All 22 lessons, both end-of-track chores, quiz bank rewritten; 0 errors and 0 warnings across 27 files. Full per-lesson detail is in the "MongoDB v4 COMPLETE" section below.
+**Last completed:** ✅ **Spring Boot — COMPLETE at the mature v4 recipe.** All **23 lessons** rebuilt from the
+2026-07-18 "HTML-track depth" pass (26–31KB) to the current recipe (48–77KB, every one `det=12 ex=6`), and the
+**quiz bank rewritten to the v4 curriculum** (200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed
+62/63/75). Whole track passes `python validate.py tutorials/springboot` with **0 errors and 0 warnings**
+(24 files). Per-lesson detail in the "Spring Boot v4 COMPLETE" section below.
+
+⚠️ **Open item for the next session — the depth floor reclassified the older tracks.** Commit `a50b7ac`
+introduced `V4_MIN_KB = 45` in `validate.py` as a *review flag* (plus a `REVIEWED_THIN` allowlist). Under it,
+**279 lessons across 13 previously-"DONE" tracks now warn**: java 45, javascript 38, html 32, css 28, react 28,
+nodejs 24, angular 23, dotnet 23, aspnet 17, system-design 11, python 4, linux 1. Clean at 0 warnings: aws,
+cicd, docker, kubernetes, mongodb, redis, leetcode, sql, database-concepts, vector-databases, springboot. The
+flag is a prompt to re-read, **not** a size target — some of those lessons are genuinely complete and belong in
+`REVIEWED_THIN`. The earlier "0 errors AND 0 warnings site-wide" claim below was true under the *old* floor.
+
+**Previously in this programme:** ✅ **Site-wide cleanup — all 23 quiz banks de-skewed and de-duplicated, and every track passing validate.py with 0 errors AND 0 warnings** (under the pre-`a50b7ac` floor). Detail in the "SITE-WIDE CLEANUP COMPLETE" section below. Before that in the same session: ✅ **MongoDB v4 (track 19) — COMPLETE**, and it was the last v3 track. All 22 lessons, both end-of-track chores, quiz bank rewritten; 0 errors and 0 warnings across 27 files. Full per-lesson detail is in the "MongoDB v4 COMPLETE" section below.
+
+**✅ Spring Boot v4 COMPLETE (2026-08-31)** — `tutorials/springboot/`, 23 lessons rebuilt across 6 sections.
+Lessons 1–18 were rebuilt 2026-08-28 → 08-30; **19–23 and the bank landed 2026-08-31**. Per-lesson findings for
+the closing five:
+
+*§5 Production (cont.)* — ✅ `microservices.html` **77KB** (**capacity is request-seconds, not requests** —
+a dependency going 40 ms → 8 s needed 2,000 threads against 200 and killed a healthy service in 90 s at **6%
+CPU**; the default read timeout is **infinite** in RestTemplate/RestClient/JDK client, and the **third** timeout
+— pool acquisition — is the one that rebuilds the bug a level down; timeout budgets from your own SLA and the
+dependency's p99.9, plus deadline propagation; **a read timeout does not mean the work did not happen** —
+**1,143 customers charged twice**; retry amplification 3×3×3 = **27×**, and a storm that took 6% failures to
+71%; breaker defaults that never open (`minimumNumberOfCalls: 100`, 50% rate) and **slow-call rate** as the
+setting that would have helped — 9 s responses with HTTP 200 are a 0% failure rate; breaker state is per JVM;
+good vs bad fallbacks; semaphore vs thread-pool bulkheads and **one pool per downstream**; decorator order
+`Retry(CircuitBreaker(TimeLimiter(Bulkhead)))`; idempotency that **stores the response** with a unique
+constraint; the **dual write** — 311 of 2.14M orders nobody heard about — and the outbox; sagas, where a
+**compensation is not a rollback**; availability arithmetic — twelve 99.9% dependencies is **98.8%**, 43 min/mo
+→ 8h38m) ·
+✅ `production.html` **65KB** (`JarLauncher` and nested-jar classloading; **layered jars took pushes 4m10s → 11 s
+and deploys 6m40s → 1m20s**; `ddl-auto: update` as undefined/unreviewable/unrepeatable; **Flyway checksums are
+immutable by mechanism** — a comment edit crash-looped 24 pods at 02:00; **review migrations for locks** — one
+`ALTER TABLE` held `ACCESS EXCLUSIVE` for **4m38s** on 41M rows; `lock_timeout`; **expand/contract**, because a
+rolling deploy runs two versions against one schema for minutes; graceful shutdown, and the endpoint-propagation
+race that still dropped **1,847 requests per deploy** until a `preStop: sleep 5` — plus the grace-period
+arithmetic; **heap is not the process** — exit 137 with no stack trace, non-heap 25–40% of RSS,
+`MaxRAMPercentage` over `-Xmx`; **CFS throttling: p99 2.4 s at 34% average CPU**, 180 ms with the limit removed;
+`ActiveProcessorCount`; startup 47 s → 28 s (CDS) → 21 s (AOT) → 1.4 s (native) with the honest native
+trade-offs; exec-form `ENTRYPOINT` or SIGTERM never reaches the JVM)
+*§6 Event-Driven & Reactive ×3* — ✅ `api-design.html` **70KB** (the breaking-change taxonomy, including the
+additive change that **500'd a partner** because `FAIL_ON_UNKNOWN_PROPERTIES` defaults to *true*, and the enum
+value that fails a *whole* response; four versioning strategies and the **measured cost of four live versions** —
+31 DTOs, **67 `if (version >= 3)` branches**, a pricing bug live in v2 for **5 months**, and a simple field going
+from 20 min to 4 h; version at the edge mapper only; deprecation with `Deprecation`/`Sunset` headers, **410 not
+404**, and **brownouts**; unbounded list endpoints as an availability bug; **offset pagination duplicated 47 and
+missed 51 orders** in one export, and cost 4.2 s at `OFFSET 500000` versus **3 ms** keyset — with the unique
+tie-breaker that makes keyset correct; `COUNT(*)` at **2.9 s** against a 4 ms page; sortable-field allow-lists;
+**61 support edits silently lost in a month**, fixed with `@Version` as an ETag and `If-Match` → 412;
+`If-Match` vs `Idempotency-Key`; PATCH's omit-vs-null problem; **generated OpenAPI regenerates to match the
+break** — a committed baseline plus a diff gate is what makes it a contract; consumer-driven contracts; and
+"nobody uses that field" as a hypothesis needing per-consumer telemetry) ·
+✅ `messaging.html` **70KB** (**a log is not a queue**, and the three rules that follow; **a null key shipped 214
+cancelled orders**; delivery guarantees and why **exactly-once is Kafka-to-Kafka** and says nothing about your
+database; **auto-commit acknowledged 1,412 records that were never processed**, silently, found by a finance
+reconciliation 3 weeks later; ack modes; idempotent consumers three ways; the consumer's two clocks and the
+**rebalance death spiral** — 500 × 800 ms against a 300 s `max.poll.interval.ms` gave **47 rebalances, 181,000
+reprocessed records and 4.1M lag at 11% CPU**; concurrency is partitions, not threads; **one poison pill blocked
+a partition for 9 hours** while five looked healthy; `ErrorHandlingDeserializer`; blocking retry vs
+`@RetryableTopic` and the **ordering it trades away**; a DLT nobody reads as data loss with extra steps; schema
+compatibility across a **retention window** — a required field broke live consumers *and* 7 days of published
+events; fat vs thin events and the 15,000-requests-per-minute call-back amplifier; **lag alerting on max
+per-partition delay in time**, not sums; **6-hour retention plus an 8-hour outage deleted 2.9M events** and the
+consumer came back reporting zero lag; and `FOR UPDATE SKIP LOCKED` as the honest default for one team) ·
+✅ `reactive.html` **66KB** (the thread-ceiling problem, and the measured MVC/WebFlux comparison at **both**
+concurrencies — 380 vs 9,700 req/s at 10k connections, but **p99 520 ms vs 545 ms at 200**, so *reactive does not
+reduce latency*; **virtual threads now take most of the general-purpose reason to rewrite**, and what they do not
+cover; **nothing happens until you subscribe** — 4,100 "saved" orders, zero rows, no error; **`flatMap`'s default
+concurrency of 256** taking pricing from 40 ms to 8.7 s; **one 12 ms JDBC call took p99 from 90 ms to 6.4 s at
+22% CPU** because it froze one of four event loops, and BlockHound as the only mechanical defence;
+`boundedElastic` makes blocking *safe*, not *scalable*; R2DBC's real cost is losing the ORM; **`ThreadLocal` is
+gone** — trace ids missing for six weeks, and a hand-rolled principal leaking across users in **0.4% of
+responses**; Reactor Context and its upstream-flowing `contextWrite`; **backpressure as a demand protocol**, and
+the unbounded `onBackpressureBuffer` that **OOM'd in 40 s**; where backpressure cannot help and load shedding
+must; streaming with cancellation as the capability with no blocking equivalent; `checkpoint()` over
+`Hooks.onOperatorDebug()`; and an honest decision framework)
+
+Bank: sets 8–10 re-scoped so the six hardest lessons get real coverage — 8 folds in caching/async, 9 is
+observability + resilience + production, 10 is APIs/messaging/reactive as the mock exam.
 
 **Previously:** ✅ **CI/CD v4 (track 18) — COMPLETE** (21 lessons, 7 redirect stubs, bank rewritten; 0 errors and 0 warnings across 29 files) — detail below.
 
@@ -542,7 +623,7 @@ Target **~500–700 lines (~35–50KB)** per lesson. Structure:
 | 2 | CSS | ✅ **DONE** — all 28 mastery-depth lessons shipped (Foundations ×7, Layout ×6, Motion & Interaction ×3, Modern CSS ×5, Architecture ×3, Production ×4). Old combined pages (colors-units-typography.html, transitions-animations.html, cross-browser-a11y.html) kept as redirect stubs. Link-audited clean (0 broken internal hrefs). Quiz bank not yet re-tuned. |
 | 3 | JavaScript | ✅ **DONE (v4+ expanded, 2026-07-18)** — **38 lessons** at mastery depth (Language Core ×9, Objects & Data ×7, Async ×5, Browser & Web Platform ×5, Modules & Tooling ×2, Production ×10). **+5 new: Functional Patterns (Language Core), Dates/Time & Intl (Objects & Data), WebSockets & Real-Time (Browser), Testing JavaScript + Design Patterns in JavaScript (Production)**. Old combined pages kept as legacy stubs. Link-audited clean; quiz banks retuned to the new topics (sets 2/3/4/8/10) — validate 10/200/0. |
 | 4 | React | ✅ **DONE** — all 28 mastery-depth lessons shipped (Foundations ×7, Effects & Lifecycle ×5, State Management ×5, Performance ×4, Patterns & Quality ×4, Full-Stack React ×3 incl. Server Components, Next.js, Production Patterns). Old combined pages (props-state, forms-events, context-state) kept as redirect stubs. Heavy cross-linking to JS track + between lessons (later lessons cite earlier by number). Link-audited clean; quiz banks validate 10/200/0 (not yet re-tuned to v4 topics). |
-| — | Spring Boot | ✅ **DONE (v4+ expanded, 2026-07-18)** — **23 lessons** at full HTML-track depth (300–360 lines): Core Container ×5, Web Layer ×5, Data Layer ×3, Cross-Cutting ×3, Production ×4, **+ Event-Driven & Reactive ×3 (API Design & Versioning, Messaging & Kafka, Reactive/WebFlux)**. Every lesson: "what you'll master" intro → Parts 1–6 → deep-dive senior `.note` → Common Mistakes → 6 tiered interview Qs → 6 graded exercises → Key Takeaways → pager. Link-audited clean; quiz 10/200/0 (set 10 retuned to cover the new topics). All pushed & live. |
+| — | Spring Boot | ✅ **COMPLETE at the mature v4 recipe (2026-08-31)** — **all 23 lessons** rebuilt to 48–77KB, every one `det=12 ex=6`, across 6 sections: Core Container ×5, Web Layer ×5, Data Layer ×3, Cross-Cutting ×3, Production ×4, Event-Driven & Reactive ×3. Lessons 1–18 rebuilt 08-28 → 08-30; 19–23 (Resilience & Microservices, Production & Deployment, REST API Design & Versioning, Messaging & Kafka, Reactive Spring & WebFlux) on 08-31. **Quiz bank rewritten to the v4 curriculum** — 200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed 62/63/75, sets 8–10 re-scoped for the six hardest lessons. Whole track passes `python validate.py tutorials/springboot` with **0 errors and 0 warnings** (24 files). *(Superseded the 2026-07-18 pass, which was 23 lessons at the earlier 300–360-line recipe.)* |
 | — | Java | ✅ **DONE (v4+ expanded, 2026-07-18)** — **45 lessons** at full depth. Original 40 across Foundations/OOP/Core Libraries/Modern Java/Concurrency/JVM&Perf/Professional, **+5 new: Annotations & Reflection, Regular Expressions (Core Libraries); The Module System/JPMS (Modern Java); Concurrency Patterns & Pitfalls capstone (Concurrency); Benchmarking & JMH (JVM & Performance)**. Link-audited clean; quiz 10/200/0 (sets 5 & 7 retuned for the new topics; benchmarking already in set 8). All pushed & live. |
 | 15 | Angular | ✅ **DONE (v4, 2026-07-19)** — **23 lessons** at mastery depth across 8 sections: Foundations ×4 (index=Components & Standalone, data-binding=Templates, directives=Control Flow, pipes), Components & Reactivity ×4 (component-communication, lifecycle, signals, change-detection), Services & DI ×2 (services-di, di-advanced), RxJS ×2 (rxjs, rxjs-patterns), Forms ×3 (template-forms, forms=Reactive, form-validation incl. CVA), Routing & HTTP ×3 (routing, guards-lazy, http), State ×2 (state-management, ngrx), Production ×3 (testing, performance, enterprise=SSR/i18n/security/monorepo). 12 rewritten in place + 11 new files. Modern Angular throughout: standalone, signals, @if/@for, functional guards/interceptors, zoneless, httpResource. Link-audited clean; quiz retuned (9 swaps: linkedSignal/resource, multi-providers, inject-context, catchError placement, takeUntilDestroyed, lifecycle, CVA, track identity) — 10/200/0. |
 | 16 | .NET (C#) | ✅ **DONE (v4, 2026-07-27)** — **23 lessons** at mastery depth across 6 sections: Foundations ×5 (index=How It Runs, types, control-flow, strings, methods), Object-Oriented C# ×5 (oop, inheritance, records-structs, generics, pattern-matching), Core Libraries ×4 (collections-generics, linq, delegates-events, exceptions-nullability), Async & Concurrency ×3 (async-await, **async-patterns** new, **threading** new), Runtime & Performance ×2 (memory, performance-aot), Professional ×4 (di-hosting, efcore, testing, **modern-csharp** new capstone). 12 rewritten in place + 11 new files. Modern throughout: primary constructors, collection expressions, required/init, TimeProvider, Channels, ExecuteUpdate/Delete, source generators, NativeAOT. Link-audited clean (0 broken); pager chain verified against nav order end to end; quiz banks retuned (14 swaps) — 10/200/0. |
