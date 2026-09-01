@@ -24,6 +24,31 @@ V4_MIN_KB = 45
 # further interview-relevant depth to give -- never to silence the warning.
 REVIEWED_THIN = {
     # "css/specificity.html",   # example: focused topic, fully covered at 33KB
+
+    # Reviewed 2026-08-31. Each read in full: mechanism-first, failure modes
+    # named, senior framing present, det=12 ex=6. Conceptual/foundational
+    # topics that have no further interview-relevant depth to give.
+    "linux/index.html",              # 44KB, kernel/userspace + the 3-part process
+    "python/index.html",             # 35KB, name/object model, mutable default, copying
+    "python/control-flow.html",      # 38KB, LEGB, late binding, match, exceptions
+    "python/data-structures.html",   # 42KB, per-operation complexity, hashability
+    "python/strings-io.html",        # 42KB, str/bytes boundary, encodings, pathlib
+
+    # system-design, reviewed 2026-08-31. All at the mature SD/case-study
+    # format with 7-9 sections, deep dives and quantified takeaways; 10 of 11
+    # sit within 4KB of the floor. Three are technique lessons where extra
+    # length would be padding rather than depth.
+    "system-design/index.html",                  # 44KB, the 7 scaling stages
+    "system-design/estimation.html",             # 30KB, narrow topic, fully worked
+    "system-design/interview-framework.html",    # 42KB, technique, not a subject
+    "system-design/tradeoff-driven-design.html", # 44KB, technique, not a subject
+    "system-design/cap-theorem.html",            # 41KB, PACELC, tunable consistency
+    "system-design/consistent-hashing.html",     # 42KB, vnodes, keys-not-load
+    "system-design/distributed-consensus.html",  # 42KB, Raft, why reads are harder
+    "system-design/cost-capacity-slo.html",      # 41KB, W=1/(1-p), unit economics
+    "system-design/migration-strategies.html",   # 44KB, shadow reads, dual-write
+    "system-design/design-instagram-feed.html",  # 41KB, case study, fan-out hybrid
+    "system-design/design-search-engine.html",   # 44KB, case study, doc-partitioning
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
