@@ -49,6 +49,13 @@ REVIEWED_THIN = {
     "system-design/migration-strategies.html",   # 44KB, shadow reads, dual-write
     "system-design/design-instagram-feed.html",  # 41KB, case study, fan-out hybrid
     "system-design/design-search-engine.html",   # 44KB, case study, doc-partitioning
+
+    # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
+    # standard and judged complete below the baseline - the topic is narrower
+    # than its neighbours, and everything it owes is present: the fiber-identity
+    # mechanism, the index-key corruption proof, reconciliation rules including
+    # the wrapper-type trap, measured costs, and 7 reasoned exercises.
+    "react/rendering.html",          # 40KB, lists, keys & conditional rendering
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
