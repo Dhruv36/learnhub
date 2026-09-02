@@ -56,6 +56,7 @@ REVIEWED_THIN = {
     # mechanism, the index-key corruption proof, reconciliation rules including
     # the wrapper-type trap, measured costs, and 7 reasoned exercises.
     "react/rendering.html",          # 40KB, lists, keys & conditional rendering
+    "react/events.html",             # 44KB, synthetic events & the two dispatch systems
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
