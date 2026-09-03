@@ -58,6 +58,9 @@ REVIEWED_THIN = {
     "react/rendering.html",          # 40KB, lists, keys & conditional rendering
     "react/events.html",             # 44KB, synthetic events & the two dispatch systems
     "react/render-cycle.html",       # 40KB, the five phases, purity, commit timing
+
+    # java, reviewed 2026-09-03 during the rebuild.
+    "java/types.html",               # 44KB, primitives vs references, promotion, pass-by-value
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
