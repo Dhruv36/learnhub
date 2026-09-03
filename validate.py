@@ -61,6 +61,8 @@ REVIEWED_THIN = {
 
     # java, reviewed 2026-09-03 during the rebuild.
     "java/types.html",               # 44KB, primitives vs references, promotion, pass-by-value
+    "java/operators.html",           # 43KB, integer division, short-circuit, bitwise, precedence
+    "java/control-flow.html",        # 43KB, branching, the four loops, termination reasoning
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
