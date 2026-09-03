@@ -63,6 +63,9 @@ REVIEWED_THIN = {
     "java/types.html",               # 44KB, primitives vs references, promotion, pass-by-value
     "java/operators.html",           # 43KB, integer division, short-circuit, bitwise, precedence
     "java/control-flow.html",        # 43KB, branching, the four loops, termination reasoning
+    "java/methods.html",             # 43KB, signatures, overload resolution, recursion limits
+    "java/strings.html",             # 41KB, immutability, the pool, encoding and locale
+    "java/arrays.html",              # 42KB, contiguity, shallow copy, covariance
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
