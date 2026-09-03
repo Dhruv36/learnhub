@@ -57,6 +57,7 @@ REVIEWED_THIN = {
     # the wrapper-type trap, measured costs, and 7 reasoned exercises.
     "react/rendering.html",          # 40KB, lists, keys & conditional rendering
     "react/events.html",             # 44KB, synthetic events & the two dispatch systems
+    "react/render-cycle.html",       # 40KB, the five phases, purity, commit timing
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
