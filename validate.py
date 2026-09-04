@@ -90,6 +90,7 @@ REVIEWED_THIN = {
     "java/concurrent-collections.html", # 44KB, CHM mechanism, computeIfAbsent recursion, LongAdder
     "java/virtual-threads.html",     # 42KB, mount/unmount, pinning by JDK version, ScopedValue
     "java/performance.html",         # 43KB, Amdahl, tail amplification, safepoint bias, flame graphs
+    "java/benchmarking.html",        # 44KB, the five JIT distortions, fork isolation, reading error bars
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
