@@ -84,6 +84,7 @@ REVIEWED_THIN = {
     "java/pattern-matching.html",    # 35KB, flow scoping, null rule, record deconstruction
     "java/modern-java.html",         # 43KB, var inference traps, text block indent rule, LTS map
     "java/modules.html",             # 41KB, three accessibility conditions, split packages, jlink limits
+    "java/annotations-reflection.html", # 44KB, retention default trap, getGenericType, invoke cost
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
