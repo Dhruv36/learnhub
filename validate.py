@@ -85,6 +85,7 @@ REVIEWED_THIN = {
     "java/modern-java.html",         # 43KB, var inference traps, text block indent rule, LTS map
     "java/modules.html",             # 41KB, three accessibility conditions, split packages, jlink limits
     "java/annotations-reflection.html", # 44KB, retention default trap, getGenericType, invoke cost
+    "java/threads.html",             # 43KB, thread cost arithmetic, six states, cooperative interruption
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
