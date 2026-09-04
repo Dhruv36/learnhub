@@ -87,6 +87,7 @@ REVIEWED_THIN = {
     "java/annotations-reflection.html", # 44KB, retention default trap, getGenericType, invoke cost
     "java/threads.html",             # 43KB, thread cost arithmetic, six states, cooperative interruption
     "java/memory-model.html",        # 42KB, happens-before rules, safe publication, final freeze
+    "java/concurrent-collections.html", # 44KB, CHM mechanism, computeIfAbsent recursion, LongAdder
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
