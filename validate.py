@@ -74,6 +74,12 @@ REVIEWED_THIN = {
     "java/collections.html",         # 42KB, choosing a collection, the contains cliff
     "java/collections-internals.html", # 43KB, buckets, spread, treeify, resize
     "java/generics.html",            # 43KB, erasure, invariance, PECS, heap pollution
+    "java/optional.html",            # 36KB, return-type tool, orElse vs orElseGet
+    "java/lambdas.html",             # 39KB, capture, invokedynamic, method refs
+    "java/streams.html",             # 36KB, laziness, collectors, parallel reality
+    "java/io.html",                  # 37KB, bytes vs chars, buffering, atomic writes
+    "java/regex.html",               # 38KB, compile cost, backtracking, ReDoS
+    "java/dates-money.html",         # 39KB, moment vs clock reading, BigDecimal traps
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
