@@ -88,6 +88,7 @@ REVIEWED_THIN = {
     "java/threads.html",             # 43KB, thread cost arithmetic, six states, cooperative interruption
     "java/memory-model.html",        # 42KB, happens-before rules, safe publication, final freeze
     "java/concurrent-collections.html", # 44KB, CHM mechanism, computeIfAbsent recursion, LongAdder
+    "java/virtual-threads.html",     # 42KB, mount/unmount, pinning by JDK version, ScopedValue
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
