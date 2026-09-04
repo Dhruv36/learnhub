@@ -73,6 +73,7 @@ REVIEWED_THIN = {
     "java/enums-nested.html",        # 43KB, enums as classes, ordinal, this$0 leak
     "java/collections.html",         # 42KB, choosing a collection, the contains cliff
     "java/collections-internals.html", # 43KB, buckets, spread, treeify, resize
+    "java/generics.html",            # 43KB, erasure, invariance, PECS, heap pollution
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
