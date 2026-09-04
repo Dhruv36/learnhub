@@ -66,6 +66,11 @@ REVIEWED_THIN = {
     "java/methods.html",             # 43KB, signatures, overload resolution, recursion limits
     "java/strings.html",             # 41KB, immutability, the pool, encoding and locale
     "java/arrays.html",              # 42KB, contiguity, shallow copy, covariance
+    "java/oop.html",                 # 42KB, invariants, constructors, access, static
+    "java/inheritance.html",         # 44KB, dispatch, fragile base class, composition
+    "java/interfaces.html",          # 41KB, contracts, defaults, diamond, lambdas
+    "java/equality.html",            # 42KB, the contract, vanishing objects, ordering
+    "java/enums-nested.html",        # 43KB, enums as classes, ordinal, this$0 leak
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
