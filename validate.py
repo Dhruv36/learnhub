@@ -86,6 +86,7 @@ REVIEWED_THIN = {
     "java/modules.html",             # 41KB, three accessibility conditions, split packages, jlink limits
     "java/annotations-reflection.html", # 44KB, retention default trap, getGenericType, invoke cost
     "java/threads.html",             # 43KB, thread cost arithmetic, six states, cooperative interruption
+    "java/memory-model.html",        # 42KB, happens-before rules, safe publication, final freeze
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
