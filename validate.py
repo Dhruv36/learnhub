@@ -71,6 +71,8 @@ REVIEWED_THIN = {
     "java/interfaces.html",          # 41KB, contracts, defaults, diamond, lambdas
     "java/equality.html",            # 42KB, the contract, vanishing objects, ordering
     "java/enums-nested.html",        # 43KB, enums as classes, ordinal, this$0 leak
+    "java/collections.html",         # 42KB, choosing a collection, the contains cliff
+    "java/collections-internals.html", # 43KB, buckets, spread, treeify, resize
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
