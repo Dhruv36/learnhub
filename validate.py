@@ -89,6 +89,7 @@ REVIEWED_THIN = {
     "java/memory-model.html",        # 42KB, happens-before rules, safe publication, final freeze
     "java/concurrent-collections.html", # 44KB, CHM mechanism, computeIfAbsent recursion, LongAdder
     "java/virtual-threads.html",     # 42KB, mount/unmount, pinning by JDK version, ScopedValue
+    "java/performance.html",         # 43KB, Amdahl, tail amplification, safepoint bias, flame graphs
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
