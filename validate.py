@@ -80,6 +80,8 @@ REVIEWED_THIN = {
     "java/io.html",                  # 37KB, bytes vs chars, buffering, atomic writes
     "java/regex.html",               # 38KB, compile cost, backtracking, ReDoS
     "java/dates-money.html",         # 39KB, moment vs clock reading, BigDecimal traps
+    "java/records-sealed.html",      # 40KB, generated members, shallow immutability, ADTs
+    "java/pattern-matching.html",    # 35KB, flow scoping, null rule, record deconstruction
 }
 
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta",
