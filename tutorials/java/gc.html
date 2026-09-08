@@ -17,295 +17,748 @@
   <aside class="sidebar" id="sidebar"></aside>
 
   <main class="content">
-    <h1>Garbage Collection <span class="level-badge level-advanced">JVM & Performance</span></h1>
-    <p><strong>What you'll master in this lesson:</strong> how the garbage collector actually reclaims memory
-       (mark-sweep-compact and generational collection); the fundamental trade-off between throughput, latency,
-       and footprint; the main collectors (G1, ZGC, Parallel, Serial) and when to choose each; what
-       "stop-the-world" pauses are and why they matter; and how to read GC logs and tune the heap. Garbage
-       collection is Java's defining feature — it removes manual memory bugs but introduces its own tuning
-       discipline, and understanding it is essential for any latency-sensitive system and a deep interview
-       topic.</p>
+    <h1>Garbage Collection <span class="level-badge level-adv">JVM &amp; Performance</span></h1>
 
-    <h2>Part 1 — How Collection Works: Mark, Sweep, Compact</h2>
-    <pre>// The core algorithm, in three conceptual phases:
-1. MARK    Start from GC ROOTS (thread stacks, static fields) and trace every reachable object.
-           Everything reached is LIVE; everything else is garbage.
+    <p><strong>What you'll master:</strong> that GC works on <strong>reachability, not reference counting</strong>
+       — which is why Java has no cycle problem and why a "leak" is always something still reachable; the weak
+       generational hypothesis and the consequence that makes everything else make sense — <strong>a copying
+       collector's cost is proportional to survivors, not to garbage</strong>, so allocating a million objects
+       that die immediately is nearly free; why allocation is a <strong>pointer bump in a TLAB</strong>; what a
+       card table buys and what it costs on every reference write; how G1, ZGC and Shenandoah actually differ
+       and what you trade for a sub-millisecond pause; the four numbers worth reading in a GC log; and why most
+       "GC problems" are allocation-rate or leak problems that no tuning flag will fix. Prerequisites:
+       <a href="memory.html">Memory: Stack, Heap &amp; References</a>.</p>
 
-2. SWEEP   Reclaim the memory of unmarked (unreachable) objects.
+    <h2>Part 1 — Reachability, Not Counting</h2>
 
-3. COMPACT Move surviving objects together to eliminate fragmentation, so free space is contiguous
-           (fast bump-pointer allocation) — not all collectors compact, but most do for the old gen.</pre>
-    <p>The key idea (from the Memory lesson): the GC reclaims <strong>unreachable</strong> objects, found by
-       tracing references from GC roots. This reachability approach — unlike reference counting — correctly
-       collects cycles. Compaction matters because sweeping alone leaves "holes" (fragmentation) that slow
-       allocation and waste space; moving survivors together restores fast, contiguous allocation.</p>
-    <div class="note">💡 <strong>You never call the GC explicitly.</strong> <code>System.gc()</code> is only a
-      <em>suggestion</em> the JVM may ignore, and calling it is almost always wrong — it can force an expensive
-      full collection at a bad time. The GC runs automatically based on heap pressure. Your job is not to
-      trigger it but to feed it well (low allocation rate, objects that die young) and, when necessary, to
-      choose and tune the right collector.</div>
+<pre>  THE JVM DOES NOT COUNT REFERENCES. It asks a different question:
+  starting from a set of ROOTS, which objects can I reach?
 
-    <h2>Part 2 — Generational Collection (why it's fast)</h2>
-    <pre>// Using the young/old heap split from the Memory lesson:
-MINOR GC  — collects the YOUNG generation (Eden + survivors). Frequent, fast, short pauses.
-            Most objects are dead here (die young), so little is copied → cheap.
+  Anything unreachable is garbage — whether or not other garbage
+  points at it.
 
-MAJOR / FULL GC — collects the OLD generation (and often everything). Infrequent, slower,
-            longer pauses. Long-lived objects accumulate here and are expensive to collect.
+  THE GC ROOTS:
 
-// Objects that survive several minor GCs are PROMOTED (tenured) to the old generation.</pre>
-    <div class="note">🎯 <strong>Generational collection is why modern GC is efficient.</strong> Because most
-      objects die young, collecting the small young generation frequently reclaims most garbage cheaply, and
-      the expensive whole-heap collection happens rarely. This is the single most important GC concept: the
-      collector does far less work than scanning the entire heap every time. A common performance problem is a
-      high <em>promotion rate</em> — objects surviving to the old generation that shouldn't — which triggers
-      costly major GCs; it usually points to objects living longer than necessary or an undersized young
-      generation.</div>
+    local variables and parameters in every live stack frame
+    static fields of loaded classes
+    JNI local and global references
+    active Java threads (the Thread objects themselves)
+    objects held by the JVM itself (system class loader, exception
+      being thrown, monitors currently held)
 
-    <h2>Part 3 — The Fundamental Trade-off: Throughput vs Latency vs Footprint</h2>
+  WHY THIS BEATS REFERENCE COUNTING — CYCLES COLLECT THEMSELVES:
+
+    a.next = b;
+    b.next = a;        // each has count 1
+    a = null; b = null;
+
+  A counting collector leaks this forever. A tracing collector simply
+  never reaches the pair from a root, so both die. Python needs a
+  separate cycle detector for exactly this reason; Java does not.
+
+  THE CONSEQUENCE THAT MATTERS FOR DEBUGGING:
+
+    A JAVA MEMORY LEAK IS ALWAYS SOMETHING STILL REACHABLE.
+
+  There is no "forgot to free". If memory grows without bound, some
+  root still reaches the objects — a static Map, a listener list, a
+  ThreadLocal on a pooled thread, a cache with no eviction. The heap
+  dump question is never "what leaked" but "WHAT PATH FROM A ROOT
+  KEEPS THIS ALIVE", which is exactly what a dominator tree answers.
+
+  MARK-SWEEP-COMPACT, THE BASELINE ALGORITHM:
+
+    MARK     trace from roots, flag everything reachable
+    SWEEP    reclaim the space of everything unmarked
+    COMPACT  slide survivors together to remove fragmentation
+
+  Compaction is what keeps allocation cheap — see Part 3 — but it
+  MOVES OBJECTS, which means every reference to them must be updated,
+  which is why naive collectors must stop the world to do it.
+
+  FINALIZERS ARE DEAD. Object.finalize() is removed; it made objects
+  survive an extra cycle, ran on an unbounded queue with no timing
+  guarantee, and could resurrect the object. Use try-with-resources
+  for deterministic cleanup, and java.lang.ref.Cleaner as the safety
+  net — never as the primary mechanism.</pre>
+
+    <h2>Part 2 — The Generational Hypothesis</h2>
+
+<pre>  THE WEAK GENERATIONAL HYPOTHESIS, measured across decades of real
+  programs:
+
+    MOST OBJECTS DIE YOUNG. Typically 90-98% of allocations are
+    unreachable by the next collection.
+
+  Think about what you actually allocate: a StringBuilder inside a
+  method, boxed values in a stream pipeline, an iterator, a DTO for
+  one request. Almost none of it outlives the call.
+
+  THE HEAP IS SPLIT TO EXPLOIT THIS:
+
+    ┌──────────── YOUNG GENERATION ────────────┬─── OLD GEN ───┐
+    │   Eden          │  S0   │  S1            │               │
+    │  (allocate)     │(from) │ (to)           │  (tenured)    │
+    └─────────────────┴───────┴────────────────┴───────────────┘
+         ~80%            10%     10%              typically 2/3
+                                                  of total heap
+
+  A YOUNG COLLECTION (a "minor GC"):
+
+    1. Trace from roots, but only INTO the young generation.
+    2. COPY every live object out of Eden and the in-use survivor
+       space into the OTHER survivor space.
+    3. Increment each survivor's age. At the TENURING THRESHOLD
+       (default 15, adaptive) promote it to the old generation.
+    4. Eden and the vacated survivor space are now entirely empty —
+       reclaim them by resetting a pointer.
+
+  HERE IS THE CRUCIAL CONSEQUENCE:
+
+    A COPYING COLLECTOR TOUCHES ONLY THE SURVIVORS. Its cost is
+    O(live), NOT O(heap) and NOT O(garbage).
+
+  So a young GC that finds 2% survivors costs almost nothing no
+  matter how much was allocated. ALLOCATING GARBAGE IS NEARLY FREE;
+  KEEPING OBJECTS ALIVE IS WHAT COSTS.
+
+  That single fact overturns the instinct to "reduce allocations".
+  A million short-lived objects are cheaper than a hundred thousand
+  that survive one collection.
+
+  PREMATURE PROMOTION IS THE FAILURE MODE. If Eden is too small or
+  survivor spaces overflow, objects that would have died young get
+  copied into the old generation instead. They then require an
+  expensive old-gen collection to remove. Symptoms: old gen growing
+  steadily under a workload with no real long-lived state, and
+  frequent full collections.
+
+  WHY THE OLD GENERATION IS COLLECTED DIFFERENTLY: survival rates
+  there are high, so copying would move almost everything. Old-gen
+  algorithms therefore mark and either sweep or compact in place, and
+  they are the expensive ones.</pre>
+
     <table class="tbl">
-      <tr><th>Goal</th><th>Means</th><th>Favored by</th></tr>
-      <tr><td><strong>Throughput</strong></td><td>Max work done; GC total time minimized (accepts longer pauses)</td><td>Batch jobs, analytics</td></tr>
-      <tr><td><strong>Latency</strong></td><td>Short, predictable pauses (accepts more total GC work)</td><td>Interactive services, APIs, trading</td></tr>
-      <tr><td><strong>Footprint</strong></td><td>Minimal memory/CPU overhead</td><td>Constrained/embedded environments</td></tr>
+      <tr><th>Region</th><th>Typical share</th><th>Collected by</th><th>Survival rate</th></tr>
+      <tr><td>Eden</td><td>~65% of young</td><td>Every young GC</td><td>Very low (2–10%)</td></tr>
+      <tr><td>Survivor S0/S1</td><td>~10% each of young</td><td>Every young GC</td><td>Moderate</td></tr>
+      <tr><td>Old generation</td><td>~2/3 of heap</td><td>Old/mixed/full GC</td><td>High</td></tr>
+      <tr><td>Humongous (G1)</td><td>Objects &gt; ½ a region</td><td>Allocated straight into old</td><td>Varies</td></tr>
+      <tr><td>Metaspace</td><td>Native memory</td><td>On class-loader death</td><td>Very high</td></tr>
     </table>
-    <p>You cannot maximize all three — improving one usually costs another. A throughput collector may pause
-       for a full second occasionally but waste little total time; a low-latency collector keeps pauses under a
-       millisecond but does more background work (more CPU). The right choice depends on what your application
-       needs: a nightly batch job wants throughput; a user-facing API wants low, predictable latency.</p>
-    <div class="note">🔍 <strong>"Stop-the-world" (STW) pauses</strong> are moments when the GC halts all
-      application threads to do its work safely. Every collector has some STW pauses; the difference is their
-      length and frequency. For a latency-sensitive service, a long STW pause means requests stall — a
-      500ms full GC pause is 500ms of frozen users. Minimizing and bounding these pauses is the whole point of
-      modern low-latency collectors.</div>
 
-    <h2>Part 4 — The Collectors & Choosing One</h2>
+    <h2>Part 3 — Allocation Is a Pointer Bump</h2>
+
+<pre>  BECAUSE COMPACTION LEAVES EDEN CONTIGUOUS, ALLOCATION DOES NOT NEED
+  A FREE LIST. It needs one pointer:
+
+    top += size;          // that is genuinely most of it
+    if (top &gt; limit) slow_path();
+
+  ~10 machine instructions. Faster than malloc, which must search a
+  free list and handle fragmentation.
+
+  BUT top IS SHARED, so a naive version needs an atomic increment per
+  allocation — a contention point across every thread.
+
+  THE FIX IS THE TLAB (THREAD-LOCAL ALLOCATION BUFFER). Each thread
+  gets its own chunk of Eden:
+
+    thread A: [==== TLAB ====][ ]
+    thread B:                 [==== TLAB ====][ ]
+
+  Inside its TLAB a thread bumps its own pointer with NO
+  SYNCHRONISATION at all. Only when the TLAB is exhausted does it
+  take a lock to claim another chunk.
+
+  TLAB sizes adapt to each thread's allocation rate. A thread that
+  allocates heavily gets bigger buffers; an idle one gets small ones.
+
+  OBJECTS TOO LARGE FOR A TLAB go directly to the shared Eden or, if
+  very large, straight into the old generation — bypassing the cheap
+  path entirely. That is one reason huge arrays behave differently
+  from many small objects.
+
+  ESCAPE ANALYSIS CAN REMOVE THE ALLOCATION ENTIRELY. If C2 proves an
+  object never escapes its method, it performs SCALAR REPLACEMENT —
+  the fields become registers and no object is created:
+
+    Point p = new Point(x, y);     // may never exist at runtime
+    return p.x + p.y;
+
+  This is why "object allocation is slow" is outdated advice and why
+  micro-optimising allocation by hand can be counterproductive: you
+  may defeat the analysis that was already eliminating it.
+
+  THE ARITHMETIC YOU CAN ACTUALLY USE:
+
+    young GC frequency = allocation rate ÷ Eden size
+
+    500 MB/s allocation, 1 GB Eden  → a young GC every 2 s
+    2 GB/s   allocation, 1 GB Eden  → a young GC every 0.5 s
+
+  Each young GC costs roughly (survivors × copy cost). So there are
+  exactly two levers: allocate less, or make Eden bigger so each
+  collection is rarer and — because more objects have died by then —
+  proportionally cheaper.</pre>
+
+    <h2>Part 4 — Cross-Generational References</h2>
+
+<pre>  A YOUNG COLLECTION WANTS TO SCAN ONLY THE YOUNG GENERATION. But an
+  old object may hold the only reference to a young one:
+
+    static List&lt;Order&gt; cache;   // in OLD gen
+    cache.add(new Order());     // the Order is in EDEN
+
+  If the collector ignores the old generation, it will conclude the
+  Order is unreachable and free a live object. Scanning the whole old
+  generation to avoid that would cost exactly what generational GC
+  was meant to save.
+
+  THE CARD TABLE SOLVES IT. The old generation is divided into
+  "cards" (512 bytes each), with a one-byte table entry per card:
+
+    old gen:  [ card 0 ][ card 1 ][ card 2 ][ card 3 ] …
+    table:       clean     DIRTY     clean     clean
+
+  A WRITE BARRIER runs on every reference store to an object field:
+
+    obj.field = ref;
+    cardTable[address(obj) &gt;&gt; 9] = DIRTY;    // ~2 instructions
+
+  At the next young GC, the collector scans only the dirty cards
+  plus the young generation, and treats references found there as
+  extra roots.
+
+  YOU PAY FOR THIS ON EVERY REFERENCE WRITE IN YOUR PROGRAM — a
+  couple of instructions, always, whether or not a GC ever happens.
+  It is one of the few places where GC imposes a cost on ordinary
+  execution rather than at collection time. It also explains why
+  primitive writes are cheaper than reference writes.
+
+  G1 GENERALISES THIS TO REMEMBERED SETS. Since G1 collects an
+  arbitrary SET of regions, each region needs to know who points into
+  it, so it keeps a per-region remembered set. That is far more
+  bookkeeping than a flat card table, and it is precisely why G1 has
+  higher overhead than Parallel on a throughput benchmark — you are
+  buying pause predictability with CPU and footprint.
+
+  THE PRACTICAL LESSON: holding young objects from long-lived
+  structures is not free. A large mutable cache in the old generation
+  dirties cards continuously and enlarges every young collection.</pre>
+
+    <h2>Part 5 — The Collectors</h2>
+
+<pre>  SERIAL  (-XX:+UseSerialGC)
+    One thread, stop-the-world, mark-copy young + mark-sweep-compact
+    old. Lowest footprint and lowest overhead.
+    USE IT: small heaps (&lt; ~100 MB), single-core containers, CLI
+    tools, and anywhere startup and footprint beat pause time. It is
+    genuinely the right answer more often than its reputation
+    suggests.
+
+  PARALLEL  (-XX:+UseParallelGC)
+    Same algorithms, many threads. Was the default through Java 8.
+    HIGHEST THROUGHPUT of any collector — nothing runs concurrently
+    with your application, so no CPU is spent on concurrent marking
+    and no write barriers beyond the card table.
+    USE IT: batch jobs, ETL, anything where total time matters and a
+    one-second pause is irrelevant.
+    COST: pauses scale with heap size. A 32 GB heap can pause for
+    seconds.
+
+  G1  (-XX:+UseG1GC)  — the default since Java 9
+    The heap is divided into ~2048 equal REGIONS (1-32 MB), and a
+    region is dynamically Eden, Survivor, Old, or Humongous:
+
+      [E][O][S][E][O][O][H][H][E][O][S][E][O] …
+
+    You state a PAUSE TARGET and G1 collects as many regions as it
+    predicts will fit in it:
+
+      -XX:MaxGCPauseMillis=200        (default)
+
+    "Garbage First" is literal — it collects the regions with the
+    most garbage per unit of work, which is why it is efficient
+    without needing a contiguous young generation.
+    MIXED COLLECTIONS clean young regions plus a few old ones each
+    cycle, spreading old-gen work out instead of doing one big pause.
+    HUMONGOUS ALLOCATIONS — objects larger than half a region — are
+    allocated directly into contiguous old regions and are hard to
+    reclaim. Many large arrays cause fragmentation and full GCs; the
+    fix is usually a bigger -XX:G1HeapRegionSize.
+    PAUSE TARGET IS A GOAL, NOT A GUARANTEE. Set it too low and G1
+    collects too little per cycle, falls behind, and eventually does
+    a full stop-the-world collection — worse than the pauses you were
+    avoiding.
+
+  ZGC  (-XX:+UseZGC)  and  SHENANDOAH  (-XX:+UseShenandoahGC)
+    Concurrent collectors: marking AND relocation happen while the
+    application runs, so pause time is essentially independent of
+    heap size.
+      pauses:  &lt; 1 ms, on heaps from a few hundred MB to 16 TB
+      how:     ZGC uses COLOURED POINTERS — metadata stored in unused
+               pointer bits — plus load barriers that fix up a
+               reference when the application reads one that has been
+               relocated. Shenandoah uses a similar load-barrier
+               approach with Brooks pointers historically.
+      cost:    5-15% throughput, higher CPU (concurrent threads
+               compete with yours), and more footprint.
+    USE THEM: latency-sensitive services with large heaps where a
+    200 ms G1 pause violates an SLA.
+    DO NOT USE THEM: batch work, small heaps, or CPU-saturated
+    services — you are paying throughput for a pause reduction nobody
+    observes.
+
+  EPSILON  (-XX:+UseEpsilonGC)
+    Allocates and never collects; the JVM dies when the heap fills.
+    Real uses: benchmarking allocation cost without GC noise, and
+    extremely short-lived jobs that finish before exhausting memory.</pre>
+
     <table class="tbl">
-      <tr><th>Collector</th><th>Optimized for</th><th>Use when</th></tr>
-      <tr><td><strong>G1</strong> (default, 9+)</td><td>Balanced — predictable pauses on large heaps</td><td>The sensible default for most server apps</td></tr>
-      <tr><td><strong>ZGC</strong> / <strong>Shenandoah</strong></td><td>Ultra-low latency (sub-millisecond pauses)</td><td>Large heaps + strict latency SLAs</td></tr>
-      <tr><td><strong>Parallel</strong></td><td>Max throughput (longer pauses OK)</td><td>Batch/analytics; pause-tolerant</td></tr>
-      <tr><td><strong>Serial</strong></td><td>Tiny footprint, single-threaded</td><td>Small heaps, containers, CLIs</td></tr>
+      <tr><th>Collector</th><th>Pause</th><th>Throughput</th><th>Heap sweet spot</th><th>Pick it when</th></tr>
+      <tr><td>Serial</td><td>High</td><td>Good</td><td>&lt; 100 MB</td><td>Small container, CLI, footprint matters</td></tr>
+      <tr><td>Parallel</td><td>High, scales with heap</td><td><strong>Best</strong></td><td>&lt; 8 GB</td><td>Batch, ETL — total time is the metric</td></tr>
+      <tr><td>G1 <em>(default)</em></td><td>Moderate, targeted</td><td>Good</td><td>4–64 GB</td><td>General server work</td></tr>
+      <tr><td>ZGC</td><td><strong>&lt; 1 ms</strong></td><td>−5–15%</td><td>8 GB – 16 TB</td><td>Latency SLA on a large heap</td></tr>
+      <tr><td>Shenandoah</td><td><strong>&lt; 1 ms</strong></td><td>−5–15%</td><td>4 GB+</td><td>Same, on OpenJDK builds that ship it</td></tr>
+      <tr><td>Epsilon</td><td>None (then death)</td><td>Maximum</td><td>Any</td><td>Benchmarking, ultra-short jobs</td></tr>
     </table>
-    <div class="note">🎯 <strong>Start with the default (G1) and only change it with a measured reason.</strong>
-      G1 divides the heap into regions and collects the ones with the most garbage first ("garbage first"),
-      aiming for a configurable pause-time target — a good balance for most server workloads. Reach for
-      <strong>ZGC</strong> or <strong>Shenandoah</strong> when you have a large heap and hard latency
-      requirements (they keep pauses sub-millisecond even on huge heaps by doing most work concurrently). Use
-      <strong>Parallel</strong> for throughput-only batch jobs and <strong>Serial</strong> for tiny
-      single-core/container workloads. Choosing a collector is a deliberate decision driven by your
-      latency/throughput needs and heap size — not a default to fiddle with speculatively.</div>
 
-    <h2>Part 5 — Reading GC Logs & Basic Tuning</h2>
-    <pre># Enable GC logging (Java 9+ unified logging):
-java -Xlog:gc*:file=gc.log -Xms4g -Xmx4g -jar app.jar
+    <h2>Part 6 — Reading the Logs and Tuning Honestly</h2>
 
-# Key heap flags:
--Xms4g -Xmx4g          # initial and MAX heap — set them EQUAL in production (avoid resize pauses)
--XX:+UseG1GC           # select the collector (G1 is default)
--XX:MaxGCPauseMillis=200   # G1 pause-time target
--XX:+HeapDumpOnOutOfMemoryError   # auto-dump on OOM for post-mortem analysis
+<pre>  ENABLE LOGGING. It is cheap and it is the only real evidence:
 
-# What to look for in logs / monitoring:
-#   - Pause durations (are STW pauses within your SLA?)
-#   - GC frequency (too frequent → heap too small or allocation rate too high)
-#   - Post-GC live-set size (growing steadily → a leak — Memory lesson)
-#   - Promotion rate (high → objects tenuring too fast → major GC pressure)</pre>
-    <div class="note">🔍 <strong>The most common tuning lever is heap size.</strong> Too small → frequent GCs
-      and OOM risk; too large → longer pauses and wasted memory. Set <code>-Xms</code> equal to <code>-Xmx</code>
-      in production so the heap doesn't resize (resizing causes pauses and unpredictability). Beyond that,
-      collector choice and pause-time targets are the main knobs — but <strong>don't tune blindly</strong>:
-      enable GC logging, measure against your actual workload and SLA, and change one thing at a time. Most GC
-      "problems" are actually application problems (a leak, a high allocation rate, an unbounded cache) that no
-      tuning will fix.</div>
+    -Xlog:gc*:file=gc.log:time,uptime,level,tags
 
-    <h2>Part 6 — Deep Dive: The GC Mindset for Real Systems</h2>
-    <ul>
-      <li><strong>Feed the generational hypothesis.</strong> The GC is optimized for objects that die young, so
-          the best-performing code keeps most objects short-lived and confined — don't hold references longer
-          than needed, don't promote transient data to long-lived caches. High promotion and high allocation
-          rates are what stress the collector.</li>
-      <li><strong>Latency comes from pauses, not total GC time.</strong> For an interactive service, a
-          collector that spends more total CPU on GC but keeps pauses tiny (ZGC) is better than one that's
-          "efficient" overall but pauses for a second. Match the collector to whether you care about tail
-          latency or aggregate throughput.</li>
-      <li><strong>Size the heap for the workload, and pin it.</strong> Enough headroom to avoid constant GC,
-          not so much that pauses (in pausing collectors) grow; equal <code>-Xms</code>/<code>-Xmx</code> for
-          predictability; and account for containers (set heap relative to the container memory limit — modern
-          JVMs are container-aware).</li>
-      <li><strong>Diagnose before tuning.</strong> GC logs and heap dumps tell you whether you have a leak
-          (rising post-GC live set), allocation pressure (frequent minor GCs), promotion pressure (frequent
-          major GCs), or genuinely need a different collector. Tuning without this data is guessing.</li>
-    </ul>
-    <div class="note">🔍 <strong>Senior framing:</strong> the mature view of GC is that it's a
-      well-engineered system you mostly <em>cooperate with</em> rather than fight. The application's memory
-      behavior — allocation rate, object lifetimes, promotion — matters far more than flags; a program that
-      allocates modestly and lets objects die young will perform well under almost any collector, while a
-      program with a leak or an unbounded cache will defeat any tuning. So the senior playbook is: write
-      allocation-conscious code where it's hot, choose the collector deliberately for your latency-vs-throughput
-      profile (default G1, ZGC/Shenandoah for strict latency on big heaps, Parallel for batch), size and pin
-      the heap, enable GC logging, and diagnose real problems from data rather than reaching for magic flags.
-      Being able to explain the throughput/latency/footprint trade-off, why generational collection is fast,
-      what a stop-the-world pause costs a service, and how you'd read a GC log to distinguish a leak from
-      allocation pressure is exactly the depth that distinguishes a senior answer — GC is where "Java developer"
-      meets "systems engineer."</div>
+  (The old -XX:+PrintGCDetails flags were removed in Java 9; unified
+  logging replaced them.)
+
+  A YOUNG COLLECTION LINE, DECODED:
+
+    [12.345s][info][gc] GC(42) Pause Young (Normal)
+                        (G1 Evacuation Pause)
+                        512M-&gt;48M(1024M) 12.456ms
+                         │     │    │      └ pause duration
+                         │     │    └ total heap size
+                         │     └ heap used AFTER
+                         └ heap used BEFORE
+
+  THE FOUR NUMBERS THAT MATTER — and none of them is "pause time on
+  its own":
+
+    1. ALLOCATION RATE = (heap used before GC n+1 − heap used after
+       GC n) ÷ elapsed. This is the number that drives everything.
+       Above ~1 GB/s, look at your code before your flags.
+    2. PROMOTION RATE = growth of the old generation per second. If
+       this is high in a service with no growing state, you have
+       PREMATURE PROMOTION — Eden or the survivor spaces are too
+       small.
+    3. LIVE SET = heap used after a FULL collection. This is your
+       real memory requirement. If it grows monotonically across
+       full GCs, you have a leak, and no flag will help.
+    4. GC OVERHEAD = time in GC ÷ wall time. Under ~5% is healthy;
+       above 10% is a problem worth chasing.
+
+  THE DIAGNOSTIC TABLE:
+
+    growing live set across full GCs   → LEAK. Take a heap dump.
+    high allocation rate, low survival → fine, or reduce allocation
+    high promotion, low real lifetime  → premature promotion; raise
+                                         -Xmn or the survivor ratio
+    long young pauses                  → too many survivors; the
+                                         young gen may be TOO BIG
+    long full pauses on G1             → humongous fragmentation, or
+                                         a pause target set too low
+    "Allocation Failure" every second  → Eden too small for the rate
+
+  TUNING, IN THE ORDER THAT ACTUALLY PAYS:
+
+    1. FIX THE ALLOCATION RATE OR THE LEAK. Most "GC problems" are
+       application problems. No collector makes a leak survivable.
+    2. SET THE HEAP SIZE. -Xms == -Xmx to avoid resize pauses. Aim
+       for a live set around 30-50% of the heap; a heap too small
+       causes constant collection, and one too large lengthens full
+       collections and wastes memory you paid for.
+    3. CHOOSE THE COLLECTOR from the table above.
+    4. SET A PAUSE GOAL if using G1 — and be realistic; too
+       aggressive is worse than none.
+    5. EVERYTHING ELSE. Survivor ratios, tenuring thresholds, region
+       sizes. Change ONE flag, measure, keep or revert.
+
+  NEVER CALL System.gc(). It requests a full stop-the-world
+  collection at the worst possible moment and tells you nothing about
+  your steady state. Disable it with -XX:+DisableExplicitGC when a
+  library insists on calling it.
+
+  CONTAINERS: modern JVMs are container-aware and read cgroup limits,
+  but the default MaxRAMPercentage is only 25%. On a 4 GB container
+  you get a 1 GB heap unless you say otherwise:
+
+    -XX:MaxRAMPercentage=75.0
+
+  Leave real headroom — metaspace, thread stacks, direct buffers and
+  JIT code cache all live outside the heap, and the container OOM
+  killer does not produce a heap dump.</pre>
 
     <h2>Common Mistakes</h2>
+
     <table class="tbl">
-      <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
-      <tr><td>Calling <code>System.gc()</code></td><td>Forced full GC at a bad time</td><td>Don't — let the JVM manage it</td></tr>
-      <tr><td>Tuning flags without measuring</td><td>Random changes, no improvement</td><td>Enable GC logging; change one thing</td></tr>
-      <tr><td>Different <code>-Xms</code>/<code>-Xmx</code> in prod</td><td>Resize pauses, unpredictability</td><td>Set them equal</td></tr>
-      <tr><td>Blaming GC for a leak</td><td>OOM despite tuning</td><td>Heap dump; fix the retained references</td></tr>
-      <tr><td>Wrong collector for the workload</td><td>Long pauses on a latency service</td><td>ZGC/Shenandoah for low latency; Parallel for batch</td></tr>
-      <tr><td>Huge heap "to be safe"</td><td>Longer pauses, wasted memory</td><td>Size to the workload with headroom</td></tr>
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Believing GC counts references</td><td>It traces reachability — which is why cycles collect fine</td><td>Ask "what root still reaches this?"</td></tr>
+      <tr><td>Calling <code>System.gc()</code></td><td>Forces a full stop-the-world pause at an arbitrary moment</td><td>Never; <code>-XX:+DisableExplicitGC</code> if a library calls it</td></tr>
+      <tr><td>"Reduce allocations" as a reflex</td><td>Short-lived garbage is nearly free — copying cost is O(survivors)</td><td>Reduce what <em>survives</em>; measure first</td></tr>
+      <tr><td>Tuning flags to fix a leak</td><td>The live set keeps growing; you only delay the OOM</td><td>Heap dump, dominator tree, find the retaining root</td></tr>
+      <tr><td>Setting a 10 ms G1 pause target</td><td>G1 collects too little, falls behind, and does a full GC — worse pauses</td><td>A realistic target, or ZGC if you truly need &lt; 1 ms</td></tr>
+      <tr><td>Making the heap as large as possible</td><td>Full collections lengthen; page-cache and other processes suffer</td><td>Live set at 30–50% of heap</td></tr>
+      <tr><td><code>-Xms</code> ≠ <code>-Xmx</code></td><td>Resize pauses and unpredictable behaviour during warmup</td><td>Set them equal in production</td></tr>
+      <tr><td>Assuming a bigger young gen is always better</td><td>More survivors per collection means <em>longer</em> young pauses</td><td>Size from the measured promotion rate</td></tr>
+      <tr><td>Ignoring premature promotion</td><td>Objects that should die young need an old-gen collection to remove</td><td>Check promotion rate; enlarge Eden or survivors</td></tr>
+      <tr><td>Many large arrays under G1</td><td>Humongous allocations fragment old regions and trigger full GCs</td><td>Raise <code>G1HeapRegionSize</code>, or avoid huge objects</td></tr>
+      <tr><td>Using ZGC on a batch job</td><td>You pay 5–15% throughput for pauses nobody measures</td><td>Parallel — total time is the metric there</td></tr>
+      <tr><td>Relying on <code>finalize()</code></td><td>Removed; it delayed collection, had no timing guarantee, and could resurrect objects</td><td><code>try-with-resources</code>; <code>Cleaner</code> only as a net</td></tr>
+      <tr><td>Reading only pause times</td><td>Misses the allocation rate, promotion rate and live set that explain them</td><td>All four numbers together</td></tr>
+      <tr><td>Default heap in a container</td><td><code>MaxRAMPercentage</code> is 25% — a 4 GB container gets a 1 GB heap</td><td>Set it explicitly, with off-heap headroom</td></tr>
+      <tr><td>Using old <code>PrintGC*</code> flags</td><td>Removed in Java 9 — the JVM may refuse to start</td><td><code>-Xlog:gc*</code></td></tr>
+      <tr><td>Changing several flags at once</td><td>You cannot attribute the change to any of them</td><td>One flag, measure, keep or revert</td></tr>
     </table>
 
     <h2>Interview Questions</h2>
-    <details class="solution"><summary>Q1 (beginner): How does garbage collection decide what to reclaim?</summary>
-      <p>By <strong>reachability</strong>. The collector starts from GC roots (live thread stack variables,
-         static fields, etc.) and traces every object reachable through references — those are live. Anything
-         not reached is unreachable and therefore garbage that can be reclaimed. This is why it's called a
-         tracing collector, and why it correctly handles reference cycles (two objects pointing at each other
-         but referenced by nothing else are both unreachable). You don't decide manually; making an object
-         unreachable (dropping all references to it) is what makes it eligible, and the GC reclaims it at some
-         later collection.</p></details>
-    <details class="solution"><summary>Q2 (beginner): What is a "stop-the-world" pause?</summary>
-      <p>A stop-the-world (STW) pause is a period during garbage collection when the JVM suspends all
-         application threads so the collector can do work that requires a stable view of memory (like moving
-         objects or finalizing which are live). During an STW pause the application does nothing — no requests
-         are served — so a long pause directly translates to latency: a 500 ms full-GC pause freezes users for
-         half a second. Every collector has some STW pauses; the difference between collectors is largely how
-         short and infrequent they keep them. Minimizing STW pause time is the central goal of low-latency
-         collectors like ZGC and Shenandoah, which do most of their work concurrently with the
-         application.</p></details>
-    <details class="solution"><summary>Q3 (mid): Explain the throughput vs latency trade-off in GC.</summary>
-      <p>Throughput means maximizing the total useful work the application does, which a GC optimizes by
-         minimizing the <em>total</em> time spent collecting — even if that means occasional long pauses.
-         Latency means keeping individual GC pauses short and predictable so no single operation stalls, which
-         typically costs <em>more</em> total GC work/CPU because the collector does much of its work
-         concurrently and in smaller increments. You can't maximize both: a throughput collector (Parallel) may
-         pause for a second occasionally but waste little aggregate time — great for a batch job where total
-         runtime is what matters; a latency collector (ZGC/Shenandoah) keeps pauses sub-millisecond but uses
-         more CPU overall — essential for an interactive service where a long pause means stalled requests and
-         bad tail latency. Footprint (memory/CPU overhead) is the third axis, favored in constrained
-         environments. The right collector follows from which of these your workload actually needs.</p></details>
-    <details class="solution"><summary>Q4 (mid): Which garbage collectors exist and how do you choose?</summary>
-      <p>The main ones: <strong>G1</strong> (the default since Java 9) divides the heap into regions and
-         collects the highest-garbage regions first, targeting predictable pauses — a balanced choice good for
-         most server applications. <strong>ZGC</strong> and <strong>Shenandoah</strong> are low-latency
-         collectors that keep pauses sub-millisecond even on very large heaps by doing almost all work
-         concurrently — choose them when you have big heaps and strict latency SLAs. <strong>Parallel</strong>
-         maximizes throughput at the cost of longer pauses — good for pause-tolerant batch/analytics jobs.
-         <strong>Serial</strong> is single-threaded with minimal overhead — suited to small heaps, single-core
-         or memory-constrained containers, and short-lived CLIs. The selection method is to start with the
-         default G1, identify your priority (tail latency vs total throughput vs footprint) and heap size, and
-         switch deliberately with measurement — ZGC/Shenandoah for latency-critical large-heap services,
-         Parallel for throughput batch, Serial for tiny footprints. You shouldn't change collectors
-         speculatively.</p></details>
-    <details class="solution"><summary>Q5 (senior): How would you diagnose and address frequent long GC pauses in a latency-sensitive service?</summary>
-      <p>First, gather data rather than guess: enable unified GC logging (<code>-Xlog:gc*</code>) and inspect
-         pause durations, frequency, which generation is being collected, the post-GC live-set trend, and the
-         promotion rate; correlate GC pauses with the service's latency spikes to confirm GC is the cause.
-         Then interpret: (1) if <em>minor</em> GCs are frequent, the allocation rate is high or the young
-         generation is too small — reduce allocation in hot paths (reuse buffers, primitives over boxed, avoid
-         needless object churn) or enlarge the young gen so short-lived objects die there instead of promoting;
-         (2) if <em>major/full</em> GCs are frequent or long, the old generation is filling — check the
-         <strong>promotion rate</strong> (objects tenuring too fast, often from an undersized young gen or
-         objects living longer than needed) and the <strong>post-GC live set</strong> (if it climbs steadily,
-         it's a <em>leak</em> — take a heap dump and fix the retained references, since no GC tuning cures a
-         leak); (3) if the live set is stable but pauses still exceed the SLA, the collector or heap size is the
-         issue — for strict latency, switch from a pausing collector to <strong>ZGC or Shenandoah</strong>,
-         which keep pauses sub-millisecond by working concurrently, and size the heap with enough headroom while
-         setting <code>-Xms</code> equal to <code>-Xmx</code> to avoid resize pauses; for G1, set a realistic
-         <code>MaxGCPauseMillis</code> target. Also verify container-awareness (heap sized within the container
-         limit) and rule out application causes like <code>System.gc()</code> calls or huge short-lived
-         allocations. The disciplined approach — measure, distinguish allocation pressure vs promotion pressure
-         vs leak vs collector mismatch, then apply the specific fix and re-measure — is what separates real GC
-         work from cargo-cult flag tweaking. Often the fix is in the application (allocation/lifetime/leak), not
-         the flags.</p></details>
-    <details class="solution"><summary>Q6 (senior): Why is <code>System.gc()</code> almost always the wrong tool, and what should you do instead?</summary>
-      <p><code>System.gc()</code> is only a <em>hint</em> that the JVM is free to ignore, and when it isn't
-         ignored it typically triggers a <strong>full, stop-the-world collection</strong> — the most expensive
-         kind — at a moment chosen by your code rather than by the collector's own heuristics, which are far
-         better informed about heap state. So it commonly does harm: injecting long pauses into a latency-
-         sensitive service, disrupting the generational collector's tuned cadence, and masking the real problem.
-         People reach for it to "fix" memory pressure or force cleanup, but if you're near OOM,
-         <code>System.gc()</code> won't help because the objects are <em>reachable</em> (a leak) — the fix is to
-         release references, not to collect harder; and if allocation pressure is the issue, the answer is to
-         allocate less or size the heap appropriately, not to force collections. The correct approach is to let
-         the JVM manage collection automatically and instead: diagnose with GC logs and heap dumps, fix leaks by
-         cutting retained references, reduce allocation rate in hot paths, size and pin the heap, and choose the
-         right collector for your latency/throughput profile. (The only legitimate uses of a GC hint are narrow
-         — e.g. benchmarking harnesses controlling state, or right before a deliberate latency-tolerant idle
-         period — and even then it's a hint. In production request paths it should essentially never appear;
-         many teams disable it with <code>-XX:+DisableExplicitGC</code>.)</p></details>
 
-    <h2>🏋️ Exercises (attempt before opening solutions)</h2>
-    <div class="exercise"><strong>1 (easy): Minor vs major.</strong> Explain the difference between a minor and a
-      major GC in terms of which generation, frequency, and pause length.
-      <details class="solution"><summary>Solution</summary>
-        <p>A <strong>minor</strong> GC collects the young generation (Eden + survivors) — frequent, fast, short
-           pauses, and reclaims most garbage cheaply because most objects die young. A <strong>major/full</strong>
-           GC collects the old generation (and often the whole heap) — infrequent but slower with longer pauses,
-           because long-lived tenured objects are expensive to collect. Objects surviving several minor GCs get
-           promoted to the old generation.</p></details></div>
-    <div class="exercise"><strong>2 (easy): Enable GC logging.</strong> State the flags to log GC and to set a
-      fixed 2GB heap, and name three things you'd look for in the log.
-      <details class="solution"><summary>Solution</summary>
-        <p><code>-Xlog:gc*:file=gc.log -Xms2g -Xmx2g</code>. Look for: pause durations (within SLA?), GC
-           frequency (too frequent → heap too small / high allocation), and the post-GC live-set trend (rising
-           → leak). Promotion rate and full-GC frequency are also key signals.</p></details></div>
-    <div class="exercise"><strong>3 (medium): Choose a collector.</strong> For each, pick a collector and
-      justify: (a) a nightly ETL batch job; (b) a low-latency trading API; (c) a tiny CLI in a constrained
-      container.
-      <details class="solution"><summary>Solution</summary>
-        <p>(a) <strong>Parallel</strong> — batch cares about total throughput, not pause length, so accept longer
-           pauses for minimal total GC time. (b) <strong>ZGC/Shenandoah</strong> — strict tail-latency needs
-           sub-millisecond pauses even under load. (c) <strong>Serial</strong> — tiny footprint, single-threaded,
-           minimal overhead for a small heap/short life. Matching collector to the throughput/latency/footprint
-           priority is the skill.</p></details></div>
-    <div class="exercise"><strong>4 (medium): Leak vs tuning.</strong> A service OOMs and someone suggests
-      raising <code>-Xmx</code>. The post-GC live set is climbing steadily. What's really wrong and what should
-      you do?
-      <details class="solution"><summary>Solution</summary>
-        <p>A steadily climbing post-GC live set means objects are being retained that should be released — a
-           <strong>leak</strong>, not undersizing. Raising <code>-Xmx</code> only delays the OOM. The fix is to
-           take a heap dump, find what's retaining memory (path to GC roots), and cut the reference — bound a
-           cache, deregister listeners, clear ThreadLocals, etc. No GC tuning cures a leak.</p></details></div>
-    <div class="exercise"><strong>5 (hard): Reduce major-GC pressure.</strong> A service has frequent, long
-      major GCs and a high promotion rate, but no leak (stable live set). Outline application- and JVM-level
-      approaches.
-      <details class="solution"><summary>Solution</summary>
-        <p>High promotion + frequent major GC without a leak means too many objects survive minor GCs and
-           tenure. Application-level: reduce object lifetimes and allocation churn so more objects die young
-           (avoid holding transient data, reuse buffers, don't stash short-lived objects in longer-lived
-           structures). JVM-level: enlarge the young generation so short-lived objects are collected there
-           before promotion, tune survivor sizing/tenuring threshold, ensure adequate total heap, and consider
-           a low-pause collector (G1 with a pause target, or ZGC/Shenandoah) if pause length is the pain.
-           Measure the promotion rate before and after each change.</p></details></div>
-    <div class="exercise"><strong>6 (hard): Explain-it test.</strong> Out loud: (a) mark-sweep-compact and
-      reachability; (b) generational collection and why it's fast; (c) the throughput/latency/footprint
-      trade-off and how it drives collector choice.
-      <details class="solution"><summary>Self-check rubric</summary>
-        <p>Pass (a) if you described tracing from roots to mark live, sweeping garbage, compacting to avoid
-           fragmentation. Pass (b) if you said most objects die young → collect the small young gen cheaply and
-           often, old gen rarely. Pass (c) if you contrasted total-GC-time (throughput) vs pause-length
-           (latency) vs overhead (footprint) and mapped G1/ZGC/Parallel/Serial to needs. This caps the JVM &
-           Performance foundation before the Performance lesson.</p></details></div>
+    <details class="solution"><summary><strong>Beginner:</strong> How does the JVM decide an object is garbage?</summary>
+      <p>By <strong>reachability</strong>, not reference counting. It traces outward from a set of GC roots —
+         local variables in live stack frames, static fields, JNI references, active threads — and anything not
+         reached is garbage.</p>
+      <p>The practical advantage is that <strong>cycles collect themselves</strong>. Two objects pointing at each
+         other have non-zero reference counts but are unreachable from any root, so a tracing collector frees
+         them. Python needs a separate cycle detector precisely because it counts.</p>
+      <p>The consequence for debugging is the one worth remembering: <strong>a Java memory leak is always
+         something still reachable</strong>. There is no "forgot to free". If the heap grows without bound, some
+         root still holds a path to the objects — a static collection, a listener list, a cache with no
+         eviction, a <code>ThreadLocal</code> on a pooled thread. So the heap-dump question is never "what
+         leaked" but "what keeps this alive", which is what a dominator tree answers.</p>
+    </details>
 
-    <div class="takeaways"><h3>🎯 Key Takeaways</h3><ul>
-      <li>GC reclaims <strong>unreachable</strong> objects via <strong>mark-sweep-compact</strong> (tracing from GC roots; compaction avoids fragmentation).</li>
-      <li><strong>Generational</strong> collection (frequent cheap minor GCs, rare expensive major GCs) is fast because most objects die young.</li>
-      <li>You trade off <strong>throughput vs latency vs footprint</strong> — you can't maximize all three; <strong>stop-the-world</strong> pauses are what hurt interactive services.</li>
-      <li>Collectors: <strong>G1</strong> (balanced default), <strong>ZGC/Shenandoah</strong> (low latency, big heaps), <strong>Parallel</strong> (throughput/batch), <strong>Serial</strong> (tiny footprint).</li>
-      <li>Never call <code>System.gc()</code>; set <code>-Xms</code> = <code>-Xmx</code>; enable GC logging and <strong>diagnose before tuning</strong>.</li>
-      <li>Most "GC problems" are application problems (leaks, high allocation/promotion) — feed the generational GC well and fix the code, not just the flags.</li>
-    </ul></div>
+    <details class="solution"><summary><strong>Beginner:</strong> What is the generational hypothesis and why does the heap follow it?</summary>
+      <p>The <strong>weak generational hypothesis</strong> is the observation that most objects die young —
+         typically 90–98% of allocations are unreachable by the next collection. That matches what programs
+         actually allocate: a <code>StringBuilder</code> inside a method, boxed values in a stream, an iterator,
+         a per-request DTO.</p>
+      <p>The heap is split into a young generation (Eden plus two survivor spaces) and an old generation so the
+         collector can exploit it. A young collection <strong>copies the survivors out</strong> and then reclaims
+         Eden wholesale by resetting a pointer.</p>
+      <p>The key consequence is that <strong>a copying collector's cost is proportional to survivors, not to
+         garbage</strong>. A collection that finds 2% live costs almost nothing regardless of how much was
+         allocated — so allocating short-lived objects is nearly free, and keeping objects alive is what
+         costs.</p>
+      <p>The old generation is collected differently because survival rates there are high; copying would move
+         nearly everything, so those algorithms mark and sweep or compact in place, and they are the expensive
+         ones.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why is allocation in Java often faster than <code>malloc</code>?</summary>
+      <p>Because compaction keeps Eden <strong>contiguous</strong>, so allocation needs no free list — it is a
+         pointer bump:</p>
+<pre>top += size;
+if (top &gt; limit) slow_path();</pre>
+      <p>That is roughly ten instructions. <code>malloc</code> must search a free list and cope with
+         fragmentation.</p>
+      <p>The shared <code>top</code> pointer would be a contention point, so each thread gets a
+         <strong>TLAB</strong> — a private chunk of Eden. Inside it a thread bumps its own pointer with no
+         synchronisation at all, taking a lock only when the buffer is exhausted. TLAB sizes adapt to each
+         thread's allocation rate.</p>
+      <p>On top of that, <strong>escape analysis</strong> may remove the allocation entirely: if C2 proves an
+         object never escapes its method, scalar replacement turns its fields into registers and no object is
+         created.</p>
+      <p>This is why "allocation is slow" is outdated, and why hand-optimising it can backfire — object pooling
+         replaces a pointer bump with bookkeeping, keeps objects alive into the old generation, and can defeat
+         the analysis that was already eliminating the allocation.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How does a young GC avoid scanning the old generation?</summary>
+      <p>With a <strong>card table</strong>. An old-generation object can hold the only reference to a young one
+         — <code>staticCache.add(new Order())</code> — so ignoring the old generation would free a live object,
+         while scanning all of it would cost exactly what generational GC was meant to save.</p>
+      <p>The old generation is divided into 512-byte <em>cards</em> with one table byte each. A <strong>write
+         barrier</strong> runs on every reference store and marks the card dirty:</p>
+<pre>obj.field = ref;
+cardTable[address(obj) &gt;&gt; 9] = DIRTY;   // ~2 instructions</pre>
+      <p>At the next young collection, the collector scans the young generation plus only the dirty cards, and
+         treats references found there as additional roots.</p>
+      <p>What makes this worth knowing is the cost model: <strong>you pay a couple of instructions on every
+         reference write in your program</strong>, whether or not a GC happens. It is one of the few places GC
+         taxes ordinary execution rather than collection time, and it is why reference writes are more expensive
+         than primitive writes.</p>
+      <p>G1 generalises this to per-region <strong>remembered sets</strong>, since it collects an arbitrary set
+         of regions. That bookkeeping is a large part of why G1 has lower throughput than Parallel — pause
+         predictability is bought with CPU and footprint.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> How do you choose a collector, and when is the default wrong?</summary>
+      <p>Start from what you are actually optimising, because the collectors trade the same two things against
+         each other.</p>
+      <table class="tbl">
+        <tr><th>Situation</th><th>Choice</th><th>Reason</th></tr>
+        <tr><td>Batch job, ETL, total time is the metric</td><td><strong>Parallel</strong></td><td>Highest throughput; nothing runs concurrently with you</td></tr>
+        <tr><td>General server, 4–64 GB</td><td><strong>G1</strong> (default)</td><td>Predictable moderate pauses</td></tr>
+        <tr><td>Latency SLA, large heap</td><td><strong>ZGC</strong> / Shenandoah</td><td>Sub-millisecond pauses independent of heap size</td></tr>
+        <tr><td>Small container, CLI tool</td><td><strong>Serial</strong></td><td>Lowest footprint and overhead</td></tr>
+      </table>
+      <p><strong>Where the default is wrong.</strong> G1 on a batch job leaves throughput on the table — Parallel
+         can be 10–20% faster in total time, and nobody measures its pauses. G1 in a small container is
+         needlessly heavy; Serial is genuinely better there. And G1 on a strict latency SLA with a large heap
+         cannot deliver what ZGC can.</p>
+      <p><strong>ZGC is not a free upgrade.</strong> It costs 5–15% throughput and runs concurrent GC threads
+         that compete with your application for CPU. On a CPU-saturated service, switching to it can make
+         end-to-end latency <em>worse</em> even though the pause histogram improves.</p>
+      <p><strong>The prior question is almost always more valuable:</strong> is this a collector problem at all?
+         A growing live set is a leak, and a 2 GB/s allocation rate is an application problem. Neither is fixed
+         by a flag. I would change the collector only after the allocation rate and live set are known to be
+         reasonable and the pause profile is still unacceptable.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A service pauses for several seconds under load. Walk through the diagnosis.</summary>
+      <p><strong>Get evidence before touching flags.</strong> <code>-Xlog:gc*:file=gc.log:time,uptime,level,tags</code>
+         is cheap and safe to enable in production.</p>
+      <p><strong>Then read four numbers, not just the pause times:</strong></p>
+      <ol>
+        <li><strong>Live set</strong> — heap used after a full collection. If it climbs monotonically across
+            full GCs, this is a leak and everything else is a symptom. Stop here and take a heap dump.</li>
+        <li><strong>Allocation rate</strong> — heap used before GC <em>n+1</em> minus heap used after GC
+            <em>n</em>, over elapsed time. Above roughly 1 GB/s, the fix is in the application.</li>
+        <li><strong>Promotion rate</strong> — old-generation growth per second. High promotion in a service with
+            no growing state means premature promotion: Eden or the survivor spaces are too small, so objects
+            that should have died young now require an old-gen collection.</li>
+        <li><strong>GC overhead</strong> — time in GC over wall time. Under 5% is healthy; above 10% needs
+            action.</li>
+      </ol>
+      <p><strong>Map the pattern to a cause.</strong> Long <em>full</em> pauses on G1 usually mean humongous
+         allocations fragmenting old regions, or a pause target set so low that G1 falls behind and is forced
+         into a full collection. Long <em>young</em> pauses mean too many survivors — and counter-intuitively
+         the young generation may be too <em>big</em>, since copying cost scales with survivors.</p>
+      <p><strong>Rule out the impostors.</strong> Not every multi-second pause is GC: check for swapping (which
+         makes any pause catastrophic), a long safepoint from something other than GC — biased-lock revocation
+         historically, or a slow thread dump — and container CPU throttling, where a cgroup quota stalls the
+         whole JVM. <code>-Xlog:safepoint</code> distinguishes these.</p>
+      <p><strong>Then fix in order:</strong> the leak or the allocation rate first; heap sizing with
+         <code>-Xms</code> equal to <code>-Xmx</code>; the collector; a realistic pause goal; and only then the
+         fine-grained flags — one at a time, measuring each.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Do these two objects ever get collected?
+<pre>class Node { Node next; }
+
+Node a = new Node();
+Node b = new Node();
+a.next = b;
+b.next = a;
+a = null;
+b = null;</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>Yes, both are collected.</strong> Each still has an incoming reference, but neither is
+         <strong>reachable from a GC root</strong> once the locals are cleared — so a tracing collector never
+         marks them.</p>
+      <table class="tbl">
+        <tr><th>Approach</th><th>Result</th></tr>
+        <tr><td>Reference counting</td><td>Both counts are 1 — leaked forever</td></tr>
+        <tr><td>Tracing (Java)</td><td>Unreachable from roots — collected</td></tr>
+      </table>
+      <p><strong>This is the central advantage of tracing</strong>, and why Java never needed a cycle detector
+         the way CPython does. Doubly-linked lists, parent/child trees and observer graphs all work without
+         special care.</p>
+      <p><strong>The flip side is the one that matters in production:</strong> if something <em>is</em> still
+         reachable, no amount of nulling elsewhere helps. Adding <code>a = null</code> inside a method is
+         almost always pointless — the frame dies at return anyway — while a static <code>List</code> holding
+         the same node keeps it alive forever.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Which loop puts more pressure on the collector?
+<pre>// A
+for (int i = 0; i &lt; 10_000_000; i++) {
+    String s = "item-" + i;
+    process(s);
+}
+
+// B
+List&lt;String&gt; all = new ArrayList&lt;&gt;();
+for (int i = 0; i &lt; 1_000_000; i++) {
+    all.add("item-" + i);
+}
+process(all);</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>B, despite allocating ten times fewer objects.</strong></p>
+      <table class="tbl">
+        <tr><th></th><th>A</th><th>B</th></tr>
+        <tr><td>Objects allocated</td><td>10,000,000</td><td>1,000,000</td></tr>
+        <tr><td>Objects surviving a young GC</td><td>≈ 0</td><td><strong>all of them</strong></td></tr>
+        <tr><td>Copied between survivor spaces</td><td>≈ 0</td><td>Repeatedly, then promoted</td></tr>
+        <tr><td>Old-generation growth</td><td>None</td><td>~60–80 MB</td></tr>
+      </table>
+      <p><strong>A copying collector's cost is O(survivors), not O(allocations).</strong> In A, every string is
+         dead by the next collection, so Eden is reclaimed by resetting a pointer and the collection is nearly
+         free. In B, everything is live, so each young GC copies the whole set, ages it, and eventually promotes
+         it — after which removing it requires an old-generation collection.</p>
+      <p><strong>The practical lesson</strong> is that "reduce allocations" is the wrong reflex. Reduce what
+         <em>survives</em>. Streaming or batching B — processing a chunk and discarding it — converts expensive
+         survivors into free garbage.</p>
+      <p><strong>And in A the allocation may not happen at all</strong>: escape analysis can scalar-replace
+         objects that never leave the method, so the loop can end up allocating nothing.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> A young GC runs every 100 ms and each takes 50 ms. Diagnose
+      it from these two lines.
+<pre>[10.000s] GC(50) Pause Young 2048M-&gt;1900M(4096M) 50.1ms
+[10.100s] GC(51) Pause Young 2048M-&gt;1910M(4096M) 51.3ms</pre>
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The survival rate is enormous and the old generation is growing.</strong> Each collection
+         reclaims only 148 MB of 2048 MB — roughly <strong>93% of objects survive</strong>, against the 2–10%
+         a healthy young collection sees.</p>
+      <table class="tbl">
+        <tr><th>Metric</th><th>Value</th><th>Verdict</th></tr>
+        <tr><td>GC overhead</td><td>50 ms per 100 ms = <strong>50%</strong></td><td>Catastrophic (healthy &lt; 5%)</td></tr>
+        <tr><td>Survival rate</td><td>~93%</td><td>Should be 2–10%</td></tr>
+        <tr><td>Allocation rate</td><td>~1.5 GB/s</td><td>Very high</td></tr>
+        <tr><td>Post-GC floor</td><td>1900 → 1910 MB</td><td>Climbing — a leak or unbounded cache</td></tr>
+      </table>
+      <p><strong>Two problems, and the order matters.</strong> The rising floor across collections points to a
+         leak or an unbounded cache — that is the root cause and no flag fixes it. Take a heap dump and find
+         what dominates the retained set.</p>
+      <p><strong>The high survival rate is the mechanism by which it hurts.</strong> Because copying cost scales
+         with survivors, 93% survival means every collection copies nearly the entire young generation and then
+         promotes it, which is why 50 ms pauses are back-to-back.</p>
+      <p><strong>What would be wrong here:</strong> enlarging the heap. It buys time before the OOM and makes
+         each collection copy even more. Enlarging Eden only helps if the objects are genuinely short-lived and
+         being collected too early — the climbing floor says they are not.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Allocation is 1 GB/s and Eden is 512 MB. How often does a
+      young GC run, and what are your options?
+      <details class="solution"><summary>Solution</summary>
+<pre>frequency = allocation rate ÷ Eden size
+          = 1024 MB/s ÷ 512 MB
+          = one young GC every 0.5 s</pre>
+      <p>Whether that is a problem depends entirely on the pause length, which depends on <strong>survivors, not
+         on the rate</strong>. At 5% survival each collection copies ~25 MB and takes a few milliseconds — two
+         collections a second is completely fine.</p>
+      <table class="tbl">
+        <tr><th>Option</th><th>Effect</th><th>Cost</th></tr>
+        <tr><td>Enlarge Eden (<code>-Xmn</code>)</td><td>Halving the frequency; more objects die before each GC, so survival <em>falls</em></td><td>Less heap for the old generation</td></tr>
+        <tr><td>Reduce allocation</td><td>Proportional drop in frequency</td><td>Application work — and often the real fix</td></tr>
+        <tr><td>Switch to ZGC</td><td>Pause disappears from the latency profile</td><td>5–15% throughput</td></tr>
+        <tr><td>Do nothing</td><td>Correct if pauses are already a few ms</td><td>None</td></tr>
+      </table>
+      <p><strong>The non-obvious one is that a bigger Eden usually lowers the survival <em>rate</em></strong>,
+         not just the frequency: more time passes before each collection, so more objects have already died.
+         The saving is better than linear.</p>
+      <p><strong>The limit is that Eden competes with the old generation</strong> for the same heap. Taking too
+         much starves the old generation and triggers full collections — which is why <code>-Xmn</code> is a
+         measure-and-adjust flag, not a set-and-forget one.</p>
+      <p><strong>Where to start:</strong> measure the pause, not the frequency. Frequent cheap collections are a
+         healthy profile, not a problem to fix.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A 32 GB service on G1 with <code>MaxGCPauseMillis=50</code>
+      sees occasional 8-second full GCs. Explain and fix.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>The pause target is a goal, not a guarantee, and 50 ms on a 32 GB heap is unattainable.</strong>
+         G1 responds by collecting fewer regions per cycle, which means it reclaims less than the application
+         allocates. The old generation fills, concurrent marking cannot finish in time, and G1 falls back to a
+         <strong>full, single-threaded, stop-the-world compaction</strong> — the 8 seconds.</p>
+      <table class="tbl">
+        <tr><th>Contributing cause</th><th>Check</th><th>Fix</th></tr>
+        <tr><td>Pause target too aggressive</td><td>Young collections consistently missing the goal</td><td><code>MaxGCPauseMillis=200</code> and re-measure</td></tr>
+        <tr><td>Humongous allocations</td><td>"Humongous" regions in the log</td><td>Raise <code>-XX:G1HeapRegionSize</code> (16–32 MB), or split the large objects</td></tr>
+        <tr><td>Marking starts too late</td><td>"to-space exhausted" / evacuation failure</td><td>Lower <code>-XX:InitiatingHeapOccupancyPercent</code> from 45</td></tr>
+        <tr><td>Heap genuinely too small</td><td>Live set is a large fraction of 32 GB</td><td>More heap, or reduce the live set</td></tr>
+      </table>
+      <p><strong>The humongous case deserves attention</strong> because it is silent. Any object larger than half
+         a region is allocated into contiguous old-generation regions and is not collected by ordinary young
+         collections. With the default region size on a 32 GB heap, a 20 MB array qualifies — so a service
+         handling large payloads fragments the old generation until only a full compaction can recover it.</p>
+      <p><strong>If a 50 ms ceiling is a genuine requirement</strong>, G1 is the wrong collector at this heap
+         size. ZGC delivers sub-millisecond pauses independent of heap size, at 5–15% throughput. That is the
+         honest trade — you cannot get G1 to do it by tightening the target, and tightening it is what caused
+         this.</p>
+      <p><strong>Order of work:</strong> relax the target to 200 ms first and confirm the full GCs stop. That
+         single change usually resolves it, and it tells you whether you are chasing a configuration problem or
+         a real capacity problem before you change collectors.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Heap usage after every full GC rises steadily —
+      1.2 GB, 1.5 GB, 1.9 GB, 2.4 GB — until an <code>OutOfMemoryError</code>. Diagnose it.
+      <details class="solution"><summary>Solution</summary>
+      <p><strong>This is a leak, and no GC tuning will help.</strong> Heap used <em>after</em> a full collection
+         is the <strong>live set</strong> — memory that is genuinely still reachable. A rising live set means
+         something holds references it should have released.</p>
+      <p><strong>The diagnosis, in order:</strong></p>
+      <ol>
+        <li>Capture a dump at a known-bad point: <code>jcmd &lt;pid&gt; GC.heap_dump /tmp/heap.hprof</code>, or
+            arm <code>-XX:+HeapDumpOnOutOfMemoryError</code> in advance.</li>
+        <li>Open it in Eclipse MAT and read the <strong>dominator tree</strong>, not the histogram. The histogram
+            says "40 million <code>char[]</code>", which is never the answer; the dominator tree says what keeps
+            them alive.</li>
+        <li>Take the <strong>path to GC roots</strong> for the largest dominator, excluding weak and soft
+            references. That path <em>is</em> the bug.</li>
+        <li>Compare two dumps taken minutes apart to see what is growing rather than what is merely large.</li>
+      </ol>
+      <table class="tbl">
+        <tr><th>Usual culprit</th><th>Retaining root</th><th>Fix</th></tr>
+        <tr><td>Unbounded cache</td><td>A static <code>Map</code></td><td>Caffeine with a size or TTL bound</td></tr>
+        <tr><td>Listener never removed</td><td>The event source's list</td><td>Deregister, or hold weak references</td></tr>
+        <tr><td><code>ThreadLocal</code> on a pooled thread</td><td>The thread's map — the thread never dies</td><td><code>remove()</code> in a <code>finally</code></td></tr>
+        <tr><td>Class-loader leak on redeploy</td><td>A static field in a parent loader</td><td>Clear statics on shutdown</td></tr>
+        <tr><td>Growing collection in a singleton</td><td>The singleton itself</td><td>Bound it or evict</td></tr>
+      </table>
+      <p><strong>Retained size is the number to sort by</strong>, not shallow size — it is what would be freed if
+         that object were released.</p>
+      <p><strong>What would waste the outage:</strong> raising <code>-Xmx</code>, changing collector, or adding
+         <code>System.gc()</code>. The first two delay the failure; the third does nothing, because the objects
+         are reachable and a full collection has already run at every one of those measurements.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>GC traces reachability from roots</strong>, so cycles collect themselves and every leak is
+            something still reachable.</li>
+        <li><strong>Most objects die young</strong> — the hypothesis the whole generational design rests on.</li>
+        <li><strong>A copying collector's cost is O(survivors), not O(garbage)</strong> — short-lived allocation
+            is nearly free.</li>
+        <li><strong>Reduce what survives, not what you allocate.</strong></li>
+        <li><strong>Allocation is a pointer bump in a per-thread TLAB</strong>, and escape analysis may remove it
+            entirely.</li>
+        <li><strong>A write barrier and card table let young GCs skip the old generation</strong> — paid for on
+            every reference write.</li>
+        <li><strong>Premature promotion is the common young-gen failure</strong>: objects that should die young
+            need an old-gen collection instead.</li>
+        <li><strong>Parallel has the best throughput; G1 the best general balance; ZGC the smallest
+            pauses.</strong></li>
+        <li><strong>G1's pause target is a goal</strong> — set it too low and it falls behind into a full
+            GC.</li>
+        <li><strong>Humongous allocations bypass G1's young collections</strong> and fragment the old
+            generation.</li>
+        <li><strong>ZGC costs 5–15% throughput and extra CPU</strong> — wrong for batch work and saturated
+            services.</li>
+        <li><strong>Read four numbers</strong>: allocation rate, promotion rate, live set, GC overhead.</li>
+        <li><strong>A live set rising across full GCs is a leak</strong>, and no flag fixes it.</li>
+        <li><strong>Size the heap so the live set is 30–50% of it</strong>, with <code>-Xms</code> equal to
+            <code>-Xmx</code>.</li>
+        <li><strong>Containers default to 25% of RAM</strong> — set <code>MaxRAMPercentage</code>, leaving
+            off-heap headroom.</li>
+        <li><strong>Never call <code>System.gc()</code></strong>, and change one flag at a time.</li>
+      </ul>
+    </div>
 
     <div class="pager">
-      <a class="btn btn-outline" href="memory.html">← Memory: Stack, Heap & References</a>
-      <a class="btn" href="performance.html">Next: Performance & Profiling →</a>
+      <a class="btn btn-outline" href="memory.html">← Memory: Stack, Heap &amp; References</a>
+      <a class="btn" href="performance.html">Next: Performance &amp; Profiling →</a>
     </div>
   </main>
 </div>
