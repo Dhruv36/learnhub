@@ -58,6 +58,9 @@ REVIEWED_THIN = {
     "react/rendering.html",          # 40KB, lists, keys & conditional rendering
     "react/events.html",             # 44KB, synthetic events & the two dispatch systems
     "react/render-cycle.html",       # 40KB, the five phases, purity, commit timing
+    "react/data-fetching.html",      # 43KB, the four defects, waterfalls, cursor pagination
+    "react/refs.html",               # 42KB, render purity rule, callback refs, imperative libs
+    "react/custom-hooks.html",       # 44KB, logic not state, positional slots, useSyncExternalStore
 
     # java, reviewed 2026-09-03 during the rebuild.
     "java/types.html",               # 44KB, primitives vs references, promotion, pass-by-value
