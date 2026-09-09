@@ -6,23 +6,33 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ---
 
-## ▶️ RESUME HERE (last updated 2026-08-31)
+## ▶️ RESUME HERE (last updated 2026-09-09)
 
-**Last completed:** ✅ **Spring Boot — COMPLETE at the mature v4 recipe.** All **23 lessons** rebuilt from the
-2026-07-18 "HTML-track depth" pass (26–31KB) to the current recipe (48–77KB, every one `det=12 ex=6`), and the
-**quiz bank rewritten to the v4 curriculum** (200 fresh questions, `10 200 0`, 0 duplicate stems, de-skewed
-62/63/75). Whole track passes `python validate.py tutorials/springboot` with **0 errors and 0 warnings**
-(24 files). Per-lesson detail in the "Spring Boot v4 COMPLETE" section below.
+**Last completed:** ✅ **Java — COMPLETE at the mature v4 recipe.** All **46 files** pass
+`python validate.py tutorials/java` with **0 errors and 0 depth flags**. The track went 45 flagged → 0 over
+this programme; the quiz bank was already healthy (`10 200 0`, 0 duplicate stems, 60/64/76).
 
-⚠️ **Open item for the next session — the depth floor reclassified the older tracks.** Commit `a50b7ac`
-introduced `V4_MIN_KB = 45` in `validate.py` as a *review flag* (plus a `REVIEWED_THIN` allowlist). Under it,
-**279 lessons across 13 previously-"DONE" tracks now warn**: java 45, javascript 38, html 32, css 28, react 28,
-nodejs 24, angular 23, dotnet 23, aspnet 17, system-design 11, python 4, linux 1. Clean at 0 warnings: aws,
-cicd, docker, kubernetes, mongodb, redis, leetcode, sql, database-concepts, vector-databases, springboot. The
-flag is a prompt to re-read, **not** a size target — some of those lessons are genuinely complete and belong in
-`REVIEWED_THIN`. The earlier "0 errors AND 0 warnings site-wide" claim below was true under the *old* floor.
+**In progress:** 🔄 **React — 20 of 28 lessons rebuilt.** `python validate.py tutorials/react` reports
+**0 errors, 8 flagged**. Remaining: `state-patterns`, `external-state`, `router`, `code-splitting`,
+`concurrent`, `testing`, `architecture`, `production`.
 
-**Previously in this programme:** ✅ **Site-wide cleanup — all 23 quiz banks de-skewed and de-duplicated, and every track passing validate.py with 0 errors AND 0 warnings** (under the pre-`a50b7ac` floor). Detail in the "SITE-WIDE CLEANUP COMPLETE" section below. Before that in the same session: ✅ **MongoDB v4 (track 19) — COMPLETE**, and it was the last v3 track. All 22 lessons, both end-of-track chores, quiz bank rewritten; 0 errors and 0 warnings across 27 files. Full per-lesson detail is in the "MongoDB v4 COMPLETE" section below.
+**The depth floor is a review flag, never a target.** `V4_MIN_KB = 45` in `validate.py` prompts a re-read;
+lessons judged complete below it go in `REVIEWED_THIN` with a one-line note. **Never pad a lesson to cross
+45KB.** See `docs/LESSON_REBUILD_SPEC.md` for the full recipe (6 Parts, 9–12 tables, 12–16 mistake rows,
+6 tiered interview questions, 6 graded exercises, 14–16 takeaways).
+
+**Remaining tracks after React**, by flagged count:
+`javascript` 38 · `html` 32 · `nodejs` 24 · `angular` 23 · `dotnet` 23 · `css` 28 · `aspnet` 17.
+Clean at 0 flags: java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis,
+leetcode, system-design, database-concepts, vector-databases.
+
+⚠️ **On delegating this to subagents.** Across three rounds in the 2026-09-08/09 session, agents completed
+**9 lessons and failed 12 times**, always the same way: they write lesson 1 at roughly double the target,
+notice, announce "rewriting tighter", and die mid-rewrite. Giving them an explicit KB target and a named
+reference file did **not** fix it — their finished lessons still came in at 61–69KB. Lessons written directly
+landed at 42–44KB first time with no rewrite cycle. Prefer writing directly; if delegating, expect one
+completed lesson per agent and plan to finish the rest yourself.
+
 
 **✅ Spring Boot v4 COMPLETE (2026-08-31)** — `tutorials/springboot/`, 23 lessons rebuilt across 6 sections.
 Lessons 1–18 were rebuilt 2026-08-28 → 08-30; **19–23 and the bank landed 2026-08-31**. Per-lesson findings for
