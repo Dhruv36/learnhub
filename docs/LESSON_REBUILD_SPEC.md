@@ -9,7 +9,7 @@ Track: `tutorials/<track>/`
 **Reference lessons** (read two before writing anything, and match their per-Part size):
 `tutorials/react/data-fetching.html` (43KB), `tutorials/java/synchronization.html` (45KB).
 
-You are rewriting existing React lesson pages to the site's "v4 mature" depth. Plain HTML,
+You are rewriting existing lesson pages to the site's "v4 mature" depth. Plain HTML,
 no build step. **Read `tutorials/react/forms.html` and `tutorials/react/props.html` first** —
 those are the rebuilt reference lessons for this track. Match their voice, structure and
 density. If you want a second opinion on depth, `tutorials/java/synchronization.html` is the
@@ -59,7 +59,7 @@ for emphasis inside `<pre>`. HTML tags are fine everywhere outside `<pre>`.
 ### Parts 1–6
 Each part is a `<h2>` followed by a large `<pre>` block of mechanism-first teaching (annotated
 code, ASCII diagrams, measured numbers, failure cases) and/or a `<table class="tbl">`.
-Explain **why React behaves as it does** — reconciliation, the fiber work loop, effect timing,
+Explain **why the technology behaves as it does** — for React: reconciliation, the fiber work loop, effect timing,
 closure capture — not just which API to call. Where a number exists (a render count, a bundle
 size, a 16ms frame budget) give it and say what makes it vary.
 
