@@ -61,11 +61,13 @@ these files from scratch.** Deepen in place: expand interview answers to 3-6 par
 trade-offs, take mistake rows from ~7 to 12-16, takeaways from ~6 to 14-16. Rewriting loses good
 material and costs many times more.
 
-**1d. One open question on css/html exercises — decide, do not drift.**
-Their exercises are *build-and-observe labs* ("build a flex toolbar, watch the icons shrink, add
-`flex-shrink: 0`"). The spec asks for *debug exercises* (broken code, fixed code, prose on what the
-broken version does at runtime). For CSS the lab shape may genuinely teach better. Pick one per
-track deliberately and say which in the commit; do not silently mix both.
+**1d. SETTLED 2026-09-10: html/css keep their build-and-observe lab exercises.**
+Their exercises are labs ("build a flex toolbar, watch the icons shrink, add `flex-shrink: 0`") where
+the spec describes debug exercises. **Leave them as labs.** For a visual, hands-on medium the lab
+shape teaches better, they already number 6 per lesson with reasoned solutions, and the measured gap
+in these tracks is interview-answer depth, mistake rows and takeaways — not exercises. Rewriting
+working exercises would be the destruction rule 1c exists to prevent. Do not mix the two shapes
+within a track.
 
 **2. Never put HTML tags inside a `<pre>` block.**
 This is the single most common `validate.py` error. Inside `<pre>` use plain text and escape
