@@ -14,12 +14,16 @@ https://dhruv36.github.io/learnhub/
 
 | | |
 |---|---|
-| **In progress** | **React — 31 of 32 done.** 1 remains: `production` |
+| **In progress** | **None — React finished 2026-09-09.** Next up: `javascript` (38 flagged). No briefs written yet; see below. |
 | **Next tracks** | javascript 38 · html 32 · css 28 · nodejs 24 · angular 23 · dotnet 23 · aspnet 17 (by flagged count) |
-| **Complete** | java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
+| **Complete** | react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
 
 **To pick up the next lesson:** read `docs/LESSON_REBUILD_SPEC.md`, then the brief in
 `docs/TASKS/<track>-<lesson>.md`, then write the file. Full history is in `PROJECT_STATUS.md`.
+
+`docs/TASKS/` is empty — every React brief was consumed. Starting `javascript` means writing its
+briefs first: run `python validate.py tutorials/javascript` for the flagged list, then one brief
+per lesson in the format `docs/TASKS/README.md` describes.
 
 ---
 
