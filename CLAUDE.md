@@ -14,7 +14,7 @@ https://dhruv36.github.io/learnhub/
 
 | | |
 |---|---|
-| **In progress** | **React — 29 of 32 done.** 3 remain: `code-splitting`, `concurrent`, `production` |
+| **In progress** | **React — 30 of 32 done.** 2 remain: `concurrent`, `production` |
 | **Next tracks** | javascript 38 · html 32 · css 28 · nodejs 24 · angular 23 · dotnet 23 · aspnet 17 (by flagged count) |
 | **Complete** | java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
 

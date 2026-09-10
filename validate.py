@@ -61,6 +61,7 @@ REVIEWED_THIN = {
     "react/data-fetching.html",      # 43KB, the four defects, waterfalls, cursor pagination
     "react/refs.html",               # 42KB, render purity rule, callback refs, imperative libs
     "react/custom-hooks.html",       # 44KB, logic not state, positional slots, useSyncExternalStore
+    "react/code-splitting.html",     # 43KB, parse/execute cost, static specifiers, thrown-promise retry
 
     # java, reviewed 2026-09-03 during the rebuild.
     "java/types.html",               # 44KB, primitives vs references, promotion, pass-by-value
