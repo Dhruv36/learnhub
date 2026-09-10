@@ -15,10 +15,10 @@ track. For the three tracks left this is *deepening existing lessons*, not rewri
 
 | | |
 |---|---|
-| **In progress** | **html** — elaboration pass, then `css`. javascript finished 2026-09-10 (38/38). |
+| **In progress** | **css** — elaboration pass. html finished 2026-09-10 (32/32); javascript 2026-09-10 (38/38). |
 | **Measured depth** | `python tools/depth.py react javascript html css` — medians below, react is the finished reference |
-| **Next tracks** | html 32 · css 28 · nodejs 24 · angular 23 · dotnet 23 · aspnet 17 (by flagged count) |
-| **Complete** | javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
+| **Next tracks** | css 28 · nodejs 24 · angular 23 · dotnet 23 · aspnet 17 (by flagged count) |
+| **Complete** | html, javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
 
 **To pick up the next lesson:** run `python tools/depth.py <track> --per-lesson`, pick the weakest
 row, read that lesson in full, then deepen it in place. `docs/LESSON_REBUILD_SPEC.md` is the recipe;
@@ -29,7 +29,7 @@ full history is in `PROJECT_STATUS.md`.
 TARGET                 6         6 3-6 paras         6     12-16     14-16         6
 react (n=28)           6         6       194         6        16        16        10
 javascript (n=38)      8         6       202         6        16        21         2   DONE
-html (n=32)            6         6        76         6         8         6         2
+html (n=32)            6         6       212         6        18        22         2   DONE
 css (n=28)             5         6        80         6         6         6         1
 ```
 Every section exists in all three; only the depth per section is short. See rule 1c — **deepen in
@@ -53,7 +53,7 @@ track is wrong and has been made before:** in Sept 2026 a session called html/cs
 one lesson has been through the v4 recipe" purely from a 24KB median. That was false — every lesson
 already had all six sections. Measure, then go read two lessons before concluding anything.
 
-**1c. html and css are ELABORATION jobs, not rebuilds.** (javascript was, and is done.)
+**1c. css is an ELABORATION job, not a rebuild.** (javascript and html were, and are done.)
 All three already have the full v4 shape: 5-8 Parts, Common Mistakes, 6 levelled interview
 questions, 6 exercises, takeaways. They were written to a lighter earlier version of the recipe.
 What they are missing is depth *per section* — see the table in "Resume here". **Do not rewrite
