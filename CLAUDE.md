@@ -15,7 +15,7 @@ track. For the three tracks left this is *deepening existing lessons*, not rewri
 
 | | |
 |---|---|
-| **In progress** | **None started.** Next up: **dotnet** — measure it with `tools/depth.py` first. angular and nodejs finished 2026-09-11 (23/23, 24/24); css (28/28), html (32/32), javascript (38/38) on 2026-09-10. |
+| **In progress** | **dotnet** — 8/23 elaborated (async-await, async-patterns, collections-generics, control-flow, delegates-events, di-hosting, efcore, exceptions-nullability); Part 6 added to the five 5-Part lessons. DRAFTED, NOT APPLIED: `tools/pending/batchAJ-AM.py` (12 lessons); still unwritten: methods, modern-csharp, oop. aspnet drafts `tools/pending/batchBA.py`/`batchBB.py` fail — `lib.py` cannot find aspnet's takeaways block; fix that regex first. Apply from repo root with `python tools/pending/<file>.py`, gate per 1e, commit, then delete the file — re-running an applied batch duplicates its mistakes/takeaways. |
 | **Measured depth** | `python tools/depth.py react javascript html css` — medians below, react is the finished reference |
 | **Next tracks** | dotnet 23 · aspnet 17 (by flagged count) |
 | **Complete** | angular, nodejs, css, html, javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
