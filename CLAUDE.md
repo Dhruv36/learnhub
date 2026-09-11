@@ -17,7 +17,7 @@ track. For the three tracks left this is *deepening existing lessons*, not rewri
 |---|---|
 | **In progress** | **None — the v4 depth pass is complete (2026-09-11).** Every track measures at recipe with `tools/depth.py`. aspnet finished 2026-09-11 (24/24); on the way, a claim repeated in seven aspnet lessons (that `UseAuthorization` before `UseRouting` "fails open") was found false and corrected — see rule 4. dotnet (23/23), angular and nodejs finished the same day. |
 | **Measured depth** | `python tools/depth.py react javascript html css` — medians below, react is the finished reference |
-| **Next tracks** | none queued — run `python validate.py` and `tools/depth.py` across all tracks to find the next gap |
+| **Next tracks** | **mistakes/takeaways top-up (started 2026-09-11).** A full-site `depth.py` run shows several "complete" tracks below 12–16 mistakes / 14–16 takeaways, IQ depth already fine: database-concepts (10/10), linux (10/13), python and sql (takeaways 10), vector-databases (mistakes 9), docker (mistakes 10), system-design (10/12). Append rows only (rule 1e minus the IQ step). database-concepts batch 1 done: btrees, buffer-pool, index, lsm-trees. system-design's "parts 0" is its `<h2>1. …</h2>` numbering, not a gap. |
 | **Complete** | aspnet, dotnet, angular, nodejs, css, html, javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
 
 **To pick up the next lesson:** run `python tools/depth.py <track> --per-lesson`, pick the weakest
