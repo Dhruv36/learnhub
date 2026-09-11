@@ -413,42 +413,111 @@ protected override void Up(MigrationBuilder migrationBuilder)
       <tr><td>Migrating on startup</td><td>Replicas race; DDL rights at runtime; crash loops</td><td>An idempotent script as a pipeline step</td></tr>
       <tr><td>Breaking schema changes during a rolling deploy</td><td>Old code fails against the new schema</td><td>Backward-compatible changes; rename over three deploys</td></tr>
       <tr><td>Not reading the generated migration</td><td>A rename becomes drop-plus-add and destroys data</td><td>Review every migration before committing</td></tr>
+      <tr><td>Returning <code>IEnumerable&lt;T&gt;</code> from a repository and filtering in the caller</td><td>Every caller's <code>Where</code> runs in memory after a full fetch</td><td>Take the filter as a parameter, or keep <code>IQueryable</code> inside the data layer</td></tr>
+      <tr><td>Parallel queries on one context with <code>Task.WhenAll</code></td><td>"A second operation was started on this context"</td><td>Await sequentially, or one context each from <code>IDbContextFactory</code></td></tr>
+      <tr><td><code>AsSplitQuery</code> with paging and a non-unique order</td><td>Collections are loaded for a different page of parents</td><td>Order by a unique key, such as a trailing <code>Id</code></td></tr>
     </table>
 
     <h2>Interview Questions</h2>
     <details class="solution"><summary><strong>Beginner:</strong> Why is <code>DbContext</code> registered as scoped?</summary>
-      <p>Because it is designed as a short-lived unit of work and is not thread-safe. A scope in a web
-      application corresponds to one HTTP request, so each request gets its own context which is disposed when
-      the response completes — bounding both the change tracker's contents and the connection's lifetime.
-      Registering it as a singleton would share one non-thread-safe object across concurrent requests, which
-      produces intermittent "a second operation was started on this context" errors and a change tracker that
-      grows for the process lifetime. Transient would be worse in a different way, since two services in the
-      same request would get different contexts and could not participate in one transaction.</p></details>
+      <p>Because a <code>DbContext</code> is designed as a <strong>short-lived unit of work</strong>, and one HTTP request is
+      the natural unit. <code>AddDbContext</code> registers it scoped: every request gets its own context, and the request
+      scope disposes it when the response completes, releasing its connection and everything its change tracker holds.</p>
+      <p>It is also <strong>not thread-safe</strong>. A context supports one operation at a time; starting a second before
+      the first completes throws "A second operation was started on this context". That rules out
+      <strong>singleton</strong>: concurrent requests would share one context and fail intermittently under load, while its
+      change tracker grew for the life of the process and served stale entities from memory.</p>
+      <p><strong>Transient</strong> fails differently. Every class that asks for a context gets its own, so the repository
+      that loads an order and the service that calls <code>SaveChanges</code> hold different change trackers — the save
+      writes nothing, and the two can never share a transaction. Scoped is exactly the granularity at which every
+      collaborator in a request sees the same unit of work.</p>
+      <pre>  // web requests: one context per request, shared by every service in it
+  builder.Services.AddDbContext&lt;AppDbContext&gt;(o =&gt; o.UseNpgsql(conn));
+
+  // or, where there is no request scope or you need parallel queries:
+  builder.Services.AddDbContextFactory&lt;AppDbContext&gt;(o =&gt; o.UseNpgsql(conn));
+  await using var db = await factory.CreateDbContextAsync(ct);</pre>
+      <p>The follow-ups show depth. Where there is <strong>no request scope</strong> — a <code>BackgroundService</code>, a
+      singleton — use <code>IDbContextFactory&lt;T&gt;</code> and create a context per unit of work. The same factory answers
+      <strong>parallelism</strong> inside one request: <code>Task.WhenAll</code> over one context throws, so each concurrent
+      query needs its own. And <code>AddDbContextPool</code> keeps scoped semantics while reusing instances — faster, but
+      anything injected into the context's constructor, such as a tenant, is captured by the pooled instance.</p></details>
     <details class="solution"><summary><strong>Beginner:</strong> What is the N+1 problem?</summary>
-      <p>Issuing one query to fetch a list, then one additional query per item to load a related entity — so
-      fetching 100 orders and their customers costs 101 round trips instead of one. Each round trip has
-      latency, so the cost grows linearly with the page size, which is why it often looks acceptable on the
-      first page and collapses on an export or a larger page. The usual causes are looping over results and
-      touching a navigation property, or having lazy loading enabled so the database call is invisible in the
-      source. The fix is to fetch everything in one query, either with <code>Include</code> or, better for
-      read paths, a projection that selects exactly the fields needed.</p></details>
+      <p>The <strong>N+1 problem</strong> is one query to fetch a list, then one more query <em>per item</em> to fetch related
+      data — 100 orders and their customers cost 101 round trips instead of one. Each query may be fast on its own; the
+      damage is <strong>round-trip latency multiplied by N</strong>, plus pressure on the connection pool. At 2 ms a trip, a
+      page of 100 spends 200 ms waiting on the network, and an export of 10,000 simply times out.</p>
+      <pre>  // N+1: one query for the page, one per order for its customer
+  var orders = await db.Orders.OrderBy(o =&gt; o.Id).Take(100).ToListAsync(ct);
+  foreach (var o in orders)
+      names.Add((await db.Customers.FindAsync(o.CustomerId))!.Name);   // x100
+
+  // one query: the join happens in the database
+  var rows = await db.Orders.OrderBy(o =&gt; o.Id).Take(100)
+      .Select(o =&gt; new { o.Id, CustomerName = o.Customer.Name })
+      .ToListAsync(ct);</pre>
+      <p>What makes it dangerous is that it is <strong>invisible</strong>. The code reads naturally, passes review, and is
+      fast against a development database with ten rows. The usual sources are a loop that touches a navigation or calls
+      <code>FindAsync</code>, <strong>lazy loading</strong> — which turns every navigation access into a hidden query — and
+      serializers or mappers walking an object graph after the query has already run.</p>
+      <p>The fixes, in order of preference: a <strong>projection</strong> that selects exactly what the response needs, so
+      the database joins and aggregates; an <code>Include</code> when you genuinely need entities; or, when the related keys
+      come from elsewhere, <strong>one batched query</strong> — collect the ids, load them with a single
+      <code>Contains</code> that becomes <code>WHERE id IN (...)</code>, and join in memory.</p>
+      <p>What the interviewer really wants is how you <strong>find</strong> it: count queries rather than read code. Log
+      <code>Microsoft.EntityFrameworkCore.Database.Command</code> in development, watch per-request query counts in tracing,
+      and keep a test with a query budget per endpoint, so a regression fails in CI instead of in production.</p></details>
     <details class="solution"><summary><strong>Mid:</strong> What is the difference between client and server evaluation?</summary>
-      <p>Server evaluation means the operation is translated into SQL and executed by the database; client
-      evaluation means it runs in your process against data already fetched. Everything in a
-      <code>IQueryable</code> chain before materialisation must translate, and EF Core throws
-      <code>InvalidOperationException</code> if it cannot — a deliberate change from EF6, which would silently
-      fetch the table and filter in memory. The boundary moves the moment you call <code>ToList</code>,
-      <code>AsEnumerable</code> or enumerate the query: after that everything is client-side. That is why a
-      single misplaced <code>ToList()</code> converts an indexed, filtered, paged query into a full table
-      transfer, while producing identical results on a small development database.</p></details>
+      <p>An EF Core query is an <code>IQueryable</code>: an <strong>expression tree</strong> describing the query, not code
+      that has run. When you materialise it, the provider translates the tree to SQL and the database executes it —
+      <strong>server evaluation</strong>. Anything applied after materialisation runs in your process over the rows that came
+      back — <strong>client evaluation</strong>. The cost difference is an indexed seek returning 20 rows versus transferring
+      the whole table.</p>
+      <p>Since EF Core 3, EF <strong>throws</strong> when it cannot translate part of a query, instead of silently fetching
+      everything and filtering in memory as EF6 did. A custom C# method in a <code>Where</code>, or <code>ToString()</code> on
+      a column, raises <code>InvalidOperationException</code>. That is the right behaviour: a loud failure in development
+      rather than a silent full scan in production. The fix is to express the rule in translatable terms — a direct
+      comparison, an <code>EF.Functions</code> call, a computed column — not to add <code>ToList()</code> until the error goes
+      away.</p>
+      <pre>  db.Orders.Where(o =&gt; o.Total &gt; 100m).Take(20)              // server: WHERE ... LIMIT 20
+
+  db.Orders.AsEnumerable().Where(o =&gt; o.Total &gt; 100m)        // client: every row fetched
+
+  db.Orders.Where(o =&gt; o.Total &gt; 100m)
+      .Select(o =&gt; new OrderDto(o.Id, FormatMoney(o.Total)))  // allowed: final projection</pre>
+      <p>There is one sanctioned exception: client code in the <strong>final <code>Select</code></strong> is allowed, because
+      EF can fetch the columns and call your method per row without changing which rows come back. Everywhere else the
+      boundary moves at <code>ToList</code>, <code>AsEnumerable</code> and <code>foreach</code> — and, less obviously, whenever
+      a query is passed or returned as <code>IEnumerable&lt;T&gt;</code>. A repository method returning
+      <code>IEnumerable&lt;Order&gt;</code> turns every caller's <code>Where</code> into an in-memory filter over a full
+      fetch.</p>
+      <p>That is what the interviewer is probing: whether you can read a LINQ chain and say which operators reach the
+      database. Deliberate client evaluation is fine — after a server-side filter has already narrowed the rows.</p></details>
     <details class="solution"><summary><strong>Mid:</strong> When would you use <code>AsSplitQuery</code>?</summary>
-      <p>When a query includes more than one collection navigation. A single SQL statement joining two
-      collections produces a cartesian product — twenty order lines and five payments yield a hundred rows,
-      with the parent's columns repeated in every one — so the data transferred grows multiplicatively and
-      wide parent rows make it much worse. <code>AsSplitQuery</code> issues one statement per collection
-      instead, keeping the row count additive. The trade-off is atomicity: the statements execute separately,
-      so a concurrent write between them can produce an inconsistent picture, and there are more round trips.
-      For a single collection the default single query is usually better.</p></details>
+      <p>When a query <strong>includes more than one collection navigation</strong> and the collections are large enough that
+      a single join multiplies rows. By default EF Core loads an <code>Include</code> graph in one SQL statement with
+      <code>JOIN</code>s. For one collection that is fine; for two sibling collections the join produces a <strong>cartesian
+      product</strong> — 20 lines times 5 payments returns 100 rows, each repeating every column of the order — and a third
+      collection multiplies again.</p>
+      <pre>  var order = await db.Orders
+      .Include(o =&gt; o.Lines)
+      .Include(o =&gt; o.Payments)
+      .AsSplitQuery()                 // three statements: orders, lines, payments
+      .FirstOrDefaultAsync(o =&gt; o.Id == id, ct);
+
+  // or split by default, opting back in per query with AsSingleQuery():
+  o.UseNpgsql(conn, npg =&gt; npg.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery));</pre>
+      <p><code>AsSplitQuery</code> issues <strong>one statement per collection</strong>, so row counts add instead of
+      multiply: 1 + 20 + 5 rows instead of 100, with no duplicated order columns. EF logs a warning when it sees multiple
+      collection includes with no splitting behaviour configured, which is a useful prompt to decide.</p>
+      <p>The trade-offs are what the interviewer is checking. <strong>More round trips</strong>: for small collections or on a
+      high-latency link, the single query is faster. <strong>No consistency between statements</strong>: a write landing
+      between them can pair a parent with children that do not match; if that matters, run them in a transaction at snapshot
+      or repeatable-read isolation. And with <code>Skip</code>/<code>Take</code>, a split query needs a <strong>unique,
+      deterministic ordering</strong>, because each statement re-applies the paging — with ties, the collection queries can
+      load children for a different page of parents.</p>
+      <p>The rule of thumb: one collection, single query; several sizable collections, split. And for read paths, often
+      neither — a projection that selects only what the page shows avoids loading the collections at all.</p></details>
     <details class="solution"><summary><strong>Senior:</strong> An endpoint is fast in staging and times out in production with the same code. Diagnose.</summary>
       <p>The pattern points at something whose cost scales with data volume rather than with code, so I would
       look first for operations that are correct at any size but only expensive at production scale. The
@@ -815,6 +884,12 @@ migrationBuilder.AlterColumn&lt;string&gt;(
         <li>Project to DTOs as the default read path — fewer columns, database-side aggregates, and no tracking.</li>
         <li><code>Skip</code>/<code>Take</code> without a stable <code>OrderBy</code> produces overlapping or missing rows.</li>
         <li>Never migrate on startup, keep migrations backward compatible for rolling deploys, and always read the generated migration — EF turns a rename into a data-destroying drop and add.</li>
+      <li>A transient <code>DbContext</code> splits one request across several contexts, so they cannot share change tracking or a transaction.</li>
+      <li>A context runs one operation at a time; parallel queries need separate contexts from <code>IDbContextFactory</code>.</li>
+      <li>Client code is still allowed in the final <code>Select</code>; everywhere else an untranslatable expression throws.</li>
+      <li>Returning <code>IEnumerable&lt;T&gt;</code> from a data method moves every later operator into memory.</li>
+      <li>Split queries with <code>Skip</code>/<code>Take</code> need a unique, deterministic order, or children are loaded for the wrong parents.</li>
+      <li>Fix N+1 by fetching related data in one query: a projection, an <code>Include</code>, or a single <code>Contains</code> over collected keys.</li>
       </ul>
     </div>
 
