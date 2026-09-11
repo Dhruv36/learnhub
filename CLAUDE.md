@@ -15,10 +15,10 @@ track. For the three tracks left this is *deepening existing lessons*, not rewri
 
 | | |
 |---|---|
-| **In progress** | **None started.** Next up: **angular** — measure it with `tools/depth.py` first. nodejs finished 2026-09-11 (24/24); css (28/28), html (32/32), javascript (38/38) on 2026-09-10. |
+| **In progress** | **None started.** Next up: **dotnet** — measure it with `tools/depth.py` first. angular and nodejs finished 2026-09-11 (23/23, 24/24); css (28/28), html (32/32), javascript (38/38) on 2026-09-10. |
 | **Measured depth** | `python tools/depth.py react javascript html css` — medians below, react is the finished reference |
-| **Next tracks** | angular 23 · dotnet 23 · aspnet 17 (by flagged count) |
-| **Complete** | nodejs, css, html, javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
+| **Next tracks** | dotnet 23 · aspnet 17 (by flagged count) |
+| **Complete** | angular, nodejs, css, html, javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
 
 **To pick up the next lesson:** run `python tools/depth.py <track> --per-lesson`, pick the weakest
 row, read that lesson in full, then deepen it in place. `docs/LESSON_REBUILD_SPEC.md` is the recipe;
@@ -32,7 +32,8 @@ javascript (n=38)      8         6       202         6        16        21      
 html (n=32)            6         6       212         6        18        22         2   DONE
 css (n=28)             5         6       242         6        16        22         1   DONE
 nodejs (n=24)          6         6       232         6        17        20         1   DONE
-angular (n=23)         6         6        87         6         8         6         1
+angular (n=23)         6         6       234         6        16        18         1   DONE
+dotnet (n=23)          6         6       110         6         8         6         1
 ```
 Every section exists in each track above, nodejs included; only the depth per section is short. See rule 1c — **deepen in
 place, never rewrite.** `docs/TASKS/` is empty and these tracks do not need briefs: the lesson
@@ -55,8 +56,8 @@ track is wrong and has been made before:** in Sept 2026 a session called html/cs
 one lesson has been through the v4 recipe" purely from a 24KB median. That was false — every lesson
 already had all six sections. Measure, then go read two lessons before concluding anything.
 
-**1c. javascript, html, css and nodejs were ELABORATION jobs** and are done — the method in 1e is
-proven across 122 lessons. Measure angular, dotnet and aspnet before assuming the same shape.
+**1c. javascript, html, css, nodejs and angular were ELABORATION jobs** and are done — the method in 1e is
+proven across 145 lessons. Measure dotnet and aspnet before assuming the same shape.
 All three already have the full v4 shape: 5-8 Parts, Common Mistakes, 6 levelled interview
 questions, 6 exercises, takeaways. They were written to a lighter earlier version of the recipe.
 What they are missing is depth *per section* — see the table in "Resume here". **Do not rewrite
