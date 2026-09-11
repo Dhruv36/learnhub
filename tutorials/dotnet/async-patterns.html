@@ -223,42 +223,134 @@ while (await timer.WaitForNextTickAsync(ct))
       <tr><td>Fire-and-forget using request-scoped services</td><td><code>ObjectDisposedException</code> after response; lost work on shutdown</td><td>Channel + BackgroundService with its own DI scope</td></tr>
       <tr><td>Caching a faulted <code>Lazy&lt;Task&gt;</code> forever</td><td>One transient failure at startup bricks the feature until restart</td><td>Retry-wrapped factory, or reset-on-fault lazy variant</td></tr>
       <tr><td>Retry without jitter or transient-filter</td><td>Thundering-herd retries; pointless retries of permanent failures</td><td>Exponential backoff + jitter; retry only transient exception types</td></tr>
+      <tr><td>Unbounded <code>Task.WhenAll</code> over thousands of calls</td><td>Overwhelms the downstream service and local sockets</td><td><code>Parallel.ForEachAsync</code> with a limit</td></tr>
+      <tr><td>Concurrency limits based on local cores</td><td>The bottleneck is the downstream service</td><td>Size limits to the dependency's capacity</td></tr>
+      <tr><td>Returning huge lists as <code>Task&lt;List&lt;T&gt;&gt;</code></td><td>Everything materialised in memory before the first item</td><td><code>IAsyncEnumerable&lt;T&gt;</code></td></tr>
+      <tr><td>Missing <code>[EnumeratorCancellation]</code></td><td>Tokens from <code>WithCancellation</code> are ignored</td><td>Annotate the token parameter</td></tr>
+      <tr><td><code>SemaphoreSlim</code> without <code>try</code>/<code>finally</code></td><td>An exception holds the gate forever</td><td>Release in <code>finally</code></td></tr>
+      <tr><td>Re-acquiring a <code>SemaphoreSlim</code> you hold</td><td>It is not reentrant, so the method deadlocks</td><td>Restructure; acquire once</td></tr>
+      <tr><td>TCS without <code>RunContinuationsAsynchronously</code></td><td>Continuations run on the completer's thread</td><td>Pass the option</td></tr>
+      <tr><td><code>SetResult</code> where completion races</td><td>Throws when already completed</td><td><code>TrySetResult</code></td></tr>
     </table>
 
     <h2>Interview Questions</h2>
     <details class="solution"><summary><strong>Q1 (Beginner):</strong> Why is firing 5,000 HTTP requests with one <code>Task.WhenAll</code> a bad idea, and what do you do instead?</summary>
-      <p>All 5,000 start immediately and run concurrently: you exhaust outbound sockets/ports, trip the
-      target's rate limits, saturate your bandwidth, and induce timeouts that look like downstream
-      failures. Instead, bound the concurrency: <code>Parallel.ForEachAsync</code> with
-      <code>MaxDegreeOfParallelism</code> set to what the downstream can handle, or gate each task with a
-      <code>SemaphoreSlim</code> when you need per-item results. The limit protects the dependency, so
-      size it from the dependency's capacity (connection pool, documented rate limit) and make it
-      configurable.</p></details>
+      <p><code>Task.WhenAll(ids.Select(id =&gt; client.GetAsync(url(id))))</code> starts <strong>all 5,000 requests at
+      once</strong>. That causes several failures.</p>
+      <p><strong>You overwhelm the server</strong> you are calling. It may rate-limit you with 429s, slow down for every other
+      client, or treat you as an attack. <strong>You exhaust local resources</strong>: connection limits per host mean most
+      requests just queue inside <code>HttpClient</code>, sockets and memory are consumed for thousands of in-flight requests,
+      and timeouts start firing for requests that have been queued rather than running. And <strong>failures become
+      all-or-nothing</strong>: one exception faults the whole <code>WhenAll</code>, with thousands of results to sort
+      through.</p>
+      <p>The fix is <strong>bounded concurrency</strong> — a fixed number of requests in flight at a time. The simplest tool in
+      modern .NET is <code>Parallel.ForEachAsync</code>:</p>
+      <pre>  await Parallel.ForEachAsync(ids,
+      new ParallelOptions { MaxDegreeOfParallelism = 10, CancellationToken = ct },
+      async (id, token) =&gt;
+      {
+          var item = await client.GetFromJsonAsync&lt;Item&gt;($"/items/{id}", token);
+          results.Add(item);             // a thread-safe collection, e.g. ConcurrentBag
+      });</pre>
+      <p>Alternatives are a <code>SemaphoreSlim</code> limiting concurrent calls, or a <code>Channel&lt;T&gt;</code> with a
+      fixed number of consumers, which also gives back-pressure for producer/consumer pipelines. Where the API offers it, a
+      <strong>batch endpoint</strong> that fetches many items in one request beats all of these.</p>
+      <p>Choose the limit from the downstream service's capacity and rate limits, not from your own machine, and add retries
+      with backoff for transient failures so one blip does not fail the whole run.</p></details>
     <details class="solution"><summary><strong>Q2 (Beginner):</strong> What is <code>IAsyncEnumerable&lt;T&gt;</code> and when is it better than <code>Task&lt;List&lt;T&gt;&gt;</code>?</summary>
-      <p>It's the async version of a sequence: items are produced one at a time, each potentially
-      awaited, consumed with <code>await foreach</code>. Prefer it when results arrive incrementally and
-      you don't need them all at once — reading large files/DB result sets, paging an API, gRPC
-      streams. Benefits: constant memory (one item in flight instead of the whole list) and immediate
-      first results (processing starts before the source finishes). <code>Task&lt;List&lt;T&gt;&gt;</code>
-      buffers everything, so memory scales with result size and nothing is available until the end.</p></details>
+      <p><code>IAsyncEnumerable&lt;T&gt;</code> is an <strong>asynchronous stream</strong>: a sequence whose items arrive over
+      time, where fetching each item may involve awaiting. It is produced with <code>yield return</code> in an async method and
+      consumed with <code>await foreach</code>:</p>
+      <pre>  public async IAsyncEnumerable&lt;Order&gt; GetOrdersAsync(
+      [EnumeratorCancellation] CancellationToken ct = default)
+  {
+      string? page = null;
+      do {
+          var result = await _api.GetPageAsync(page, ct);
+          foreach (var o in result.Items) yield return o;
+          page = result.Next;
+      } while (page is not null);
+  }
+
+  await foreach (var order in GetOrdersAsync(ct)) Process(order);</pre>
+      <p><code>Task&lt;List&lt;T&gt;&gt;</code> delivers <strong>everything at once</strong>: the caller waits until the entire
+      list is built, and the whole list is in memory.</p>
+      <p><code>IAsyncEnumerable&lt;T&gt;</code> is better when the data is <strong>large</strong> — streaming a million rows
+      from a database keeps memory flat instead of materialising them all; when the data arrives <strong>incrementally</strong>
+      — paginated APIs, where processing can start on the first page; when the consumer may <strong>stop early</strong> —
+      breaking out of <code>await foreach</code> stops fetching further pages; and when <strong>time to first result</strong>
+      matters. ASP.NET Core can stream an <code>IAsyncEnumerable</code> result to the response as JSON, and EF Core queries can
+      be streamed with <code>AsAsyncEnumerable</code>.</p>
+      <p><code>Task&lt;List&lt;T&gt;&gt;</code> remains better when the result is small, when the caller needs the whole set —
+      to count it, sort it or iterate it twice — or when the underlying resource, such as a database connection, should not
+      stay open while the consumer does slow work per item.</p></details>
     <details class="solution"><summary><strong>Q3 (Mid):</strong> How do you protect a critical section that contains an <code>await</code>? Why won't <code>lock</code> work?</summary>
-      <p><code>lock</code> compiles to <code>Monitor.Enter/Exit</code>, which is thread-affine — the
-      thread that acquires must release. An <code>await</code> may resume on a different thread, which
-      couldn't release the monitor, so C# makes <code>await</code> inside <code>lock</code> a compile
-      error. The idiom is <code>SemaphoreSlim(1,1)</code>: <code>await _gate.WaitAsync(); try { /* async
-      work */ } finally { _gate.Release(); }</code>. <code>WaitAsync</code> queues waiters without
-      blocking threads, and a semaphore has no thread affinity — any thread may release. The
-      <code>finally</code> is essential: a leaked permit permanently shrinks the gate.</p></details>
+      <p><code>lock</code> won't even compile with an <code>await</code> inside it — the compiler rejects it. The reason is
+      that <code>lock</code> is built on <code>Monitor</code>, which is <strong>thread-affine</strong>: the lock is owned by the
+      thread that acquired it, and only that thread can release it. After an <code>await</code>, the rest of the method may
+      resume on a <strong>different thread</strong>, which would then try to release a lock it does not own. Even if it
+      resumed on the same thread, holding a thread-based lock while the thread goes off to do other work would be
+      wrong.</p>
+      <p>The standard tool is <strong><code>SemaphoreSlim</code> with a count of one</strong>, which is not tied to a thread and
+      supports asynchronous waiting:</p>
+      <pre>  private readonly SemaphoreSlim _gate = new(1, 1);
+
+  public async Task RefreshAsync(CancellationToken ct)
+  {
+      await _gate.WaitAsync(ct);         // waits without blocking a thread
+      try
+      {
+          if (IsFresh()) return;
+          _token = await _auth.GetTokenAsync(ct);
+      }
+      finally
+      {
+          _gate.Release();               // always release, even on exceptions
+      }
+  }</pre>
+      <p>The <code>try</code>/<code>finally</code> is essential: an exception without it leaves the semaphore held forever, and
+      every later caller waits indefinitely.</p>
+      <p>Two cautions. <code>SemaphoreSlim</code> is <strong>not reentrant</strong>: a method holding it that calls another
+      method acquiring it again deadlocks itself. And a lock only protects one process; with several instances of a service,
+      protecting shared state requires a <strong>distributed lock</strong> or, better, a database constraint or atomic
+      operation. Often the best answer is removing the shared mutable state altogether — for example, caching the task rather
+      than the result, so concurrent callers await the same in-flight refresh.</p></details>
     <details class="solution"><summary><strong>Q4 (Mid):</strong> What is <code>TaskCompletionSource</code> for? Name two details that make a TCS-based adapter production-grade.</summary>
-      <p>It creates a <code>Task</code> whose completion <em>you</em> control via
-      <code>SetResult/SetException/SetCanceled</code> — the bridge that wraps callback- or event-based
-      APIs (device SDKs, message replies, old Begin/End patterns) into awaitable methods; it's also how
-      the runtime itself constructs I/O tasks. Production details: (1) construct with
-      <code>TaskCreationOptions.RunContinuationsAsynchronously</code>, otherwise awaiters' continuations
-      execute synchronously on whatever thread calls <code>SetResult</code> — hijacking a library/timer
-      thread and inviting deadlocks; (2) use <code>TrySet*</code> variants since callbacks can race or
-      fire twice; (3) register cancellation (<code>ct.Register(() =&gt; tcs.TrySetCanceled(ct))</code>)
-      and unhook event handlers to avoid leaks.</p></details>
+      <p><code>TaskCompletionSource&lt;T&gt;</code> creates a task that <strong>you complete manually</strong>. It is the bridge
+      between async/await and code that signals completion some other way: callback-based APIs, events, message replies, or a
+      request waiting for a matching response on a socket. You hand out <code>tcs.Task</code>, and later call
+      <code>SetResult</code>, <code>SetException</code> or <code>SetCanceled</code>.</p>
+      <pre>  public Task&lt;Reply&gt; SendAsync(Request req, CancellationToken ct)
+  {
+      var tcs = new TaskCompletionSource&lt;Reply&gt;(
+          TaskCreationOptions.RunContinuationsAsynchronously);        // detail 1
+
+      EventHandler&lt;Reply&gt;? handler = null;
+      handler = (_, reply) =&gt; {
+          if (reply.Id != req.Id) return;
+          _bus.Replied -= handler;                                     // unsubscribe
+          tcs.TrySetResult(reply);                                     // detail 2
+      };
+      _bus.Replied += handler;
+
+      var reg = ct.Register(() =&gt; {                                  // detail 3
+          _bus.Replied -= handler;
+          tcs.TrySetCanceled(ct);
+      });
+      tcs.Task.ContinueWith(_ =&gt; reg.Dispose(), TaskScheduler.Default);
+
+      _bus.Send(req);
+      return tcs.Task;
+  }</pre>
+      <p><strong>1. <code>RunContinuationsAsynchronously</code>.</strong> By default, <code>SetResult</code> runs the awaiting
+      code <em>synchronously</em> on the thread that called it — here, the message bus's thread. That can stall the bus, cause
+      reentrancy bugs, or deadlock if the completer holds a lock. This option schedules continuations separately.</p>
+      <p><strong>2. <code>TrySet*</code> instead of <code>Set*</code>.</strong> Completion often races — a reply and a
+      cancellation or timeout arriving together. <code>SetResult</code> on an already-completed task throws;
+      <code>TrySetResult</code> simply returns false.</p>
+      <p><strong>3. Cancellation and cleanup.</strong> Register the cancellation token, dispose the registration and
+      unsubscribe the handler when the task completes, or every call leaks a handler. A timeout is usually wanted too, so a
+      reply that never arrives does not leave a task pending forever.</p></details>
     <details class="solution"><summary><strong>Q5 (Senior):</strong> Design a background work queue inside a web app: requests enqueue jobs, workers process them, the app must not lose jobs on overload or use disposed services. What do you build?</summary>
       <p>A bounded <code>Channel&lt;Job&gt;</code> registered as a singleton: endpoints
       <code>WriteAsync</code> (which awaits when full — backpressure instead of unbounded memory growth;
@@ -440,6 +532,18 @@ public class RatesService
       <li>Bounded <code>Channel&lt;T&gt;</code> is the producer/consumer backbone: backpressure by design, <code>Complete()</code> + drain for shutdown, DI-scoped consumers for background work.</li>
       <li><code>TaskCompletionSource</code> bridges callbacks to tasks — always <code>RunContinuationsAsynchronously</code>, <code>TrySet*</code>, and unhook handlers.</li>
       <li>Know the incident patterns: sync-over-async starves the pool (low CPU + high latency), fire-and-forget outlives its DI scope, unbounded queues hide overload until OOM, retries need backoff + jitter + transient filters.</li>
+      <li><strong>Unbounded fan-out overwhelms the service you call.</strong></li>
+      <li><strong>Bound concurrency with <code>Parallel.ForEachAsync</code>, a semaphore or a channel.</strong></li>
+      <li><strong>Prefer batch endpoints when available.</strong></li>
+      <li><strong><code>IAsyncEnumerable&lt;T&gt;</code> streams items as they arrive.</strong></li>
+      <li><strong>Streams keep memory flat and allow stopping early.</strong></li>
+      <li><strong>Return a list when the result is small or needed whole.</strong></li>
+      <li><strong><code>lock</code> is thread-affine and cannot span an await.</strong></li>
+      <li><strong><code>SemaphoreSlim(1, 1)</code> with <code>WaitAsync</code> guards async critical sections.</strong></li>
+      <li><strong>Always release a semaphore in <code>finally</code>.</strong></li>
+      <li><strong><code>TaskCompletionSource</code> adapts callbacks and events to tasks.</strong></li>
+      <li><strong>Use <code>RunContinuationsAsynchronously</code> and <code>TrySet*</code>.</strong></li>
+      <li><strong>Clean up handlers and cancellation registrations when the task completes.</strong></li>
     </ul></div>
 
     <div class="pager">
