@@ -440,48 +440,92 @@ public sealed class CacheWarmer(IServiceScopeFactory scopes, HybridCache cache)
       <tr><td>Cache failure propagating to the caller</td><td>A Redis outage becomes an application outage</td><td>Catch, log, fall through to the source</td></tr>
       <tr><td>Caching a fast query</td><td>Slower than not caching, plus new failure modes</td><td>Measure first; cache what is genuinely expensive</td></tr>
       <tr><td>Caching authorization decisions</td><td>Revoked permissions remain effective until expiry</td><td>Do not cache, or use very short TTLs with explicit revocation</td></tr>
+      <tr><td>Mutating an object returned by <code>IMemoryCache</code></td><td>The change leaks to every request sharing that instance</td><td>Cache immutable objects, or copies</td></tr>
+      <tr><td>The same expiration for every key</td><td>Keys populated together expire together</td><td>Add jitter to expirations</td></tr>
+      <tr><td>Evicting before the database commit</td><td>A concurrent reader re-caches the old value</td><td>Evict after the commit</td></tr>
+      <tr><td>Caching transient failures as values</td><td>A momentary error is served for the whole TTL</td><td>Cache only successful and deliberate negative results</td></tr>
     </table>
 
     <h2>Interview Questions</h2>
     <details class="solution"><summary><strong>Beginner:</strong> What is the difference between in-memory and distributed caching?</summary>
-      <p><code>IMemoryCache</code> stores objects on the current process's heap, so access is extremely fast
-      with no serialization or network hop — but each instance has its own copy, entries are lost on restart,
-      and the cache competes with the application for memory. A distributed cache such as Redis stores data in
-      an external service, so every instance sees the same values and the cache survives restarts and
-      deployments, at the cost of serialization and a network round trip of roughly half a millisecond to a
-      few milliseconds. The practical consequence is that in-memory suits per-instance derived data where
-      inconsistency between instances is tolerable, while distributed is required when instances must agree —
-      session state, rate-limit counters, or anything where a user hitting a different server must see the
-      same result.</p></details>
+      <p><strong>In-memory caching</strong> (<code>IMemoryCache</code>) stores objects inside the application process. It is
+      the <strong>fastest</strong> option: no network hop and no serialisation — the cache hands back the same object
+      reference. But each instance of the app has <strong>its own cache</strong>. With four replicas, the same data is cached
+      four times, the copies can disagree, and every deploy or restart starts cold.</p>
+      <p><strong>Distributed caching</strong> (<code>IDistributedCache</code>, usually backed by Redis) stores serialised values
+      in a <strong>shared</strong> external store. Every replica sees the same data, an eviction takes effect everywhere at
+      once, and the cache survives deploys. The costs are a network round trip and serialisation on every read, and a new
+      dependency that can fail or slow down.</p>
+      <pre>  IMemoryCache       ~nanoseconds   per instance   object references   lost on restart
+  IDistributedCache  ~milliseconds   shared         serialised bytes    survives deploys
+  HybridCache        L1 in-memory + L2 distributed, with stampede protection (.NET 9)</pre>
+      <p>Choose in-memory for small, read-heavy data where brief inconsistency between instances is acceptable: reference data,
+      feature configuration, lookup tables. Choose distributed when <strong>consistency across instances</strong> matters —
+      invalidation must be seen everywhere — or when the data is expensive enough that losing it on every deploy hurts.</p>
+      <p><strong><code>HybridCache</code></strong> combines them: a fast local tier backed by a shared tier, with protection
+      against stampedes. One caution for in-memory caching specifically: because it returns shared references,
+      <strong>mutating a cached object changes it for every request</strong>. Cache immutable objects, or copies.</p></details>
     <details class="solution"><summary><strong>Beginner:</strong> Why must a cache key include the user for personalised responses?</summary>
-      <p>Because the cache key is the entire basis on which a stored response is considered reusable. If the
-      key is just the URL and the response depends on who is asking, then the first user's response is stored
-      and served to everyone else who requests that URL. That is not a stale-data bug, it is one user
-      receiving another user's private data — a security incident. The same reasoning applies to tenant, role
-      and locale: every input that changes the response must appear in the key, and the safest habit is to
-      enumerate those inputs explicitly before adding a cache rather than assuming the URL captures them.</p></details>
+      <p>Because the cache key must identify <strong>everything that makes the response different</strong>. If a response
+      depends on who is asking, and the key does not include the user, the first user's response is stored under a key that
+      every other user's request also produces. The second user receives the first user's data.</p>
+      <pre>  // wrong: every user's "my orders" page shares one entry
+  cache.GetOrCreateAsync("orders:recent", ...);
+
+  // right: the key includes every input that varies the result
+  cache.GetOrCreateAsync($"orders:recent:{tenantId}:{userId}:{page}", ...);</pre>
+      <p>This is not a performance bug; it is a <strong>data leak</strong>. One customer sees another's orders, addresses or
+      account balance. It is a security incident, often a reportable data-protection breach, and it tends to appear only under
+      real concurrent traffic, never in a developer's single-user testing.</p>
+      <p>The same principle applies at every caching layer. For in-process and distributed caches, build keys from
+      <strong>every input</strong> that shapes the result: user, tenant, role, locale, query parameters, feature flags. For
+      output caching, configure what the entry varies by. For HTTP caching, personalised responses must be
+      <code>Cache-Control: private</code> — or <code>no-store</code> — so that CDNs and shared proxies never store them.</p>
+      <p>A better design often avoids the problem: cache the <strong>shared</strong> parts — product details, prices,
+      catalogue pages — and compose the small personalised part per request. That keeps hit rates high, since a per-user key
+      only helps if the same user repeats the same request, and it removes the risk of cross-user leaks for most of the
+      data.</p></details>
     <details class="solution"><summary><strong>Mid:</strong> What is a cache stampede and how do you prevent it?</summary>
-      <p>A stampede — or dogpile — happens when a popular cache entry expires and every concurrent request
-      misses at the same moment, so instead of one expensive query you get hundreds executing simultaneously.
-      It is particularly dangerous because it is self-reinforcing under load: the flood of identical queries
-      slows the database, which means more requests arrive and miss before the first one repopulates the
-      entry. The standard fix is request coalescing, where concurrent misses for the same key wait on a single
-      in-flight factory call rather than all executing it. <code>HybridCache</code> provides this by default,
-      which is a strong reason to prefer it over hand-rolled cache-aside. Hand-rolling it requires a per-key
-      lock with a double-check after acquiring, and the detail people get wrong is using one global lock,
-      which serialises misses across unrelated keys. Probabilistic early expiration — refreshing slightly
-      before the TTL with a randomised jitter — is a complementary technique that avoids synchronised expiry
-      across many keys.</p></details>
+      <p>A stampede — or thundering herd — happens when a <strong>hot key expires</strong> and many concurrent requests miss at
+      the same moment. Every one of them runs the expensive query or calls the slow service to rebuild the same value. A
+      database that comfortably served one query per minute for that data suddenly receives hundreds at once, slows down,
+      and the slowdown makes more requests pile up. A cache that normally protects the database becomes the trigger for its
+      overload.</p>
+      <p>The main defence is <strong>request coalescing</strong>: on a miss, only one caller computes the value, and every
+      concurrent caller for the same key awaits that single result.</p>
+      <pre>  // HybridCache coalesces concurrent misses for the same key
+  var product = await hybridCache.GetOrCreateAsync(
+      $"product:{id}",
+      async ct =&gt; await db.Products.AsNoTracking().FirstAsync(p =&gt; p.Id == id, ct),
+      new HybridCacheEntryOptions { Expiration = TimeSpan.FromMinutes(10) });</pre>
+      <p><code>HybridCache</code> does this built in. <code>IMemoryCache.GetOrCreateAsync</code> does <strong>not</strong>:
+      its factory can run concurrently for the same key, so hand-rolled code needs a per-key lock or a cached
+      <code>Lazy&lt;Task&lt;T&gt;&gt;</code>.</p>
+      <p>Further defences address when keys expire. <strong>Jitter</strong> — adding a random few percent to each
+      expiration — stops keys populated together from all expiring together. <strong>Refresh-ahead</strong> recomputes a hot
+      value in the background shortly before it expires, so readers never see a miss. <strong>Serve stale while
+      revalidating</strong> returns the slightly old value during the rebuild instead of blocking.</p>
+      <p>Coalescing protects a single instance; with many replicas, each can still rebuild once, which is usually acceptable. If
+      not, a distributed lock or a shared L2 tier reduces it further.</p></details>
     <details class="solution"><summary><strong>Mid:</strong> When would you evict a cache entry rather than update it in place?</summary>
-      <p>Almost always. Updating in place looks more efficient because it avoids the next request's cache miss,
-      but it introduces a race: two concurrent writers can commit to the database in one order and write to
-      the cache in the opposite order, leaving the cache holding a value that matches neither the final
-      database state nor any consistent point in time — and it stays wrong until the TTL expires. Eviction is
-      idempotent and always converges, because the next read repopulates from the source of truth. The cost is
-      one extra miss, which is negligible compared to serving indefinitely wrong data. The related discipline
-      is that eviction must happen on every write path, and since background jobs, migrations and other
-      services often bypass the application's write path entirely, a TTL should always remain as the
-      backstop.</p></details>
+      <p>Evicting — deleting the key when the data changes and letting the next read repopulate it from the database — is the
+      <strong>default</strong>, because it converges to correct data even when things race.</p>
+      <p>Updating in place has a classic race. Two writers change the same record: writer A saves version 1, then writer B saves
+      version 2, so the database correctly holds version 2. But their cache writes arrive in the opposite order — B writes
+      version 2 to the cache, then A, delayed by a slow network or a garbage-collection pause, writes version 1. The cache now
+      holds <strong>stale data</strong> that no future write corrects, and it is served until the TTL expires.</p>
+      <pre>  DB:     A saves v1 ─── B saves v2                   database = v2  (correct)
+  Cache:           B writes v2 ─── A writes v1        cache    = v1  (stale until TTL)
+
+  Evict instead: A deletes, B deletes → the next read loads v2 from the database</pre>
+      <p>Eviction avoids that because deleting is <strong>idempotent</strong>: however the deletes interleave, the result is
+      the same empty key, and the next read fetches the current value. It also keeps a single code path that builds the cached
+      representation, rather than duplicating it in every write.</p>
+      <p>Two timing details matter. Evict <strong>after</strong> the database commit; evicting first lets a concurrent reader
+      repopulate the old value before the write lands. And keep a <strong>TTL</strong> as a backstop for any race that remains.</p>
+      <p>Updating in place is reasonable when there is a <strong>single writer</strong>, so no race is possible, and a miss is
+      costly enough that avoiding it matters — a very hot key whose rebuild is expensive. Even then, versioned writes, which
+      reject older versions, make it safer.</p></details>
     <details class="solution"><summary><strong>Senior:</strong> After adding Redis caching, p99 latency got worse and an outage took the whole API down. Diagnose.</summary>
       <p>Two separate problems that commonly arrive together. The latency regression suggests the cached
       operations were not expensive enough to justify the round trip — a query taking around a millisecond
@@ -802,6 +846,12 @@ return await LoadFromSourceAsync(ct);
         <li>Cache negative results briefly, or enumeration of missing keys bypasses the cache entirely.</li>
         <li>A cache must never be a hard dependency — catch its failures and fall through, with aggressive timeouts so a hung cache does not stall requests.</li>
         <li>Caching a fast query behind a network hop makes it slower; a cache is justified by measured hit ratio against measured source cost.</li>
+      <li>In-memory caches are per instance and return shared references; distributed caches are shared but cost a network hop.</li>
+      <li><code>HybridCache</code> combines a local L1 with a distributed L2 and coalesces concurrent misses.</li>
+      <li>Never mutate an object retrieved from an in-memory cache.</li>
+      <li>A missing user or tenant in a cache key is a data leak, not a performance bug.</li>
+      <li>Jitter expirations so that hot keys do not all expire at the same moment.</li>
+      <li>Evict after the database commits; update in place only with a single writer and an expensive miss.</li>
       </ul>
     </div>
 
