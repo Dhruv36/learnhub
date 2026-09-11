@@ -15,10 +15,10 @@ track. For the three tracks left this is *deepening existing lessons*, not rewri
 
 | | |
 |---|---|
-| **In progress** | **dotnet** — 8/23 elaborated (async-await, async-patterns, collections-generics, control-flow, delegates-events, di-hosting, efcore, exceptions-nullability); Part 6 added to the five 5-Part lessons. DRAFTED, NOT APPLIED: `tools/pending/batchAJ-AM.py` (12 lessons); still unwritten: methods, modern-csharp, oop. aspnet drafts `tools/pending/batchBA.py`/`batchBB.py` fail — `lib.py` cannot find aspnet's takeaways block; fix that regex first. Apply from repo root with `python tools/pending/<file>.py`, gate per 1e, commit, then delete the file — re-running an applied batch duplicates its mistakes/takeaways. |
+| **In progress** | **aspnet** — 8/24 elaborated 2026-09-11 (api-design, authn-authz, authorization, caching-background, caching, clean-architecture, configuration, controllers-mvc). The other 16 were being drafted by agents into `tools/pending/batchBC.py`–`batchBF.py`: check each file exists and has 4 `apply()` calls before applying; write any missing lessons yourself. Apply with `python tools/pending/<file>.py`, gate with `tools/gate.sh aspnet <lessons>`, commit, then delete the batch (`git rm` if tracked, `rm` if not). dotnet finished 2026-09-11 (23/23; five lessons gained a Part 6). |
 | **Measured depth** | `python tools/depth.py react javascript html css` — medians below, react is the finished reference |
-| **Next tracks** | dotnet 23 · aspnet 17 (by flagged count) |
-| **Complete** | angular, nodejs, css, html, javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
+| **Next tracks** | aspnet 17 (by flagged count) |
+| **Complete** | dotnet, angular, nodejs, css, html, javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
 
 **To pick up the next lesson:** run `python tools/depth.py <track> --per-lesson`, pick the weakest
 row, read that lesson in full, then deepen it in place. `docs/LESSON_REBUILD_SPEC.md` is the recipe;
@@ -33,7 +33,8 @@ html (n=32)            6         6       212         6        18        22      
 css (n=28)             5         6       242         6        16        22         1   DONE
 nodejs (n=24)          6         6       232         6        17        20         1   DONE
 angular (n=23)         6         6       234         6        16        18         1   DONE
-dotnet (n=23)          6         6       110         6         8         6         1
+dotnet (n=23)          6         6       275         6        16        18         1   DONE
+aspnet (n=24)          6         6       125         6        12        10         1
 ```
 Every section exists in each track above, nodejs included; only the depth per section is short. See rule 1c — **deepen in
 place, never rewrite.** `docs/TASKS/` is empty and these tracks do not need briefs: the lesson
