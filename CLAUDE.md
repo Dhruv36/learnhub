@@ -69,10 +69,16 @@ material and costs many times more.
 Per lesson: expand interview answers Q1-Q4 to 3-4 paragraphs each (Q5/Q6 are usually already
 long — expanding only two of six does NOT move the median), append mistake rows to ~16, and
 append takeaways to ~16-22. Leave Parts and exercises untouched. Work in batches of four
-lessons, and gate every commit on: `validate.py` 0 errors, `quizcheck.py` OK, and the pager
-links unchanged versus HEAD. Pushes through OneDrive can exceed 120s — use a long timeout.
-Some tracks (nodejs) label answers `<strong>Beginner:</strong>` with no Q-number, so the
-splice must replace the Nth answer by position inside the Interview Questions section only.
+lessons, and gate every commit with **`tools/gate.sh <track> <lesson>...`** (from the repo root):
+`validate.py` 0 errors, `quizcheck.py` OK, and the pager links unchanged versus HEAD. Pushes
+through OneDrive can exceed 120s — use a long timeout.
+The splicer is **`tools/pending/lib.py`**: `apply(path, iq={1: html, ...}, mistakes=rows,
+takeaways=lis)` replaces the Nth interview answer by position inside the Interview Questions
+section only (some tracks label answers `<strong>Beginner:</strong>` with no Q-number) and appends
+mistake rows and takeaways. A batch script is one `apply()` per lesson; any
+`tools/pending/batch*.py` is a working template. **Apply a batch once, then delete it** — re-running duplicates its rows.
+Also check Parts with `depth.py --per-lesson`: dotnet had five lessons with only 5 Parts, which
+needed a new Part 6 inserted before Common Mistakes, not just elaboration.
 
 **1d. SETTLED 2026-09-10: html/css keep their build-and-observe lab exercises.**
 Their exercises are labs ("build a flex toolbar, watch the icons shrink, add `flex-shrink: 0`") where
@@ -90,7 +96,8 @@ fine everywhere outside `<pre>`.
 **3. Verify before every commit.**
 ```bash
 python validate.py tutorials/<track>          # 0 errors required
-python tools/quizcheck.py tutorials/<track>   # expects "10 200 0"
+python tools/quizcheck.py tutorials/<track>   # last line must be "OK"
+tools/gate.sh <track> <lesson>...             # both of the above + pager check
 ```
 
 ---
@@ -111,6 +118,11 @@ re-trimming working content.
 **Always tell an agent: do NOT run git, do NOT edit `validate.py`.** Agents have committed
 unreviewed work when not told otherwise. The parent session owns all commits.
 
+**What worked 2026-09-11:** agents wrote *batch scripts* (not lesson files) and were told to
+save after every lesson. Both still died on a 429 session limit, but left 12 finished lessons on
+disk. Have them write into `tools/pending/` (not a session temp dir) so the work survives the
+session too.
+
 ---
 
 ## Layout
@@ -119,7 +131,8 @@ unreviewed work when not told otherwise. The parent session owns all commits.
 tutorials/<track>/       lessons + nav.js (the sidebar's single source of truth)
                          quiz.html + quiz-bank-1.js (sets 1–5) + quiz-bank-2.js (sets 6–10)
 validate.py              tag nesting, unescaped < in <pre>, asset refs, links, depth flag
-tools/                   quizcheck.py, quizshuffle.js, depth.py — committed, no session deps
+tools/                   quizcheck.py, quizshuffle.js, depth.py, gate.sh — committed, no session deps
+tools/pending/           lib.py (the splicer) + drafted batch scripts not yet applied
                          depth.py measures TEACHING markers; use it instead of judging by KB
 docs/LESSON_REBUILD_SPEC.md   the v4 recipe
 docs/TASKS/              per-lesson briefs, ready to hand to an agent
