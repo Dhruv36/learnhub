@@ -15,10 +15,10 @@ track. For the three tracks left this is *deepening existing lessons*, not rewri
 
 | | |
 |---|---|
-| **In progress** | **aspnet** — 8/24 elaborated 2026-09-11 (api-design, authn-authz, authorization, caching-background, caching, clean-architecture, configuration, controllers-mvc). The other 16 were being drafted by agents into `tools/pending/batchBC.py`–`batchBF.py`: check each file exists and has 4 `apply()` calls before applying; write any missing lessons yourself. Apply with `python tools/pending/<file>.py`, gate with `tools/gate.sh aspnet <lessons>`, commit, then delete the batch (`git rm` if tracked, `rm` if not). dotnet finished 2026-09-11 (23/23; five lessons gained a Part 6). |
+| **In progress** | **None — the v4 depth pass is complete (2026-09-11).** Every track measures at recipe with `tools/depth.py`. aspnet finished 2026-09-11 (24/24); on the way, a claim repeated in seven aspnet lessons (that `UseAuthorization` before `UseRouting` "fails open") was found false and corrected — see rule 4. dotnet (23/23), angular and nodejs finished the same day. |
 | **Measured depth** | `python tools/depth.py react javascript html css` — medians below, react is the finished reference |
-| **Next tracks** | aspnet 17 (by flagged count) |
-| **Complete** | dotnet, angular, nodejs, css, html, javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
+| **Next tracks** | none queued — run `python validate.py` and `tools/depth.py` across all tracks to find the next gap |
+| **Complete** | aspnet, dotnet, angular, nodejs, css, html, javascript, react, java, springboot, python, linux, sql, aws, cicd, docker, kubernetes, mongodb, redis, leetcode, system-design, database-concepts, vector-databases |
 
 **To pick up the next lesson:** run `python tools/depth.py <track> --per-lesson`, pick the weakest
 row, read that lesson in full, then deepen it in place. `docs/LESSON_REBUILD_SPEC.md` is the recipe;
@@ -34,7 +34,7 @@ css (n=28)             5         6       242         6        16        22      
 nodejs (n=24)          6         6       232         6        17        20         1   DONE
 angular (n=23)         6         6       234         6        16        18         1   DONE
 dotnet (n=23)          6         6       275         6        16        18         1   DONE
-aspnet (n=24)          6         6       125         6        12        10         1
+aspnet (n=24)          6         6       271         6        16        16         1   DONE
 ```
 Every section exists in each track above, nodejs included; only the depth per section is short. See rule 1c — **deepen in
 place, never rewrite.** `docs/TASKS/` is empty and these tracks do not need briefs: the lesson
@@ -100,6 +100,13 @@ python validate.py tutorials/<track>          # 0 errors required
 python tools/quizcheck.py tutorials/<track>   # last line must be "OK"
 tools/gate.sh <track> <lesson>...             # both of the above + pager check
 ```
+
+**4. Verify framework-behaviour claims before repeating them.**
+In Sept 2026 seven aspnet lessons said `UseAuthorization` before `UseRouting` "fails open silently".
+Since ASP.NET Core 3.0 it throws for endpoints with authorization metadata, and a fallback policy
+applies to every request — it fails closed. A subagent reading the lessons caught it; the same pass
+found a wrong minimal-API binding claim and a wrong exception-filter claim. When a lesson asserts
+what a framework does in an edge case, check the docs before echoing it into new answers.
 
 ---
 
