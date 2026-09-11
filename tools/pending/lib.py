@@ -35,11 +35,11 @@ def apply(path, answers=None, mistakes=None, takeaways=None, iq=None):
     if iq:
         s = _replace_iq_by_position(s, path, iq)
     if mistakes:
-        m = re.search(r"(<h2>Common Mistakes</h2>.*?)(\n\s*</table>)", s, re.S)
+        m = re.search(r"(<h2>(?:\d+\.\s*)?Common Mistakes</h2>.*?)(\n\s*</table>)", s, re.S)
         assert m, "%s: no mistakes table" % path
         s = s[:m.end(1)] + "\n" + mistakes + s[m.end(1):]
     if takeaways:
-        m2 = re.search(r'(<div class="takeaways"><h3>[^<]*</h3>\s*<ul>)(.*?)(\s*</ul>\s*</div>)', s, re.S)
+        m2 = re.search(r'(<div class="takeaways">\s*<h3>[^<]*</h3>\s*<ul>)(.*?)(\s*</ul>\s*</div>)', s, re.S)
         assert m2, "%s: no takeaways" % path
         s = s[:m2.end(2)] + "\n" + takeaways + s[m2.end(2):]
 
