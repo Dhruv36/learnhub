@@ -28,7 +28,7 @@ window.QUIZ_SETS.push(
     explain: "Nothing downstream can recover the cost of reading the whole collection." },
   { q: "usedDisk: true means…", options: ["The query used the journal", "A blocking stage exceeded 100 MB and spilled", "The index was read from disk"], answer: 1,
     explain: "Correct behaviour, and orders of magnitude slower — a signal to reduce the input rather than to enable spilling." },
-  { q: "On a sharded collection the first number to read is…", options: ["docsExamined", "nReturned", "shardsTargeted"], answer: 2,
+  { q: "On a sharded collection the first number to read is…", options: ["docsExamined", "nReturned", "How many shards were targeted"], answer: 2,
     explain: "The top-level summary sums all shards, so excellent-looking ratios can hide a 12-shard broadcast." },
   { q: "Slow queries should be ranked by…", options: ["Documents examined", "Worst single execution", "Total time (count × mean)"], answer: 2,
     explain: "A 41 ms query run 98,000 times an hour cost 67 minutes; the 4-second report everyone complained about cost 8 seconds." },
