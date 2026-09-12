@@ -224,7 +224,7 @@ MEASURED: the query that was fast on the server and slow in the app
       <tr><td><code>limit()</code></td><td>Bounds everything downstream — but only stops the <em>scan</em> early if the sort comes from the index</td><td>A blocking SORT reads everything regardless</td></tr>
       <tr><td><code>batchSize()</code></td><td>Fewer round trips on large reads</td><td>Larger batches mean more memory held per cursor; the reply is capped at 16 MB per batch regardless</td></tr>
       <tr><td>Cursor timeouts</td><td>Idle cursors are closed after 10 minutes</td><td>A slow consumer that pauses mid-iteration gets <code>CursorNotFound</code>; process in bounded batches instead</td></tr>
-      <tr><td><code>allowDiskUse</code></td><td>Lets an aggregation stage spill past 100 MB</td><td>It converts a failure into something very slow. Usually a signal to reduce earlier, not to enable</td></tr>
+      <tr><td><code>allowDiskUse</code></td><td>Lets a stage spill to disk past 100 MB — the default from 6.0, opt-in before</td><td>It converts a failure into something very slow, and on 6.0+ it happens without anyone asking. Check <code>usedDisk</code>; it is usually a signal to reduce earlier</td></tr>
     </table>
 
     <p>The general principle: <code>explain</code> measures the database's work, and the database is often not
@@ -426,21 +426,36 @@ MEASURED: case-insensitive search
 
     <details class="solution"><summary><strong>Beginner:</strong> Why is <code>skip()</code> slow for deep pagination?</summary>
       <p>Because <code>skip(n)</code> does not seek — it walks the index from the start and discards the first
-         <em>n</em> entries. Those entries are read; they are just thrown away. So cost grows linearly with
+         <em>n</em> entries, reading every one. So cost grows linearly with
          the page number, and paging through a whole result set is quadratic overall.</p>
       <p>Measured on a customer with 100,000 orders and a perfect index: 4 ms on page 1, 310 ms on page 1,000,
-         2,100 ms on page 5,000. The index was not the problem, which is why this cannot be fixed by
-         indexing.</p>
-      <p>Keyset pagination fixes it: instead of "skip 19,980", pass the last row's sort key and ask for
-         "everything after this", which is a normal indexed seek. Every page then costs the same.</p>
+         2,100 ms on page 5,000. No index fixes that. <code>skip</code> is also unstable: an insert while someone is paging shifts every later
+         page by one, so an item is shown twice.</p>
+      <p>Keyset pagination fixes both: instead of "skip 19,980", pass the last row's sort key and ask for
+         "everything after this", which is a normal indexed seek. Every page then costs the same. The price is
+         what interviewers probe for: no jumping to page 500, only next and previous; and the sort key
+         must be made unique by appending <code>_id</code> to the sort and the index, or rows sharing a
+         timestamp across a page boundary are duplicated or dropped.</p>
+      <p>I would keep <code>skip</code> for small admin tables where nobody goes past page five — at
+         <code>skip(180)</code> it measured 5 ms. To verify a keyset rewrite,
+         explain a <em>deep</em> page: <code>totalKeysExamined</code> should stay near the page size with no
+         blocking <code>SORT</code>. A page-1 explain looks fine for both designs, which is how the problem
+         ships.</p>
     </details>
 
     <details class="solution"><summary><strong>Beginner:</strong> What is the difference between <code>countDocuments</code> and <code>estimatedDocumentCount</code>?</summary>
       <p><code>estimatedDocumentCount()</code> reads collection metadata — about 1 ms regardless of size — but
-         takes no filter and can be briefly inaccurate after an unclean shutdown.
-         <code>countDocuments(filter)</code> runs a real query. With a good index it is a
-         <code>COUNT_SCAN</code> over keys with no document fetches, but it still walks every matching key,
-         so on 41 million matches it took 6.4 seconds.</p>
+         takes no filter. <code>countDocuments(filter)</code> runs a real aggregation (<code>$match</code> then
+         <code>$group</code>). With a good index it is a <code>COUNT_SCAN</code> over keys with no document
+         fetches, but it still walks every matching key, so on 41 million matches it took 6.4 seconds.</p>
+      <p>The caveats an interviewer is usually fishing for are on the estimate's side. Because it reads
+         metadata, it can drift after an unclean shutdown until <code>validate</code> is run on the
+         collection, and on a sharded cluster it counts orphaned documents that <code>countDocuments</code>
+         filters out.</p>
+      <p>A migration trap: the legacy <code>count()</code> is deprecated because with no filter it silently
+         returned the metadata estimate and with one it ran a real count, and callers could not tell which
+         they got. And because <code>countDocuments</code> is an aggregation, it rejects <code>$where</code>, <code>$near</code> and <code>$nearSphere</code> — rewrite those with
+         <code>$expr</code> and <code>$geoWithin</code>.</p>
       <p>The practical consequence is that there is no fast exact count of a filtered set at scale. The
          options are a bounded count (<code>{ limit: 1000 }</code> → "1,000+"), a maintained counter, or not
          showing a total. I would ask what decision the number supports first — in the case I measured, the
@@ -452,24 +467,39 @@ MEASURED: case-insensitive search
          serialisation, network transfer, driver deserialisation, and the round trips to fetch subsequent
          cursor batches.</p>
       <p>In the case I measured, the query returned 182,000 documents with no projection — about 740 MB across
-         roughly 40 batches. The server genuinely did its part in 4 ms.</p>
+         roughly 40 batches. The server genuinely did its part in 4 ms. Verify that at the driver with command
+         monitoring — each <code>find</code> and <code>getMore</code> fires its own started and succeeded
+         event — and count the <code>getMore</code>s. On the server, the profiler records each
+         <code>getMore</code> as a separate operation carrying its <code>originatingCommand</code>, so a query
+         whose cost lives in its tail shows up as many small getMores, not one slow find.</p>
       <p>The diagnosis is <code>nReturned</code> and <code>responseLength</code> in the profiler, not explain.
          The fixes in order of effect: a <code>limit</code> (does anything need 182,000 documents?), a
          projection (740 MB → 31 MB by returning six fields), and only then <code>batchSize</code> for a
          genuine bulk read. Adding an index would have changed nothing.</p>
+      <p>Each lever has a cost. A larger <code>batchSize</code> means fewer round trips but more memory held
+         per cursor; wire compression (<code>compressors=zstd</code>) helps a bandwidth-bound link and costs
+         CPU at both ends; and <code>toArray()</code> on 182,000 documents holds them all in application
+         memory at once, where iterating the cursor would not.</p>
     </details>
 
     <details class="solution"><summary><strong>Mid:</strong> How do you make a case-insensitive search use an index?</summary>
-      <p>A case-insensitive regex like <code>/^amy@example\.com$/i</code> cannot use an index even though it is
-         anchored, because case folding changes the key ordering — measured at 2,900 ms as a collection scan
+      <p>A case-insensitive regex like <code>/^amy@example\.com$/i</code> cannot use an index effectively even
+         though it is anchored. The planner only turns a case-sensitive prefix into a key range; with the
+         <code>i</code> flag the best case is testing the regex against every key of an index on
+         <code>email</code>, and with no such index — the measured case — it was a 2,900 ms collection scan
          over 4.2M users.</p>
       <p>Two options. Store a normalised <code>emailLower</code> field, index it, and query it with a
-         lowercased input: 3 ms, and completely explicit. Or create a collation index with
-         <code>strength: 2</code> and specify the same collation on every query — also 3 ms, but if any call
-         site omits <code>.collation()</code> it silently falls back to a collection scan while the unique
-         constraint still applies case-insensitively.</p>
-      <p>I default to the normalised field. It is a little more code and no hidden coupling between the query
-         and the index, and it behaves identically in every driver and in the shell.</p>
+         lowercased input: 3 ms, and explicit. Or create a collation index with <code>strength: 2</code> and
+         specify the same collation on every query — also 3 ms, but any call site that omits
+         <code>.collation()</code> silently falls back to a collection scan. A collection default collation
+         removes that trap, since queries and indexes inherit it, but it cannot be changed after creation. And <code>$regex</code> is not collation-aware, so the collation index does
+         nothing for "starts with, any case".</p>
+      <p>I default to the normalised field: no hidden coupling between query and index, and it serves prefix search
+         too (<code>{ emailLower: /^amy/ }</code>). Its failure mode
+         is drift — every write path, bulk imports included, must maintain it. An <code>$expr</code> validator
+         comparing it with <code>$toLower</code> can enforce the pairing, though <code>$toLower</code> is only
+         well-defined for ASCII; for non-ASCII names, collation is the more correct tool. Verify with explain:
+         an IXSCAN with a point bound on <code>emailLower</code>.</p>
     </details>
 
     <details class="solution"><summary><strong>Senior:</strong> Design a systematic query-tuning process for a team, including the parts people skip.</summary>

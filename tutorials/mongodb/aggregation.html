@@ -362,13 +362,16 @@ MEASURED: the blank line that cost 3.2 GB
     <h2>Part 6 — Memory Limits and the Boundary of the Tool</h2>
 
 <pre>
-  Each blocking stage gets 100 MB by default.
-  Exceed it and the pipeline FAILS:
+  Each blocking stage gets 100 MB.
+  Before 6.0 -- or on any version with allowDiskUse: false --
+  exceeding it FAILS the pipeline:
 
     QueryFailedError: Exceeded memory limit for $group, but didn't
     allow external sort. Pass allowDiskUse:true to opt in.
 
-  With { allowDiskUse: true } it spills to temporary files instead.
+  Since 6.0 the allowDiskUseByDefault server parameter is true, so
+  the stage spills to temporary files instead -- silently. The only
+  signs are the clock and usedDisk: true in the profiler.
 
   MEASURED, same $group over 41M documents:
     within 100 MB                          2.1 s
@@ -386,7 +389,7 @@ MEASURED: the blank line that cost 3.2 GB
       <tr><td>Per blocking stage</td><td>100 MB</td><td>Reduce the stream before it; <code>allowDiskUse</code> only for batch</td></tr>
       <tr><td>Any single output document</td><td>16 MB</td><td>Never <code>$push</code> unbounded; use <code>$topN</code></td></tr>
       <tr><td><code>$facet</code> sub-pipelines</td><td>Each blocking stage inside gets its own budget, but they run over the same input</td><td>Put a shared <code>$match</code> before the <code>$facet</code>, not inside each branch</td></tr>
-      <tr><td><code>$graphLookup</code></td><td>100 MB regardless of <code>allowDiskUse</code></td><td>Bound it with <code>maxDepth</code> and <code>restrictSearchWithMatch</code></td></tr>
+      <tr><td><code>$graphLookup</code></td><td>100 MB regardless of <code>allowDiskUse</code> through 8.0; later releases can spill</td><td>Bound it with <code>maxDepth</code> and <code>restrictSearchWithMatch</code></td></tr>
       <tr><td>Result cursor</td><td>16 MB per batch</td><td>Normal cursor iteration handles this</td></tr>
     </table>
 
@@ -435,8 +438,16 @@ MEASURED: the blank line that cost 3.2 GB
          since the original fields no longer exist.</p>
       <p>The important distinction from SQL is that a pipeline is procedural: you choose the order, and the
          optimiser only makes a limited set of provably safe rewrites. A badly ordered pipeline stays badly
-         ordered, which is good news for reasoning about cost — you can read it top to bottom and estimate
-         the stream size at each step.</p>
+         ordered.</p>
+      <p>That is also what an interviewer is probing: whether you can reason about cost from the shape.
+         Annotate each stage with documents in and out — 4.1M into the <code>$match</code>, 310k out, 82k after
+         the <code>$group</code> — and the cost sits wherever a large number enters a blocking stage. Check the
+         estimate with <code>explain("executionStats")</code>, which shows the rewritten pipeline and each
+         stage's document count.</p>
+      <p>Say when <em>not</em> to use one: a pipeline of only <code>$match</code>, <code>$sort</code>,
+         <code>$project</code> and <code>$limit</code> is a <code>find()</code> in disguise, pushed down into
+         the same query layer. It earns its place when documents must be grouped, reshaped, joined, or written
+         elsewhere with <code>$merge</code>.</p>
     </details>
 
     <details class="solution"><summary><strong>Beginner:</strong> Why should <code>$match</code> come first?</summary>
@@ -447,6 +458,15 @@ MEASURED: the blank line that cost 3.2 GB
          references a field produced by an earlier stage — including when an independent predicate is
          bundled into the same <code>$match</code> as a dependent one. Splitting that <code>$match</code> so
          the independent half can lead is often a two-line change with a very large effect.</p>
+      <p>First is necessary, not sufficient. A leading <code>$match</code> on an unindexed field is still a
+         <code>COLLSCAN</code> — it shrinks downstream work, not the read. And a predicate on a computed value,
+         such as <code>{ $expr: { $eq: [{ $year: "$createdAt" }, 2026] } }</code>, cannot use an index even
+         first; as a range on the raw <code>createdAt</code> field, it can.</p>
+      <p>Not every filter belongs at the front: one on an accumulator, like revenue over £1,000, must follow
+         the <code>$group</code> that creates it. To verify the leading one, check
+         <code>explain("executionStats")</code> for an <code>IXSCAN</code> with <code>totalDocsExamined</code>
+         close to what the <code>$match</code> passes on; a large gap means the index covers only part of the
+         predicate.</p>
     </details>
 
     <details class="solution"><summary><strong>Mid:</strong> Which stages are blocking, and why does it matter?</summary>
@@ -460,19 +480,32 @@ MEASURED: the blank line that cost 3.2 GB
          stream before it reaches a blocking stage: filter first, project away unused fields, limit early.</p>
       <p>The one exception worth knowing: a <code>$sort</code> that is first in the pipeline and served by an
          index is not blocking at all — the index already provides the order.</p>
+      <p>A stronger answer says what each one's memory scales with. <code>$group</code> holds one entry per
+         distinct key: 41M documents into 200 regions is trivial, while grouping on a near-unique
+         <code>sessionId</code> exhausts the budget. <code>$sort</code> holds every document it receives unless
+         an adjacent <code>$limit</code> makes it a top-<em>k</em>. And blocking costs latency: nothing reaches
+         the client until the input is consumed.</p>
+      <p>To find the offending stage, look for <code>usedDisk: true</code> in the profiler; since 6.0 an
+         over-budget stage usually shows up as a slow query, not an error.</p>
     </details>
 
     <details class="solution"><summary><strong>Mid:</strong> A pipeline fails with <code>BSONObjectTooLarge</code> after a <code>$group</code>. What happened?</summary>
-      <p>An accumulator built an array bigger than 16 MB. A <code>$group</code> output document is still a BSON
-         document and subject to the same limit as any other, so <code>$push</code> or
-         <code>$addToSet</code> over a large group can exceed it. In the case I have seen, one order had
-         312,000 status events and <code>$push: "$$ROOT"</code> collected them all.</p>
+      <p>An accumulator built an array bigger than 16 MB. The result is still a BSON document, so
+         <code>$push</code> or <code>$addToSet</code> over a large group can exceed it. In the case I have
+         seen, one order had 312,000 status events and <code>$push: "$$ROOT"</code> collected them all.</p>
       <p>The failure characteristic worth noting: it had worked for 14 months, because no group had ever been
          that large. Unbounded accumulators do not degrade — they work perfectly until one day they fail
          completely.</p>
       <p>If you need only the top few, <code>$topN</code> with a <code>sortBy</code> is bounded by construction
          and cannot fail this way. If you genuinely need every element of a huge group, <code>$group</code>
          is the wrong tool — page through that group's documents directly instead.</p>
+      <p>Strictly, the manual applies the 16 MB limit to documents the pipeline returns or writes; intermediate
+         documents may exceed it. So the same <code>$group</code> can survive when a later stage trims the
+         array and fail when it is last or feeds <code>$merge</code> — a passing test proves little, and the
+         oversized array is still built in memory.</p>
+      <p>Look for the outlier before it finds you:
+         <code>{ $group: { _id: "$orderId", n: { $sum: 1 } } }, { $sort: { n: -1 } }, { $limit: 5 }</code>
+         lists the largest groups; track that maximum.</p>
     </details>
 
     <details class="solution"><summary><strong>Senior:</strong> Should you use <code>allowDiskUse: true</code>?</summary>
@@ -485,10 +518,16 @@ MEASURED: the blank line that cost 3.2 GB
          can the first stage use an index; is there a <code>$match</code> that could move earlier; are we
          carrying fields we never use; is <code>$sort</code> adjacent to its <code>$limit</code>; and could a
          <code>$topN</code> replace an unbounded accumulator.</p>
-      <p>Where it <em>is</em> legitimate: a genuine batch job — a nightly rollup over a year of data — where
-         the data volume is irreducible and slow is acceptable. There I would enable it deliberately, run it
-         on a secondary or analytics node, and set a <code>maxTimeMS</code>. What I would not do is set it
-         globally as a default, because that removes the signal that tells you a pipeline has gone wrong.</p>
+      <p>Know the version, because the question changed under it: since MongoDB 6.0 the
+         <code>allowDiskUseByDefault</code> server parameter is <code>true</code>, so an over-budget
+         <code>$group</code> or <code>$sort</code> spills silently instead of failing — the warning is gone
+         unless you ask for it. For request-path pipelines I would pass <code>allowDiskUse: false</code>
+         explicitly (or set the parameter to <code>false</code> on the cluster), so a pipeline that outgrows its
+         budget fails in testing rather than quietly slowing down in production, and I would watch for
+         <code>usedDisk: true</code> in the profiler either way.</p>
+      <p>Where spilling <em>is</em> legitimate: a genuine batch job — a nightly rollup over a year of data —
+         where the data volume is irreducible and slow is acceptable. There I would allow it deliberately, run
+         it on a secondary or analytics node, and set a <code>maxTimeMS</code>.</p>
     </details>
 
     <details class="solution"><summary><strong>Senior:</strong> A dashboard runs six aggregations on every page load and the primary is struggling. Redesign it.</summary>
@@ -889,8 +928,8 @@ MEASURED: the blank line that cost 3.2 GB
             boundaries made one rollup 4% low every Monday.</li>
         <li><strong>Blocking stages get 100 MB.</strong> <code>allowDiskUse</code> turns a failure into a 19×
             slowdown — it is for batch jobs, not a fix for a badly ordered pipeline.</li>
-        <li><strong><code>$graphLookup</code> ignores <code>allowDiskUse</code></strong> and is capped at 100 MB
-            regardless.</li>
+        <li><strong><code>$graphLookup</code> ignores <code>allowDiskUse</code> through 8.0</strong> and is capped
+            at 100 MB regardless; later releases can spill it, which is slower, not safer.</li>
         <li><strong>Verify with <code>explain</code>, which shows the pipeline after rewriting.</strong> If a
             stage did not move, that is where you find out.</li>
         <li><strong>If the first stage cannot use an index to shrink the input, the pipeline does not belong on

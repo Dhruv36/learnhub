@@ -293,8 +293,9 @@ MEASURED: running total, two ways
     - maxDepth is not optional in practice; your data will contain
       a cycle eventually, and without it the stage walks until it
       hits the memory cap
-    - the 100 MB limit applies and allowDiskUse does NOT lift it
-    - the foreign collection cannot be sharded
+    - through 8.0 it is capped at 100 MB and ignores allowDiskUse;
+      later releases let it spill, which is slower, not safer
+    - the foreign collection may be sharded only from 5.1
 
   For hot-path traversal, denormalise instead: an ancestors array
   read in 8 ms versus 640 ms for $graphLookup. Full treatment in
@@ -476,7 +477,7 @@ THE IDEMPOTENCY TRAP
       <tr><td><code>documents:</code> windows where a duration is meant</td><td>Position-based, so gaps silently shift the window</td><td><code>range:</code> with <code>unit:</code></td></tr>
       <tr><td>Self-joining for running totals</td><td>41 s, plus an array per row that can hit 16 MB</td><td><code>$setWindowFields</code> — 340 ms</td></tr>
       <tr><td><code>$unionWith</code> expecting deduplication</td><td>It is UNION ALL; duplicates pass through</td><td><code>$group</code> afterwards if you need distinct</td></tr>
-      <tr><td><code>$graphLookup</code> without <code>maxDepth</code></td><td>Walks until it hits the 100 MB cap, which <code>allowDiskUse</code> does not lift</td><td>Set <code>maxDepth</code> and <code>restrictSearchWithMatch</code></td></tr>
+      <tr><td><code>$graphLookup</code> without <code>maxDepth</code></td><td>Walks until it hits the 100 MB cap, which <code>allowDiskUse</code> does not lift through 8.0</td><td>Set <code>maxDepth</code> and <code>restrictSearchWithMatch</code></td></tr>
       <tr><td><code>$merge</code> with an accumulating <code>whenMatched</code> pipeline</td><td>A retried job double-counts silently — one day reported 2× revenue, found 11 days later</td><td>Recompute the period and <code>"replace"</code></td></tr>
       <tr><td>Advancing the watermark before <code>$merge</code> succeeds</td><td>A failed run permanently skips a window of data</td><td>Advance only after success, and re-process with an overlap</td></tr>
       <tr><td><code>$function</code> for logic expressible natively</td><td>94 s versus 3.1 s, no index use, an injection surface</td><td>Native expressions; reserve JS for genuinely custom accumulators</td></tr>
@@ -493,6 +494,15 @@ THE IDEMPOTENCY TRAP
          the collection — so nothing inside a branch can use an index. Any filtering you can do belongs
          <em>before</em> the <code>$facet</code>, where it can be an indexed query. Repeating the same
          <code>$match</code> inside each branch instead was measured at 9.4 seconds versus 2.1.</p>
+      <p>Two limits come with it. The result is one document, capped at 16 MB, so any branch returning rows
+         needs a <code>$limit</code>. And a branch's accumulated result is held to 100 MB, which
+         <code>allowDiskUse</code> cannot lift because <code>$facet</code> cannot spill — a branch that works
+         on a small category can fail on the largest.</p>
+      <p>The interviewer is probing whether you know it shares the read, not the work, and so when
+         <em>not</em> to use it. A <code>rows</code> branch sorting by rating must sort every match in memory;
+         <code>find().sort({ rating: -1 }).limit(20)</code> on an index
+         <code>{ category: 1, inStock: 1, rating: -1 }</code> reads twenty. When each branch is cheap as its
+         own indexed query, separate parallel queries are often faster.</p>
     </details>
 
     <details class="solution"><summary><strong>Beginner:</strong> What is <code>$setWindowFields</code> for?</summary>
@@ -501,9 +511,18 @@ THE IDEMPOTENCY TRAP
          <code>$shift</code>. You give it a <code>partitionBy</code> (the grouping), a <code>sortBy</code>
          (the order within each partition), and a window describing which surrounding rows each output value
          should see.</p>
-      <p>Before it existed, a running total meant self-joining the collection to itself — measured at 41
+      <p>Before it arrived in 5.0, a running total meant self-joining the collection to itself — measured at 41
          seconds for a case that <code>$setWindowFields</code> does in 340 ms, in one stage instead of
          four.</p>
+      <p>The contrast with <code>$group</code> is the heart of the question: <code>$group</code> collapses each
+         partition to one row, so "each month's revenue <em>and</em> its share of the region's year" once
+         needed a second grouping and a join back. A window keeps every row and attaches the computed
+         value.</p>
+      <p>The costs worth naming: it is blocking and holds a partition at a time, so the risk is one oversized
+         partition — or no <code>partitionBy</code> at all, as in a global ranking — not total row count; it
+         can spill like <code>$group</code>, with the same slowdown. It does not guarantee output order, so add
+         a <code>$sort</code> if callers depend on one. And rank operators and bounded windows require
+         <code>sortBy</code>.</p>
     </details>
 
     <details class="solution"><summary><strong>Mid:</strong> What is the difference between a <code>documents</code> window and a <code>range</code> window?</summary>
@@ -518,21 +537,33 @@ THE IDEMPOTENCY TRAP
          <code>documents</code> only when you genuinely mean "the last N rows", like a customer's previous
          five orders. And if the gaps themselves are meaningful, <code>$densify</code> and <code>$fill</code>
          before the window stage so the missing periods exist with the right values.</p>
+      <p>A <code>range</code> window needs one ascending <code>sortBy</code> field — dates with a
+         <code>unit</code>, numbers otherwise. A series keyed on a string like <code>"2026-08-01"</code> fails,
+         and the tempting fix, switching to <code>documents</code>, quietly brings the gap bug back; window on
+         a <code>$dateTrunc</code> date.</p>
+      <p>To verify, emit the window's span —
+         <code>from: { $min: "$day", window: { documents: [-6, "current"] } }</code> — and any
+         <code>from</code> more than six days back is a window wider than its label.</p>
     </details>
 
     <details class="solution"><summary><strong>Mid:</strong> How do you make a <code>$merge</code>-based rollup safe to re-run?</summary>
       <p>Recompute a whole period and <code>whenMatched: "replace"</code>, rather than accumulating into the
-         existing document. Replacing is idempotent by construction: running it once, twice, or five times
-         after failures produces the same result.</p>
+         existing document. Replacing is idempotent by construction.</p>
       <p>The trap is the custom pipeline form —
          <code>whenMatched: [{ $set: { total: { $add: ["$total", "$$new.total"] } } }]</code> — which reads as
          "accumulate" and behaves as "accumulate on every run". A retry after a transient error double-counts
-         silently. In one case a day showed 2× revenue and was found eleven days later by an analyst who
-         thought it had been a good week.</p>
+         silently, with plausible-looking numbers.</p>
       <p>The other half is the watermark: advance it only after <code>$merge</code> succeeds, and re-process
          with a deliberate overlap of a day or two so late-arriving events and timezone edges land inside a
          recomputed window. Overlap is only safe <em>because</em> the merge replaces — the two properties
          work together.</p>
+      <p>Two gaps remain even with "replace". <code>$merge</code> is not atomic: writes made before a failure
+         stay, and readers see a half-updated collection mid-run — if that is unacceptable, rebuild with
+         <code>$out</code>, which swaps in at the end.</p>
+      <p>And "replace" only touches keys the recomputation still produces. If every order on a day is
+         refunded, the <code>$match</code> drops them, no row is emitted, and the old figure survives every
+         re-run. That is what "is it really idempotent?" is fishing for; the fix is to emit every key, for
+         example <code>$densify</code> the window's dates and <code>$fill</code> revenue with 0.</p>
     </details>
 
     <details class="solution"><summary><strong>Senior:</strong> When would you use <code>$function</code> or <code>$accumulator</code>?</summary>
@@ -543,7 +574,10 @@ THE IDEMPOTENCY TRAP
          <code>$multiply</code>/<code>$add</code> expressions. They can never use an index, they are a
          code-injection surface if any part is constructed from user input, they are unavailable on some
          managed tiers, and their cost is invisible in <code>explain</code> — the plan shows a stage, not
-         what is happening inside it.</p>
+         what is happening inside it. And since MongoDB 8.0 all server-side JavaScript —
+         <code>$function</code>, <code>$accumulator</code> and <code>$where</code> — is deprecated and logs a
+         warning on use, while hardened deployments often disable it outright with
+         <code>security.javascriptEnabled: false</code>.</p>
       <p>The legitimate cases are narrow: a genuinely custom accumulator that the built-ins cannot express
          (some statistical aggregate, a custom merge for a distributed sketch), or a one-off migration where
          clarity matters more than speed and the volume is small. "The native expression was awkward to
@@ -949,8 +983,8 @@ THE IDEMPOTENCY TRAP
             partition is the failure mode, not total row count.</li>
         <li><strong><code>$unionWith</code> is UNION ALL.</strong> Put the <code>$match</code> in the
             sub-pipeline so it can use indexes, and <code>$group</code> afterwards if you need distinct.</li>
-        <li><strong><code>$graphLookup</code> needs <code>maxDepth</code></strong>, and its 100 MB limit ignores
-            <code>allowDiskUse</code>.</li>
+        <li><strong><code>$graphLookup</code> needs <code>maxDepth</code></strong>, and through 8.0 its 100 MB
+            limit ignores <code>allowDiskUse</code>.</li>
         <li><strong><code>$merge</code> turns an expensive aggregation into a point read.</strong> It is the
             highest-leverage architectural change in the pipeline toolkit.</li>
         <li><strong>Recompute and <code>"replace"</code>; never accumulate.</strong> An accumulating

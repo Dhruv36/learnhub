@@ -14,7 +14,7 @@ window.QUIZ_SETS.push(
     explain: "The index is rejecting rows without fetching, so the fix is reordering rather than adding a field." },
   { q: "[MinKey, MaxKey] in indexBounds means…", options: ["The bounds are optimal", "That field contributed nothing to bounding the scan", "The field is unindexed"], answer: 1,
     explain: "Read the bounds top to bottom and stop at the first one — every field below it is dead weight for this query." },
-  { q: "A SORT stage in the plan means…", options: ["Results are streamed in order", "A blocking in-memory sort, capped at 32 MB", "The index supplied the order"], answer: 1,
+  { q: "A SORT stage in the plan means…", options: ["Results are streamed in order", "A blocking in-memory sort that spills to disk past 100 MB", "The index supplied the order"], answer: 1,
     explain: "Nothing is returned until the last input is read, and any limit above it saves no work." },
   { q: "Low examined counts but high executionTimeMillis suggests…", options: ["Disk reads, lock contention or a saturated server", "A missing index", "A bad plan"], answer: 0,
     explain: "Run it twice — if the second run is fast, the first was reading from disk and it is a capacity problem." },
