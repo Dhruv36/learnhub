@@ -8,6 +8,10 @@ A GeeksforGeeks/W3Schools-style learning site: plain HTML/CSS/JS, no build step.
 
 ## ▶️ RESUME HERE (last updated 2026-09-09)
 
+> **Stale below this line — `CLAUDE.md` is the current state and is auto-loaded.** As of 2026-09-13 the
+> v4 depth pass, the mistakes/takeaways top-up, the short-IQ pass and the linux re-read are all complete;
+> React and every track listed below as remaining have since been finished. This file is history.
+
 **Last completed:** ✅ **Java — COMPLETE at the mature v4 recipe.** All **46 files** pass
 `python validate.py tutorials/java` with **0 errors and 0 depth flags**. The track went 45 flagged → 0 over
 this programme; the quiz bank was already healthy (`10 200 0`, 0 duplicate stems, 60/64/76).
