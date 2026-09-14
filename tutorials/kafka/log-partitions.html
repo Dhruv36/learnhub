@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topics, Partitions &amp; the Log — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Topics, Partitions &amp; the Log <span class="level-badge level-basic">Foundations</span></h1>
+    <p><strong>What you'll master:</strong> what a partition physically is on a broker's disk — segments and
+       their sparse indexes — and how a fetch at any offset is found without scanning; the <strong>record
+       batch</strong>, which is the real unit Kafka stores, compresses and replicates; the difference between the
+       <strong>log end offset and the high watermark</strong>, and why a consumer cannot see a record the leader
+       already holds; exactly how a key becomes a partition, why <strong>a Python or Go producer can send the same
+       key to a different partition than a Java one</strong>, and why adding partitions breaks per-key ordering;
+       hot partitions; choosing a partition count with arithmetic; and the <strong>future-dated timestamp that
+       stops retention from deleting anything</strong>. Prerequisites:
+       <a href="index.html">What Kafka Actually Is</a>.</p>
+
+    <h2>Part 1 — A Partition Is a Directory of Segments</h2>
+
+    <p>On a broker, every partition replica is a directory named <code>&lt;topic&gt;-&lt;partition&gt;</code>
+       inside one of the configured <code>log.dirs</code>. The log is not one ever-growing file: it is split into
+       <em>segments</em>, and each segment is named after the first offset it contains.</p>
+
+<pre>
+/var/lib/kafka/data/orders-3/
+  00000000000000000000.log         segment 1: offsets 0 .. 1,843,001        (closed)
+  00000000000000000000.index       sparse offset → byte position
+  00000000000000000000.timeindex   sparse timestamp → offset
+  00000000000001843002.log         segment 2: offsets 1,843,002 .. 3,702,414 (closed)
+  00000000000001843002.index
+  00000000000001843002.timeindex
+  00000000000003702415.log         ACTIVE segment — every write goes here
+  00000000000003702415.index
+  00000000000003702415.timeindex
+  00000000000003702415.snapshot    producer-state snapshot (idempotence bookkeeping)
+  leader-epoch-checkpoint          which leader epoch began at which offset
+  partition.metadata               the topic's id
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>Effect</th></tr>
+      <tr><td><code>segment.bytes</code> (topic) / <code>log.segment.bytes</code></td><td>1 GiB</td><td>Roll to a new segment when the active one reaches this size</td></tr>
+      <tr><td><code>segment.ms</code> / <code>log.roll.hours</code></td><td>7 days</td><td>Roll even if the size was never reached</td></tr>
+      <tr><td><code>index.interval.bytes</code></td><td>4,096</td><td>Add one offset-index entry roughly every 4 KB of log</td></tr>
+      <tr><td><code>segment.index.bytes</code></td><td>10 MB</td><td>Maximum index file size; a full index also rolls the segment</td></tr>
+    </table>
+
+    <p><strong>Why segments exist:</strong> deletion and compaction work on whole files. Retention deletes a
+       closed segment in one unlink instead of rewriting a huge file, and the active segment is never touched by
+       either. This is why segment size quietly controls how precisely retention works — a topic with 1 GiB
+       segments and little traffic may keep data days past <code>retention.ms</code>, because the old records sit
+       in a segment that has not closed yet.</p>
+
+    <p><strong>Finding offset 3,702,900 without scanning:</strong></p>
+
+<pre>
+1. Pick the segment:  base offsets [0, 1843002, 3702415] kept in memory, sorted
+                      → 3,702,900 lives in segment 3702415
+2. Search the index:  00000000000003702415.index is memory-mapped
+                      entries are (relative offset, byte position), 8 bytes each
+                      binary search → largest entry ≤ 485 (= 3,702,900 − 3,702,415)
+                      → (480, position 1,961,234)
+3. Scan the .log:     read forward from byte 1,961,234 until offset 3,702,900
+                      at most ~4 KB of scanning, because an entry exists every ~4 KB
+</pre>
+
+    <div class="note">🔑 <strong>The index is sparse on purpose.</strong> Indexing every record would make the
+       index as big as a large part of the log. One entry per ~4 KB keeps each index small enough to stay in
+       memory, and the cost is a short sequential scan — which is cheap. The <code>.timeindex</code> works the
+       same way for timestamps (12-byte entries: an 8-byte timestamp and a 4-byte relative offset), and it is what
+       makes "reset this group to 09:00 yesterday" a fast lookup.</div>
+
+    <h2>Part 2 — The Record Batch: the Real Unit of Storage</h2>
+
+    <p>Producers do not send records one by one, and brokers do not store them that way. The unit on the wire,
+       on disk and in replication is the <strong>record batch</strong> (message format v2, introduced in Kafka
+       0.11 and the only format Kafka 4.0 still supports).</p>
+
+<pre>
+RECORD BATCH (header = 61 bytes)
+  baseOffset            int64    offset of the first record — assigned by the BROKER
+  batchLength           int32
+  partitionLeaderEpoch  int32
+  magic                 int8     = 2
+  crc                   uint32   covers everything after this field
+  attributes            int16    compression codec, timestamp type, transactional?, control batch?
+  lastOffsetDelta       int32
+  baseTimestamp         int64
+  maxTimestamp          int64
+  producerId            int64  ┐
+  producerEpoch         int16  ├ idempotence and transactions live HERE, once per batch
+  baseSequence          int32  ┘
+  recordCount           int32
+  records[] ─┐   (compressed together as ONE block when compression is on)
+             ▼
+RECORD
+  length varint · attributes int8 · timestampDelta varlong · offsetDelta varint
+  key (varint length + bytes) · value (varint length + bytes) · headers[]
+</pre>
+
+    <p>Three consequences follow from that layout:</p>
+
+    <table class="tbl">
+      <tr><th>Design choice</th><th>Consequence</th></tr>
+      <tr><td>Offsets and timestamps stored as deltas from the batch base</td><td>The broker assigns offsets by writing one <code>baseOffset</code>, without recompressing the records</td></tr>
+      <tr><td>Compression applies to the whole batch</td><td>Larger batches compress better; a batch of one record barely compresses at all</td></tr>
+      <tr><td>Producer id, epoch and sequence are per batch</td><td>Idempotence costs a few bytes per batch, not per record</td></tr>
+      <tr><td>Size limits apply to the batch</td><td>One record bigger than <code>max.request.size</code> (1 MB) or the broker's <code>message.max.bytes</code> (about 1 MB) is rejected outright</td></tr>
+    </table>
+
+    <p><strong>Message size limits must agree along the whole path.</strong> Raising the broker's
+       <code>message.max.bytes</code> is not enough: the producer's <code>max.request.size</code>, the topic's
+       <code>max.message.bytes</code> and the consumer's fetch limits have to allow it too, and replication must
+       be able to fetch it. A record larger than 1 MB is usually a sign that the payload belongs in object storage,
+       with Kafka carrying a reference to it.</p>
+
+    <h2>Part 3 — Log End Offset, High Watermark, and What a Consumer Can See</h2>
+
+    <p>Every replica has a <strong>log end offset (LEO)</strong>: the offset the next record will get. The
+       leader also tracks the <strong>high watermark (HW)</strong>: the highest offset that every in-sync replica
+       has copied. Consumers can read only below the high watermark.</p>
+
+<pre>
+                offsets:  ...  96   97   98   99  100  101
+leader    (broker 1)           ■    ■    ■    ■    ■    ■     LEO = 102
+follower  (broker 2)           ■    ■    ■    ■                LEO = 100
+follower  (broker 3)           ■    ■    ■    ■    ■           LEO = 101
+
+HIGH WATERMARK = min LEO across the ISR = 100
+consumers can read offsets ≤ 99. Offsets 100 and 101 exist on the leader but are INVISIBLE,
+because a leader failure right now could elect broker 2, which does not have them.
+</pre>
+
+    <p>The high watermark is how Kafka stops consumers from reading records that could vanish in a leader
+       failover. If a consumer could read offset 101 and broker 2 then became leader, the consumer would have
+       processed a record that no longer exists — and the new leader would later assign offset 101 to a
+       <em>different</em> record.</p>
+
+    <table class="tbl">
+      <tr><th>Offset</th><th>Meaning</th><th>Who uses it</th></tr>
+      <tr><td>Log start offset</td><td>Oldest offset still retained</td><td><code>earliest</code> resets; retention</td></tr>
+      <tr><td>High watermark</td><td>Replicated to the whole ISR; readable</td><td>Default consumers; the "end" in lag</td></tr>
+      <tr><td>Last stable offset (LSO)</td><td>Below any still-open transaction</td><td><code>read_committed</code> consumers</td></tr>
+      <tr><td>Log end offset</td><td>Next offset to be written on this replica</td><td>Replication; not visible to consumers</td></tr>
+    </table>
+
+    <p><strong>Offsets are not a record count.</strong> Offsets always increase, but they are not always
+       consecutive for data records. Transactional producers write <em>control records</em> (commit and abort
+       markers) that take offsets of their own and are never delivered to your code, and compaction removes
+       records while leaving the survivors at their original offsets. So "end offset minus start offset" is an
+       upper bound on the number of records, not a count, and code that expects <code>offset + 1</code> to be the
+       next record it receives will be surprised.</p>
+
+<pre>
+compacted or transactional partition, as a consumer sees it:
+  offset 40  key=a
+  offset 41  key=b
+  offset 44  key=c        ◄── 42, 43: a commit marker and a compacted-away record
+  offset 45  key=a
+</pre>
+
+    <h2>Part 4 — From Key to Partition</h2>
+
+    <p>The producer, not the broker, decides which partition a record goes to. With the Java client's default
+       behaviour:</p>
+
+<pre>
+key present:   partition = toPositive(murmur2(serializedKeyBytes)) % numPartitions
+key null:      "sticky" — fill a batch for one partition, then move on (KIP-480, Kafka 2.4)
+               since 3.3 (KIP-794) it switches after about batch.size bytes, and sends
+               fewer records to partitions whose brokers are responding slowly
+explicit:      new ProducerRecord&lt;&gt;(topic, partition, key, value) overrides everything
+</pre>
+
+    <p>The hash is taken over the <em>serialized bytes</em> of the key, which has a practical consequence: the
+       same logical key serialized differently — a number sent as a string by one service and as a 4-byte integer
+       by another — lands on different partitions, and per-key ordering silently disappears.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A Java service and a Python service produce to the same topic with the same keys, and
+         per-customer ordering breaks.</strong> The Java client uses murmur2. Clients built on librdkafka —
+         confluent-kafka for Python, Go and .NET, among others — default to <code>consistent_random</code>, which
+         hashes keys with CRC32. The same key goes to different partitions depending on which service wrote it, so
+         one customer's events are split across two partitions with no order between them.</p>
+      <p>✅ <strong>Make every producer on a topic use the same partitioner.</strong> Set
+         <code>partitioner=murmur2_random</code> on librdkafka clients so they match the Java client, and write a
+         test that produces a known key from each language and asserts the partition. Exercise 2 shows the
+         mismatch.</p>
+    </div>
+
+    <p><strong>Adding partitions remaps keys.</strong> Because the partition is the hash modulo the partition
+       count, changing the count changes where most keys go. Going from 6 to 8 partitions, a key keeps its
+       partition only when <code>h % 6 == h % 8</code>, which holds for 6 of every 24 hash values:</p>
+
+<pre>
+6 → 8 partitions:   25% of keys stay put, 75% move to a different partition
+6 → 12 partitions:  50% stay (h % 12 is either h % 6 or h % 6 + 6)
+
+During the change, customer 42's OLD events sit in partition 1 and NEW ones go to partition 7.
+A consumer of partition 7 can process "order shipped" before another consumer has finished
+"order paid" in partition 1. Per-key order is broken exactly at the moment of the change.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Situation</th><th>Can you add partitions?</th><th>Safer approach</th></tr>
+      <tr><td>Unkeyed events (logs, metrics)</td><td>Yes — nothing depends on placement</td><td>Add freely</td></tr>
+      <tr><td>Keyed, order matters, can pause producers</td><td>Yes, with a drain</td><td>Stop producers, let consumers catch up, add, restart</td></tr>
+      <tr><td>Keyed, order matters, no pause possible</td><td>Risky</td><td>Create a new topic with more partitions and migrate consumers deliberately</td></tr>
+      <tr><td>Compacted "current state" topic</td><td>No</td><td>A key's older value stays in the old partition and is never compacted away</td></tr>
+    </table>
+
+    <p><strong>Hot partitions</strong> come from skewed keys. If one tenant produces 40% of traffic and the key
+       is the tenant id, one partition carries 40% of the load no matter how many partitions exist, and the one
+       consumer assigned to it falls behind while the others sit idle. The usual fix is a composite key —
+       <code>tenant-42#3</code>, spreading a large tenant across a few buckets — which keeps ordering within each
+       bucket but gives up ordering across the whole tenant. Decide which ordering the business actually
+       needs before choosing the key.</p>
+
+    <h2>Part 5 — Choosing a Partition Count</h2>
+
+    <p>You cannot reduce a topic's partition count, and increasing it has the costs above, so the number
+       deserves some arithmetic at creation time. Size for the <em>slower</em> of the two sides:</p>
+
+<pre>
+target throughput                     T = 120 MB/s at peak, growing 50%/year
+per-partition PRODUCE rate (measured) P = 20 MB/s
+per-partition CONSUME rate (measured) C = 5 MB/s   ◄── consumers do real work; usually the limit
+
+partitions ≥ max(T / P, T / C) = max(6, 24) = 24
+headroom for 2 years of growth (×2.25) → 54, round to 60 (divisible by many consumer counts)
+</pre>
+
+    <p>The consume side usually decides it, because each consumer does real work per record — a database write,
+       an API call — and a partition can only be processed as fast as one consumer handles it. Measure
+       <code>C</code> with your real handler, not with a benchmark consumer that discards records.</p>
+
+    <table class="tbl">
+      <tr><th>More partitions buy</th><th>More partitions cost</th></tr>
+      <tr><td>More consumer parallelism</td><td>More open files and memory on every broker</td></tr>
+      <tr><td>Spreading load over more brokers</td><td>More replication traffic and more leaders to move in a failover</td></tr>
+      <tr><td>Headroom without remapping keys later</td><td>Smaller batches per partition in producers, so worse compression and more requests</td></tr>
+      <tr><td></td><td>Longer rebalances for consumer groups</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Partitions are cheap individually and expensive in bulk.</strong> KRaft raised
+       the number of partitions a cluster can manage well, but each partition is still a set of files, a
+       replication stream and a producer batch. A producer writing to 2,000 partitions spreads its
+       <code>buffer.memory</code> (32 MB by default) across 2,000 batches, so each batch is small, compression is
+       poor and requests multiply. Prefer a sensible count per topic over "1,000 just in case".</div>
+
+    <p><strong>Placement matters as much as count.</strong> Set <code>broker.rack</code> on each broker (to its
+       availability zone, for example) so that Kafka spreads a partition's replicas across racks. Without it, all
+       three replicas of a partition can land in one zone, and losing the zone loses the partition despite a
+       replication factor of 3.</p>
+
+    <h2>Part 6 — Timestamps, and the Record That Blocks Retention</h2>
+
+    <p>Every record carries a timestamp, and the topic's <code>message.timestamp.type</code> decides whose clock
+       it comes from.</p>
+
+    <table class="tbl">
+      <tr><th>Type</th><th>Set by</th><th>Good for</th><th>Risk</th></tr>
+      <tr><td><code>CreateTime</code> (default)</td><td>The producer, or your code explicitly</td><td>Event time: when the thing happened</td><td>Wrong producer clocks, or code passing bad values</td></tr>
+      <tr><td><code>LogAppendTime</code></td><td>The broker, on append</td><td>Retention and time lookups that must be reliable</td><td>Loses the original event time (put it in the payload instead)</td></tr>
+    </table>
+
+    <p><strong>Time-based retention uses the largest timestamp in a segment.</strong> A segment becomes eligible
+       for deletion only when its <em>newest</em> record is older than <code>retention.ms</code>. So one record
+       stamped in the future — a device with a clock set to 2036, or a bug that writes milliseconds where seconds
+       were expected — keeps its whole segment, and in practice every later segment's deletion is blocked behind
+       it, since segments are deleted oldest first.</p>
+
+<pre>
+segment 0   max timestamp = 2026-09-01          ► deletable after 7 days
+segment 1   max timestamp = 2036-01-01  (!)     ► NOT deletable for ten years
+segment 2   max timestamp = 2026-09-12          ► blocked: retention deletes from the oldest end
+            ... disk use grows without limit, and nothing reports an error
+</pre>
+
+    <p>Kafka 3.6 added broker-side limits on how far a record's timestamp may sit before or after the broker's
+       clock (<code>log.message.timestamp.before.max.ms</code> and <code>after.max.ms</code>, KIP-937), so records
+       with absurd timestamps can be rejected at write time. Check the defaults in the version you run; for topics
+       fed by devices or third parties, set a strict limit or use <code>LogAppendTime</code>. Exercise 5 recovers a
+       partition from exactly this state.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Trusting producer timestamps on a topic whose disk usage "just keeps growing".</strong> The
+         team raises disk alerts, adds brokers and shortens <code>retention.ms</code>, and nothing is ever
+         deleted, because the problem is one record stamped years ahead that pins its segment.</p>
+      <p>✅ <strong>Check the timestamps before changing retention.</strong>
+         <code>kafka-dump-log.sh</code> prints each batch's largest timestamp (as <code>CreateTime:</code> on the
+         batch line); the <code>.timeindex</code> of the oldest segment shows the largest time in it. Delete up to a known offset with
+         <code>kafka-delete-records.sh</code>, then stop it recurring with a timestamp limit or
+         <code>LogAppendTime</code>.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Expecting retention to be exact</td><td>Only closed segments are deleted; quiet topics keep data longer</td><td>Lower <code>segment.ms</code> if deletion timing matters</td></tr>
+      <tr><td>Treating offset differences as record counts</td><td>Control records and compaction leave gaps</td><td>Count records you actually consume</td></tr>
+      <tr><td>Expecting <code>offset + 1</code> to be the next record</td><td>Gaps appear on transactional and compacted topics</td><td>Use the offsets the consumer returns</td></tr>
+      <tr><td>Mixing Java and librdkafka producers on one keyed topic</td><td>Different hash functions split keys across partitions</td><td><code>partitioner=murmur2_random</code> everywhere, with a test</td></tr>
+      <tr><td>Serializing the same key differently in two services</td><td>The hash differs, so the partition differs</td><td>One key schema shared by every producer</td></tr>
+      <tr><td>Adding partitions to a keyed topic in place</td><td>Most keys move; per-key order breaks at the change</td><td>Drain first, or migrate to a new topic</td></tr>
+      <tr><td>Adding partitions to a compacted topic</td><td>Old values stay in the old partition forever</td><td>Recreate the topic with the new count</td></tr>
+      <tr><td>Keying by a heavily skewed field</td><td>One hot partition, one overloaded consumer</td><td>Composite keys that spread large keys over buckets</td></tr>
+      <tr><td>Sizing partitions from producer throughput only</td><td>Consumers doing real work fall behind</td><td>Size from the slower of produce and consume rates</td></tr>
+      <tr><td>"1,000 partitions just in case"</td><td>Tiny batches, poor compression, slow rebalances</td><td>Measured count plus growth headroom</td></tr>
+      <tr><td>No <code>broker.rack</code></td><td>All replicas can share one zone</td><td>Set racks so replicas spread across zones</td></tr>
+      <tr><td>Raising only the broker's message size limit</td><td>Producers, topics or consumers still reject large records</td><td>Change every limit on the path, or store large payloads elsewhere</td></tr>
+      <tr><td>Trusting producer clocks for retention</td><td>A future timestamp pins segments and disk grows forever</td><td>Timestamp limits or <code>LogAppendTime</code></td></tr>
+      <tr><td>Reading records past the high watermark in custom tooling</td><td>Seeing data that a failover can erase</td><td>Treat the high watermark as the end of the log</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How is a partition stored on disk?</summary>
+      <p>As a directory per partition replica, containing a series of <strong>segment</strong> files. Each
+         segment is a <code>.log</code> file of record batches plus two small indexes, and it is named after the
+         first offset it holds — <code>00000000000001843002.log</code> starts at offset 1,843,002. Only the newest
+         segment, the active one, receives writes; it rolls to a new segment at 1 GiB or after 7 days by
+         default.</p>
+      <p>The indexes are what make random access fast. The <code>.index</code> maps offsets to byte positions,
+         but sparsely — about one entry per 4 KB of log — so it stays small and memory-mapped. To fetch an offset,
+         the broker picks the segment by base offset, binary-searches the index for the nearest entry below the
+         target, and scans forward a few kilobytes. The <code>.timeindex</code> does the same for timestamps.</p>
+      <p>Splitting the log into segments is also what makes retention cheap: deleting old data means removing
+         whole closed files, never rewriting a large one. The trade-off is that retention can only be as precise as
+         the segment size allows, because the active segment is never deleted.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How does a producer choose a partition, and what does that mean for ordering?</summary>
+      <p>With the Java client, a record with a key goes to <code>murmur2(keyBytes) % numPartitions</code>, so
+         every record with the same key lands in the same partition and stays in order. A record without a key is
+         placed by the <em>sticky</em> partitioner: the producer fills a batch for one partition, then moves to
+         another, which gives good batching while spreading load. Code can also name a partition explicitly.</p>
+      <p>For ordering, that means: same key, same partition, strict order; different keys, no defined order
+         between them. So the key has to be the thing whose events must stay in order — the order id or customer
+         id, for example.</p>
+      <p>Two things break this quietly. <strong>Adding partitions</strong> changes the modulus, so most keys
+         move to a new partition, and old and new events for a key can be processed out of order. And
+         <strong>producers written in different languages</strong> may not use the same hash: librdkafka-based
+         clients default to a CRC32-based partitioner, so a Python producer and a Java producer can send the same
+         key to different partitions unless the librdkafka client is set to <code>murmur2_random</code>.</p>
+      <p>The key is also a load decision. A key with a very skewed distribution makes one hot partition,
+         whatever the partition count.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is the high watermark, and why can't a consumer read a record the leader already has?</summary>
+      <p>Each replica has a log end offset, the next offset it will write. The high watermark is the highest
+         offset that every in-sync replica has copied — effectively the minimum log end offset across the ISR.
+         Consumers can only read records below it.</p>
+      <p>The reason is failover safety. A record the leader has but some in-sync follower does not could
+         disappear: if the leader fails, that follower may become leader, and the record was never on it. If a
+         consumer had already read and acted on it, the consumer would have processed a record that no longer
+         exists — and the new leader would eventually give the same offset to a different record. Hiding
+         everything above the high watermark means a consumer only ever sees records that survive a leader
+         change.</p>
+      <p>There is a second boundary for transactions: the last stable offset. A <code>read_committed</code>
+         consumer reads only below the first still-open transaction, so an open transaction holds back everything
+         after it, including records from other producers. A transaction that is left open for a long time shows up
+         as consumer lag that no amount of consumer scaling fixes.</p>
+      <p>In practice this is also why <code>acks=all</code> latency and consumer end-to-end latency are linked:
+         a slow follower in the ISR delays the high watermark, which delays what consumers can see, even though
+         the leader wrote the record immediately.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A topic's disk usage grows without limit even though <code>retention.ms</code> is 3 days. What do you check?</summary>
+      <p>Retention is not running the way it appears to, and I would work through the causes that stop segments
+         from becoming deletable.</p>
+      <p><strong>1. The cleanup policy.</strong> If <code>cleanup.policy</code> is <code>compact</code> only,
+         time-based retention never deletes anything — compaction keeps the latest record per key forever. Check
+         with <code>kafka-configs.sh --describe --entity-type topics</code>.</p>
+      <p><strong>2. Future timestamps.</strong> Retention compares <code>retention.ms</code> against the
+         <em>largest</em> timestamp in a segment. One record stamped years ahead pins its segment, and because
+         segments are deleted from the oldest end, everything after it is blocked too. <code>kafka-dump-log.sh</code>
+         on the oldest segment prints each batch's largest timestamp; this is the cause I would expect
+         when producers set timestamps themselves.</p>
+      <p><strong>3. Segments that never close.</strong> With low traffic and large segments, the active segment
+         holds days of data and is never deleted while active. <code>segment.ms</code> bounds this.</p>
+      <p><strong>4. Size versus time.</strong> <code>retention.bytes</code> is per partition, not per topic, so
+         the total can be many times the configured number. Also confirm the broker-level setting is not being
+         overridden differently than expected at the topic level.</p>
+      <p>The fix follows the cause: correct the policy, delete up to a known offset with
+         <code>kafka-delete-records.sh</code> and add timestamp limits or <code>LogAppendTime</code>, or lower
+         <code>segment.ms</code>. What I would not do first is shorten retention further — if segments are not
+         deletable, a shorter retention changes nothing.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A keyed topic has 12 partitions and needs to handle four times the traffic. How do you increase capacity without breaking ordering?</summary>
+      <p>First I would confirm what "capacity" is short of. If the consumers are the bottleneck because each
+         record needs slow work, more partitions help. If the brokers are the bottleneck, more brokers or better
+         batching might be enough without changing the partition count at all. And if a few hot keys carry most of
+         the traffic, adding partitions does nothing for them — the hot key still hashes to one partition.</p>
+      <p>If more partitions are genuinely needed, the problem is that changing the count remaps most keys: 12 → 48
+         keeps a key's partition only for a quarter of hash values. During the change, a key's older records sit in
+         its old partition and new records go to a new one, so a consumer can process a later event before an
+         earlier one. There are three ways to handle it.</p>
+      <p><strong>1. Drain and switch in place.</strong> Pause the producers, wait until every consumer group has
+         zero lag, add the partitions, resume. Simple and correct, but it needs a producer pause, and every
+         consumer group must be caught up, including slow batch ones.</p>
+      <p><strong>2. Migrate to a new topic.</strong> Create <code>orders.v2</code> with 48 partitions. Point
+         producers at it; let consumers finish the old topic, then switch them to the new one. No producer pause, and
+         the old topic stays available for replay, but consumers must handle the switch-over, and every consumer
+         group has to migrate.</p>
+      <p><strong>3. Parallelise inside the consumer.</strong> Keep 12 partitions and process each partition's
+         records concurrently by key inside the consumer — a pool of workers where records for the same key always
+         go to the same worker, committing offsets only up to the lowest fully processed record. Libraries such as
+         Confluent's parallel consumer do this. Ordering per key is kept and nothing is repartitioned, at the cost of
+         more complex offset handling.</p>
+      <p><strong>Recommendation:</strong> if the constraint is consumer work per record, I would try option 3
+         first, since it avoids touching the topic at all. If partitions must grow, a new topic is the safer path for
+         anything order-sensitive; I would reserve the in-place change for topics where a short producer pause is
+         acceptable. And whichever is chosen, I would size the new count for several years of growth so it is not
+         repeated.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Walk through how you would choose the partition count and key for a new "payments" topic.</summary>
+      <p><strong>Start with the key, because it decides ordering and load.</strong> Payments go through state
+         changes — authorised, captured, refunded — that must be processed in order for one payment, so the key has
+         to be at least the payment id. If downstream consumers maintain per-account balances, ordering per account
+         matters too, and the account id is the better key. I would check the distribution: a marketplace with one
+         merchant doing 30% of volume would make a merchant-id key a hot partition, which rules it out.</p>
+      <p><strong>Then size the count from measured rates.</strong> Say peak is 3,000 payments per second at about
+         2 KB each — 6 MB/s — which any single partition can accept. The real limit is the consumer: if the ledger
+         consumer needs 8 ms per payment because it writes to a database, one partition handles about 125 per
+         second, so 3,000 per second needs 24 partitions just for today's peak. With room for three years of growth
+         at 40% a year, that is about 66; I would choose 72, which divides evenly among many consumer counts.</p>
+      <p><strong>Then durability and placement:</strong> replication factor 3, <code>min.insync.replicas=2</code>,
+         <code>broker.rack</code> set so replicas span three zones, <code>acks=all</code> and idempotence on every
+         producer, and topic auto-creation off so the topic exists only with these settings.</p>
+      <p><strong>Then retention:</strong> long enough to cover the longest plausible consumer outage plus
+         reconciliation needs — for payments, weeks rather than days — with the disk arithmetic done explicitly,
+         and <code>LogAppendTime</code> or a timestamp limit so a bad client clock cannot pin segments.</p>
+      <p><strong>Recommendation:</strong> key by account id if balance consumers need account-level ordering
+         (otherwise by payment id), 72 partitions sized from the consumer's measured throughput, RF 3 across three
+         zones with <code>min.insync.replicas=2</code>, and every producer using the same partitioner. I would write
+         the arithmetic into the topic's design note so the next person to change it can see why.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Force segment rolls and read the segment files, their names
+      and their indexes.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kt --create --topic segs --partitions 1 --replication-factor 1 \
+    --config segment.bytes=102400                      # 100 KB segments
+$ for i in $(seq 1 3000); do printf 'k%d:%0100d\n' $((i % 50)) $i; done | \
+    kafka-console-producer.sh --bootstrap-server localhost:9092 --topic segs \
+    --property parse.key=true --property key.separator=:
+
+$ docker exec kafka ls /tmp/kraft-combined-logs/segs-0/ | grep '\.log$'
+00000000000000000000.log
+00000000000000000812.log
+00000000000000001625.log
+00000000000000002437.log          ◄── active segment
+</pre>
+      <p>Each file name is the first offset in that segment; the gaps between names show how many records fit in
+         100 KB. Now look at the sparse index of one segment:</p>
+<pre>
+$ docker exec kafka /opt/kafka/bin/kafka-dump-log.sh \
+    --files /tmp/kraft-combined-logs/segs-0/00000000000000000812.index | head -5
+Dumping /tmp/kraft-combined-logs/segs-0/00000000000000000812.index
+offset: 842 position: 4108
+offset: 872 position: 8216
+offset: 902 position: 12324
+</pre>
+      <p>About one index entry per 4 KB of log, as <code>index.interval.bytes=4096</code> specifies. Your exact
+         numbers depend on batch sizes. Note that the index refers to batches: the producer grouped records, so an
+         entry points to the start of a batch, and a fetch scans forward from there.</p>
+      <table class="tbl">
+        <tr><th>You changed</th><th>You see</th></tr>
+        <tr><td><code>segment.bytes</code> to 100 KB</td><td>Several segments, each named by base offset</td></tr>
+        <tr><td>Nothing (default <code>index.interval.bytes</code>)</td><td>An index entry roughly every 4 KB</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Produce the same keys from the Java console producer and from
+      Python's confluent-kafka, and compare partitions.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# Java client (console producer)
+$ printf 'cust-1:a\ncust-2:b\ncust-3:c\n' | kafka-console-producer.sh \
+    --bootstrap-server localhost:9092 --topic orders \
+    --property parse.key=true --property key.separator=:
+
+# Python, librdkafka defaults
+from confluent_kafka import Producer
+p = Producer({"bootstrap.servers": "localhost:9092"})
+for k in ("cust-1", "cust-2", "cust-3"):
+    p.produce("orders", key=k, value="py",
+              on_delivery=lambda e, m: print(m.key().decode(), "→ partition", m.partition()))
+p.flush()
+</pre>
+<pre>
+$ kafka-console-consumer.sh ... --topic orders --from-beginning \
+    --property print.key=true --property print.partition=true
+Partition:1  cust-1  a            ◄── Java
+Partition:2  cust-2  b
+Partition:0  cust-3  c
+cust-1 → partition 0              ◄── Python: a DIFFERENT partition for cust-1
+cust-2 → partition 2
+cust-3 → partition 1
+</pre>
+      <p>The exact partitions depend on the hash values, but with default settings the two clients disagree for
+         many keys. The fix is one line in the Python producer:</p>
+<pre>
+p = Producer({"bootstrap.servers": "localhost:9092", "partitioner": "murmur2_random"})
+</pre>
+      <p>With <code>murmur2_random</code>, keyed records get the same partitions as the Java client (null keys
+         are still spread randomly). Add a test to every producer's build that sends a fixed set of keys and checks
+         the partitions against a table produced by the Java client.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Add partitions to a keyed topic and measure how many keys
+      move.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kt --create --topic remap --partitions 6 --replication-factor 1
+$ seq 1 1000 | sed 's/.*/key-&amp;:before/' | kafka-console-producer.sh ... --topic remap \
+    --property parse.key=true --property key.separator=:
+$ kt --alter --topic remap --partitions 8
+$ seq 1 1000 | sed 's/.*/key-&amp;:after/'  | kafka-console-producer.sh ... --topic remap \
+    --property parse.key=true --property key.separator=:
+
+$ kafka-console-consumer.sh ... --topic remap --from-beginning --timeout-ms 5000 \
+    --property print.key=true --property print.partition=true \
+  | awk '{split($1,p,":"); part[$2" "$3]=p[2]}
+         END {for (k in part) {split(k,a," "); if (a[2]=="before") b[a[1]]=part[k]; else af[a[1]]=part[k]}
+              for (k in b) {n++; if (b[k]==af[k]) same++}
+              printf "%d of %d keys kept their partition (%.0f%%)\n", same, n, 100*same/n}'
+251 of 1000 keys kept their partition (25%)
+</pre>
+      <p>About a quarter stayed, matching the arithmetic: <code>h % 6 == h % 8</code> for 6 of every 24 hash
+         values. For the other three quarters, a consumer of the new partition can process <code>after</code>
+         before another consumer has processed <code>before</code> for the same key.</p>
+      <table class="tbl">
+        <tr><th>Change</th><th>Keys that stay</th></tr>
+        <tr><td>6 → 8</td><td>25%</td></tr>
+        <tr><td>6 → 12</td><td>50%</td></tr>
+        <tr><td>6 → 7</td><td>about 14% (6 of 42)</td></tr>
+      </table>
+      <p>Doubling keeps half the keys, because each old partition splits into two new ones. That is why teams
+         that must grow in place prefer multiples, but even doubling moves half of all keys.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> One consumer in a group of eight is always far behind.
+      Prove whether it is a hot partition.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kafka-consumer-groups.sh ... --describe --group ledger | awk 'NR==1 || $6 &gt; 1000'
+GROUP   TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG      CONSUMER-ID
+ledger  payments  5          91203344        93880112        2676768  consumer-5-...
+
+$ kafka-log-dirs.sh --bootstrap-server kafka:9092 --describe --topic-list payments \
+  | grep '^{' | jq -r '.brokers[].logDirs[].partitions[] | "\(.partition) \(.size)"' | sort -k2 -n | tail -3
+payments-2  41203344102
+payments-7  42881190034
+payments-5  331902771203        ◄── 8x the size of the others
+</pre>
+      <p>Partition 5 holds eight times the data of its neighbours: this is skew in the keys, not a slow consumer.
+         Adding consumers does nothing, because partition 5 can only have one consumer in the group. Find the keys
+         responsible by sampling the partition:</p>
+<pre>
+$ kafka-console-consumer.sh ... --topic payments --partition 5 --offset latest \
+    --max-messages 20000 --property print.key=true | cut -f1 | sort | uniq -c | sort -rn | head -3
+  14211 merchant-8812
+    402 merchant-1170
+    388 merchant-3001
+</pre>
+      <p>One merchant is 71% of the partition. Choices, in order of preference: key by something finer if
+         per-merchant ordering is not actually required (payment id); spread the large merchant across buckets
+         (<code>merchant-8812#0..7</code>) if ordering within a payment is enough; or give that merchant its own
+         topic with more partitions. Each gives up some ordering; choose the one the business can live with.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A producer with a wrong clock stamped records ten years
+      ahead. Show that retention stops working, then recover.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+// Java: the timestamp argument is used as-is under CreateTime
+long tenYears = 10L * 365 * 24 * 3600 * 1000;
+producer.send(new ProducerRecord&lt;&gt;("clock", 0, System.currentTimeMillis() + tenYears, "k", "future"));
+</pre>
+<pre>
+$ kt --create --topic clock --partitions 1 --replication-factor 1 \
+    --config retention.ms=60000 --config segment.ms=10000
+# produce normal records, then the future one, then more normal records, for a few minutes
+
+$ docker exec kafka /opt/kafka/bin/kafka-dump-log.sh \
+    --files /tmp/kraft-combined-logs/clock-0/00000000000000000000.log | grep -o 'CreateTime: [0-9]*' | sort -u | tail -2
+CreateTime: 1789286400000          ◄── 2026-09-13
+CreateTime: 2104646400000          ◄── 2036-09-10: ten years ahead
+
+$ kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic clock --time -2
+clock:0:0                           ◄── nothing deleted, though retention is 1 minute
+</pre>
+      <p>The segment containing the future record cannot expire for ten years, and the segments after it wait
+         behind it. Recover by deleting everything below a chosen offset, then prevent recurrence:</p>
+<pre>
+$ echo '{"version":1,"partitions":[{"topic":"clock","partition":0,"offset":480}]}' &gt; del.json
+$ kafka-delete-records.sh --bootstrap-server localhost:9092 --offset-json-file del.json
+partition: clock-0  low_watermark: 480
+
+$ kafka-configs.sh --bootstrap-server localhost:9092 --alter --entity-type topics \
+    --entity-name clock --add-config message.timestamp.type=LogAppendTime
+</pre>
+      <p><code>kafka-delete-records.sh</code> moves the log start offset forward; the segments below it are then
+         removed. Choosing the offset is a data decision — records below it are gone for every consumer — so check
+         with the teams that read the topic. With <code>LogAppendTime</code> the broker stamps records itself; if
+         the event time matters to consumers, carry it in the payload.</p>
+      <table class="tbl">
+        <tr><th>Option</th><th>Protects retention</th><th>Keeps producer event time in the timestamp</th></tr>
+        <tr><td><code>LogAppendTime</code></td><td>Yes</td><td>No</td></tr>
+        <tr><td>Timestamp limits (KIP-937, 3.6+)</td><td>Yes — bad records are rejected</td><td>Yes</td></tr>
+        <tr><td>Nothing</td><td>No</td><td>Yes</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Design the partitioning for a clickstream topic: 400,000
+      events per second at peak, 600 bytes each, consumed by a sessionization job that needs all of one user's
+      events in order and handles 4,000 events per second per partition.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+volume         400,000 ev/s × 600 B = 240 MB/s at peak (compression reduces the stored bytes)
+key            user id       — sessionization needs one user's events in order
+consumer limit 400,000 / 4,000 = 100 partitions for today's peak
+growth         +50%/yr, sized for 2 years → 100 × 2.25 = 225 → choose 240
+
+producer side  240 MB/s over 240 partitions = 1 MB/s per partition — trivial for brokers
+retention      3 days × 240 MB/s ≈ 62 TB before compression; × RF 3 ≈ 187 TB
+</pre>
+      <p><strong>Check the key distribution before trusting the number.</strong> Clickstreams contain bots and
+         crawlers that generate far more events than any person; if one "user" produces 2% of traffic, its partition
+         runs at about five times the average. Filtering or routing bot traffic to a separate topic protects the
+         job.</p>
+      <table class="tbl">
+        <tr><th>Decision</th><th>Choice</th><th>Reason</th></tr>
+        <tr><td>Key</td><td>User id</td><td>The job's ordering requirement</td></tr>
+        <tr><td>Partitions</td><td>240</td><td>Consumer-bound: 100 today, headroom for two years, divisible by many counts</td></tr>
+        <tr><td>Partitioner</td><td>murmur2 on every producer</td><td>Web, mobile and backend producers may use different client libraries</td></tr>
+        <tr><td>Timestamps</td><td>Event time in the payload; <code>LogAppendTime</code> or strict limits on the topic</td><td>Browser and phone clocks are unreliable</td></tr>
+        <tr><td>Replication</td><td>RF 3, <code>min.insync.replicas=2</code>, racks set</td><td>Standard durability; clickstream loss is tolerable but not desirable</td></tr>
+      </table>
+      <p>The number that drives everything is the consumer's per-partition rate, which is why it has to be
+         measured with the real job. If the job later gets faster, the extra partitions cost little; if it gets
+         slower, there is headroom before a repartition is needed.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>A partition is a directory of segments,</strong> each named after its first offset; only the active segment is written.</li>
+        <li><strong>The offset index is sparse</strong> — about one entry per 4 KB — so it stays in memory and a lookup is a binary search plus a short scan.</li>
+        <li><strong>Retention and compaction work on whole, closed segments,</strong> so segment size limits how precisely retention acts.</li>
+        <li><strong>The record batch is the real unit</strong> of storage, compression and replication; bigger batches compress better.</li>
+        <li><strong>Size limits apply along the whole path;</strong> raising only the broker's limit does not let large records through.</li>
+        <li><strong>Consumers read only below the high watermark,</strong> so they never see records a leader failover could erase.</li>
+        <li><strong><code>read_committed</code> consumers stop at the last stable offset,</strong> so one long-open transaction holds back the whole partition.</li>
+        <li><strong>Offsets always increase but are not consecutive</strong> on transactional or compacted topics, so they are not a record count.</li>
+        <li><strong>The Java client partitions keyed records by <code>murmur2(key) % partitions</code>;</strong> null keys use the sticky partitioner.</li>
+        <li><strong>librdkafka clients hash keys differently by default;</strong> set <code>partitioner=murmur2_random</code> when they share a topic with Java producers.</li>
+        <li><strong>Adding partitions moves most keys</strong> — 75% when going from 6 to 8 — and breaks per-key order during the change.</li>
+        <li><strong>Hot partitions come from skewed keys,</strong> and no number of partitions or consumers fixes them.</li>
+        <li><strong>Size partition count from the slower side,</strong> which is usually the consumer doing real work per record.</li>
+        <li><strong>Set <code>broker.rack</code></strong> or replicas can share one zone despite RF 3.</li>
+        <li><strong>Time retention uses a segment's largest timestamp,</strong> so one future-dated record can stop all deletion.</li>
+        <li><strong>Use <code>LogAppendTime</code> or timestamp limits</strong> for topics fed by clocks you do not control.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="index.html">← What Kafka Actually Is</a>
+      <a href="quiz.html">Kafka Quizzes →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
