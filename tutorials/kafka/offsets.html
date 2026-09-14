@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Offsets &amp; Commit Strategies — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Offsets &amp; Commit Strategies <span class="level-badge level-adv">Delivery &amp; Durability</span></h1>
+    <p><strong>What you'll master:</strong> where committed offsets actually live — the compacted
+       <code>__consumer_offsets</code> topic — and how a group finds its coordinator; the commit contract
+       (<strong>you commit the <em>next</em> offset to read</strong>) and the off-by-one bugs it invites; exactly
+       when auto-commit is at-least-once and <strong>the one design change that makes it lose records</strong>;
+       synchronous, asynchronous and per-partition commit strategies and their duplicate windows; the
+       <strong><code>commitAsync</code> retry that rewinds a group</strong>; committing correctly around rebalances;
+       storing offsets in your own database, in the same transaction as the results, for an exactly-once effect;
+       and resetting offsets safely when you need to replay. Prerequisites:
+       <a href="replication.html">Replication, ISR &amp; acks</a>.</p>
+
+    <h2>Part 1 — Where Committed Offsets Live</h2>
+
+    <p>A consumer group's progress is stored in Kafka itself, in an internal topic called
+       <code>__consumer_offsets</code>. A commit is simply a produce request to that topic: a record whose key is
+       <em>(group, topic, partition)</em> and whose value is the offset plus some metadata.</p>
+
+<pre>
+__consumer_offsets   50 partitions (offsets.topic.num.partitions), RF 3, cleanup.policy=compact
+
+a commit for group "billing", orders-3, offset 88120433 is a record:
+   key   = (billing, orders, 3)
+   value = { offset: 88120433, leaderEpoch: 7, metadata: "", commitTimestamp: ... }
+
+compaction keeps only the LATEST value per key → the table of current positions stays small
+</pre>
+
+    <p><strong>How a group finds its coordinator.</strong> Every group is mapped to one partition of
+       <code>__consumer_offsets</code>, and the broker leading that partition is the group's coordinator:</p>
+
+<pre>
+coordinator partition = abs(hash(group.id)) % 50
+coordinator broker    = the current leader of that __consumer_offsets partition
+
+consequence: all of a group's commits and membership traffic go to ONE broker.
+A very busy group (thousands of members, commits every few ms) loads that broker;
+many small groups spread naturally across the 50 partitions.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting (broker)</th><th>Default</th><th>Why it matters</th></tr>
+      <tr><td><code>offsets.topic.num.partitions</code></td><td>50</td><td>Fixed once the topic exists; spreads coordinator load</td></tr>
+      <tr><td><code>offsets.topic.replication.factor</code></td><td>3</td><td>Must be achievable, or the topic cannot be created on first use</td></tr>
+      <tr><td><code>offsets.retention.minutes</code></td><td>10,080 (7 days)</td><td>How long offsets survive after a group becomes empty</td></tr>
+      <tr><td><code>offsets.commit.timeout.ms</code></td><td>5 s</td><td>How long a commit waits for replication before failing</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Committed offsets are only as durable as <code>__consumer_offsets</code>.</strong>
+       A development cluster started with one broker creates it with replication factor 1 (the default of 3 cannot
+       be met, so single-broker setups lower it). If that setting is carried into production, losing one broker
+       loses the positions of every group whose coordinator partition lived there — and those groups restart from
+       <code>auto.offset.reset</code>. Check it with <code>kafka-topics.sh --describe --topic __consumer_offsets</code>
+       on every cluster.</div>
+
+    <h2>Part 2 — The Commit Contract</h2>
+
+    <p>A committed offset means <strong>"the next record this group should read is this offset"</strong>. It is
+       not "the last record processed". Getting this wrong by one is one of the most common bugs in hand-written
+       commit code.</p>
+
+<pre>
+processed records at offsets 100, 101, 102 of orders-3
+
+CORRECT:  commit 103   → a restart resumes at 103: nothing skipped, nothing repeated
+WRONG:    commit 102   → a restart resumes at 102: record 102 is processed AGAIN, every restart
+WRONG:    commit 104   → a restart resumes at 104: record 103 is SKIPPED, never processed
+</pre>
+
+<pre>
+// per-partition commit after processing a batch — note the + 1
+Map&lt;TopicPartition, OffsetAndMetadata&gt; toCommit = new HashMap&lt;&gt;();
+for (TopicPartition tp : batch.partitions()) {
+    List&lt;ConsumerRecord&lt;String, String&gt;&gt; recs = batch.records(tp);
+    long last = recs.get(recs.size() - 1).offset();
+    toCommit.put(tp, new OffsetAndMetadata(last + 1));
+}
+consumer.commitSync(toCommit);
+</pre>
+
+    <p>The no-argument forms, <code>commitSync()</code> and <code>commitAsync()</code>, commit the consumer's
+       current <em>position</em> for every assigned partition — the offset after the last record returned by
+       <code>poll()</code>. That is correct only if every record returned has been processed. If your code
+       processes part of a batch and then calls <code>commitSync()</code>, it commits the unprocessed remainder
+       too.</p>
+
+    <table class="tbl">
+      <tr><th>Call</th><th>Commits</th><th>Safe when</th></tr>
+      <tr><td><code>commitSync()</code></td><td>Current position of every assigned partition</td><td>The whole batch from the last <code>poll()</code> has been processed</td></tr>
+      <tr><td><code>commitSync(map)</code></td><td>Exactly the offsets you pass</td><td>You pass last processed + 1, per partition</td></tr>
+      <tr><td><code>commitAsync()</code></td><td>Current positions, without waiting</td><td>As <code>commitSync()</code>, and you tolerate a lost commit</td></tr>
+      <tr><td>Auto-commit</td><td>Positions at the time of a later <code>poll()</code></td><td>Processing finishes inside the poll loop (Part 3)</td></tr>
+    </table>
+
+    <p><strong>Committed offsets carry the leader epoch.</strong> Since Kafka 2.1 (KIP-320), a commit includes
+       the leader epoch of the last record consumed. If the partition's log was later truncated — after an unclean
+       leader election, for example — a consumer resuming from that offset can detect that the log it read no
+       longer matches, instead of silently continuing from a position that now points to different records.</p>
+
+    <h2>Part 3 — Auto-Commit, Precisely</h2>
+
+    <p>With <code>enable.auto.commit=true</code> (the default when a <code>group.id</code> is set), the
+       consumer commits every <code>auto.commit.interval.ms</code> (5 s). The detail that decides everything is
+       <em>when</em>: the commit happens inside <code>poll()</code>, and it commits the positions reached by the
+       <em>previous</em> <code>poll()</code>.</p>
+
+<pre>
+poll #1 → records 0..499        your loop processes 0..499
+poll #2 → (auto-commit 500)     commits 500 — records 0..499 are DONE, so this is correct
+          → records 500..999    your loop processes them
+crash during processing of 700
+restart → resumes at 500        records 500..699 processed again: AT-LEAST-ONCE ✔
+</pre>
+
+    <p>So auto-commit is at-least-once <strong>as long as every record is fully processed before the next
+       <code>poll()</code></strong>. Also, <code>close()</code> performs a final auto-commit, so a clean
+       shutdown commits exactly what was processed. The guarantee breaks the moment processing leaves the poll
+       loop:</p>
+
+<pre>
+poll #1 → records 0..499 → handed to a thread pool / queue; loop returns immediately
+poll #2 → auto-commit 500 → but the pool has only finished 0..120
+          ...crash...
+restart → resumes at 500  → records 121..499 were NEVER processed: LOST, silently
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Adding an executor to "speed up" an auto-committing consumer.</strong> The code change looks
+         harmless — <code>executor.submit(() -&gt; handle(record))</code> instead of <code>handle(record)</code> —
+         and throughput improves. But the next <code>poll()</code> now auto-commits records that are still waiting
+         in the executor's queue, and any crash or redeploy loses them. Nothing errors; the records are simply
+         never processed.</p>
+      <p>✅ <strong>Once processing is asynchronous, commit manually.</strong> Turn auto-commit off and commit
+         only offsets whose records have finished — for keyed worker pools, the lowest offset still in flight per
+         partition, as the consumers lesson describes. The <a href="../springboot/messaging.html">Spring Boot
+         Messaging lesson</a> shows the same failure through a framework's listener container.</p>
+    </div>
+
+    <table class="tbl">
+      <tr><th>Processing model</th><th>Auto-commit gives</th></tr>
+      <tr><td>Synchronous, inside the poll loop</td><td>At-least-once; up to ~5 s (or one batch) reprocessed after a crash</td></tr>
+      <tr><td>Handed to another thread or queue</td><td>Records can be lost on crash — effectively at-most-once for in-flight work</td></tr>
+      <tr><td>Batch buffered across several polls before writing</td><td>Lost on crash: commits run ahead of the buffered writes</td></tr>
+    </table>
+
+    <h2>Part 4 — Manual Commit Strategies</h2>
+
+    <p>With <code>enable.auto.commit=false</code>, your code decides when progress is recorded. The choice is a
+       trade between commit overhead and how much work is repeated after a crash.</p>
+
+    <table class="tbl">
+      <tr><th>Strategy</th><th>Duplicates after a crash</th><th>Cost</th></tr>
+      <tr><td><code>commitSync</code> after every record</td><td>At most 1 record</td><td>A blocking round trip per record — throughput collapses</td></tr>
+      <tr><td><code>commitSync</code> after every batch</td><td>At most one batch</td><td>One blocking round trip per poll; the common default</td></tr>
+      <tr><td><code>commitAsync</code> per batch, <code>commitSync</code> on shutdown and revocation</td><td>At most a few batches</td><td>Cheap; a failed async commit is simply superseded</td></tr>
+      <tr><td>Every N records or T seconds</td><td>Up to N records or T seconds of work</td><td>Tunable; right for very high rates</td></tr>
+      <tr><td>Offsets stored with the results (Part 6)</td><td>None, for the results' store</td><td>Your storage must be transactional</td></tr>
+    </table>
+
+    <p><strong>The async retry trap.</strong> <code>commitAsync</code> does not retry by itself, for a good
+       reason. If your callback retries a failed commit, it may land after a later commit has already succeeded,
+       and move the group <em>backwards</em>:</p>
+
+<pre>
+t1  commitAsync(offset 2000)  ─┐  fails (coordinator moving)
+t2  commitAsync(offset 3000)   │─ succeeds → committed = 3000
+t3  callback retries 2000     ─┘  succeeds → committed = 2000   ◄── REWOUND by 1,000 records
+restart → records 2000..2999 processed again
+</pre>
+
+<pre>
+// if you retry async commits, only retry the newest one
+AtomicLong seq = new AtomicLong();
+long mySeq = seq.incrementAndGet();
+consumer.commitAsync(offsets, (committed, err) -&gt; {
+    if (err != null &amp;&amp; mySeq == seq.get()) {
+        // still the latest attempt: safe to retry (from the poll thread, not here — the consumer
+        // is not thread-safe; set a flag and let the loop retry)
+        retryLatest = offsets;
+    }
+});
+</pre>
+
+    <p>In practice the simplest robust pattern is: <code>commitAsync()</code> after each batch without retries,
+       and <code>commitSync()</code> at the points that matter — when partitions are revoked and on shutdown —
+       where blocking is acceptable and the final position must be recorded.</p>
+
+<pre>
+try {
+    while (running) {
+        var batch = consumer.poll(Duration.ofMillis(500));
+        process(batch);
+        consumer.commitAsync();              // fast path; a failure is fixed by the next one
+    }
+} finally {
+    try { consumer.commitSync(); }           // final, blocking, retried internally
+    finally { consumer.close(); }
+}
+</pre>
+
+    <h2>Part 5 — Commits and Rebalances</h2>
+
+    <p>A rebalance can take a partition away from a consumer at any <code>poll()</code>. If the consumer has
+       processed records from that partition but not committed them, the new owner starts from the old committed
+       offset and processes them again. A rebalance listener closes that window:</p>
+
+<pre>
+consumer.subscribe(List.of("orders"), new ConsumerRebalanceListener() {
+    public void onPartitionsRevoked(Collection&lt;TopicPartition&gt; parts) {
+        consumer.commitSync(processedOffsetsFor(parts));   // record progress BEFORE giving them up
+    }
+    public void onPartitionsAssigned(Collection&lt;TopicPartition&gt; parts) { }
+    public void onPartitionsLost(Collection&lt;TopicPartition&gt; parts) {
+        // already reassigned elsewhere: DO NOT commit — clean up local state only
+    }
+});
+</pre>
+
+    <table class="tbl">
+      <tr><th>Callback</th><th>When</th><th>Commit here?</th></tr>
+      <tr><td><code>onPartitionsRevoked</code></td><td>Before partitions are taken away in an orderly rebalance</td><td>Yes — synchronously, only processed offsets</td></tr>
+      <tr><td><code>onPartitionsAssigned</code></td><td>After new partitions are given</td><td>No; seek here if you store offsets yourself</td></tr>
+      <tr><td><code>onPartitionsLost</code></td><td>The consumer lost them without an orderly revoke (session expired, poll timeout)</td><td>No — another member may already own them</td></tr>
+    </table>
+
+    <p><strong>A commit after losing ownership fails.</strong> If a consumer exceeds
+       <code>max.poll.interval.ms</code>, it leaves the group, and its next commit throws
+       <code>CommitFailedException</code>: the coordinator rejects commits from a member that no longer owns the
+       partitions, which is what stops a zombie consumer from overwriting the new owner's progress. Treat the
+       exception as "these records will be reprocessed by someone else", not as an error to retry.</p>
+
+    <p><strong>Cooperative rebalancing changes when the listener runs.</strong> With the cooperative sticky
+       assignor, <code>onPartitionsRevoked</code> is called only for partitions actually moving away, and the rest
+       keep being consumed during the rebalance. Code that assumed "revoked means everything" — flushing all state,
+       committing all partitions — needs adjusting when switching assignors. The rebalancing lesson covers this.</p>
+
+    <h2>Part 6 — Offsets Outside Kafka, and Resetting Them</h2>
+
+    <p>When the results of processing go into a transactional database, you can store the consumer's offsets
+       in that database, <em>in the same transaction as the results</em>. Then the results and the progress
+       marker can never disagree: either both commit or neither does.</p>
+
+<pre>
+table consumer_offsets(group_id, topic, partition, next_offset, PRIMARY KEY(group_id, topic, partition))
+
+per batch, ONE database transaction:
+  BEGIN;
+    INSERT/UPSERT the results for records 1000..1499;
+    UPDATE consumer_offsets SET next_offset = 1500 WHERE group_id='ledger' AND topic='payments' AND partition=3;
+  COMMIT;
+
+on assignment (onPartitionsAssigned):
+  next = SELECT next_offset FROM consumer_offsets WHERE ...;
+  consumer.seek(partition, next);      ◄── Kafka's committed offsets are not used at all
+</pre>
+
+    <p>A crash before <code>COMMIT</code> rolls back both the results and the offset, and the records are
+       fetched again; a crash after it finds the new offset already stored. The database sees each record's effect
+       exactly once, without needing idempotent writes — this is the "exactly-once effect" for a database sink.
+       Many teams still commit to Kafka as well, for monitoring: lag tools read Kafka's committed offsets.</p>
+
+    <table class="tbl">
+      <tr><th>Approach</th><th>Guarantee for the sink</th><th>Requires</th></tr>
+      <tr><td>Commit to Kafka after writing</td><td>At-least-once; duplicates possible</td><td>Idempotent writes (upserts by key)</td></tr>
+      <tr><td>Offsets in the DB, same transaction</td><td>Exactly-once effect</td><td>A transactional sink; seek on assignment</td></tr>
+      <tr><td>Kafka transactions (Kafka → Kafka)</td><td>Exactly-once within Kafka</td><td>Output is a Kafka topic; see the transactions lesson</td></tr>
+    </table>
+
+    <p><strong>Resetting offsets</strong> is how you replay after a bug or skip a poisoned range. The tool acts
+       on one group at a time, so other groups reading the same topic are unaffected — and it refuses to run while
+       the group has active members, which prevents the running consumers from immediately overwriting the reset
+       with their own commits.</p>
+
+<pre>
+$ kafka-consumer-groups.sh --bootstrap-server kafka:9092 --group ledger --topic payments \
+    --reset-offsets --to-datetime 2026-09-14T09:00:00.000 --dry-run     # default: shows, changes nothing
+$ kafka-consumer-groups.sh ... --reset-offsets --to-datetime 2026-09-14T09:00:00.000 --execute
+
+other targets:  --to-earliest  --to-latest  --to-offset N  --shift-by -500
+                --by-duration PT2H   --to-current   --from-file plan.csv
+scope:          --topic payments:3,4   (only those partitions)   or   --all-topics
+</pre>
+
+    <div class="note">🔑 <strong>Replaying data replays its side effects.</strong> Resetting a group re-runs
+       everything its consumers do: database writes, but also emails, webhooks and charges. Before a replay, list
+       what the consumer does per record and check each effect is idempotent — or run the replay through a
+       separate code path that performs only the safe effects. Save the current offsets first
+       (<code>--reset-offsets --to-current --export &gt; before.csv</code>) so the reset itself can be undone.</div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Committing the last processed offset</td><td>That record is reprocessed after every restart</td><td>Commit last processed + 1</td></tr>
+      <tr><td>Committing past unprocessed records</td><td>They are skipped forever after a restart</td><td>Commit only what has finished</td></tr>
+      <tr><td><code>commitSync()</code> after processing part of a batch</td><td>Commits the whole batch's positions, including the unprocessed part</td><td>Pass explicit offsets</td></tr>
+      <tr><td>Auto-commit with processing on other threads</td><td>Records still queued are committed and lost on crash</td><td>Manual commits of finished offsets</td></tr>
+      <tr><td>Auto-commit with batching across polls</td><td>Commits run ahead of the buffered writes</td><td>Commit after each flush, manually</td></tr>
+      <tr><td><code>commitSync</code> per record</td><td>One blocking round trip per record</td><td>Commit per batch</td></tr>
+      <tr><td>Retrying <code>commitAsync</code> blindly</td><td>An old commit can land after a newer one and rewind the group</td><td>Retry only the latest, or rely on the next commit</td></tr>
+      <tr><td>No commit on revocation</td><td>The new owner repeats processed work</td><td><code>commitSync</code> in <code>onPartitionsRevoked</code></td></tr>
+      <tr><td>Committing in <code>onPartitionsLost</code></td><td>Commit fails, or clobbers the new owner</td><td>Clean up only</td></tr>
+      <tr><td>Retrying on <code>CommitFailedException</code></td><td>The partitions already belong to someone else</td><td>Accept reprocessing; fix the poll-interval cause</td></tr>
+      <tr><td><code>__consumer_offsets</code> with RF 1</td><td>One broker loss wipes groups' positions</td><td>RF 3; check every cluster</td></tr>
+      <tr><td>Storing offsets in the DB but not seeking on assignment</td><td>The consumer uses Kafka's offsets and the DB values are ignored</td><td>Seek in <code>onPartitionsAssigned</code></td></tr>
+      <tr><td>Resetting offsets without checking side effects</td><td>Emails, charges or webhooks sent again</td><td>Audit per-record effects before replaying</td></tr>
+      <tr><td>Resetting without saving the current offsets</td><td>No way back if the reset was wrong</td><td><code>--to-current --export</code> first</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does committing an offset mean, and where is it stored?</summary>
+      <p>Committing records a consumer group's progress on a partition, so that after a restart or rebalance the
+         group resumes from there. The committed value is the offset of the <em>next</em> record to read — after
+         processing offsets 100 to 102, the group commits 103.</p>
+      <p>It is stored in Kafka, in the internal topic <code>__consumer_offsets</code>. A commit is a record keyed
+         by group, topic and partition, and the topic is compacted so only the latest value per key is kept. Each
+         group is mapped by a hash of its group id to one partition of that topic, and the leader of that partition
+         acts as the group's coordinator, handling its membership and commits.</p>
+      <p>A few consequences are worth knowing. Commits are only as durable as that topic's replication factor.
+         Committed offsets expire after a group has been empty for <code>offsets.retention.minutes</code>, 7 days by
+         default. And committing is separate from reading: the consumer's position advances as it polls, but only a
+         commit survives a restart.</p>
+      <p>The commit point decides the delivery guarantee: commit after processing and you get at-least-once, with
+         duplicates after a crash; commit before processing and you get at-most-once, with possible loss.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Is auto-commit safe?</summary>
+      <p>It depends on where processing happens, and the precise answer is more useful than "never use it".</p>
+      <p>Auto-commit runs inside <code>poll()</code> and commits the positions reached by the <em>previous</em>
+         poll. If your loop fully processes each batch before calling <code>poll()</code> again, every committed
+         offset covers only finished records, so auto-commit gives at-least-once delivery. A crash reprocesses at
+         most the records since the last commit — around five seconds' worth by default. A clean
+         <code>close()</code> also commits one last time.</p>
+      <p>It becomes unsafe as soon as records leave the loop before they are finished: handed to a thread pool,
+         put on an in-memory queue, or buffered to be written later in bulk. Then the next <code>poll()</code>
+         commits records that have not been processed, and a crash loses them without any error.</p>
+      <p>So I use auto-commit for simple consumers that process synchronously and can tolerate a few seconds of
+         duplicates. For anything that processes asynchronously, batches across polls, or needs exact control over
+         duplicates, I turn it off and commit manually after the work is done.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Compare <code>commitSync</code> and <code>commitAsync</code>. Which do you use, and when?</summary>
+      <p><code>commitSync</code> blocks until the coordinator confirms the commit, retrying retriable errors
+         internally. It is reliable, and it costs a round trip each time the loop commits.
+         <code>commitAsync</code> sends the commit and returns immediately, reporting the result to an optional
+         callback. It does not retry, deliberately.</p>
+      <p>The reason it does not retry is ordering. If an async commit of offset 2000 fails and a later async
+         commit of 3000 succeeds, retrying the first would move the group back to 2000. So a failed async commit is
+         normally just left alone — the next commit, which includes later offsets, supersedes it. If you do retry
+         in a callback, only retry when no newer commit has been sent, which can be tracked with a sequence
+         number.</p>
+      <p>The pattern I use combines them: <code>commitAsync</code> after each batch in the normal loop, so
+         commits do not slow processing, and <code>commitSync</code> in the two places where the final position
+         must be recorded — in <code>onPartitionsRevoked</code> before partitions move to another consumer, and in
+         the shutdown path before <code>close()</code>.</p>
+      <p>Commit frequency is a separate decision from the method. Committing after every batch bounds duplicates
+         to one batch; committing every few seconds reduces load on the coordinator for very high-rate consumers at
+         the cost of more reprocessing after a crash.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A consumer writes to Postgres and must never apply a record twice. How do you achieve that?</summary>
+      <p>There are two approaches, and the choice depends on whether the writes can be made naturally
+         idempotent.</p>
+      <p><strong>If they can,</strong> use at-least-once delivery with idempotent writes. Each record has a stable
+         identity — a business key or an event id — and the write is an upsert or an insert that ignores
+         conflicts on that key. Duplicates still arrive after crashes and rebalances, but applying one twice
+         changes nothing. Offsets are committed to Kafka after the database commit. This is simple and works well
+         for state updates ("set order 42 to shipped").</p>
+      <p><strong>If they cannot</strong> — incrementing a balance, appending to a ledger — store the consumer
+         offsets in Postgres, in the same transaction as the results. Each batch becomes one transaction that writes
+         the results and updates a row holding the next offset for that partition. On assignment, the consumer reads
+         that row and seeks to it, ignoring Kafka's committed offsets. A crash either rolls back both results and
+         offset, or finds both committed, so each record's effect is applied exactly once.</p>
+      <p>The second approach has costs: every assignment must seek correctly, the offsets table becomes part of the
+         schema, and lag monitoring needs either a parallel commit to Kafka or a custom exporter.</p>
+      <p>I would use idempotent upserts wherever the data allows it, and reserve database-stored offsets for
+         genuinely non-idempotent effects such as balances. Either way I would test by killing the consumer
+         mid-batch repeatedly and checking the totals.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A bug in a consumer corrupted data for two hours. Plan the replay.</summary>
+      <p>A replay is a production change with side effects, so I would plan it like one rather than just resetting
+         offsets.</p>
+      <p><strong>1. Establish the window and the scope.</strong> From deploy logs and the data, find when the bad
+         version started and stopped processing, per partition if possible. Identify which consumer group was
+         affected; other groups reading the same topic are independent and must not be touched.</p>
+      <p><strong>2. Check that the input still exists.</strong> The topic's retention must still cover the start
+         of the window. If the data is compacted, the replay sees only the latest value per key, which may or may
+         not be what the consumer needs.</p>
+      <p><strong>3. Audit side effects.</strong> List everything the consumer does per record. Database upserts
+         are usually safe to repeat. Emails, payments, webhooks and increments are not. Either make those paths
+         idempotent first (for example, skip emails whose event id was already sent), or run the replay with those
+         effects disabled.</p>
+      <p><strong>4. Undo the damage if needed.</strong> Replaying may simply overwrite bad rows with correct ones,
+         or the bad rows may need deleting first — for appends, replaying without cleanup creates duplicates.</p>
+      <p><strong>5. Execute safely.</strong> Deploy the fixed version with the group stopped; export the current
+         offsets with <code>--to-current --export</code> as the rollback; reset with <code>--to-datetime</code>
+         and <code>--dry-run</code> first, checking the new offsets per partition; then <code>--execute</code> and
+         start the consumers. Watch lag drain and verify the data.</p>
+      <p><strong>Recommendation:</strong> make replay a routine, rehearsed capability rather than an emergency
+         procedure — idempotent effects by design, a documented list of each consumer's side effects, and retention
+         long enough to cover the time it takes to detect a bug. The worst replays are the ones where the team
+         discovers mid-incident that the consumer also sends emails.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Why does Kafka reject commits from a consumer that was removed from the group, and what does that protect?</summary>
+      <p>Because of zombies. When a consumer stalls longer than <code>max.poll.interval.ms</code> or loses its
+         session, the group reassigns its partitions to another member, which starts processing from the last
+         committed offset. The old consumer may not know it has been removed — it may be in the middle of a long
+         batch — and when it finishes, it tries to commit.</p>
+      <p>If that commit were accepted, it could move the committed offset to a position that no longer reflects
+         the new owner's progress. Usually it would be behind (causing extra reprocessing), but in some patterns it
+         could be ahead of records the new owner has not processed, causing them to be skipped. The coordinator
+         prevents this by checking the member id and the group's generation: a commit from a member of an old
+         generation is rejected with <code>CommitFailedException</code>.</p>
+      <p>It protects the committed offset only. It does not stop the zombie's side effects — the zombie may
+         already have written the batch's results to a database while the new owner writes the same records again.
+         That is why at-least-once consumers need idempotent writes even when commits are correct, and why the
+         strongest designs fence zombies at the sink too: storing offsets in the database transaction, or using
+         Kafka transactions, where the producer epoch fences an old instance's writes.</p>
+      <p>Operationally, a <code>CommitFailedException</code> should be logged and counted, and treated as a sign
+         of a poll-loop problem — batches too slow for the poll interval — rather than retried.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Commit by hand and prove what the committed value means.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+props.put("enable.auto.commit", "false");
+consumer.assign(List.of(new TopicPartition("orders", 0)));
+consumer.seek(new TopicPartition("orders", 0), 0);
+var batch = consumer.poll(Duration.ofSeconds(2));
+long last = -1;
+for (var r : batch) { last = r.offset(); if (r.offset() == 9) break; }   // "process" 0..9
+consumer.commitSync(Map.of(new TopicPartition("orders", 0), new OffsetAndMetadata(last)));  // BUG: no +1
+</pre>
+<pre>
+$ kafka-consumer-groups.sh ... --describe --group offdemo
+GROUP    TOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+offdemo  orders  0          9               500             491
+
+restart → first record received: offset 9   ◄── already processed once
+</pre>
+      <p>Committing 9 means "the next record to read is 9", so record 9 is processed again on every restart.
+         Fix it with <code>new OffsetAndMetadata(last + 1)</code>: the tool then shows 10 and a restart begins at
+         record 10.</p>
+      <table class="tbl">
+        <tr><th>Committed</th><th>Restart begins at</th><th>Effect</th></tr>
+        <tr><td>9 (last processed)</td><td>9</td><td>One duplicate per restart</td></tr>
+        <tr><td>10 (last + 1)</td><td>10</td><td>Correct</td></tr>
+        <tr><td>11</td><td>11</td><td>Record 10 skipped forever</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show auto-commit losing records once processing moves to a
+      thread pool.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+props.put("enable.auto.commit", "true");
+props.put("auto.commit.interval.ms", "1000");
+ExecutorService pool = Executors.newFixedThreadPool(4);
+AtomicLong processed = new AtomicLong();
+while (true) {
+    for (var r : consumer.poll(Duration.ofMillis(200))) {
+        pool.submit(() -&gt; { sleep(50); processed.incrementAndGet(); });   // slow work, off the loop
+    }
+}
+// after ~5 seconds: kill -9 the JVM
+</pre>
+<pre>
+before kill:  processed = 380       committed offset (all partitions) = 2,000
+after restart: consumption resumes at 2,000
+records 380..1,999 were committed but never processed → 1,620 records LOST
+</pre>
+      <p>The loop polled far faster than the pool could work, and each <code>poll()</code> auto-committed
+         positions for records still sitting in the pool's queue. Run the same test with
+         <code>handle(r)</code> called directly in the loop and the result is the opposite: after the kill, a few
+         records are processed <em>twice</em>, none are lost.</p>
+      <table class="tbl">
+        <tr><th>Processing</th><th>After a crash</th></tr>
+        <tr><td>In the poll loop, auto-commit</td><td>A few duplicates (at-least-once)</td></tr>
+        <tr><td>In a thread pool, auto-commit</td><td>Silent loss of queued records</td></tr>
+        <tr><td>In a thread pool, manual commit of finished offsets</td><td>A few duplicates (at-least-once)</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce an async commit retry rewinding a group, then fix
+      the retry logic.
+      <details class="solution"><summary>Solution</summary>
+      <p>Simulate the race deterministically by recording callbacks and replaying the failed one late:</p>
+<pre>
+List&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; failed = new ArrayList&lt;&gt;();
+OffsetCommitCallback naiveRetry = (offsets, err) -&gt; { if (err != null) failed.add(offsets); };
+
+consumer.commitAsync(Map.of(tp, new OffsetAndMetadata(2000)), naiveRetry);  // pretend it failed:
+failed.add(Map.of(tp, new OffsetAndMetadata(2000)));
+consumer.commitSync(Map.of(tp, new OffsetAndMetadata(3000)));               // a later commit succeeds
+for (var o : failed) consumer.commitSync(o);                                 // the naive "retry"
+System.out.println(consumer.committed(Set.of(tp)).get(tp).offset());
+</pre>
+<pre>
+2000        ◄── the group moved BACKWARDS; 1,000 records will be reprocessed
+</pre>
+      <p>Two correct designs:</p>
+      <table class="tbl">
+        <tr><th>Design</th><th>How</th></tr>
+        <tr><td>Do not retry async commits</td><td>The next <code>commitAsync</code> supersedes a failed one; <code>commitSync</code> on revoke and shutdown</td></tr>
+        <tr><td>Retry only the newest</td><td>Keep a sequence number; in the callback, retry only if no newer commit was sent, and do the retry from the poll thread</td></tr>
+      </table>
+      <p>A third safeguard is to never commit an offset lower than the one you last committed successfully for
+         that partition — a simple check in your commit helper that makes rewinding impossible by accident.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Measure duplicates during a rebalance with and without a
+      revocation commit.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+setup: topic with 6 partitions, 2 consumers, manual commits every 10 seconds,
+       each record writes its offset to a table with a UNIQUE constraint that COUNTS conflicts
+
+run A (no listener): start a third consumer mid-stream to trigger a rebalance
+run B (listener):    onPartitionsRevoked → commitSync(processed offsets for those partitions)
+</pre>
+<pre>
+run A:  duplicate writes during rebalance = 14,210   (up to 10 s of work per moved partition)
+run B:  duplicate writes during rebalance = 0
+</pre>
+      <p>Without the listener, each moved partition was handed over with a committed offset up to 10 seconds old,
+         and the new owner repeated that work. With a synchronous commit of <em>processed</em> offsets during
+         revocation, the new owner starts exactly where the old one stopped.</p>
+      <table class="tbl">
+        <tr><th>Situation</th><th>Commit possible?</th><th>Duplicates</th></tr>
+        <tr><td>Orderly rebalance, listener commits</td><td>Yes</td><td>None</td></tr>
+        <tr><td>Orderly rebalance, no listener</td><td>Not attempted</td><td>Everything since the last periodic commit</td></tr>
+        <tr><td>Partitions lost (session or poll timeout)</td><td>No — rejected</td><td>Everything since the last commit</td></tr>
+      </table>
+      <p>The last row is why idempotent writes are still needed: a consumer that stalls and loses its partitions
+         never gets the chance to commit.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build a consumer that applies each payment to an account
+      balance exactly once, by storing offsets in Postgres.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+CREATE TABLE balances (account text PRIMARY KEY, cents bigint NOT NULL);
+CREATE TABLE kafka_offsets (grp text, topic text, part int, next_offset bigint,
+                            PRIMARY KEY (grp, topic, part));
+</pre>
+<pre>
+consumer.subscribe(List.of("payments"), new ConsumerRebalanceListener() {
+    public void onPartitionsAssigned(Collection&lt;TopicPartition&gt; parts) {
+        for (TopicPartition tp : parts) {
+            Long next = db.queryNextOffset("ledger", tp.topic(), tp.partition());
+            if (next != null) consumer.seek(tp, next);          // the DB is the source of truth
+        }
+    }
+    public void onPartitionsRevoked(Collection&lt;TopicPartition&gt; parts) { }  // nothing to commit: DB has it
+});
+
+while (running) {
+    var batch = consumer.poll(Duration.ofMillis(500));
+    for (TopicPartition tp : batch.partitions()) {
+        var recs = batch.records(tp);
+        db.inTransaction(tx -&gt; {
+            for (var r : recs) tx.update("UPDATE balances SET cents = cents + ? WHERE account = ?",
+                                         amount(r), account(r));
+            tx.upsert("kafka_offsets", "ledger", tp.topic(), tp.partition(),
+                      recs.get(recs.size() - 1).offset() + 1);
+        });
+    }
+    consumer.commitAsync();      // optional: only so lag dashboards stay accurate
+}
+</pre>
+      <p>Test it the way it will fail: produce 100,000 payments of known total, kill the consumer with
+         <code>kill -9</code> at random moments twenty times, and compare the final sum of balances with the
+         expected total.</p>
+<pre>
+expected total change: 48,213,904 cents
+auto-commit version:   48,391,117   (over by 177,213: payments applied twice)
+DB-offset version:     48,213,904   (exact, on every run)
+</pre>
+      <table class="tbl">
+        <tr><th>Crash point</th><th>What happens on restart</th></tr>
+        <tr><td>Before the transaction commits</td><td>Balances and offset both rolled back; the batch is fetched and applied again, once</td></tr>
+        <tr><td>After the transaction commits, before <code>commitAsync</code></td><td>Consumer seeks to the DB offset; Kafka's older commit is ignored</td></tr>
+      </table>
+      <p>Note the per-partition transaction: offsets are per partition, so each transaction covers one
+         partition's records and its own offset row. Also make sure only one instance can hold a partition at a
+         time — a zombie that lost its partition could still commit a transaction, so the offset upsert should be
+         conditional on the expected previous value.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> A consumer group skipped a range of records after a bad
+      deploy. Recover exactly that range for one group, without touching other groups on the same topic.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# 1. stop the group's consumers (the tool refuses to reset an active group)
+$ kafka-consumer-groups.sh ... --describe --group notifier --state
+GROUP     COORDINATOR (ID)   ASSIGNMENT-STRATEGY  STATE   #MEMBERS
+notifier  kafka-2:9092 (2)                        Empty   0
+
+# 2. save the current position: this is the rollback
+$ kafka-consumer-groups.sh ... --group notifier --topic events \
+    --reset-offsets --to-current --export --dry-run &gt; notifier-before.csv
+
+# 3. find the start of the skipped range and preview the reset
+$ kafka-consumer-groups.sh ... --group notifier --topic events \
+    --reset-offsets --to-datetime 2026-09-14T13:05:00.000 --dry-run
+GROUP     TOPIC   PARTITION  NEW-OFFSET
+notifier  events  0          7710422
+notifier  events  1          7702981
+...
+
+# 4. apply, then start the consumers
+$ kafka-consumer-groups.sh ... --reset-offsets --to-datetime 2026-09-14T13:05:00.000 --execute
+</pre>
+      <p>The records after the skipped range will be processed again as the group catches up. For a notifier
+         that sends emails, that matters: check that the consumer deduplicates by event id before resending, or
+         the replay emails everyone twice for the records that were <em>not</em> skipped.</p>
+      <table class="tbl">
+        <tr><th>Step</th><th>Protects against</th></tr>
+        <tr><td>Stop the group first</td><td>Running consumers overwriting the reset with their own commits</td></tr>
+        <tr><td><code>--export</code> the current offsets</td><td>A wrong reset with no way back</td></tr>
+        <tr><td><code>--dry-run</code> and read the new offsets per partition</td><td>A wrong timestamp or time zone (the tool takes local time unless you specify an offset)</td></tr>
+        <tr><td>Scope with <code>--group</code> and <code>--topic</code></td><td>Touching other groups or topics</td></tr>
+        <tr><td>Check per-record side effects</td><td>Duplicate emails, charges or webhooks</td></tr>
+      </table>
+      <p>If only the skipped range should be processed — not everything after it — reset to the start of the
+         range, let the consumer run until it reaches the end of the range, and handle the rest with deduplication,
+         since the tool has no "stop at" option; or write a small one-off consumer using <code>assign()</code> and
+         <code>seek()</code> that reads exactly the range and exits.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Committed offsets live in the compacted <code>__consumer_offsets</code> topic,</strong> and a commit is a produce request to it.</li>
+        <li><strong>Each group has one coordinator,</strong> the leader of partition <code>hash(group.id) % 50</code> of that topic.</li>
+        <li><strong><code>__consumer_offsets</code> needs replication factor 3;</strong> RF 1 carried from a dev setup loses every group's position with one broker.</li>
+        <li><strong>A committed offset is the next record to read</strong> — commit last processed + 1.</li>
+        <li><strong>The no-argument commits use the current position,</strong> so they commit the whole last batch whether processed or not.</li>
+        <li><strong>Auto-commit commits the previous poll's positions inside <code>poll()</code>,</strong> which is at-least-once only if processing finishes in the loop.</li>
+        <li><strong>Handing records to a thread pool under auto-commit loses them on crash,</strong> silently.</li>
+        <li><strong><code>commitAsync</code> does not retry,</strong> because a late retry can rewind the group; the next commit supersedes a failed one.</li>
+        <li><strong>Use <code>commitAsync</code> in the loop and <code>commitSync</code> on revocation and shutdown.</strong></li>
+        <li><strong>Commit processed offsets in <code>onPartitionsRevoked</code>;</strong> never commit in <code>onPartitionsLost</code>.</li>
+        <li><strong><code>CommitFailedException</code> means you no longer own the partitions;</strong> accept reprocessing and fix the slow loop.</li>
+        <li><strong>Commit fencing protects the offset, not the side effects;</strong> writes still need idempotency or a transactional sink.</li>
+        <li><strong>Storing offsets in the same DB transaction as the results</strong> gives an exactly-once effect for that database.</li>
+        <li><strong>Resetting offsets affects one group and requires it to be stopped;</strong> dry-run first and export the current offsets.</li>
+        <li><strong>A replay re-runs every side effect,</strong> so audit what each consumer does per record before resetting.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="replication.html">← Replication, ISR &amp; acks</a>
+      <a href="exactly-once.html">Idempotence &amp; Transactions →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

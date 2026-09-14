@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Idempotence &amp; Transactions — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Idempotence &amp; Transactions <span class="level-badge level-adv">Delivery &amp; Durability</span></h1>
+    <p><strong>What you'll master:</strong> the three gaps the idempotent producer leaves open, and how
+       transactions close them; the transaction protocol — the coordinator, <code>__transaction_state</code>, and
+       the <strong>commit markers written into every partition</strong>; the consume-transform-produce loop, and
+       the <strong>missing <code>seek()</code> after an abort that silently skips records</strong>; zombie fencing
+       with <code>transactional.id</code> and epochs; why <strong>downstream consumers see aborted data by
+       default</strong>; the hanging transaction that freezes every <code>read_committed</code> reader of a
+       partition, and how to find and abort it; and an honest account of what exactly-once costs and where it
+       stops. Prerequisites: <a href="offsets.html">Offsets &amp; Commit Strategies</a> and the idempotence section
+       of <a href="producers.html">Producers</a>.</p>
+
+    <h2>Part 1 — What Idempotence Leaves Open</h2>
+
+    <p>The idempotent producer (default since Kafka 3.0) stops the producer's own retries from writing
+       duplicates: each batch carries a producer id, epoch and sequence number, and the broker discards a batch it
+       has already written. That solves one problem precisely, and leaves three others.</p>
+
+    <table class="tbl">
+      <tr><th>Gap</th><th>Example</th><th>Why idempotence cannot help</th></tr>
+      <tr><td>Restarts</td><td>The app crashes after sending, restarts, and resends records it is unsure about</td><td>The new producer has a new producer id; the broker cannot relate the two</td></tr>
+      <tr><td>Atomic writes to several partitions</td><td>An order event to <code>orders</code> and a stock event to <code>inventory</code> must both appear or neither</td><td>Idempotence is per partition; one write can succeed while the other fails</td></tr>
+      <tr><td>Read-process-write</td><td>Consume from <code>payments</code>, write an enriched record to <code>payments.enriched</code>, commit the input offset</td><td>The output write and the offset commit are two separate operations; a crash between them duplicates or loses</td></tr>
+    </table>
+
+<pre>
+consume offset 500 ─► produce enriched record ─► commit offset 501
+                                              ▲
+                          crash HERE: the output exists, the commit does not
+                          restart → reprocess 500 → the enriched record is written TWICE
+
+transactions make "produce outputs" and "commit input offsets" ONE atomic step
+</pre>
+
+    <p>Transactions extend the same producer id and epoch mechanism across restarts (by giving the producer a
+       stable identity) and across partitions (by committing or aborting a group of writes, including offset
+       commits, together).</p>
+
+    <h2>Part 2 — The Transaction Protocol</h2>
+
+    <p>A transactional producer is configured with a <code>transactional.id</code>, a name that stays the same
+       across restarts of the same logical producer. A broker acting as the <strong>transaction coordinator</strong>
+       — chosen, like the group coordinator, by hashing the id onto a partition of the internal
+       <code>__transaction_state</code> topic — records each transaction's state.</p>
+
+<pre>
+producer                          transaction coordinator              data partitions
+────────                          ───────────────────────              ───────────────
+initTransactions()   ────────────► assign producer id, BUMP epoch
+                                   (fences any older instance)
+beginTransaction()   (local only)
+send(orders-2, …)    ────────────► AddPartitionsToTxn(orders-2) ──►   records written, marked
+send(inventory-5, …)                AddPartitionsToTxn(inventory-5)    "transactional", NOT yet visible
+sendOffsetsToTransaction(…) ─────► adds the group's offsets as part of the transaction
+commitTransaction()  ────────────► state = PrepareCommit (durable in __transaction_state)
+                                   write COMMIT MARKERS ───────────►  a control record in orders-2,
+                                                                      inventory-5, __consumer_offsets
+                                   state = CompleteCommit
+</pre>
+
+    <p><strong>The markers are the mechanism.</strong> A transaction's records are written to their partitions
+       as they are sent, and a <em>commit</em> or <em>abort</em> control record is appended to each partition at
+       the end. A <code>read_committed</code> consumer delivers a transaction's records only once it sees the
+       commit marker, and skips them if it sees an abort marker. Brokers keep an aborted-transaction index
+       (<code>.txnindex</code>, next to each segment) so consumers can filter aborted records efficiently.</p>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
+      <tr><td><code>transactional.id</code> (producer)</td><td>none</td><td>Stable identity; enables transactions and fencing</td></tr>
+      <tr><td><code>transaction.timeout.ms</code> (producer)</td><td>60 s</td><td>The coordinator aborts a transaction open longer than this</td></tr>
+      <tr><td><code>transaction.max.timeout.ms</code> (broker)</td><td>15 min</td><td>Upper limit for the producer's timeout</td></tr>
+      <tr><td><code>transaction.state.log.replication.factor</code> / <code>min.isr</code></td><td>3 / 2</td><td>Durability of transaction state; single-broker dev setups lower these</td></tr>
+      <tr><td><code>transactional.id.expiration.ms</code> (broker)</td><td>7 days</td><td>An unused id's state is removed after this</td></tr>
+      <tr><td><code>isolation.level</code> (consumer)</td><td><code>read_uncommitted</code></td><td>Whether a consumer hides open and aborted transactions</td></tr>
+    </table>
+
+    <p>Markers take offsets. Each commit or abort writes one control record per partition in the transaction,
+       and those records are never delivered to your code, so transactional topics always have gaps in the
+       offsets your consumers see — expected, and one reason offsets are not a record count.</p>
+
+    <h2>Part 3 — The Consume-Transform-Produce Loop</h2>
+
+    <p>The main use of transactions is a service that reads from Kafka, transforms, and writes back to Kafka.
+       The input offsets are committed <em>inside</em> the transaction, so outputs and progress are atomic.</p>
+
+<pre>
+Properties pp = new Properties();
+pp.put("transactional.id", "enricher-" + instanceId);      // stable per instance, see Part 4
+pp.put("enable.idempotence", "true");                       // required, and implied
+KafkaProducer&lt;String, String&gt; producer = new KafkaProducer&lt;&gt;(pp, ...);
+producer.initTransactions();                               // fences older instances with this id
+
+Properties cp = new Properties();
+cp.put("group.id", "enricher");
+cp.put("enable.auto.commit", "false");                      // offsets go through the producer
+cp.put("isolation.level", "read_committed");                // do not read other apps' aborted data
+KafkaConsumer&lt;String, String&gt; consumer = new KafkaConsumer&lt;&gt;(cp, ...);
+consumer.subscribe(List.of("payments"));
+
+while (running) {
+    ConsumerRecords&lt;String, String&gt; batch = consumer.poll(Duration.ofMillis(200));
+    if (batch.isEmpty()) continue;
+    producer.beginTransaction();
+    try {
+        for (var r : batch) producer.send(new ProducerRecord&lt;&gt;("payments.enriched", r.key(), enrich(r.value())));
+        producer.sendOffsetsToTransaction(nextOffsets(batch), consumer.groupMetadata());
+        producer.commitTransaction();
+    } catch (ProducerFencedException | OutOfOrderSequenceException | AuthorizationException fatal) {
+        producer.close();                                   // this instance is finished
+        throw fatal;
+    } catch (KafkaException abortable) {
+        producer.abortTransaction();
+        rewindToCommitted(consumer);                        // ◄── the step people forget
+    }
+}
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Aborting and carrying on with the next <code>poll()</code>.</strong> After
+         <code>abortTransaction()</code> the outputs are discarded and the offsets were never committed — but the
+         consumer's in-memory <em>position</em> has already moved past the batch. The next <code>poll()</code>
+         returns the records after it, and the aborted batch is never processed. Nothing errors; the records are
+         simply skipped.</p>
+      <p>✅ <strong>Seek back to the committed offsets after every abort.</strong> For each assigned partition,
+         read <code>consumer.committed(...)</code> and <code>seek()</code> to it (or to the beginning, if nothing is
+         committed), so the aborted batch is fetched and processed again. Exercise 3 reproduces the skip.</p>
+    </div>
+
+<pre>
+void rewindToCommitted(KafkaConsumer&lt;?, ?&gt; c) {
+    Map&lt;TopicPartition, OffsetAndMetadata&gt; committed = c.committed(c.assignment());
+    for (TopicPartition tp : c.assignment()) {
+        OffsetAndMetadata om = committed.get(tp);
+        if (om != null) c.seek(tp, om.offset());
+        else c.seekToBeginning(List.of(tp));        // or apply your auto.offset.reset policy
+    }
+}
+</pre>
+
+    <p><strong><code>sendOffsetsToTransaction(offsets, consumer.groupMetadata())</code></strong> passes the
+       consumer group's generation along with the offsets (KIP-447, Kafka 2.5). The coordinator uses it to reject
+       offset commits from a consumer that has lost its partitions in a rebalance. Before 2.5, safe fencing needed
+       one transactional producer per input partition; with it, one producer per application instance is
+       enough.</p>
+
+    <h2>Part 4 — Zombie Fencing</h2>
+
+    <p>A <em>zombie</em> is an instance that the rest of the system considers dead but that is still running —
+       paused by garbage collection, cut off by a network partition — and that may wake up and write. Transactions
+       fence zombies with epochs.</p>
+
+<pre>
+instance A: transactional.id = enricher-7, epoch 4      running normally
+instance A pauses for 2 minutes (a long GC pause, a frozen VM)
+orchestrator starts instance B with transactional.id = enricher-7
+instance B: initTransactions() → coordinator BUMPS the epoch to 5, aborts A's open transaction
+instance A wakes up, tries to send or commit with epoch 4
+   → ProducerFencedException: A can never write under this id again
+</pre>
+
+    <table class="tbl">
+      <tr><th>What is fenced</th><th>By</th><th>Result for the zombie</th></tr>
+      <tr><td>Its data writes</td><td>Producer epoch per <code>transactional.id</code></td><td><code>ProducerFencedException</code>; must close</td></tr>
+      <tr><td>Its offset commits</td><td>Consumer group generation (KIP-447)</td><td>Commit rejected; its transaction aborts</td></tr>
+      <tr><td>Its open transaction</td><td>The new instance's <code>initTransactions()</code></td><td>Aborted, so its partial output is never visible</td></tr>
+    </table>
+
+    <p><strong>Fencing only works if the id is stable and unique per logical instance.</strong> Two common
+       mistakes break it in opposite directions:</p>
+
+    <table class="tbl">
+      <tr><th>Choice of <code>transactional.id</code></th><th>Problem</th></tr>
+      <tr><td>A random UUID per start</td><td>A restarted instance never fences its previous self; a zombie can still commit</td></tr>
+      <tr><td>The same id for every instance</td><td>Each instance fences the others on start-up; only one can run</td></tr>
+      <tr><td>Stable per slot (e.g., the StatefulSet pod ordinal: <code>enricher-0</code>, <code>enricher-1</code>)</td><td>Correct: a replacement for slot 1 fences the old slot 1 and nothing else</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Fencing stops zombie writes to Kafka, not to anything else.</strong> If the
+       zombie also writes to a database or calls an API, those effects go through: the epoch check happens only on
+       Kafka brokers. A consume-transform-produce loop is protected end to end only when all of its outputs are
+       Kafka topics. Anything else needs its own fencing — a version check in the database, or an idempotency key
+       at the API.</div>
+
+    <h2>Part 5 — Readers: <code>read_committed</code>, the LSO and Hanging Transactions</h2>
+
+    <p>Transactions affect readers in two ways, and both surprise people.</p>
+
+    <p><strong>1. The default consumer reads everything.</strong> <code>isolation.level</code> defaults to
+       <code>read_uncommitted</code>, which delivers transactional records as soon as they are written —
+       including records from transactions that later abort. A downstream team that consumes your transactional
+       topic with default settings sees data your service threw away.</p>
+
+<pre>
+producer: begin → send A, B → ABORT          (A and B must never be seen)
+          begin → send C     → COMMIT
+
+read_uncommitted consumer (DEFAULT) receives:  A, B, C     ◄── aborted records delivered
+read_committed consumer receives:              C
+</pre>
+
+    <p><strong>2. <code>read_committed</code> readers wait for the oldest open transaction.</strong> They read
+       only up to the <em>last stable offset</em> (LSO): the offset of the first record belonging to a transaction
+       that is still open. Everything after it — including committed records from other producers — waits.</p>
+
+<pre>
+partition payments.enriched-2
+offsets:  100  101  102  103  104  105  106  107
+          c    c    T1   c    c    T1   c    c         T1 = open transaction from producer X
+                    ▲
+                    LSO = 102: read_committed consumers stop here, although 103, 104, 106, 107
+                    are committed records from other producers
+</pre>
+
+    <p>So end-to-end latency for <code>read_committed</code> consumers includes the producer's transaction
+       duration. A producer committing every 5 seconds adds up to 5 seconds of latency for every reader of those
+       partitions. And a transaction that never finishes — a <strong>hanging transaction</strong> — stops readers
+       of its partitions until it times out.</p>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Likely cause</th><th>Check</th></tr>
+      <tr><td><code>read_committed</code> lag grows, <code>read_uncommitted</code> consumers are fine</td><td>An open or hanging transaction holding the LSO</td><td><code>kafka-transactions.sh describe-producers</code> on the partition</td></tr>
+      <tr><td>Latency equals the producer's commit interval</td><td>Normal: readers wait for commits</td><td>Shorten the commit interval if latency matters</td></tr>
+      <tr><td>Stall ending after about a minute</td><td>A crashed producer's transaction hit <code>transaction.timeout.ms</code></td><td>Broker logs for the coordinator aborting it</td></tr>
+      <tr><td>Stall that never ends</td><td>A hanging transaction the coordinator does not know about</td><td><code>kafka-transactions.sh find-hanging</code>, then <code>abort</code></td></tr>
+    </table>
+
+<pre>
+$ kafka-transactions.sh --bootstrap-server kafka:9092 describe-producers --topic payments.enriched --partition 2
+ProducerId  ProducerEpoch  LatestCoordinatorEpoch  LastSequence  LastTimestamp  CurrentTransactionStartOffset
+81003       5              3                       4411          ...            102        ◄── open since offset 102
+
+$ kafka-transactions.sh --bootstrap-server kafka:9092 find-hanging --broker-id 2
+$ kafka-transactions.sh --bootstrap-server kafka:9092 abort \
+    --topic payments.enriched --partition 2 --start-offset 102
+</pre>
+
+    <p>Kafka 4.0 strengthened the broker-side defences against hanging transactions (KIP-890), which rely on
+       up-to-date clients; the tooling above remains the way to find and clear one when it happens.</p>
+
+    <h2>Part 6 — What Exactly-Once Costs, and Where It Stops</h2>
+
+    <table class="tbl">
+      <tr><th>Cost</th><th>Where it comes from</th><th>How to manage it</th></tr>
+      <tr><td>Throughput overhead per transaction</td><td>Coordinator round trips and one marker per partition</td><td>Larger transactions: commit every 100 ms–1 s, not per record</td></tr>
+      <tr><td>Reader latency</td><td><code>read_committed</code> waits for commit</td><td>Commit interval sized to the latency budget</td></tr>
+      <tr><td>Operational complexity</td><td>Fencing ids, hanging transactions, fatal vs abortable errors</td><td>Frameworks (Kafka Streams) that handle the loop for you</td></tr>
+      <tr><td>Every downstream reader must opt in</td><td><code>read_committed</code> is not the default</td><td>Document it in the topic's contract</td></tr>
+    </table>
+
+    <p><strong>Kafka Streams wraps all of this.</strong> Setting <code>processing.guarantee=exactly_once_v2</code>
+       makes a Streams application run the consume-transform-produce loop transactionally, including its state
+       stores' changelogs, with a default commit interval of 100 ms. For most read-process-write services on
+       Kafka, that is simpler and safer than hand-writing the loop.</p>
+
+    <p><strong>Where exactly-once stops:</strong></p>
+
+<pre>
+source DB ──(CDC or outbox)──► Kafka ──(transactional loop)──► Kafka ──(sink consumer)──► DB / API
+          ▲                           ◄──── exactly-once ────►          ▲
+          at-least-once: make the                                        at-least-once: idempotent writes,
+          event id stable                                                or offsets stored in the sink's
+                                                                         transaction (offsets lesson)
+</pre>
+
+    <table class="tbl">
+      <tr><th>Boundary</th><th>Kafka transactions help?</th><th>Use instead</th></tr>
+      <tr><td>Kafka → Kafka</td><td>Yes</td><td>Transactions or Kafka Streams EOS</td></tr>
+      <tr><td>Kafka → database</td><td>No</td><td>Offsets in the DB transaction, or idempotent upserts</td></tr>
+      <tr><td>Kafka → HTTP API / email</td><td>No</td><td>Idempotency keys; deduplicate on the receiving side</td></tr>
+      <tr><td>Database → Kafka</td><td>No</td><td>Transactional outbox with CDC, and stable event ids</td></tr>
+    </table>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Enabling transactions and telling stakeholders the pipeline is "exactly-once".</strong> The
+         final consumer writes to a warehouse with plain inserts. After a rebalance it reprocesses a batch, and the
+         warehouse double-counts revenue — the transactions upstream were correct, and irrelevant to the step that
+         failed.</p>
+      <p>✅ <strong>State the guarantee per boundary.</strong> Transactions give exactly-once between Kafka
+         topics. Each boundary with another system needs its own mechanism — idempotent writes keyed by a stable
+         event id, or offsets stored in the sink's own transaction — and the pipeline's guarantee is the weakest of
+         them.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>No <code>seek()</code> after <code>abortTransaction()</code></td><td>The consumer's position is past the aborted batch; it is skipped</td><td>Rewind every partition to its committed offset</td></tr>
+      <tr><td>Downstream consumers left on <code>read_uncommitted</code></td><td>They receive records from aborted transactions</td><td><code>isolation.level=read_committed</code></td></tr>
+      <tr><td>A random <code>transactional.id</code> per start</td><td>Restarts never fence the previous instance</td><td>A stable id per logical instance</td></tr>
+      <tr><td>The same <code>transactional.id</code> on every instance</td><td>Instances fence each other; only one survives</td><td>One id per slot (pod ordinal, partition group)</td></tr>
+      <tr><td>Retrying after <code>ProducerFencedException</code></td><td>The instance is permanently fenced</td><td>Close the producer and exit or recreate</td></tr>
+      <tr><td>Committing offsets with the consumer as well</td><td>Offsets commit outside the transaction; atomicity lost</td><td>Auto-commit off; <code>sendOffsetsToTransaction</code> only</td></tr>
+      <tr><td>One transaction per record</td><td>Coordinator overhead dominates; throughput collapses</td><td>Transactions spanning a poll batch or a time interval</td></tr>
+      <tr><td>Very long transactions</td><td><code>read_committed</code> readers wait for them</td><td>Commit every 100 ms–1 s</td></tr>
+      <tr><td>A large <code>transaction.timeout.ms</code> "to be safe"</td><td>A crashed producer stalls readers for that long</td><td>Keep it near the default</td></tr>
+      <tr><td>Diagnosing a hanging transaction as consumer slowness</td><td>Scaling consumers does nothing</td><td>Compare read_committed and read_uncommitted lag; use <code>kafka-transactions.sh</code></td></tr>
+      <tr><td>Expecting fencing to cover database writes</td><td>Zombies still write to the database</td><td>Version checks or offsets in the DB transaction</td></tr>
+      <tr><td>Calling the whole pipeline exactly-once</td><td>Sinks outside Kafka still duplicate</td><td>State the guarantee per boundary</td></tr>
+      <tr><td>Transaction state topic with RF 1 in production</td><td>One broker loss breaks every transactional producer</td><td>RF 3, <code>min.isr</code> 2</td></tr>
+      <tr><td>Hand-writing the loop where Streams fits</td><td>Every subtle error path is yours to get right</td><td>Kafka Streams with <code>exactly_once_v2</code></td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What problem do Kafka transactions solve that the idempotent producer does not?</summary>
+      <p>The idempotent producer prevents duplicates caused by the producer's own retries: each batch is numbered,
+         and the broker ignores a batch it has already written. But it only works within one producer session and
+         one partition at a time.</p>
+      <p>Transactions add three things. <strong>Atomic writes across partitions and topics:</strong> a group of
+         records to several partitions either all become visible or none do. <strong>Atomic read-process-write:</strong>
+         the input offsets are committed as part of the same transaction as the output records, so a crash can
+         never leave outputs written without the offsets committed, or the reverse. <strong>Continuity across
+         restarts:</strong> a stable <code>transactional.id</code> lets a restarted producer fence off its previous
+         incarnation, so an old instance cannot keep writing.</p>
+      <p>The typical use is a service that consumes from one topic, transforms, and produces to another. With
+         transactions and <code>read_committed</code> consumers downstream, each input record's output appears
+         exactly once in the output topic, even across crashes and rebalances.</p>
+      <p>The limit is that all of this happens inside Kafka. As soon as a step writes to a database or calls an
+         API, that step needs its own idempotency.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What does <code>isolation.level=read_committed</code> do, and why is it not the default?</summary>
+      <p>It makes a consumer deliver transactional records only after their transaction commits, and never
+         deliver records from transactions that abort. Non-transactional records are delivered as usual.</p>
+      <p>It works using markers and the last stable offset. A transaction's records are written to the log as
+         they are produced; a commit or abort marker follows at the end. A <code>read_committed</code> consumer reads
+         only up to the first record of any still-open transaction, and uses the broker's aborted-transaction index
+         to drop records from aborted ones.</p>
+      <p>It is not the default because it costs latency and most topics are not transactional. A
+         <code>read_committed</code> consumer waits for open transactions, including other producers' — so its
+         end-to-end latency includes their commit intervals, and a stuck transaction stalls it. For
+         non-transactional topics it makes no difference.</p>
+      <p>The practical consequence is that the producer's team has to tell every consumer of a transactional
+         topic to set it. Otherwise downstream services quietly read records that the producer aborted, and the
+         transactions protect nothing for them.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Walk through the consume-transform-produce loop and the failure cases it must handle.</summary>
+      <p>The producer has a stable <code>transactional.id</code> and calls <code>initTransactions()</code> once,
+         which registers it and fences any previous instance with the same id. The consumer has auto-commit off and
+         <code>isolation.level=read_committed</code>. For each batch: <code>beginTransaction()</code>; send the
+         output records; <code>sendOffsetsToTransaction()</code> with the next offsets and the consumer's group
+         metadata; <code>commitTransaction()</code>.</p>
+      <p><strong>Fatal errors</strong> — <code>ProducerFencedException</code>, an out-of-order sequence, or an
+         authorization failure — mean this producer can never continue. Another instance has taken over its id, or
+         something is misconfigured. The producer must be closed; retrying is pointless.</p>
+      <p><strong>Abortable errors</strong> — a timeout, a record too large, a transient broker problem — mean this
+         transaction failed but the producer can continue. Call <code>abortTransaction()</code>, which discards the
+         batch's outputs, and then — the step most often missed — seek the consumer back to the committed offsets.
+         Its position has already advanced past the batch, so without the seek the batch is skipped. Then process it
+         again in a new transaction.</p>
+      <p><strong>Rebalances</strong> are covered by passing the consumer's group metadata with the offsets: if the
+         consumer has lost its partitions, the coordinator rejects the offset commit and the transaction aborts,
+         so a zombie cannot commit progress on partitions it no longer owns.</p>
+      <p>Finally, commit per batch or per time interval, not per record, and make sure every downstream consumer
+         reads with <code>read_committed</code>. In practice I would reach for Kafka Streams with
+         <code>exactly_once_v2</code>, which implements exactly this loop and its error handling.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How should you choose <code>transactional.id</code> values?</summary>
+      <p>The id is what the coordinator uses to recognise "the same producer, restarted". Choosing it means
+         deciding what counts as the same logical producer.</p>
+      <p>It must be <strong>stable across restarts of one instance</strong>, so that a replacement fences its
+         predecessor. A random UUID per start fails this: the old instance, if it is a zombie, keeps its own id and
+         epoch and nothing stops it. It must also be <strong>unique between instances that run at the same
+         time</strong>. If every replica uses the same id, each new one fences the others, and the service can only
+         run one instance.</p>
+      <p>The usual answer is one id per instance slot: the service name plus a stable ordinal, such as the pod
+         ordinal in a Kubernetes StatefulSet (<code>enricher-0</code>, <code>enricher-1</code>). When pod 1 is
+         replaced, the new pod 1 fences the old one, and pods 0 and 2 are unaffected.</p>
+      <p>Since Kafka 2.5, input-partition zombies are also fenced through the consumer group generation passed in
+         <code>sendOffsetsToTransaction</code>, so ids no longer need to be tied to input partitions — one per
+         instance is enough. Older designs used one id per input partition, which is where much of the confusing
+         advice online comes from.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Downstream <code>read_committed</code> consumers of a topic stopped progressing, while <code>read_uncommitted</code> consumers of the same topic are fine. Diagnose it.</summary>
+      <p>That contrast is diagnostic in itself: the data is being written, but it is not becoming <em>stable</em>.
+         <code>read_committed</code> consumers read only up to the last stable offset — the first record of the
+         oldest still-open transaction on each partition — so an open transaction that does not finish holds back
+         everything after it.</p>
+      <p><strong>Step 1: find the partitions and the open transaction.</strong> Lag per partition shows which
+         partitions are stuck. <code>kafka-transactions.sh describe-producers</code> on one of them lists producer ids
+         with a <code>CurrentTransactionStartOffset</code>; the one matching the stuck position is the culprit.</p>
+      <p><strong>Step 2: is it merely slow or truly hanging?</strong> If the producer is alive and commits
+         eventually — for example, it commits every 30 seconds, or holds transactions open while calling a slow
+         service — this is a design problem: shorten the transactions. If the producer crashed, the coordinator
+         should abort the transaction after <code>transaction.timeout.ms</code>; a stall ending after about that
+         long is this case, and a very large configured timeout makes it long.</p>
+      <p><strong>Step 3: a transaction the coordinator does not know about.</strong> Rarely — historically through
+         client or broker bugs — a partition can hold an open transaction that the coordinator has no record of, so
+         no timeout ever aborts it. <code>kafka-transactions.sh find-hanging</code> identifies these, and
+         <code>abort</code> writes the abort marker directly for that partition, which releases the LSO.</p>
+      <p><strong>Recommendation:</strong> abort the hanging transaction to unblock readers, then fix the cause —
+         keep <code>transaction.timeout.ms</code> near its default, keep clients and brokers current (Kafka 4.0
+         added stronger protection against hanging transactions), and add monitoring that compares
+         <code>read_committed</code> progress with the partition's high watermark, so a stuck LSO alerts within
+         minutes rather than when a downstream team notices.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A team wants "exactly-once" for a pipeline: Postgres → Kafka → enrichment service → Kafka → data warehouse. Design it.</summary>
+      <p>I would design each boundary separately, because Kafka transactions cover only one of the four hops, and
+         the pipeline is only as strong as its weakest one.</p>
+      <p><strong>Postgres → Kafka:</strong> transactional outbox. The application writes each business change and
+         an outbox row in the same database transaction; Debezium captures the outbox table and publishes it. This
+         is at-least-once — CDC can republish after a restart — so every event carries a stable id (the outbox row
+         id) that later stages can deduplicate on.</p>
+      <p><strong>Kafka → enrichment → Kafka:</strong> exactly-once with transactions, preferably Kafka Streams
+         with <code>exactly_once_v2</code>. Duplicates arriving from the outbox are handled here if needed, by
+         keying on the event id and keeping a deduplication store (a Streams state store with a retention window).
+         The output topic is consumed with <code>read_committed</code>.</p>
+      <p><strong>Kafka → warehouse:</strong> this sink is outside Kafka, so it needs its own mechanism. For a
+         warehouse, idempotent loading is usual: write batches into a staging table and <code>MERGE</code> on the
+         event id, so reprocessing a batch after a rebalance changes nothing. If the warehouse supports
+         transactions, storing the consumer offsets in the same transaction as each load is the alternative.</p>
+      <p><strong>Costs to state:</strong> end-to-end latency includes the enrichment commit interval (100 ms by
+         default in Streams); deduplication state has to be sized for the window in which duplicates can arrive;
+         and every consumer of the enriched topic must use <code>read_committed</code>.</p>
+      <p><strong>Recommendation:</strong> outbox with stable event ids at the source, Kafka Streams EOS in the
+         middle, idempotent MERGE at the warehouse — and describe it to stakeholders as "each event's effect is
+         applied exactly once", defined by the event id, rather than as a property of Kafka alone. Then test it by
+         killing each component mid-flow and reconciling counts against the source.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Commit one transaction and abort another, then read the
+      topic at both isolation levels.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+producer.initTransactions();
+
+producer.beginTransaction();
+producer.send(new ProducerRecord&lt;&gt;("tx-demo", "k", "A-aborted"));
+producer.send(new ProducerRecord&lt;&gt;("tx-demo", "k", "B-aborted"));
+producer.flush();                   // records are now in the log
+producer.abortTransaction();
+
+producer.beginTransaction();
+producer.send(new ProducerRecord&lt;&gt;("tx-demo", "k", "C-committed"));
+producer.commitTransaction();
+</pre>
+<pre>
+$ kafka-console-consumer.sh ... --topic tx-demo --from-beginning
+A-aborted
+B-aborted
+C-committed                                          ◄── default: read_uncommitted
+
+$ kafka-console-consumer.sh ... --topic tx-demo --from-beginning \
+    --consumer-property isolation.level=read_committed
+C-committed
+</pre>
+      <p>The aborted records were really written to the partition — the <code>flush()</code> made sure of it —
+         and a default consumer delivers them. Only <code>read_committed</code> consumers apply the abort.</p>
+      <table class="tbl">
+        <tr><th>Record</th><th><code>read_uncommitted</code></th><th><code>read_committed</code></th></tr>
+        <tr><td>A, B (aborted)</td><td>Delivered</td><td>Skipped</td></tr>
+        <tr><td>C (committed)</td><td>Delivered immediately</td><td>Delivered after the commit marker</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Find the transaction markers in the log and the gaps they
+      leave in consumer offsets.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker exec kafka /opt/kafka/bin/kafka-dump-log.sh \
+    --files /tmp/kraft-combined-logs/tx-demo-0/00000000000000000000.log | grep -E 'baseOffset'
+baseOffset: 0 lastOffset: 1 count: 2 ... isTransactional: true isControl: false ...   (A, B)
+baseOffset: 2 lastOffset: 2 count: 1 ... isTransactional: true isControl: true  ...   (ABORT marker)
+baseOffset: 3 lastOffset: 3 count: 1 ... isTransactional: true isControl: false ...   (C)
+baseOffset: 4 lastOffset: 4 count: 1 ... isTransactional: true isControl: true  ...   (COMMIT marker)
+
+$ kafka-console-consumer.sh ... --topic tx-demo --from-beginning \
+    --consumer-property isolation.level=read_committed --property print.offset=true
+Offset:3  C-committed
+</pre>
+      <p>Five offsets were used for one visible record: two aborted records and two markers. The log end offset
+         is 5, a <code>read_committed</code> consumer sees one record, and lag tools will report the group as caught
+         up at offset 5.</p>
+      <table class="tbl">
+        <tr><th>Offset</th><th>Content</th><th>Delivered to <code>read_committed</code>?</th></tr>
+        <tr><td>0–1</td><td>Aborted data</td><td>No</td></tr>
+        <tr><td>2</td><td>Abort marker</td><td>Never (control record)</td></tr>
+        <tr><td>3</td><td>Committed data</td><td>Yes</td></tr>
+        <tr><td>4</td><td>Commit marker</td><td>Never (control record)</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce records being skipped after an abort, then fix
+      the loop.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+// inject a failure on the batch containing offset 40
+while (running) {
+    var batch = consumer.poll(Duration.ofMillis(200));
+    if (batch.isEmpty()) continue;
+    producer.beginTransaction();
+    try {
+        for (var r : batch) {
+            if (r.offset() == 40 &amp;&amp; !failedOnce) { failedOnce = true; throw new KafkaException("injected"); }
+            producer.send(new ProducerRecord&lt;&gt;("out", r.key(), r.value()));
+        }
+        producer.sendOffsetsToTransaction(nextOffsets(batch), consumer.groupMetadata());
+        producer.commitTransaction();
+    } catch (KafkaException e) {
+        producer.abortTransaction();
+        // (no rewind)
+    }
+}
+</pre>
+<pre>
+input records: 0..99      output records (read_committed): 0..29, 50..99
+                                                          ◄── the batch 30..49 is GONE
+</pre>
+      <p>The abort discarded the outputs for records 30–49, and the consumer's position was already at 50, so
+         the next <code>poll()</code> continued from there. Add the rewind:</p>
+<pre>
+    } catch (KafkaException e) {
+        producer.abortTransaction();
+        rewindToCommitted(consumer);     // seek every assigned partition to its committed offset
+    }
+...
+output records (read_committed): 0..99            ◄── batch 30..49 reprocessed, exactly once
+</pre>
+      <table class="tbl">
+        <tr><th>After abort</th><th>Output</th></tr>
+        <tr><td>No rewind</td><td>Records 30–49 missing, no error</td></tr>
+        <tr><td>Rewind to committed offsets</td><td>Every record exactly once</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show zombie fencing: start a second instance with the same
+      <code>transactional.id</code> while the first is paused.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+// instance A
+producerA.initTransactions();                 // epoch 0
+producerA.beginTransaction();
+producerA.send(new ProducerRecord&lt;&gt;("out", "k", "from-A"));
+// ... A pauses here (simulate with a breakpoint or a long sleep) ...
+
+// instance B, same transactional.id
+producerB.initTransactions();                 // epoch 1: A's open transaction is ABORTED
+producerB.beginTransaction();
+producerB.send(new ProducerRecord&lt;&gt;("out", "k", "from-B"));
+producerB.commitTransaction();
+
+// A wakes up
+producerA.commitTransaction();
+→ org.apache.kafka.common.errors.ProducerFencedException: There is a newer producer with the same
+  transactionalId which fences the current one.
+</pre>
+<pre>
+$ kafka-console-consumer.sh ... --topic out --from-beginning --consumer-property isolation.level=read_committed
+from-B                                         ◄── A's record never becomes visible
+</pre>
+      <p>Now repeat with a random id per instance: B does not fence A, A's commit succeeds, and both records are
+         visible — the zombie wrote. The stable id is what makes fencing work.</p>
+      <table class="tbl">
+        <tr><th>Ids</th><th>Outcome</th></tr>
+        <tr><td>Same stable id</td><td>A fenced; only B's output visible</td></tr>
+        <tr><td>Random per instance</td><td>No fencing; both outputs visible</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Create a transaction that stays open, watch
+      <code>read_committed</code> consumers stall, and clear it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+pp.put("transaction.timeout.ms", "600000");        // 10 minutes (the demo's "mistake")
+producer.initTransactions();
+producer.beginTransaction();
+producer.send(new ProducerRecord&lt;&gt;("orders.tx", 0, "k", "open-forever"));
+producer.flush();
+// kill -9 this process now: the transaction is left open
+</pre>
+<pre>
+# another, non-transactional producer keeps writing to the same partition
+$ kafka-consumer-groups.sh ... --describe --group rc-readers      (isolation.level=read_committed)
+PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+0          120             5120            5000         ◄── stuck at 120, the open transaction's start
+$ kafka-consumer-groups.sh ... --describe --group ru-readers      (read_uncommitted)
+0          5120            5120            0            ◄── fine
+
+$ kafka-transactions.sh --bootstrap-server localhost:9092 describe-producers --topic orders.tx --partition 0
+ProducerId  ProducerEpoch  ...  CurrentTransactionStartOffset
+2001        0              ...  120
+</pre>
+      <p>The coordinator will abort it when the 10-minute timeout expires. To release readers now, abort it
+         directly:</p>
+<pre>
+$ kafka-transactions.sh --bootstrap-server localhost:9092 abort \
+    --topic orders.tx --partition 0 --start-offset 120
+$ kafka-consumer-groups.sh ... --describe --group rc-readers
+0          5120            5120            0            ◄── released
+</pre>
+      <table class="tbl">
+        <tr><th>Setting</th><th>Stall after a producer crash</th></tr>
+        <tr><td><code>transaction.timeout.ms</code> = 60 s (default)</td><td>Up to about a minute</td></tr>
+        <tr><td>= 10 minutes</td><td>Up to 10 minutes</td></tr>
+        <tr><td>Manual <code>abort</code></td><td>As long as it takes someone to notice — so alert on it</td></tr>
+      </table>
+      <p>Monitor it: alert when a <code>read_committed</code> group's position stops moving while the partition's
+         high watermark keeps rising.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Decide, for each stage of a fraud-scoring pipeline, which
+      delivery guarantee it gets and how.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+payments (Kafka)  ─►  scorer  ─►  scores (Kafka)  ─►  alerting  ─►  PagerDuty / email
+                          │
+                          └──►  feature store (Redis) update per payment
+</pre>
+      <table class="tbl">
+        <tr><th>Stage</th><th>Guarantee</th><th>Mechanism</th></tr>
+        <tr><td>payments → scores</td><td>Exactly-once</td><td>Transactional loop (or Streams <code>exactly_once_v2</code>); <code>read_committed</code> readers of <code>scores</code></td></tr>
+        <tr><td>Feature store update inside the scorer</td><td>At-least-once</td><td>Transactions do not cover Redis: make the update idempotent (<code>SET</code> a value computed from the event, not <code>INCR</code>), keyed by payment id</td></tr>
+        <tr><td>scores → alerting</td><td>At-least-once</td><td>Commit after sending; each alert carries the payment id</td></tr>
+        <tr><td>Alert → PagerDuty</td><td>Effectively once</td><td>PagerDuty's deduplication key set to the payment id, so a resend updates the same incident</td></tr>
+      </table>
+      <p>Two points decide the design. First, the Redis update is a side effect inside the transactional service,
+         and it will run again whenever a transaction aborts and the batch is reprocessed — which is exactly the
+         normal recovery path. An increment there would drift upward over time; a value derived from the event
+         does not. Second, the alerting stage talks to external systems, so the end-to-end "once" comes from a
+         deduplication key at the receiver, not from Kafka.</p>
+      <p>The summary for stakeholders: "each payment is scored exactly once into the scores topic; alerts may be
+         sent more than once but are deduplicated by payment id at PagerDuty; feature updates are idempotent". That
+         sentence is accurate, and "the pipeline is exactly-once" is not.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Idempotence stops retry duplicates within one producer session;</strong> transactions cover restarts, multiple partitions and read-process-write.</li>
+        <li><strong>A transaction's records are written immediately and made visible by commit markers</strong> appended to every partition involved.</li>
+        <li><strong>Markers use offsets,</strong> so transactional topics always show gaps in consumer offsets.</li>
+        <li><strong><code>sendOffsetsToTransaction</code> commits input offsets atomically with the outputs,</strong> and with group metadata (KIP-447) fences rebalanced-away consumers.</li>
+        <li><strong>After <code>abortTransaction()</code>, seek back to the committed offsets,</strong> or the aborted batch is silently skipped.</li>
+        <li><strong>Fatal errors such as <code>ProducerFencedException</code> end the producer;</strong> abortable errors mean abort, rewind and retry.</li>
+        <li><strong><code>initTransactions()</code> bumps the epoch and fences older instances</strong> with the same <code>transactional.id</code>.</li>
+        <li><strong>Use a stable id per instance slot:</strong> random ids never fence, a shared id fences every other instance.</li>
+        <li><strong>Fencing protects Kafka writes only;</strong> zombie writes to databases and APIs need their own guard.</li>
+        <li><strong>Consumers default to <code>read_uncommitted</code> and see aborted records;</strong> every reader of a transactional topic must opt in.</li>
+        <li><strong><code>read_committed</code> readers stop at the last stable offset,</strong> so reader latency includes the producer's commit interval.</li>
+        <li><strong>A hanging transaction stalls read_committed readers of its partition;</strong> find it with <code>kafka-transactions.sh</code> and abort it.</li>
+        <li><strong>Keep transactions short and <code>transaction.timeout.ms</code> near its 60 s default.</strong></li>
+        <li><strong>Commit per batch or interval, never per record,</strong> to keep coordinator overhead small.</li>
+        <li><strong>Kafka Streams with <code>exactly_once_v2</code></strong> implements the whole loop and is usually the better choice than hand-written code.</li>
+        <li><strong>Exactly-once ends at Kafka's edge;</strong> state the guarantee per boundary and use idempotent writes or sink-side offsets beyond it.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="offsets.html">← Offsets &amp; Commit Strategies</a>
+      <a href="quiz.html">Kafka Quizzes →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
