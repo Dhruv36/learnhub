@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Serialization &amp; Schema Evolution — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Serialization &amp; Schema Evolution <span class="level-badge level-adv">Data Design</span></h1>
+    <p><strong>What you'll master:</strong> why Kafka's indifference to your bytes makes the schema your real
+       contract; JSON, Avro, Protobuf and JSON Schema compared on the properties that matter in a log; how a
+       schema registry works, down to the <strong>five bytes it prepends to every record</strong>; the
+       compatibility modes and the <strong>deployment order each one forces</strong>; exactly which changes are
+       safe in Avro and Protobuf; why a topic's retention window demands <strong>transitive</strong> compatibility;
+       the producer that writes plain JSON into an Avro topic and blocks a partition; and how to ship a genuinely
+       breaking change without stopping every consumer. Prerequisites:
+       <a href="rebalancing.html">Rebalancing &amp; Group Membership</a>; the Spring Boot
+       <a href="../springboot/messaging.html">Messaging lesson</a> introduces events as contracts.</p>
+
+    <h2>Part 1 — Kafka Stores Bytes; the Contract Lives Elsewhere</h2>
+
+    <p>A Kafka record's key and value are byte arrays. The broker never parses them, validates them or checks
+       that one record looks like the next. Everything that gives those bytes meaning — field names, types,
+       which fields are required — lives in the producer's serializer and the consumer's deserializer.</p>
+
+<pre>
+producer: Order object ──serializer──► bytes ──► broker (stores bytes, no idea what they mean)
+consumer: bytes ──deserializer──► Order object          ◄── if this fails, the record is a POISON PILL
+
+Consequences:
+  • nothing stops a producer from writing a different shape tomorrow
+  • a record that cannot be deserialized fails in the consumer's poll loop, not at the producer
+  • the log keeps OLD shapes for the whole retention period — consumers must read all of them
+</pre>
+
+    <p>That last point is what makes Kafka different from an API. An HTTP endpoint only has to accept today's
+       requests. A consumer that starts from the beginning of a topic, or replays last week, must read every
+       version of the data still in the log — records written by producers that were retired months ago on a
+       compacted topic. The schema is a contract with the past as well as the present.</p>
+
+    <div class="note">🔑 <strong>A record that cannot be deserialized blocks its partition.</strong> The consumer
+       throws inside <code>poll()</code>, before your code ever sees the record, so a naive loop retries the same
+       record forever while everything behind it waits. Handle deserialization failures explicitly — catch the
+       exception, skip or dead-letter the record by seeking past it (Spring's
+       <code>ErrorHandlingDeserializer</code> does this) — and, better, prevent bad records reaching the topic in
+       the first place with a registry and producer controls.</div>
+
+    <h2>Part 2 — Choosing a Format</h2>
+
+    <table class="tbl">
+      <tr><th>Format</th><th>Schema needed to read?</th><th>Size</th><th>Evolution support</th><th>Typical fit</th></tr>
+      <tr><td>JSON (no schema)</td><td>No — self-describing</td><td>Large: field names in every record</td><td>None enforced; anything goes</td><td>Prototypes, low volume, external partners</td></tr>
+      <tr><td>JSON Schema</td><td>No, but validated against one</td><td>Large</td><td>Enforced by a registry; rules are subtle</td><td>Teams committed to JSON that want checks</td></tr>
+      <tr><td>Avro</td><td><strong>Yes</strong> — binary has no field names or tags</td><td>Small</td><td>Strong, well-defined rules; defaults are central</td><td>The Kafka ecosystem default (Connect, Streams, CDC)</td></tr>
+      <tr><td>Protobuf</td><td>Partly — tags identify fields, types need the schema</td><td>Small</td><td>Strong; field numbers are the contract</td><td>Organisations already using gRPC/Protobuf</td></tr>
+    </table>
+
+<pre>
+the same order, three encodings
+
+JSON   {"orderId":"o-1042","amount":1999,"currency":"EUR"}               51 bytes, names repeated every time
+Avro   0c 6f 2d 31 30 34 32  9e 1f  06 45 55 52                          13 bytes: values only, in schema order
+       ◄──── "o-1042" ────►  1999   ◄─ "EUR" ─►                          (unreadable without the WRITER's schema)
+Proto  0a 06 6f 2d 31 30 34 32  10 cf 0f  1a 03 45 55 52                  16 bytes: tag + value per field
+</pre>
+
+    <p><strong>Avro's reader needs the writer's schema.</strong> Because an Avro record is just values in the
+       order the writer's schema declared them, a reader cannot decode it without knowing exactly which schema
+       wrote it. Avro then <em>resolves</em> the writer's schema against the reader's own: fields the reader does
+       not know are skipped, fields the writer did not have are filled from the reader's defaults. That
+       resolution is what makes evolution work — and why every record must identify its writer schema, which is
+       the registry's job.</p>
+
+    <p>The size difference matters at Kafka volumes: at 100,000 records per second, 40 bytes of repeated field
+       names is 4 MB/s — about 10 TB a month before replication — though compression recovers part of it, since
+       repeated names compress well within a batch.</p>
+
+    <h2>Part 3 — How a Schema Registry Works</h2>
+
+    <p>A schema registry (Confluent Schema Registry, Apicurio, AWS Glue Schema Registry and others) stores
+       versioned schemas and checks new versions against compatibility rules. The serializers integrate with it:
+       the producer's serializer looks up (or registers) the schema and writes its id into every record; the
+       consumer's deserializer uses the id to fetch the writer's schema.</p>
+
+<pre>
+Confluent wire format (used by Confluent and compatible registries)
+
+byte 0       magic byte   0x00
+bytes 1-4    schema id    big-endian int32, e.g. 00 00 00 2a = schema 42
+bytes 5..    payload      Avro binary (Protobuf adds message-index varints first)
+
+producer: schema not yet cached → POST it to the registry → id 42 → cache it → write 00 00000002a + payload
+consumer: sees id 42 → GET /schemas/ids/42 once → cache it → decode with writer schema 42 + reader schema
+</pre>
+
+    <table class="tbl">
+      <tr><th>Concept</th><th>Meaning</th><th>Default / note</th></tr>
+      <tr><td>Subject</td><td>The name a sequence of schema versions is registered under</td><td><code>TopicNameStrategy</code>: <code>&lt;topic&gt;-value</code> and <code>&lt;topic&gt;-key</code></td></tr>
+      <tr><td><code>RecordNameStrategy</code></td><td>Subject = the record's fully qualified name</td><td>Several event types per topic, each evolving separately</td></tr>
+      <tr><td><code>TopicRecordNameStrategy</code></td><td>Subject = topic + record name</td><td>Several types per topic, scoped to that topic</td></tr>
+      <tr><td>Compatibility level</td><td>Rule a new version must satisfy</td><td>Confluent's default is <code>BACKWARD</code></td></tr>
+      <tr><td><code>auto.register.schemas</code></td><td>Serializer registers unknown schemas itself</td><td><code>true</code> by default — usually wrong in production</td></tr>
+    </table>
+
+    <p><strong>Turn off auto-registration in production.</strong> With the default, any producer build carrying
+       a changed class registers a new schema version the first time it runs. The compatibility check still
+       applies, but the change was never reviewed, and a change that passes the check can still be wrong for
+       consumers (a field that became meaningless, a unit that changed). Register schemas from CI after review,
+       and set <code>auto.register.schemas=false</code> — with <code>use.latest.version=true</code> where
+       producers should write the latest registered version.</p>
+
+    <p><strong>The registry is on the critical path, but only briefly.</strong> Clients cache schemas by id, so
+       a registry outage does not affect records whose schemas are already cached. It does block a producer
+       starting up with an uncached schema and a consumer meeting a schema id it has not seen — so run the
+       registry replicated, and include it in capacity and failure testing.</p>
+
+    <h2>Part 4 — Compatibility Modes and the Order of Deployment</h2>
+
+    <p>Each compatibility mode answers one question: which side can be upgraded first without breaking the
+       other?</p>
+
+    <table class="tbl">
+      <tr><th>Mode</th><th>Guarantee</th><th>Upgrade first</th><th>Allowed (Avro)</th></tr>
+      <tr><td><code>BACKWARD</code> (default)</td><td>New schema can read data written with the previous one</td><td><strong>Consumers</strong></td><td>Delete fields; add fields with defaults</td></tr>
+      <tr><td><code>FORWARD</code></td><td>Previous schema can read data written with the new one</td><td><strong>Producers</strong></td><td>Add fields; delete fields that had defaults</td></tr>
+      <tr><td><code>FULL</code></td><td>Both directions</td><td>Either</td><td>Add or delete fields that have defaults</td></tr>
+      <tr><td><code>*_TRANSITIVE</code></td><td>The same, checked against <em>all</em> previous versions</td><td>As above</td><td>As above, across the whole history</td></tr>
+      <tr><td><code>NONE</code></td><td>No checks</td><td>Coordinate by hand</td><td>Anything, including breaking changes</td></tr>
+    </table>
+
+<pre>
+BACKWARD: v2 deletes field "coupon" (no default)
+  deploy consumers with v2 first → they read old v1 records (coupon ignored)  ✔
+  then producers write v2        → consumers on v2 read them                 ✔
+  WRONG ORDER: producers first   → consumers still on v1 read v2 records with no "coupon"
+                                   and v1 has no default for it → DESERIALIZATION FAILS  ✘
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Assuming "the registry accepted it" means "any deployment order is safe".</strong> Under
+         <code>BACKWARD</code>, the registry guarantees only that <em>new consumers</em> can read <em>old
+         data</em>. A team that ships the producer first — the natural order, because the producer "owns" the
+         topic — breaks every consumer still on the old schema, with a change the registry approved.</p>
+      <p>✅ <strong>Derive the deployment order from the mode, and write it down.</strong> <code>BACKWARD</code>:
+         consumers first. <code>FORWARD</code>: producers first. If you cannot control consumer deployments —
+         many teams, external consumers — use <code>FULL_TRANSITIVE</code> and restrict changes to adding or
+         removing fields with defaults, so the order stops mattering.</p>
+    </div>
+
+    <p><strong>Why transitive matters in Kafka.</strong> Non-transitive modes compare a new version only with
+       the latest one. But a consumer may read any version still in the log. Three pairwise-compatible steps can
+       add up to an incompatible whole:</p>
+
+<pre>
+v1: { id }
+v2: { id, region = "eu" }       add a field WITH a default     → BACKWARD-compatible with v1 ✔
+v3: { id, region }              remove the default from region  → BACKWARD-compatible with v2 ✔
+                                                                 (v2 data always has region)
+a v3 consumer replays last week's v1 records: no region, and v3 has no default → FAILS ✘
+
+BACKWARD            accepts v3 (checks v3 against v2 only)
+BACKWARD_TRANSITIVE rejects v3 (checks v3 against v1 and v2)
+</pre>
+
+    <p>For topics with long retention, compaction or replay requirements, choose a transitive mode. The cost is
+       small — some changes that look harmless get rejected — and the protection covers exactly the case Kafka
+       makes common.</p>
+
+    <h2>Part 5 — Safe and Unsafe Changes, by Format</h2>
+
+    <table class="tbl">
+      <tr><th>Change (Avro)</th><th>BACKWARD</th><th>FORWARD</th><th>Note</th></tr>
+      <tr><td>Add a field with a default</td><td>✔</td><td>✔</td><td>The universally safe change</td></tr>
+      <tr><td>Add a field without a default</td><td>✘</td><td>✔</td><td>New readers cannot fill it for old data</td></tr>
+      <tr><td>Remove a field that had a default</td><td>✔</td><td>✔</td><td>Old readers use their default</td></tr>
+      <tr><td>Remove a field without a default</td><td>✔</td><td>✘</td><td>Old readers cannot decode new data</td></tr>
+      <tr><td>Rename a field</td><td>✘</td><td>✘</td><td>Unless the reader declares an <code>alias</code> for the old name</td></tr>
+      <tr><td>Widen a type (int → long, float → double)</td><td>✔</td><td>✘</td><td>Readers may promote the writer's type, not narrow it</td></tr>
+      <tr><td>Add an enum symbol</td><td>✔</td><td>✘ unless the enum declares a default</td><td>Old readers fail on an unknown symbol</td></tr>
+      <tr><td>Make a field nullable (union with null)</td><td>✔</td><td>✘</td><td>Old readers cannot decode a null</td></tr>
+    </table>
+
+    <p><strong>Protobuf's contract is the field number.</strong> Names can change freely; numbers cannot.</p>
+
+<pre>
+message Order {
+  string order_id = 1;
+  int64  amount   = 2;
+  reserved 3;                    // was "coupon": its NUMBER can never be reused
+  reserved "coupon";
+  string currency = 4;
+  optional string region = 5;    // proto3 "optional": readers can tell "unset" from ""
+}
+
+safe:    add a field with a new number; rename; remove a field and RESERVE its number
+unsafe:  reuse a number (old data is decoded as the wrong field); change a field's type incompatibly;
+         proto2 "required" fields (can never be removed safely)
+</pre>
+
+    <p><strong>Proto3 defaults hide absence.</strong> Without <code>optional</code>, a proto3 scalar field that
+       is not set reads as its zero value — <code>0</code>, <code>""</code>, <code>false</code>. A consumer cannot
+       tell "the amount is zero" from "this producer is too old to send an amount". For fields where absence
+       means something, declare them <code>optional</code> (proto3.15+) or use wrapper types.</p>
+
+    <p><strong>JSON Schema compatibility is less intuitive.</strong> Whether adding a property is compatible
+       depends on whether the schema is <em>open</em> (allows unknown properties) or <em>closed</em>
+       (<code>additionalProperties: false</code>). Under a closed model, adding an optional property is not
+       backward compatible in the way it is in Avro. Teams using JSON Schema should test their intended changes
+       against the registry's checker rather than reasoning from Avro rules.</p>
+
+    <h2>Part 6 — Shipping Changes Safely, Including Breaking Ones</h2>
+
+    <p>Schema changes should go through the same pipeline as code: reviewed, checked automatically, and deployed
+       in a known order.</p>
+
+<pre>
+pull request changes order.avsc
+  CI: POST /compatibility/subjects/orders-value/versions/latest   {"schema": "..."}
+      → {"is_compatible": false, "messages": ["READER_FIELD_MISSING_DEFAULT_VALUE ... region"]}
+      → build fails; the reviewer sees exactly which rule was broken
+  merge → CI registers the new version → deploy in the order the compatibility mode requires
+</pre>
+
+    <p><strong>A genuinely breaking change</strong> — a rename without aliases, a type change, restructuring
+       an event — cannot pass a compatibility check, and should not be forced through with <code>NONE</code>.
+       Two patterns handle it:</p>
+
+    <table class="tbl">
+      <tr><th>Pattern</th><th>How</th><th>Cost</th></tr>
+      <tr><td>Expand and contract within one schema</td><td>Add the new field (with a default) alongside the old; producers fill both; consumers move to the new field; finally remove the old one</td><td>Several releases; both fields meanwhile</td></tr>
+      <tr><td>New topic version</td><td>Create <code>orders.v2</code>; producers write both topics during migration; consumers switch one by one; retire <code>orders</code></td><td>Double writes; every consumer migrates; replay spans two topics</td></tr>
+    </table>
+
+<pre>
+expand and contract: renaming customerId → accountId
+
+release 1  schema: customerId, accountId (default null)   producer writes BOTH
+release 2  consumers read accountId, fall back to customerId if null
+release 3  (after retention has aged out records without accountId) make accountId required,
+           remove customerId — both steps checked by the registry
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Setting a subject's compatibility to <code>NONE</code> "just for this release".</strong> The
+         breaking schema is registered, the producer deploys, and every consumer still on the old schema fails —
+         along with any consumer that later replays records written before the change. The setting is often left at
+         <code>NONE</code> afterwards, removing the protection for every later change.</p>
+      <p>✅ <strong>Treat a breaking change as a migration, not a registration.</strong> Expand and contract
+         where possible; a new topic version where not. Both keep every record in the log readable by the consumers
+         expected to read it, and the compatibility level never has to be lowered.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Schemaless JSON on shared topics</td><td>Shapes drift; consumers break without warning</td><td>A registry-backed format</td></tr>
+      <tr><td>No handling for deserialization failures</td><td>One bad record blocks its partition forever</td><td>Catch, dead-letter, seek past it</td></tr>
+      <tr><td>Producers bypassing the serializer</td><td>Plain JSON in an Avro topic: "Unknown magic byte!" in every consumer</td><td>One serializer per topic; ACLs on who may produce</td></tr>
+      <tr><td><code>auto.register.schemas=true</code> in production</td><td>Unreviewed schema versions registered by deployments</td><td>Register from CI; auto-registration off</td></tr>
+      <tr><td>Deploying producers first under <code>BACKWARD</code></td><td>Old consumers cannot read the new data</td><td>Consumers first for BACKWARD; producers first for FORWARD</td></tr>
+      <tr><td>Non-transitive modes on long-retention topics</td><td>Replays fail on older versions still in the log</td><td><code>BACKWARD_TRANSITIVE</code> or <code>FULL_TRANSITIVE</code></td></tr>
+      <tr><td>Adding a field without a default</td><td>Rejected under BACKWARD, or breaks new readers</td><td>Always give new fields defaults</td></tr>
+      <tr><td>Renaming a field directly</td><td>Incompatible in both directions</td><td>Aliases, or expand and contract</td></tr>
+      <tr><td>Reusing a Protobuf field number</td><td>Old records decode into the wrong field</td><td><code>reserved</code> numbers and names</td></tr>
+      <tr><td>Relying on proto3 zero values</td><td>"Unset" and "zero" are indistinguishable</td><td><code>optional</code> fields or wrappers</td></tr>
+      <tr><td>Adding enum symbols carelessly</td><td>Old readers fail on the new symbol</td><td>An enum default, and consumers upgraded first</td></tr>
+      <tr><td>Lowering compatibility to <code>NONE</code> for a release</td><td>Breaks consumers and replays; often left on</td><td>Migrations: expand and contract, or a v2 topic</td></tr>
+      <tr><td>Running a single registry instance</td><td>New producers and unseen schema ids fail during an outage</td><td>A replicated registry, tested in failure drills</td></tr>
+      <tr><td>Reasoning about JSON Schema with Avro rules</td><td>Changes that seem safe are incompatible under a closed model</td><td>Test with the registry's checker</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Why do Kafka teams use a schema registry?</summary>
+      <p>Because Kafka itself treats every record as bytes. It does not know or check what the bytes contain, so
+         nothing in Kafka prevents a producer from changing the shape of its data and breaking every consumer. A
+         schema registry adds the missing contract.</p>
+      <p>It does three things. It <strong>stores versioned schemas</strong> for each subject (usually one per
+         topic key and value). It <strong>checks new versions against compatibility rules</strong> before accepting
+         them, so a change that would break readers is rejected at registration rather than discovered in
+         production. And it lets records be <strong>compact</strong>: instead of carrying field names, each record
+         carries a small schema id, and consumers fetch and cache the schema it refers to.</p>
+      <p>For Avro in particular the registry is close to essential, because Avro binary data cannot be decoded
+         without the exact schema that wrote it; the schema id in each record is how a consumer finds that
+         schema.</p>
+      <p>What it does not do is decide deployment order or catch semantic changes — a field whose meaning changed
+         but whose type did not passes every check. Those still need review.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between backward and forward compatibility?</summary>
+      <p><strong>Backward compatible</strong> means the new schema can read data written with the old schema.
+         That lets you upgrade consumers first: new consumers can still read everything already in the topic and
+         everything old producers keep writing. Deleting a field, or adding one that has a default, is backward
+         compatible.</p>
+      <p><strong>Forward compatible</strong> means the old schema can read data written with the new schema. That
+         lets you upgrade producers first: consumers still on the old schema can read what new producers write.
+         Adding a field is forward compatible, because old readers ignore it; so is deleting a field that had a
+         default.</p>
+      <p><strong>Full</strong> compatibility means both, and allows only adding or removing fields that have
+         defaults — changes that are safe in any deployment order.</p>
+      <p>In Kafka there is also the <em>transitive</em> dimension: whether the check covers only the previous
+         version or all of them. Because consumers can replay old records from the log, the transitive variants are
+         usually the right choice for topics with long retention.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A schema change passed the registry's check, yet consumers started failing after the release. How?</summary>
+      <p>Several explanations are consistent with that, and I would check them in this order.</p>
+      <p><strong>Deployment order.</strong> The most common: the subject uses <code>BACKWARD</code> compatibility,
+         which only guarantees that new readers can read old data. The producer was deployed first, and consumers
+         still on the old schema cannot read the new records — for example, a field they require without a default
+         was removed. The registry did its job; the rollout order was wrong for the mode.</p>
+      <p><strong>Non-transitive checking.</strong> The new version is compatible with the previous version but not
+         with older ones still in the log. A consumer that replays or starts from the beginning reaches records
+         written with an old version and fails.</p>
+      <p><strong>A subject mismatch.</strong> With a naming strategy different from what consumers expect, the
+         check may have run against a different subject than the one consumers read — or auto-registration
+         created a new subject with no history, so there was nothing to be incompatible with.</p>
+      <p><strong>Semantics.</strong> The schema is compatible but the meaning changed — amounts moved from euros
+         to cents, a timestamp from seconds to milliseconds — and consumers computed wrong results or failed
+         validation. No compatibility checker catches that.</p>
+      <p>The fixes are process: document the deployment order per mode, use a transitive mode for replayable
+         topics, register from CI with auto-registration off, and review semantic changes as breaking changes that
+         need a migration.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Compare Avro and Protobuf for Kafka events.</summary>
+      <p>Both are compact binary formats with defined evolution rules, so either is a reasonable choice; the
+         differences are in how they identify fields and how the ecosystem supports them.</p>
+      <p><strong>Avro</strong> writes only values, in schema order. A reader must have the writer's schema, and
+         Avro resolves it against the reader's schema: unknown fields are skipped, missing fields take the reader's
+         defaults. Defaults are therefore central to evolution. Avro has the deepest Kafka ecosystem support —
+         Kafka Connect, CDC tools like Debezium and Kafka Streams serdes all default to or strongly support it —
+         and it works well with dynamic, schema-driven tooling.</p>
+      <p><strong>Protobuf</strong> writes a tag (field number) with each value. Readers can skip unknown fields
+         without the writer's schema, and names can change freely because the number is the contract. Its risks are
+         reusing a field number and proto3's zero-value defaults, which hide whether a field was set. It is the
+         natural choice where services already use gRPC and Protobuf definitions are the organisation's shared
+         language.</p>
+      <p>I would choose Avro for data-platform-centred pipelines — CDC, Connect, analytics — and Protobuf where
+         the same messages flow through gRPC services. In either case the registry and compatibility discipline
+         matter more than the format.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> You own a topic read by twelve teams. How do you run schema evolution for it?</summary>
+      <p>With twelve consumer teams I cannot coordinate deployments, so the design has to make deployment order
+         irrelevant and make breaking changes rare and deliberate.</p>
+      <p><strong>Compatibility:</strong> <code>FULL_TRANSITIVE</code>. Every change must be readable by old and new
+         consumers and against every version still in the log, which restricts routine changes to adding and
+         removing fields with defaults. That is limiting, and that is the point: any team can deploy in any
+         order, and replays always work.</p>
+      <p><strong>Process:</strong> the schema lives in a repository with the producer, changes arrive as pull
+         requests, CI runs the registry's compatibility check and a set of consumer contract tests (sample records
+         for each version, decoded with each consumer team's current schema), and CI — not the producer at runtime
+         — registers the new version. Auto-registration is off. Field documentation is part of the schema, including
+         units and semantics.</p>
+      <p><strong>Breaking changes</strong> go through expand and contract, with announced timelines: add the new
+         field, produce both, give consumers a deadline to migrate, and only remove the old field after the
+         retention period has aged out records without the new one. For restructurings that cannot be expressed
+         that way, a new topic version with a dual-write period.</p>
+      <p><strong>Operations:</strong> a replicated registry, consumers that dead-letter undecodable records rather
+         than block, and ACLs so only the owning service can produce to the topic.</p>
+      <p><strong>Recommendation:</strong> FULL_TRANSITIVE, schema changes reviewed and registered by CI, contract
+         tests against consumers' schemas, and a written deprecation policy for breaking changes. The registry
+         enforces the syntax; the process has to protect the semantics.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Consumers of an Avro topic suddenly fail with "Unknown magic byte!". Diagnose and prevent it.</summary>
+      <p>The message means a record does not start with the registry wire format's magic byte (0), so the
+         deserializer cannot even find a schema id. The record was not written by the registry-aware serializer.</p>
+      <p><strong>Diagnose:</strong> find the failing partition and offset from the consumer error, and read the raw
+         bytes of that record with a plain consumer. Usually the first byte is <code>{</code> (0x7b): someone
+         produced JSON — a test script, a console producer used for a quick fix, a new service configured with a
+         string serializer, or a Connect connector with the wrong converter. Headers or the client id in broker
+         logs can identify the producer.</p>
+      <p><strong>Recover:</strong> the consumers are stuck on that record, because deserialization fails before
+         application code can decide anything. Skip it: move the group past it with
+         <code>kafka-consumer-groups.sh --reset-offsets --to-offset</code> for that partition (after checking there
+         are no other bad records), or deploy an error-handling deserializer that routes it to a dead-letter topic.
+         If the bad records carried real data, re-produce them correctly.</p>
+      <p><strong>Prevent:</strong> restrict who can write with ACLs — only the owning service's principal should have
+         write access to the topic. Configure every consumer to dead-letter undecodable records instead of blocking.
+         Some platforms offer broker-side schema validation, which rejects records whose schema id is missing or
+         unknown at produce time; where available, it moves the failure from the consumers to the offending
+         producer, which is where it belongs.</p>
+      <p><strong>Recommendation:</strong> ACLs so only the owner produces, error-handling deserializers with a
+         dead-letter topic on every consumer, and broker-side validation if your platform supports it. The incident
+         is small; the systemic weakness is that anyone could write anything to a topic that twelve teams
+         depend on.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Read the raw bytes of an Avro record and find its schema.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic orders \
+    --from-beginning --max-messages 1 \
+    --value-deserializer org.apache.kafka.common.serialization.ByteArrayDeserializer | xxd | head -2
+00000000: 0000 0000 2a0c 6f2d 3130 3432 9e1f 0645  ....*.o-1042...E
+00000010: 5552 0a                                  UR.
+</pre>
+      <table class="tbl">
+        <tr><th>Bytes</th><th>Meaning</th></tr>
+        <tr><td><code>00</code></td><td>Magic byte</td></tr>
+        <tr><td><code>00 00 00 2a</code></td><td>Schema id 42</td></tr>
+        <tr><td><code>0c 6f 2d 31 30 34 32</code></td><td>Avro string: length 6 (zig-zag <code>0c</code>), "o-1042"</td></tr>
+        <tr><td><code>9e 1f</code></td><td>Avro long 1999 (zig-zag: 3998, as a 2-byte varint)</td></tr>
+        <tr><td><code>06 45 55 52</code></td><td>Avro string: length 3, "EUR"</td></tr>
+      </table>
+<pre>
+$ curl -s http://registry:8081/schemas/ids/42 | jq -r .schema | jq .
+{ "type": "record", "name": "Order", "fields": [
+    {"name": "orderId", "type": "string"},
+    {"name": "amount",  "type": "long"},
+    {"name": "currency","type": "string"} ] }
+</pre>
+      <p>There are no field names in the payload at all — the values appear in the order the schema lists the
+         fields, and only schema 42 can decode them. (The trailing <code>0a</code> in the dump is the newline the
+         console tool prints.)</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Check two proposed changes against the registry before
+      registering them.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ curl -s http://registry:8081/config/orders-value
+{"compatibilityLevel":"BACKWARD"}
+
+# change A: add "region" WITH a default
+$ curl -s -X POST -H 'Content-Type: application/vnd.schemaregistry.v1+json' \
+    http://registry:8081/compatibility/subjects/orders-value/versions/latest \
+    -d '{"schema":"{\"type\":\"record\",\"name\":\"Order\",\"fields\":[{\"name\":\"orderId\",\"type\":\"string\"},{\"name\":\"amount\",\"type\":\"long\"},{\"name\":\"currency\",\"type\":\"string\"},{\"name\":\"region\",\"type\":\"string\",\"default\":\"eu\"}]}"}'
+{"is_compatible":true}
+
+# change B: add "region" WITHOUT a default
+...
+{"is_compatible":false}          (add ?verbose=true to see the reason: a reader field missing a default)
+</pre>
+      <table class="tbl">
+        <tr><th>Change</th><th>BACKWARD</th><th>Why</th></tr>
+        <tr><td>Add <code>region</code> with default</td><td>Compatible</td><td>New readers fill it with "eu" for old records</td></tr>
+        <tr><td>Add <code>region</code> without default</td><td>Incompatible</td><td>New readers have no value to use for old records</td></tr>
+      </table>
+      <p>Put exactly this call in CI for every schema change. It turns a production incident into a failed build
+         with a precise reason.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Under BACKWARD compatibility, deploy a field removal in the
+      wrong order and then the right order.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+v1 (current): { orderId, amount, coupon }          coupon has NO default
+v2 (proposed): { orderId, amount }                 coupon removed → BACKWARD-compatible ✔
+
+wrong order: producer on v2 first, consumers still on v1
+  consumer decodes a v2 record with its v1 reader schema:
+  org.apache.kafka.common.errors.SerializationException: Error deserializing Avro message for id 43
+  Caused by: org.apache.avro.AvroTypeException: Found Order, expecting Order, missing required field coupon
+</pre>
+      <p>The registry approved v2 because a v2 <em>reader</em> can read v1 data. It says nothing about a v1
+         reader reading v2 data — that would be forward compatibility.</p>
+<pre>
+right order: consumers on v2 first (they read v1 records, ignoring coupon), then the producer on v2
+  every consumer is already able to read what the producer starts writing ✔
+</pre>
+      <table class="tbl">
+        <tr><th>Mode</th><th>Safe deployment order</th></tr>
+        <tr><td><code>BACKWARD</code></td><td>Consumers, then producers</td></tr>
+        <tr><td><code>FORWARD</code></td><td>Producers, then consumers</td></tr>
+        <tr><td><code>FULL</code></td><td>Either</td></tr>
+      </table>
+      <p>If the consumer teams cannot be sequenced before the producer, this change needs a different form: give
+         <code>coupon</code> a default in a first release (now removing it later is FULL-compatible), then remove
+         it.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show that BACKWARD accepts a change that breaks replay,
+      and that BACKWARD_TRANSITIVE catches it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+subject orders-value, compatibility BACKWARD
+v1: { id }                                  registered
+v2: { id, region: string = "eu" }           compatible with v1 ✔  registered
+v3: { id, region: string }   (no default)   compatible with v2 ✔  registered    ◄── only v2 checked
+
+replay from the beginning with a v3 consumer:
+  v1 records (no region, and v3 has no default) → AvroTypeException: missing required field region
+</pre>
+<pre>
+$ curl -s -X PUT -H 'Content-Type: application/vnd.schemaregistry.v1+json' \
+    http://registry:8081/config/orders-value -d '{"compatibility":"BACKWARD_TRANSITIVE"}'
+
+# re-check v3 against ALL versions
+$ curl -s -X POST ... /compatibility/subjects/orders-value/versions?verbose=true -d '{"schema": "...v3..."}'
+{"is_compatible":false, "messages":["... READER_FIELD_MISSING_DEFAULT_VALUE, location:/fields/1 ... version 1"]}
+</pre>
+      <table class="tbl">
+        <tr><th>Mode</th><th>v3 accepted?</th><th>Replay from the beginning</th></tr>
+        <tr><td><code>BACKWARD</code></td><td>Yes</td><td>Fails on v1 records</td></tr>
+        <tr><td><code>BACKWARD_TRANSITIVE</code></td><td>No</td><td>Safe</td></tr>
+      </table>
+      <p>Records written with v1 remain in the log for as long as retention allows — indefinitely, on a compacted
+         topic. That is why transitive modes are the right default for Kafka topics.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Someone produced plain JSON into an Avro topic. Recover the
+      stuck consumers and stop it recurring.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+consumer log (repeating, lag growing on partition 4 only):
+  org.apache.kafka.common.errors.RecordDeserializationException: Error deserializing key/value for
+  partition orders-4 at offset 9120441. If needed, please seek past the record to continue consumption.
+  Caused by: org.apache.kafka.common.errors.SerializationException: Unknown magic byte!
+
+$ kafka-console-consumer.sh ... --topic orders --partition 4 --offset 9120441 --max-messages 3 \
+    --value-deserializer org.apache.kafka.common.serialization.ByteArrayDeserializer | head -c 60
+{"orderId":"o-77","amount":500,"currency":"EUR"}              ◄── JSON, not Avro
+</pre>
+      <p>Recover by moving past the bad records, after checking how many there are:</p>
+<pre>
+# confirm the next valid record's offset (raw read shows where Avro records resume), e.g. 9120444
+$ kafka-consumer-groups.sh ... --group billing --topic orders:4 --reset-offsets --to-offset 9120444 --execute
+</pre>
+      <table class="tbl">
+        <tr><th>Layer</th><th>Prevention</th></tr>
+        <tr><td>Who can write</td><td>ACLs: only the owning service's principal may produce to <code>orders</code></td></tr>
+        <tr><td>Consumers</td><td>An error-handling deserializer that dead-letters undecodable records and moves on</td></tr>
+        <tr><td>Broker (where supported)</td><td>Schema-id validation at produce time, rejecting records without a valid id</td></tr>
+        <tr><td>Data</td><td>Re-produce the three orders correctly through the owning service, if they were real</td></tr>
+      </table>
+      <p>Note the exception type: modern clients raise <code>RecordDeserializationException</code> with the
+         partition and offset, precisely so that code can decide to seek past the record. A consumer loop that
+         catches it, dead-letters the raw bytes and seeks to <code>offset + 1</code> keeps one bad record from
+         becoming an outage.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Plan the rename of <code>customerId</code> to
+      <code>accountId</code> on a <code>FULL_TRANSITIVE</code> topic with 30-day retention.
+      <details class="solution"><summary>Solution</summary>
+      <p>A rename is incompatible in both directions, so it becomes a sequence of compatible releases:</p>
+<pre>
+release 1 (schema v5): add accountId: ["null","string"] default null     FULL-compatible ✔
+          producer writes customerId AND accountId (same value)
+release 2: consumers read accountId, falling back to customerId when accountId is null
+           (null only for records written before release 1)
+wait:      30 days of retention, so no record without accountId remains in the log
+           (on a COMPACTED topic, "waiting" is not enough: every key must have been rewritten —
+            republish the latest value for each key, or keep the fallback forever)
+release 3 (schema v6): customerId given a default, if it lacked one      FULL-compatible ✔
+release 4 (schema v7): remove customerId                                  FULL-compatible ✔
+          consumers remove the fallback
+</pre>
+      <table class="tbl">
+        <tr><th>Release</th><th>Registry check</th><th>Who must have deployed first</th></tr>
+        <tr><td>1: add <code>accountId</code></td><td>Passes</td><td>No one (FULL)</td></tr>
+        <tr><td>2: consumers switch</td><td>No schema change</td><td>Release 1 producer</td></tr>
+        <tr><td>3–4: retire <code>customerId</code></td><td>Passes</td><td>All consumers off <code>customerId</code>; retention elapsed</td></tr>
+      </table>
+      <p>Two details make it work. The new field is nullable with a default, so every intermediate schema is
+         compatible with every older one. And the removal waits for the log, not just for the consumers: a
+         consumer replaying 30-day-old records still needs <code>customerId</code> until those records have expired.
+         Publish the timeline to consumer teams at release 1, because releases 3 and 4 depend on all of them.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Kafka stores bytes and never checks them;</strong> the schema is the real contract between producers and consumers.</li>
+        <li><strong>The log holds every version written during retention,</strong> so consumers must read the past as well as the present.</li>
+        <li><strong>An undecodable record fails inside <code>poll()</code> and blocks its partition</strong> unless you dead-letter it and seek past it.</li>
+        <li><strong>Avro binary carries no field names;</strong> a reader needs the writer's schema, which the record's schema id identifies.</li>
+        <li><strong>The registry wire format is a zero byte, a 4-byte schema id, then the payload.</strong></li>
+        <li><strong>Clients cache schemas by id,</strong> so a registry outage mainly affects new producers and unseen schema ids.</li>
+        <li><strong>Turn off <code>auto.register.schemas</code> in production</strong> and register reviewed schemas from CI.</li>
+        <li><strong>BACKWARD means new readers can read old data:</strong> deploy consumers first.</li>
+        <li><strong>FORWARD means old readers can read new data:</strong> deploy producers first.</li>
+        <li><strong>FULL allows only adding or removing fields with defaults,</strong> which makes deployment order irrelevant.</li>
+        <li><strong>Use transitive modes on replayable topics;</strong> pairwise compatibility can add up to an incompatible history.</li>
+        <li><strong>In Avro, every new field needs a default;</strong> renames need aliases or a migration.</li>
+        <li><strong>In Protobuf, the field number is the contract:</strong> never reuse one, reserve removed numbers.</li>
+        <li><strong>Proto3 zero values hide absence;</strong> use <code>optional</code> where "unset" means something.</li>
+        <li><strong>Ship breaking changes as expand-and-contract or a new topic version,</strong> never by lowering compatibility to NONE.</li>
+        <li><strong>Only the owning service should be able to produce to a shared topic;</strong> ACLs prevent the "Unknown magic byte!" incident.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="rebalancing.html">← Rebalancing &amp; Group Membership</a>
+      <a href="quiz.html">Kafka Quizzes →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

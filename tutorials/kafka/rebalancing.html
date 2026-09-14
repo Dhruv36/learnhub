@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rebalancing &amp; Group Membership — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Rebalancing &amp; Group Membership <span class="level-badge level-adv">Delivery &amp; Durability</span></h1>
+    <p><strong>What you'll master:</strong> every event that triggers a rebalance, including the ones nobody
+       expects; the classic protocol's JoinGroup/SyncGroup rounds and why an <strong>eager rebalance stops the whole
+       group</strong>; why <strong>one slow member can hold every other member idle for up to
+       <code>max.poll.interval.ms</code></strong>; cooperative incremental rebalancing and the single rolling bounce
+       that switches a default-configured group to it; static membership and its trade-off; the new broker-driven
+       protocol that became generally available in Kafka 4.0; the <strong>autoscaling feedback loop</strong> in
+       which scaling on lag creates more lag; and the metrics that tell you how much rebalancing actually costs
+       you. Prerequisites: <a href="exactly-once.html">Idempotence &amp; Transactions</a> and
+       <a href="consumers.html">Consumers &amp; Consumer Groups</a>.</p>
+
+    <h2>Part 1 — What Triggers a Rebalance</h2>
+
+    <p>A rebalance redistributes a group's partitions among its current members. It is necessary — a group
+       must adapt when members come and go — but each one interrupts consumption, so the first step in taming
+       rebalances is knowing what causes them.</p>
+
+    <table class="tbl">
+      <tr><th>Trigger</th><th>Typical cause</th><th>Avoidable?</th></tr>
+      <tr><td>A member joins</td><td>Scale-out, a deploy starting a new pod, a restart</td><td>Restarts: yes, with static membership</td></tr>
+      <tr><td>A member leaves cleanly</td><td>Scale-in, a deploy stopping a pod, <code>close()</code></td><td>Restarts: yes, with static membership</td></tr>
+      <tr><td>Session timeout</td><td>Crash, network partition, a GC pause longer than <code>session.timeout.ms</code> (45 s)</td><td>Partly: fix pauses; tune the timeout</td></tr>
+      <tr><td>Poll timeout</td><td>Processing a batch took longer than <code>max.poll.interval.ms</code> (5 min)</td><td>Yes: fit batches inside the budget</td></tr>
+      <tr><td>Subscription change</td><td>A regex subscription matches a newly created topic</td><td>Yes: explicit topic lists</td></tr>
+      <tr><td>Partition count change</td><td>Partitions added to a subscribed topic</td><td>Planned, so schedule it</td></tr>
+    </table>
+
+    <p><strong>A rolling deploy is a rebalance storm by default.</strong> Replacing ten consumers one at a time,
+       each stop and each start triggers a rebalance: twenty rebalances in a few minutes. With the eager protocol,
+       each one pauses the whole group. The rest of this lesson is largely about reducing that number or the cost of
+       each one.</p>
+
+    <p>Each completed rebalance starts a new <strong>generation</strong> of the group, numbered upwards. The
+       generation is part of every commit and every transactional offset commit, which is how the coordinator
+       rejects work from members of an older generation — the zombie protection seen in the offsets and
+       transactions lessons.</p>
+
+    <h2>Part 2 — The Classic Protocol, and the Stop-the-World Rebalance</h2>
+
+    <p>In the classic protocol (every Kafka version, and still the default client behaviour), the brokers do not
+       compute assignments. One consumer, the group <em>leader</em>, does it, in two rounds:</p>
+
+<pre>
+coordinator                  consumer A (leader)      consumer B            consumer C (new)
+    │  ◄──────────────── JoinGroup ───────────────── JoinGroup ─────────── JoinGroup
+    │    waits until every known member has rejoined, up to the REBALANCE TIMEOUT
+    │    (= each member's max.poll.interval.ms)
+    │  ───── JoinGroup response: member list + subscriptions (to the leader only) ─────►
+    │                         leader runs the ASSIGNOR, client-side
+    │  ◄──────── SyncGroup(assignment) ──── SyncGroup ─────────── SyncGroup
+    │  ───── each member receives its partitions ──────────────────────────────►
+    │                         generation N+1 begins
+</pre>
+
+    <p>With an <strong>eager</strong> assignor (range, round-robin, sticky), every member revokes
+       <em>all</em> of its partitions before rejoining, and nobody consumes anything until the new assignment is
+       delivered. The pause covers the whole group, not just the partitions that move.</p>
+
+<pre>
+eager rebalance when consumer C joins a group of A and B (6 partitions)
+
+before:   A: p0 p1 p2        B: p3 p4 p5
+revoke:   A: —               B: —              ◄── ALL consumption stops
+assign:   A: p0 p1           B: p2 p3          C: p4 p5
+          (4 of 6 partitions never needed to stop at all)
+</pre>
+
+    <div class="note">🔑 <strong>The slowest member sets the length of everyone's pause.</strong> The
+       coordinator waits for every known member to send JoinGroup, and a member only does so on its next
+       <code>poll()</code>. If one consumer is 90 seconds into processing a large batch, every other member —
+       which has already revoked its partitions and rejoined — sits idle for those 90 seconds. The wait can last
+       up to <code>max.poll.interval.ms</code>, 5 minutes by default. Raising <code>max.poll.interval.ms</code> to
+       "fix" slow batches therefore also lengthens the worst-case stall of every rebalance. Exercise 3 measures
+       it.</div>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>Effect on rebalances</th></tr>
+      <tr><td><code>session.timeout.ms</code></td><td>45 s (since 3.0)</td><td>How long before a silent member is removed</td></tr>
+      <tr><td><code>heartbeat.interval.ms</code></td><td>3 s</td><td>How quickly members learn a rebalance has started</td></tr>
+      <tr><td><code>max.poll.interval.ms</code></td><td>5 min</td><td>Also the rebalance timeout: how long the group may wait for a member to rejoin</td></tr>
+      <tr><td><code>group.initial.rebalance.delay.ms</code> (broker)</td><td>3 s</td><td>Delays the first rebalance of an empty group, so members starting together join one rebalance</td></tr>
+    </table>
+
+    <h2>Part 3 — Cooperative Incremental Rebalancing</h2>
+
+    <p>The cooperative protocol (KIP-429, Kafka 2.4) keeps the classic JoinGroup/SyncGroup rounds but changes
+       what members give up. Members keep their partitions while rejoining, and only partitions that must move are
+       revoked — in a second, follow-up rebalance.</p>
+
+<pre>
+cooperative rebalance when consumer C joins (6 partitions)
+
+round 1:  A keeps p0 p1 p2, B keeps p3 p4 p5 while rejoining (still consuming)
+          assignor decides: move p2 → C and p5 → C
+          A revokes ONLY p2, B revokes ONLY p5
+round 2:  C receives p2 p5
+          p0 p1 p3 p4 were consumed throughout
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>Eager (range, round-robin, sticky)</th><th>Cooperative sticky</th></tr>
+      <tr><td>Partitions paused</td><td>All, for the whole rebalance</td><td>Only those moving</td></tr>
+      <tr><td>Rounds</td><td>One</td><td>Two when anything moves</td></tr>
+      <tr><td><code>onPartitionsRevoked</code> receives</td><td>Everything the member owned</td><td>Only the partitions leaving it</td></tr>
+      <tr><td>Balance</td><td>Depends on the assignor</td><td>Balanced, moving as little as possible</td></tr>
+    </table>
+
+    <p><strong>Switching is a one-bounce change for default configurations.</strong> Since Kafka 3.0 the Java
+       consumer's default <code>partition.assignment.strategy</code> is <code>[RangeAssignor,
+       CooperativeStickyAssignor]</code>: the group uses range (the first strategy every member supports) while
+       advertising cooperative support. A single rolling bounce that removes <code>RangeAssignor</code> from the
+       list moves the group to cooperative sticky.</p>
+
+<pre>
+today (default):   partition.assignment.strategy = [RangeAssignor, CooperativeStickyAssignor]  → range is used
+rolling bounce:    partition.assignment.strategy = [CooperativeStickyAssignor]
+                   from the FIRST restart the group selects cooperative-sticky — the only strategy every
+                   member now shares. Members still listing range keep EAGER revocation (a consumer uses the
+                   rebalance protocol all of its own assignors support) until they restart too.
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Switching an explicitly configured eager group straight to cooperative in one bounce.</strong>
+         If members currently list only <code>RangeAssignor</code>, a restarted member listing only
+         <code>CooperativeStickyAssignor</code> shares no strategy with the rest, and it fails to join with
+         <code>InconsistentGroupProtocolException</code> — or, depending on timing, the group runs with members that
+         disagree about revocation semantics.</p>
+      <p>✅ <strong>Two bounces when starting from an explicit eager list:</strong> first add the cooperative
+         assignor <em>after</em> the eager one (<code>[range, cooperative-sticky]</code>) on every member, then do a
+         second bounce removing the eager one. Groups on the 3.0+ default list already completed the first step.
+         Also review rebalance listeners: code that flushed everything in <code>onPartitionsRevoked</code> now only
+         needs to handle the partitions passed to it.</p>
+    </div>
+
+    <h2>Part 4 — Static Membership</h2>
+
+    <p>With dynamic membership, a consumer that restarts is a new member: its departure triggers one rebalance
+       and its return another. <strong>Static membership</strong> (KIP-345, Kafka 2.3) gives each consumer a
+       persistent identity, <code>group.instance.id</code>, and the coordinator keeps that member's partitions
+       reserved while it is briefly away.</p>
+
+<pre>
+group.instance.id = orders-consumer-3        (stable per instance: e.g. the StatefulSet pod name)
+
+dynamic member restarts:   leave → REBALANCE → (restart) → join → REBALANCE
+static member restarts:    (goes silent) → restart within session.timeout.ms → rejoins with the same id
+                           → gets its old partitions back → NO rebalance
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>Dynamic</th><th>Static</th></tr>
+      <tr><td>Restart within the session timeout</td><td>Two rebalances</td><td>None</td></tr>
+      <tr><td>Clean shutdown (<code>close()</code>)</td><td>Leaves at once; partitions move immediately</td><td>Does not leave; partitions wait for the session timeout</td></tr>
+      <tr><td>Instance truly gone</td><td>Detected after the session timeout</td><td>Detected after the session timeout</td></tr>
+      <tr><td>Typical <code>session.timeout.ms</code></td><td>45 s</td><td>Raised to cover a restart, e.g. 2–5 minutes</td></tr>
+    </table>
+
+    <p><strong>The trade-off is detection time.</strong> To survive a restart without rebalancing, the session
+       timeout must be longer than the restart takes. But the same timeout decides how long a genuinely dead
+       instance's partitions go unread. A static group with a 5-minute session timeout that loses a node for good
+       stops reading that node's partitions for 5 minutes. Choose the timeout from how long restarts actually
+       take, and alert on lag so a dead static member is noticed.</p>
+
+    <p><strong>Ids must be unique among running instances.</strong> If two consumers start with the same
+       <code>group.instance.id</code>, the coordinator fences the older one with
+       <code>FencedInstanceIdException</code>. That is correct behaviour for a replaced pod, but it also means that
+       a deployment which briefly runs old and new pods side by side with the same ids (a surge) will fence one of
+       them. StatefulSets, which replace a pod only after the old one is gone, fit static membership naturally.</p>
+
+    <h2>Part 5 — The New Consumer Group Protocol (KIP-848)</h2>
+
+    <p>Kafka 4.0 made a redesigned protocol generally available. It removes the group-wide synchronisation
+       barrier altogether: the <strong>broker</strong> computes assignments, and each member converges on its
+       target assignment independently through its regular heartbeats.</p>
+
+<pre>
+classic:   every member stops at a barrier (JoinGroup), the leader assigns, everyone resumes (SyncGroup)
+KIP-848:   the group coordinator holds a TARGET assignment and updates it when membership changes
+           each member's heartbeat response says "release p2" or "you now own p5"
+           members reconcile one at a time; there is no point at which the whole group waits
+</pre>
+
+    <table class="tbl">
+      <tr><th>Aspect</th><th>Classic protocol</th><th>KIP-848 (<code>group.protocol=consumer</code>)</th></tr>
+      <tr><td>Who assigns</td><td>The leader consumer, client-side</td><td>The group coordinator, broker-side</td></tr>
+      <tr><td>Synchronisation</td><td>Group-wide barrier</td><td>None; incremental per member</td></tr>
+      <tr><td>Slow member effect</td><td>Delays everyone's rebalance</td><td>Delays only the partitions it must release</td></tr>
+      <tr><td>Session and heartbeat settings</td><td>Client (<code>session.timeout.ms</code>, <code>heartbeat.interval.ms</code>)</td><td>Broker (<code>group.consumer.session.timeout.ms</code>, <code>group.consumer.heartbeat.interval.ms</code>)</td></tr>
+      <tr><td>Choosing an assignor</td><td><code>partition.assignment.strategy</code></td><td>Broker default, or <code>group.remote.assignor</code> (e.g. <code>uniform</code>, <code>range</code>)</td></tr>
+    </table>
+
+    <p><strong>Adopting it:</strong> brokers must run a version with the protocol enabled (it is on by default in
+       4.0), and consumers opt in with <code>group.protocol=consumer</code>. Client settings that the broker now
+       owns — the session timeout, heartbeat interval and client-side assignor — no longer apply and should be
+       removed from the consumer configuration. Brokers can convert an existing classic group as its members roll
+       over to the new protocol, governed by the broker's migration policy setting, so a group can move without
+       being stopped. Test the upgrade path on a staging group first: custom client-side assignors and some older
+       frameworks do not carry over.</p>
+
+    <p>The new protocol addresses the biggest structural cost of classic rebalances. It does not remove the
+       need for the rest of this lesson: a consumer that exceeds its poll interval still loses its partitions, and
+       moving a partition still means its new owner starts from the last commit.</p>
+
+    <h2>Part 6 — Rebalances in Production: Measuring and Avoiding Storms</h2>
+
+    <p>Rebalances are cheap when rare and expensive when constant. The consumer reports what they cost, in the
+       <code>consumer-coordinator-metrics</code> group:</p>
+
+<pre>
+rebalance-rate-per-hour        how often — should be near zero outside deploys
+rebalance-latency-avg / max    how long each takes, from start to new assignment
+failed-rebalance-total         rebalances that failed and had to restart
+last-rebalance-seconds-ago     has the group been stable lately?
+partition-revoked-latency-avg  time spent in onPartitionsRevoked (your listener's cost)
+</pre>
+
+    <p><strong>The autoscaling feedback loop.</strong> Scaling consumers on lag seems natural, but each scaling
+       action is a membership change, and each membership change is a rebalance that pauses consumption and
+       <em>increases</em> lag:</p>
+
+<pre>
+lag rises → autoscaler adds 2 pods → 2 rebalances (eager: whole group paused ~20 s each)
+          → lag rises further during the pauses → autoscaler adds 2 more pods → 2 more rebalances
+          → pods beyond the partition count are idle, but still trigger rebalances when they come and go
+          → when lag finally falls, scale-in causes another round of rebalances
+</pre>
+
+    <table class="tbl">
+      <tr><th>Measure</th><th>Why it breaks the loop</th></tr>
+      <tr><td>Cap replicas at the partition count</td><td>Extra members add rebalances and no capacity</td></tr>
+      <tr><td>Scale on lag in time, with long stabilisation windows</td><td>A brief spike during a rebalance does not trigger another scale event</td></tr>
+      <tr><td>Scale in slowly and in steps</td><td>Scale-in is not urgent; each step is a rebalance</td></tr>
+      <tr><td>Cooperative sticky or KIP-848</td><td>Each rebalance pauses only the moving partitions</td></tr>
+      <tr><td>Static membership for restarts</td><td>Deploys and pod restarts stop causing rebalances</td></tr>
+    </table>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Treating frequent rebalances as normal background noise.</strong> A group showing forty
+         rebalances an hour looks like it "recovers each time", so nobody investigates. In fact it spends a large
+         share of every hour paused, reprocesses records after each move, and rebuilds any local caches it keeps
+         per partition. The lag graph shows a sawtooth that everyone has learned to ignore.</p>
+      <p>✅ <strong>Alert on <code>rebalance-rate-per-hour</code> outside deploy windows,</strong> and find the
+         trigger in the consumer logs: members leaving for poll timeouts point to slow batches; session timeouts
+         point to GC pauses or network trouble; joins and leaves point to autoscaling or crash loops. Each has a
+         specific fix, and none is "rebalances are just how Kafka works".</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Staying on eager assignment</td><td>Every rebalance pauses the whole group</td><td>Cooperative sticky, or the KIP-848 protocol</td></tr>
+      <tr><td>Raising <code>max.poll.interval.ms</code> to hide slow batches</td><td>Also lengthens every rebalance a slow member is part of</td><td>Smaller batches; faster processing</td></tr>
+      <tr><td>Switching an explicit eager list straight to cooperative</td><td>Members fail to join or disagree on revocation</td><td>Two bounces: add cooperative after eager, then remove eager</td></tr>
+      <tr><td>Listener code assuming revocation means "everything"</td><td>Under cooperative it flushes or drops state for partitions it keeps</td><td>Handle only the partitions passed in</td></tr>
+      <tr><td>Regex subscriptions matching new topics</td><td>A new topic triggers an unexpected rebalance and consumption</td><td>Explicit topic lists</td></tr>
+      <tr><td>Random <code>group.instance.id</code> values</td><td>Static membership does nothing; every restart rebalances</td><td>Stable ids per instance slot</td></tr>
+      <tr><td>Static ids with surge deployments</td><td>Old and new pods fence each other</td><td>StatefulSets, or no surge for static groups</td></tr>
+      <tr><td>A long static session timeout without lag alerts</td><td>A dead member's partitions sit unread for minutes</td><td>Timeout sized to restart time; alert on lag</td></tr>
+      <tr><td>Autoscaling beyond the partition count</td><td>Idle members that still cause rebalances</td><td>Cap replicas at partitions</td></tr>
+      <tr><td>Scaling on instantaneous record lag</td><td>Rebalance-induced spikes trigger more scaling</td><td>Time lag with stabilisation windows</td></tr>
+      <tr><td>GC pauses near <code>session.timeout.ms</code></td><td>Members expire and rejoin repeatedly</td><td>Fix the pauses before tuning the timeout</td></tr>
+      <tr><td>Keeping KIP-848 client-side settings after switching</td><td>Settings are ignored or rejected; the broker's values apply</td><td>Set timeouts and assignor on the broker</td></tr>
+      <tr><td>Ignoring rebalance metrics</td><td>Constant pauses hidden in a "normal" lag sawtooth</td><td>Alert on <code>rebalance-rate-per-hour</code></td></tr>
+      <tr><td>Slow work in <code>onPartitionsRevoked</code></td><td>Extends every rebalance by that much</td><td>Commit and release quickly; defer heavy cleanup</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is a consumer group rebalance, and what triggers one?</summary>
+      <p>A rebalance is how a consumer group redistributes partitions among its members. The group's
+         coordinator starts one whenever the membership or the subscription changes, and at the end each member
+         has a new set of partitions and the group has a new generation number.</p>
+      <p>Triggers include a member joining (a new instance, a restart), a member leaving cleanly, a member being
+         removed because it stopped heartbeating for <code>session.timeout.ms</code> or did not call
+         <code>poll()</code> within <code>max.poll.interval.ms</code>, a change in the subscribed topics (for
+         example, a regex subscription matching a new topic), and partitions being added to a subscribed topic.</p>
+      <p>Rebalances matter because they interrupt consumption. With the classic eager protocol, every member stops
+         consuming every partition until the rebalance completes. Partitions that move also restart from the last
+         committed offset, so some records are processed again.</p>
+      <p>So the goals are to have fewer of them — avoiding poll timeouts, using static membership for restarts —
+         and to make each cheaper, with cooperative rebalancing or Kafka 4.0's new group protocol.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How does cooperative rebalancing differ from eager rebalancing?</summary>
+      <p>In an <strong>eager</strong> rebalance, every member revokes all its partitions at the start, the group
+         computes a new assignment, and then members start consuming their new partitions. All consumption stops
+         for the duration, even for partitions that end up with the same owner.</p>
+      <p>In a <strong>cooperative</strong> rebalance, members keep their partitions while the group computes the
+         new assignment. Only partitions that need to move are revoked from their current owners, and a follow-up
+         rebalance gives them to their new owners. Everything else is consumed throughout.</p>
+      <p>The cost is an extra round when partitions move, and listener code must cope with receiving only the
+         partitions that are leaving rather than all of them. The benefit is large for big groups and frequent
+         membership changes, such as rolling deploys.</p>
+      <p>In the Java client it is the <code>CooperativeStickyAssignor</code>. Since Kafka 3.0 the default
+         assignor list includes it after the range assignor, so a group on defaults can switch with one rolling
+         bounce that removes range from the list.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A group of 30 consumers pauses for several minutes whenever one pod is replaced. Why, and how do you fix it?</summary>
+      <p>Several minutes is far longer than a rebalance normally takes, which suggests the classic protocol's
+         barrier: the coordinator waits for every member to rejoin, and a member only rejoins on its next
+         <code>poll()</code>. If some members are in the middle of long batches, everyone else waits for them —
+         up to <code>max.poll.interval.ms</code>. If that setting has been raised to accommodate slow processing,
+         the wait can be many minutes. With eager assignment, the whole group consumes nothing during it.</p>
+      <p>And a pod replacement causes two rebalances: one when the old pod leaves, one when the new pod joins.</p>
+      <p>The fixes, in order of impact: <strong>shorten the poll loop</strong> — reduce
+         <code>max.poll.records</code> so each batch finishes in seconds, then lower
+         <code>max.poll.interval.ms</code> back towards its default, which bounds the wait. <strong>Switch to
+         cooperative sticky</strong>, so members keep consuming their unaffected partitions during the rebalance.
+         <strong>Use static membership</strong> with a session timeout longer than a pod restart, so replacing a pod
+         causes no rebalance at all. And evaluate <strong>the KIP-848 protocol</strong> on Kafka 4.0, which has no
+         group-wide barrier.</p>
+      <p>I would confirm the diagnosis first from <code>rebalance-latency-max</code> and the consumer logs, which
+         show how long each member took to rejoin.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is static membership, and what does it cost?</summary>
+      <p>Static membership gives each consumer a persistent identity with <code>group.instance.id</code>. The
+         coordinator remembers which partitions belong to that id, and if the consumer disconnects and comes back
+         with the same id within <code>session.timeout.ms</code>, it gets the same partitions back without a
+         rebalance. Rolling restarts and brief network interruptions stop disturbing the rest of the group.</p>
+      <p>The cost is detection time. The session timeout has to be longer than a restart takes, often a few
+         minutes, and during that time a consumer that has genuinely died still holds its partitions and nobody
+         reads them. Even a clean <code>close()</code> does not hand partitions over immediately, because a static
+         member does not send a leave request.</p>
+      <p>There are also identity rules. Ids must be stable across restarts of an instance and unique between
+         running instances; a second consumer starting with the same id fences the first. That fits StatefulSets
+         well, but not deployments that run old and new pods side by side.</p>
+      <p>I would use it for groups where restarts are frequent and partitions carry expensive local state — a
+         cache or a Kafka Streams state store — where avoiding a move is worth more than faster failure detection,
+         and pair it with a lag alert tuned to the session timeout.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Consumers autoscale on lag, and during traffic peaks the group rebalances constantly and lag gets worse. Explain and redesign.</summary>
+      <p>The autoscaler and the rebalance protocol are fighting each other. Every scale-out adds members, and every
+         member added triggers a rebalance. With eager assignment each rebalance pauses the whole group, so lag
+         rises during it; the autoscaler sees higher lag and adds more pods, which triggers more rebalances. Pods
+         beyond the partition count add no capacity but still cause rebalances when they start and stop. When the
+         peak passes, scale-in triggers another series.</p>
+      <p><strong>Redesign, in layers.</strong> First, make the scaling signal robust: scale on lag measured in
+         time, over a window long enough to ignore the spike a single rebalance causes, with a stabilisation period
+         after each action, and scale in slowly. Second, bound it: maximum replicas equal to the partition count.
+         Third, make each rebalance cheap: cooperative sticky assignment or the KIP-848 protocol, so adding a
+         member moves a few partitions while everything else keeps flowing.</p>
+      <p>Fourth, question autoscaling itself. Consumer capacity is bounded by partitions, and a group sized for
+         the peak — with each instance processing efficiently — often costs little more than one that scales,
+         without the operational instability. For predictable daily peaks, scheduled scaling ahead of the peak
+         avoids scaling in the middle of it.</p>
+      <p><strong>Recommendation:</strong> move the group to cooperative rebalancing (or KIP-848 on 4.0), cap
+         replicas at the partition count, scale on time lag with long windows and slow scale-in, and measure
+         <code>rebalance-rate-per-hour</code> before and after. If peaks are predictable, replace reactive scaling
+         with a schedule.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Should a team move its consumer groups to the KIP-848 protocol now? How would you plan it?</summary>
+      <p>The protocol removes the classic design's main weakness — the group-wide barrier where the slowest member
+         holds everyone up — and moves assignment to the broker, which also makes rebalances easier to observe and
+         reason about centrally. For large groups with frequent membership changes, the benefit is real.</p>
+      <p><strong>Preconditions:</strong> brokers on Kafka 4.0 or later with the protocol enabled, and consumers on
+         a client version that supports <code>group.protocol=consumer</code>. Anything that relies on the classic
+         protocol's specifics needs checking: custom client-side assignors, frameworks that manage rebalances
+         themselves, and tools that read group state. Kafka Streams applications have their own rebalance protocol
+         work, separate from this one, and should be treated separately.</p>
+      <p><strong>Plan:</strong> start with a low-risk group in staging; remove client settings that the broker now
+         owns (session timeout, heartbeat interval, assignment strategy) and set the broker-side equivalents
+         deliberately; roll the members over and confirm the group converts without stopping; compare
+         rebalance latency, lag during a rolling deploy, and error rates against the classic baseline. Then move
+         production groups one at a time, starting with those that suffer most from rebalances.</p>
+      <p><strong>Recommendation:</strong> yes for groups where rebalances are a measured problem, after a staging
+         trial; no hurry for small, stable groups that rarely rebalance, where cooperative sticky assignment already
+         captures most of the benefit. Keep the rollback — switching members back to the classic protocol — tested
+         until the new protocol has run through a few production deploys.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure how long each partition stops during a rebalance,
+      with eager and with cooperative assignment.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+// in each consumer, log a line per partition whenever consumption resumes after a gap
+for (var r : consumer.poll(Duration.ofMillis(100))) {
+    long gap = System.currentTimeMillis() - lastSeen.getOrDefault(r.partition(), System.currentTimeMillis());
+    if (gap &gt; 1000) System.out.printf("p%d resumed after %d ms%n", r.partition(), gap);
+    lastSeen.put(r.partition(), System.currentTimeMillis());
+}
+// produce ~100 records/s to a 6-partition topic; run 2 consumers; then start a third
+</pre>
+<pre>
+partition.assignment.strategy = RangeAssignor (eager)
+p0 resumed after 3620 ms   p1 resumed after 3598 ms   p2 resumed after 3701 ms
+p3 resumed after 3644 ms   p4 resumed after 3710 ms   p5 resumed after 3688 ms   ◄── all six stopped
+
+partition.assignment.strategy = CooperativeStickyAssignor
+p2 resumed after 3310 ms   p5 resumed after 3290 ms                             ◄── only the two that moved
+</pre>
+      <table class="tbl">
+        <tr><th>Assignor</th><th>Partitions paused</th><th>Total paused partition-seconds</th></tr>
+        <tr><td>Eager</td><td>6 of 6</td><td>About 22</td></tr>
+        <tr><td>Cooperative sticky</td><td>2 of 6</td><td>About 7</td></tr>
+      </table>
+      <p>The moving partitions pause for a similar time in both cases; the difference is that eager stops the
+         four partitions that did not need to move. In a group of hundreds of partitions and a rolling deploy
+         of many instances, that difference is most of the cost.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Restart a consumer with and without static membership and
+      count the rebalances.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# dynamic: restart one of three consumers
+[Consumer ... groupId=g] Successfully joined group with generation Generation{generationId=7, ...}
+[Consumer ... groupId=g] Successfully joined group with generation Generation{generationId=8, ...}
+                                                               ◄── two new generations: leave + join
+
+# static: group.instance.id=g-consumer-2, session.timeout.ms=120000
+# stop the process, start it again within 2 minutes
+[Consumer ... groupId=g] Successfully joined group with generation Generation{generationId=8, ...}
+                                                               ◄── same generation: no rebalance
+$ kafka-consumer-groups.sh ... --describe --group g --members --verbose
+GROUP  CONSUMER-ID     GROUP-INSTANCE-ID  ...  ASSIGNMENT
+g      g-consumer-2-…  g-consumer-2       ...  t(2,3)          ◄── same partitions as before
+</pre>
+      <p>Now stop the static consumer and do not restart it. Its partitions stay assigned to it — unread, their
+         lag climbing — until the 2-minute session timeout expires, and only then are they reassigned. That is the
+         trade-off in one observation.</p>
+      <table class="tbl">
+        <tr><th>Membership</th><th>Restart</th><th>Permanent loss</th></tr>
+        <tr><td>Dynamic</td><td>Two rebalances</td><td>Reassigned after 45 s</td></tr>
+        <tr><td>Static, 2 min timeout</td><td>No rebalance</td><td>Reassigned after 2 min</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Show one slow member holding a whole eager group idle during
+      a rebalance.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+setup: 3 consumers, eager (RangeAssignor), max.poll.interval.ms = 120000
+consumer C processes each batch with a 60-second sleep (a "heavy" batch)
+
+t=0     C calls poll(), gets a batch, starts its 60 s of work
+t=5     consumer D starts and joins → rebalance begins
+        A and B revoke everything and send JoinGroup at their next poll (within ms)
+        C is inside its batch: it will not poll again until t=60
+t=60    C finishes, polls, sends JoinGroup → the rebalance can complete
+t=61    everyone resumes
+
+A's log: "Revoke previously assigned partitions ..." at t=5, next records at t=61
+</pre>
+      <p>A and B consumed nothing for 56 seconds because of C's batch, despite being completely healthy. With
+         <code>max.poll.interval.ms</code> at 5 minutes and a batch that takes 4, the stall would be 4 minutes.</p>
+      <table class="tbl">
+        <tr><th>Change</th><th>Worst-case wait for a slow member</th></tr>
+        <tr><td>None (batch 60 s)</td><td>About 60 s for the whole group</td></tr>
+        <tr><td><code>max.poll.records</code> reduced so batches take 5 s</td><td>About 5 s</td></tr>
+        <tr><td>Cooperative sticky</td><td>A and B keep their partitions and continue; only moving partitions wait</td></tr>
+        <tr><td>KIP-848 protocol</td><td>No group-wide barrier; only partitions C must release wait for C</td></tr>
+      </table>
+      <p>The lesson generalises: in the classic protocol, batch duration is not a per-consumer concern. It sets
+         the rebalance latency for the whole group.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Move a group from range to cooperative sticky assignment
+      during a rolling deploy, and verify each step.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# step 0: check what members currently configure — the log prints effective values at startup
+partition.assignment.strategy = [class org.apache.kafka.clients.consumer.RangeAssignor,
+                                 class org.apache.kafka.clients.consumer.CooperativeStickyAssignor]
+... Successfully joined group with generation Generation{generationId=12, ..., protocol='range'}
+</pre>
+      <p>This group is on the 3.0+ default list, so one bounce is enough:</p>
+<pre>
+# rolling bounce: each member restarted with
+partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+
+# after the FIRST member restarts, cooperative-sticky is the only strategy all members share:
+... Successfully joined group with generation Generation{generationId=13, ..., protocol='cooperative-sticky'}
+# members not yet restarted still list range as well, so they keep revoking ALL their partitions
+# on each rebalance (eager behaviour) — safe, just not incremental yet
+</pre>
+      <p>The assignor switches on the first restart; the revocation behaviour switches member by member, because
+         each consumer uses the rebalance protocol that every assignor in its own list supports. Once the last
+         member runs the cooperative-only list, the group rebalances incrementally. Confirm it with the
+         <code>protocol=</code> field and with a rebalance log showing only moved partitions being revoked.</p>
+      <table class="tbl">
+        <tr><th>Starting configuration</th><th>Bounces needed</th></tr>
+        <tr><td>Default list <code>[range, cooperative-sticky]</code></td><td>One: remove range</td></tr>
+        <tr><td>Explicit <code>[range]</code> only</td><td>Two: add cooperative after range; then remove range</td></tr>
+        <tr><td>Explicit <code>[range]</code> → <code>[cooperative-sticky]</code> in one bounce</td><td>Broken: restarted members share no strategy with the rest</td></tr>
+      </table>
+      <p>After switching, re-read the rebalance listener: <code>onPartitionsRevoked</code> now receives only
+         partitions that are leaving, and code that cleared all state there must clear only those partitions'
+         state.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A lag-based autoscaler makes rebalances worse during peaks.
+      Reproduce the loop and redesign the scaling policy.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+topic: 24 partitions        consumer processes 500 rec/s per instance
+autoscaler: scale out by 2 when record lag &gt; 100,000, check every 30 s, max 40 replicas
+
+peak arrives: 9,000 rec/s → 18 instances needed
+t=0    8 instances, lag rising → +2 → 2 rebalances (eager, ~25 s each, whole group paused)
+t=30   lag higher because of the pauses → +2 → 2 more rebalances
+...
+t=240  30 instances: 6 of them IDLE (only 24 partitions) — still rebalancing on every change
+       rebalance-rate-per-hour: 96
+</pre>
+      <p>The redesigned policy:</p>
+      <table class="tbl">
+        <tr><th>Change</th><th>Value</th><th>Effect</th></tr>
+        <tr><td>Maximum replicas</td><td>24 (the partition count)</td><td>No idle members</td></tr>
+        <tr><td>Scaling signal</td><td>Time lag &gt; 60 s, averaged over 3 minutes</td><td>A single rebalance's spike no longer triggers a scale event</td></tr>
+        <tr><td>Scale-out step</td><td>To the computed need: ceil(rate / 500), in one action</td><td>One membership change instead of many</td></tr>
+        <tr><td>Stabilisation after scaling</td><td>5 minutes</td><td>Lets lag drain before judging again</td></tr>
+        <tr><td>Scale-in</td><td>One instance per 10 minutes</td><td>Few rebalances when traffic falls</td></tr>
+        <tr><td>Assignment</td><td>Cooperative sticky (or KIP-848)</td><td>Each change moves only a few partitions</td></tr>
+      </table>
+<pre>
+after: peak handled with 2 scale events, rebalance-rate-per-hour ≈ 6, max time lag 48 s
+</pre>
+      <p>Computing the needed instance count directly from the input rate — rather than stepping up by a fixed
+         amount — is what cuts the number of membership changes. And if the peak is predictable, scaling on a
+         schedule shortly before it avoids scaling during it at all.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Move a consumer group to the KIP-848 protocol on a Kafka 4.0
+      cluster and compare a rolling deploy before and after.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# consumer configuration: before
+group.id=orders-enricher
+partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+session.timeout.ms=45000
+heartbeat.interval.ms=3000
+
+# consumer configuration: after
+group.id=orders-enricher
+group.protocol=consumer
+# group.remote.assignor=uniform      (optional; otherwise the broker's default assignor)
+# session.timeout.ms / heartbeat.interval.ms / partition.assignment.strategy REMOVED:
+#   the broker's group.consumer.* settings apply now
+</pre>
+<pre>
+$ kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group orders-enricher --state
+GROUP            COORDINATOR (ID)  ASSIGNMENT-STRATEGY  STATE   #MEMBERS
+orders-enricher  kafka-3:9092 (3)  uniform              Stable  12
+</pre>
+      <p>Roll the members over one at a time; the broker converts the classic group as members arrive with the
+         new protocol (subject to its migration policy). Then run the same rolling deploy of all 12 instances as
+         before and compare:</p>
+      <table class="tbl">
+        <tr><th>Rolling deploy of 12 instances</th><th>Classic, cooperative sticky</th><th>KIP-848</th></tr>
+        <tr><td>Group-wide barriers</td><td>24 (one per leave and join)</td><td>None</td></tr>
+        <tr><td>Partitions paused at any moment</td><td>Those moving, plus waits on the slowest member per rebalance</td><td>Only those moving</td></tr>
+        <tr><td>Peak time lag during the deploy</td><td>Measure it: this is the number to compare</td><td>Measure it</td></tr>
+      </table>
+      <p>Record your own numbers rather than trusting a table — the gain depends on group size, batch duration
+         and how long instances take to start. Keep the rollback (restoring the old configuration) ready until the
+         new protocol has been through several production deploys, and check any tooling or framework that reads
+         group state.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Rebalances follow membership and subscription changes:</strong> joins, leaves, session and poll timeouts, regex matches, partition additions.</li>
+        <li><strong>A rolling deploy causes two rebalances per instance</strong> unless membership is static.</li>
+        <li><strong>Each rebalance starts a new generation,</strong> which is how commits from zombies are rejected.</li>
+        <li><strong>The classic protocol has a group-wide barrier:</strong> the leader consumer assigns partitions after every member rejoins.</li>
+        <li><strong>Eager assignors revoke every partition,</strong> stopping the whole group even for partitions that do not move.</li>
+        <li><strong>The slowest member sets everyone's pause,</strong> up to <code>max.poll.interval.ms</code>; raising it lengthens rebalances.</li>
+        <li><strong>Cooperative sticky revokes only moving partitions</strong> and keeps the rest flowing, at the cost of a second round.</li>
+        <li><strong>The 3.0+ default assignor list allows a one-bounce switch to cooperative;</strong> explicit eager lists need two bounces.</li>
+        <li><strong>Under cooperative assignment, <code>onPartitionsRevoked</code> receives only leaving partitions.</strong></li>
+        <li><strong>Static membership avoids rebalances on restarts</strong> within <code>session.timeout.ms</code>, but delays detection of dead members by the same amount.</li>
+        <li><strong>Static ids must be stable per instance and unique among running instances;</strong> duplicates are fenced.</li>
+        <li><strong>Kafka 4.0's KIP-848 protocol moves assignment to the broker</strong> and removes the group-wide barrier; opt in with <code>group.protocol=consumer</code>.</li>
+        <li><strong>Under KIP-848, session, heartbeat and assignor settings move to the broker.</strong></li>
+        <li><strong>Autoscaling on lag can feed itself;</strong> cap replicas at partitions and scale on time lag with long windows.</li>
+        <li><strong>Alert on <code>rebalance-rate-per-hour</code>;</strong> frequent rebalances are a defect with a findable cause.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="exactly-once.html">← Idempotence &amp; Transactions</a>
+      <a href="schemas.html">Serialization &amp; Schema Evolution →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
