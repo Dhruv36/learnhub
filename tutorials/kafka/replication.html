@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Replication, ISR &amp; acks — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Replication, ISR &amp; acks <span class="level-badge level-adv">Delivery &amp; Durability</span></h1>
+    <p><strong>What you'll master:</strong> how followers copy a leader — they are, in effect, consumers of it —
+       and how the high watermark moves; the <strong>in-sync replica set</strong>, what gets a replica removed
+       from it, and why one paused broker can stall every <code>acks=all</code> write to its partitions for 30
+       seconds; the <strong><code>acks</code> × <code>min.insync.replicas</code> matrix</strong> that decides
+       exactly how many failures you survive for reads, writes and durability; clean, preferred and unclean leader
+       election, and why <strong>an "acknowledged" record is in memory on several machines, not on disk</strong>;
+       surviving a zone outage; and the operational work — rolling restarts, reassignment with throttles, leader
+       balance — that keeps replication healthy. Prerequisites:
+       <a href="consumers.html">Consumers &amp; Consumer Groups</a>.</p>
+
+    <h2>Part 1 — Followers Are Consumers of the Leader</h2>
+
+    <p>Each partition has one leader and, with replication factor N, N − 1 followers. Producers write only to
+       the leader. Followers keep up by sending the leader <em>fetch requests</em> — the same request consumers
+       use — and appending what they receive to their own copy of the log.</p>
+
+<pre>
+producer ──(produce, acks=all)──► LEADER  broker 1   log: 0 … 1041   LEO 1042
+                                     ▲   ▲
+               fetch "from 1040" ────┘   └──── fetch "from 1042"
+                                     │         │
+                            FOLLOWER broker 2   FOLLOWER broker 3
+                            LEO 1040            LEO 1042
+
+A follower's fetch offset TELLS the leader how far it has replicated.
+high watermark = min LEO across the ISR = 1040
+the acks=all request for offset 1041 completes when broker 2 fetches from 1042 or later
+</pre>
+
+    <p>The design has two useful properties. Followers can batch aggressively, because they fetch in the same
+       large chunks as consumers; and the leader learns each follower's progress for free, from the offset each
+       fetch asks for. The high watermark then travels back to followers in fetch responses, so they learn which
+       of their records are committed.</p>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>Effect</th></tr>
+      <tr><td><code>num.replica.fetchers</code></td><td>1</td><td>Fetcher threads per source broker; more helps followers keep up on busy brokers</td></tr>
+      <tr><td><code>replica.fetch.max.bytes</code></td><td>1 MB</td><td>Per-partition fetch size for replication</td></tr>
+      <tr><td><code>replica.fetch.wait.max.ms</code></td><td>500 ms</td><td>How long a leader may hold a follower fetch with no new data</td></tr>
+      <tr><td><code>replica.lag.time.max.ms</code></td><td>30 s (10 s before 2.5)</td><td>A follower not caught up within this time leaves the ISR</td></tr>
+    </table>
+
+    <p><strong>Leader epochs keep replicas consistent across failovers.</strong> Every leader change increments
+       the partition's leader epoch, and each batch is stamped with the epoch it was written in. When a replica
+       rejoins as a follower, it asks the new leader where its epoch ended and truncates anything past that point
+       before fetching. This replaced an older, high-watermark-based scheme that could lose or diverge data in
+       some double-failure cases (KIP-101), and it is why a returning replica sometimes logs that it is truncating
+       its log — that is correct behaviour, not corruption.</p>
+
+    <h2>Part 2 — The In-Sync Replica Set</h2>
+
+    <p>The ISR is the set of replicas considered caught up: the leader plus every follower that has reached the
+       leader's log end offset within the last <code>replica.lag.time.max.ms</code>. It is the set that
+       <code>acks=all</code> waits for and the set a new leader is normally chosen from.</p>
+
+<pre>
+t=0      ISR = {1, 2, 3}         all three fetching normally
+t=0      broker 3 pauses (a long GC pause, a frozen VM, a saturated disk)
+t=0..30s acks=all writes to partitions with broker 3 in the ISR WAIT for it
+         producers see latency climb to ~30 s; some requests hit request.timeout.ms (30 s) and retry
+t=30s    leader removes broker 3:  ISR = {1, 2}      "Shrinking ISR from 1,2,3 to 1,2"
+         pending writes complete; latency returns to normal
+later    broker 3 recovers, catches up to the leader's LEO → "Expanding ISR from 1,2 to 1,2,3"
+</pre>
+
+    <div class="note">🔑 <strong>A replica that is slow but not dead is the worst case for latency.</strong> A
+       crashed broker drops out of the ISR quickly once its session with the controller ends. A broker that is
+       <em>alive but stalled</em> stays in the ISR for up to <code>replica.lag.time.max.ms</code>, and during that
+       window every <code>acks=all</code> write to its partitions waits for it. Lowering the setting shortens the
+       stall but makes replicas drop out on ordinary hiccups, which causes ISR churn and brief periods of weaker
+       durability. Most clusters keep the 30 s default and fix the source of the stalls — GC, noisy neighbours,
+       disks.</div>
+
+    <table class="tbl">
+      <tr><th>Metric (broker)</th><th>Healthy value</th><th>What non-zero means</th></tr>
+      <tr><td><code>UnderReplicatedPartitions</code></td><td>0</td><td>Some partitions have fewer in-sync replicas than their replication factor</td></tr>
+      <tr><td><code>UnderMinIsrPartitionCount</code></td><td>0</td><td>Partitions refusing <code>acks=all</code> writes right now</td></tr>
+      <tr><td><code>AtMinIsrPartitionCount</code></td><td>0</td><td>One more failure and those partitions refuse writes</td></tr>
+      <tr><td><code>IsrShrinksPerSec</code> / <code>IsrExpandsPerSec</code></td><td>Near 0</td><td>Replicas repeatedly falling behind and catching up — ISR churn</td></tr>
+      <tr><td><code>OfflinePartitionsCount</code> (controller)</td><td>0</td><td>Partitions with no leader at all: unavailable for reads and writes</td></tr>
+    </table>
+
+<pre>
+$ kafka-topics.sh --bootstrap-server kafka:9092 --describe --under-replicated-partitions
+  Topic: orders  Partition: 4  Leader: 1  Replicas: 1,2,3  Isr: 1,2
+$ kafka-topics.sh --bootstrap-server kafka:9092 --describe --under-min-isr-partitions
+  (empty: good — nothing is refusing writes)
+$ kafka-topics.sh --bootstrap-server kafka:9092 --describe --unavailable-partitions
+</pre>
+
+    <h2>Part 3 — The acks × min.insync.replicas Matrix</h2>
+
+    <p>Durability is decided by three numbers together: the topic's replication factor, its
+       <code>min.insync.replicas</code>, and the producer's <code>acks</code>. <code>min.insync.replicas</code>
+       only applies to <code>acks=all</code> writes: if the ISR is smaller than it, the leader refuses the write
+       with <code>NotEnoughReplicasException</code>, which the producer retries until
+       <code>delivery.timeout.ms</code>.</p>
+
+    <table class="tbl">
+      <tr><th>RF / min ISR / acks</th><th>Acknowledged writes survive</th><th>Writes still accepted with</th><th>Verdict</th></tr>
+      <tr><td>3 / 1 / all</td><td>Only if the ISR had more than the leader at the time</td><td>2 brokers down</td><td>Default settings — durability can silently degrade to one copy</td></tr>
+      <tr><td>3 / 2 / all</td><td>Any 1 broker loss</td><td>1 broker down</td><td>The standard production choice</td></tr>
+      <tr><td>3 / 3 / all</td><td>Any 2 broker losses</td><td>0 brokers down — any single failure stops writes</td><td>Rarely worth it; a routine restart blocks producers</td></tr>
+      <tr><td>3 / 2 / 1</td><td>Not guaranteed — leader-only acknowledgement</td><td>2 brokers down</td><td><code>min.insync.replicas</code> is ignored for <code>acks=1</code></td></tr>
+      <tr><td>2 / 2 / all</td><td>Any 1 broker loss</td><td>0 down — every restart blocks writes</td><td>Why RF 2 is awkward</td></tr>
+      <tr><td>2 / 1 / all</td><td>Not guaranteed while the ISR is the leader alone</td><td>1 down</td><td>Available, but weak</td></tr>
+      <tr><td>4 / 3 / all</td><td>Any 2 broker losses</td><td>1 broker down</td><td>Used for two-zone layouts (see Part 5)</td></tr>
+    </table>
+
+<pre>
+The rule of thumb:     RF = min.insync.replicas + 1 (at least), acks = all
+
+  writes tolerate          RF − min.insync.replicas     broker failures
+  acknowledged data survives  min.insync.replicas − 1   broker failures (guaranteed)
+  with RF 3 / min ISR 2:   1 and 1 — and a rolling restart never blocks producers
+</pre>
+
+    <p><strong>Consumers are unaffected by <code>min.insync.replicas</code>.</strong> A partition with only its
+       leader in the ISR refuses <code>acks=all</code> writes but still serves reads up to the high watermark. So
+       "writes failing, reads fine" is the expected signature of a partition below its minimum ISR.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Relying on <code>acks=all</code> with the default <code>min.insync.replicas=1</code>.</strong>
+         During a period when both followers have fallen out of the ISR — a slow disk, a network problem — the
+         leader keeps accepting <code>acks=all</code> writes on its own and acknowledges them as fully replicated.
+         If that broker is then lost, every write from that period is gone, and nothing reported a problem.</p>
+      <p>✅ <strong>Set <code>min.insync.replicas=2</code> with replication factor 3,</strong> as a broker default
+         and on existing topics. The leader then refuses writes it cannot replicate, the producer retries and
+         eventually reports the failure, and the choice between "stop writing" and "risk losing data" is made by the
+         configuration you chose rather than by accident.</p>
+    </div>
+
+    <h2>Part 4 — Leader Election: Clean, Preferred and Unclean</h2>
+
+    <p>When a leader fails, the controller chooses a new leader for each of its partitions. Normally the new
+       leader must come from the ISR, so it has every committed record — a <strong>clean</strong> election.</p>
+
+<pre>
+Replicas: 1,2,3   Leader: 1   ISR: 1,2,3     broker 1 fails
+controller: pick the first replica in the ISR that is alive → broker 2 leads, ISR {2,3}
+committed data (below the high watermark) is on broker 2: nothing acknowledged is lost
+
+Replicas: 1,2,3   Leader: 1   ISR: 1         (followers had fallen behind), broker 1 fails
+unclean.leader.election.enable = false (default) → NO leader: partition OFFLINE until broker 1 returns
+unclean.leader.election.enable = true            → broker 2 leads with what it has;
+                                                  everything it never received is LOST, and when
+                                                  broker 1 returns it truncates to match
+</pre>
+
+    <table class="tbl">
+      <tr><th>Election</th><th>When</th><th>Data</th><th>Availability</th></tr>
+      <tr><td>Clean</td><td>An ISR member is alive</td><td>No committed data lost</td><td>Restored in seconds</td></tr>
+      <tr><td>Unclean (off by default)</td><td>No ISR member alive, and enabled</td><td>Records the new leader lacks are lost</td><td>Restored immediately</td></tr>
+      <tr><td>None</td><td>No ISR member alive, unclean disabled</td><td>Nothing lost</td><td>Partition offline until an ISR member returns</td></tr>
+      <tr><td>Preferred</td><td>Rebalancing leadership back to the first listed replica</td><td>None lost</td><td>Brief leader move</td></tr>
+    </table>
+
+    <p><strong>Preferred leaders keep load balanced.</strong> The first replica in a partition's list is its
+       <em>preferred</em> leader, and replica assignment spreads preferred leaders evenly. After failures, leaders
+       pile up on the surviving brokers. With <code>auto.leader.rebalance.enable=true</code> (the default), the
+       controller checks every 5 minutes and moves leadership back when a broker's share is more than 10% off; you
+       can also trigger it with <code>kafka-leader-election.sh --election-type preferred</code>.</p>
+
+    <p><strong>Eligible leader replicas.</strong> Kafka 4.x adds a refinement (KIP-966) that tracks replicas
+       which were not in the ISR but are still known to hold all committed data, so a partition can recover more
+       safely after certain multi-broker failures. It changes the fine print of which replicas may be elected;
+       check whether it is enabled in the version you run before relying on it.</p>
+
+    <div class="note">🔑 <strong>"Acknowledged" means in memory on several machines, not on disk.</strong> Kafka
+       does not fsync each write; it relies on the page cache, and the kernel writes data to disk later. An
+       <code>acks=all</code> record exists in the page cache of every in-sync replica. That survives any failure
+       that leaves a replica's machine running — process crashes, a broker restart — and any failure of a
+       <em>single</em> machine. It does not survive every replica's machine losing power at the same moment. That
+       is why replicas should sit in different racks or zones: replication across independent failure domains is
+       the durability mechanism, and flushing every write (<code>flush.messages=1</code>) costs far more than it
+       adds for most workloads.</div>
+
+    <h2>Part 5 — Surviving a Zone Outage</h2>
+
+    <p>In a cloud region, the realistic large failure is losing an availability zone. Rack-aware placement
+       (<code>broker.rack</code> set to the zone) puts each partition's replicas in different zones, so the
+       question becomes what the replication settings do when one zone disappears.</p>
+
+<pre>
+3 zones, RF 3 (one replica per zone), min.insync.replicas = 2, controllers in all 3 zones
+
+zone A lost:
+  every partition keeps 2 replicas → ISR = 2 ≥ min ISR → reads AND writes continue
+  leaders that were in zone A move to B or C within seconds
+  controller quorum: 2 of 3 controllers remain → still has a majority ✔
+
+zones A and B lost:
+  ISR = 1 &lt; min ISR → acks=all writes REFUSED; reads continue from the survivors
+  controller quorum: 1 of 3 → no majority → no metadata changes, no new leader elections
+</pre>
+
+    <table class="tbl">
+      <tr><th>Layout</th><th>One zone lost</th><th>Notes</th></tr>
+      <tr><td>3 zones, RF 3, min ISR 2</td><td>Reads and writes continue</td><td>The standard layout; controllers spread 1 per zone</td></tr>
+      <tr><td>2 zones, RF 3, min ISR 2</td><td>Depends which zone: the zone holding 2 replicas of a partition takes writes down with it</td><td>Uneven by construction</td></tr>
+      <tr><td>2 zones, RF 4, min ISR 3</td><td>Writes stop (only 2 replicas left)</td><td>Durable, not available</td></tr>
+      <tr><td>2 zones, RF 4, min ISR 2</td><td>Reads and writes continue on 2 replicas</td><td>Available; durability rests on the 2 surviving copies</td></tr>
+      <tr><td>1 zone</td><td>Everything lost</td><td>Replication factor cannot help</td></tr>
+    </table>
+
+    <p><strong>The controller quorum needs its own placement.</strong> KRaft controllers use Raft, which needs a
+       majority to operate. Three controllers in three zones survive one zone; three controllers in two zones can
+       lose the zone holding two of them and with it the majority. Without a working quorum, brokers keep serving
+       existing leaders, but no leader can be re-elected and no topic or configuration can change — so a second
+       failure during that time cannot be repaired automatically.</p>
+
+    <p><strong>Two-zone regions force a real trade-off.</strong> With only two zones there is no layout where
+       losing either zone keeps both durability (two acknowledged copies) and writes. You choose: RF 4 with min ISR
+       3 keeps durability and stops writes; RF 4 with min ISR 2 keeps writing on the surviving copies. Either way
+       the controller quorum needs a tiebreaker in a third location to survive losing a zone. Stretch clusters over
+       two zones are covered further in the multi-region lesson.</p>
+
+    <h2>Part 6 — Operating Replication</h2>
+
+    <p>Most replication problems in practice come from routine operations done hastily: restarts, adding brokers,
+       and moving partitions.</p>
+
+    <p><strong>Rolling restarts.</strong> A broker shutting down cleanly (<code>SIGTERM</code>) first moves
+       leadership of its partitions to other in-sync replicas — <em>controlled shutdown</em> — so producers see a
+       leader change rather than errors. The rule for the next step is simple and often skipped:</p>
+
+<pre>
+for each broker:
+    stop it cleanly (SIGTERM — never kill -9)
+    start it
+    WAIT until UnderReplicatedPartitions == 0 across the cluster   ◄── the step people skip
+    (optionally) run a preferred leader election
+next broker
+
+Restarting the next broker while the previous one is still catching up means some partitions
+have 2 of 3 replicas down: with min ISR 2 they refuse writes; with min ISR 1 they run on one copy.
+</pre>
+
+    <p><strong>Moving partitions.</strong> Adding a broker does not move any existing data to it; you reassign
+       partitions explicitly. Reassignment copies each moved replica from scratch, which is a large amount of
+       traffic competing with normal replication and client traffic, so throttle it:</p>
+
+<pre>
+$ kafka-reassign-partitions.sh --bootstrap-server kafka:9092 \
+    --reassignment-json-file move.json --execute --throttle 50000000       # 50 MB/s
+$ kafka-reassign-partitions.sh ... --reassignment-json-file move.json --verify
+   (verify also REMOVES the throttle once the moves finish — run it, or the throttle stays)
+
+time to move 6 TB at 50 MB/s = 6,000,000 MB / 50 = 120,000 s ≈ 33 hours
+</pre>
+
+    <table class="tbl">
+      <tr><th>Operation</th><th>Risk</th><th>Safeguard</th></tr>
+      <tr><td>Rolling restart</td><td>Two replicas of a partition down at once</td><td>Wait for zero under-replicated partitions between brokers</td></tr>
+      <tr><td>Partition reassignment</td><td>Saturating disks and network; producers slow down</td><td><code>--throttle</code>, move in batches, <code>--verify</code> afterwards</td></tr>
+      <tr><td>Adding brokers</td><td>New brokers stay empty; old ones stay full</td><td>Plan the reassignment; tools such as Cruise Control automate balancing</td></tr>
+      <tr><td>Enabling unclean election during an outage</td><td>Silent data loss, and it stays enabled afterwards</td><td>A written decision, and a follow-up to turn it off</td></tr>
+      <tr><td>Changing <code>min.insync.replicas</code> on a live topic</td><td>Raising it can make partitions refuse writes immediately</td><td>Check current ISR sizes first</td></tr>
+    </table>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Keeping <code>min.insync.replicas=1</code></td><td><code>acks=all</code> can mean "the leader alone"</td><td><code>min.insync.replicas=2</code> with RF 3</td></tr>
+      <tr><td>Setting <code>min.insync.replicas</code> equal to RF</td><td>Any single broker restart stops writes</td><td>RF at least min ISR + 1</td></tr>
+      <tr><td>Assuming <code>min.insync.replicas</code> protects <code>acks=1</code> producers</td><td>It applies only to <code>acks=all</code></td><td>Keep producers on <code>acks=all</code></td></tr>
+      <tr><td>Replication factor 2 for important data</td><td>Either every restart blocks writes, or data rests on one copy</td><td>RF 3</td></tr>
+      <tr><td>No <code>broker.rack</code></td><td>Replicas can share one zone and die together</td><td>Rack-aware placement across zones</td></tr>
+      <tr><td>Controllers concentrated in one or two zones</td><td>Losing that zone loses the quorum</td><td>One controller per zone, three or five in total</td></tr>
+      <tr><td>Restarting the next broker too soon</td><td>Two replicas down at once; writes refused or data at risk</td><td>Wait for zero under-replicated partitions</td></tr>
+      <tr><td>Killing brokers with SIGKILL for restarts</td><td>No controlled shutdown; clients see errors and slower recovery</td><td>SIGTERM and wait for a clean exit</td></tr>
+      <tr><td>Enabling unclean election "temporarily"</td><td>Acknowledged data is lost, and the setting is forgotten</td><td>Keep it off; if used, document it and revert</td></tr>
+      <tr><td>Reassigning partitions without a throttle</td><td>Replication traffic starves clients</td><td><code>--throttle</code>, then <code>--verify</code> to remove it</td></tr>
+      <tr><td>Forgetting <code>--verify</code> after a reassignment</td><td>The throttle stays and slows future recovery</td><td>Always run <code>--verify</code> when moves finish</td></tr>
+      <tr><td>Alerting only on offline partitions</td><td>Under-replication and min-ISR problems go unseen until data is at risk</td><td>Alert on under-replicated, at-min-ISR and under-min-ISR counts</td></tr>
+      <tr><td>Treating "acknowledged" as "on disk"</td><td>Correlated power loss can lose page-cache data</td><td>Replicas in independent failure domains</td></tr>
+      <tr><td>Lowering <code>replica.lag.time.max.ms</code> to cut stalls</td><td>ISR churn on normal hiccups</td><td>Fix the cause of stalls (GC, disks, noisy neighbours)</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the ISR?</summary>
+      <p>The in-sync replica set: the partition's leader plus every follower that is caught up with it. A
+         follower counts as in sync if it has reached the leader's log end offset within
+         <code>replica.lag.time.max.ms</code> (30 seconds by default). Followers that fall further behind are removed
+         and added back once they catch up.</p>
+      <p>The ISR matters for three things. <code>acks=all</code> writes are acknowledged once every ISR member has
+         them. The high watermark — the limit of what consumers can read — is the lowest log end offset across the
+         ISR. And when a leader fails, the new leader is chosen from the ISR, which is what guarantees that no
+         acknowledged record is lost in a normal failover.</p>
+      <p>The ISR can shrink without anyone noticing, which is why <code>min.insync.replicas</code> exists. It sets
+         the smallest ISR size at which the leader still accepts <code>acks=all</code> writes. With replication factor
+         3 and <code>min.insync.replicas=2</code>, a partition keeps accepting writes with one replica down, and
+         refuses them rather than acknowledging with only one copy.</p>
+      <p>In monitoring terms, a partition whose ISR is smaller than its replica list is <em>under-replicated</em>,
+         and that count should be zero in a healthy cluster.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What do the producer's <code>acks</code> settings mean?</summary>
+      <p><code>acks</code> decides when the leader tells the producer a write succeeded.</p>
+      <p><strong><code>acks=0</code>:</strong> the producer does not wait for any response. Fastest, but any failure
+         loses data silently, and the producer cannot even retry because it never learns of the failure.
+         <strong><code>acks=1</code>:</strong> the leader responds once the record is in its own log. If the leader
+         fails before a follower copies it, the new leader does not have it, and an acknowledged write is lost.
+         <strong><code>acks=all</code>:</strong> the leader responds once every in-sync replica has the record. This
+         is the default since Kafka 3.0.</p>
+      <p><code>acks=all</code> is only as strong as the ISR it waits for, so it has to be paired with
+         <code>min.insync.replicas</code>. With the default of 1, a leader whose followers have all dropped out
+         would acknowledge <code>acks=all</code> writes on its own. With <code>min.insync.replicas=2</code>, it
+         refuses them instead.</p>
+      <p>The cost of <code>acks=all</code> is latency: the write waits for the slowest in-sync follower. In a
+         healthy cluster that is a few milliseconds more than <code>acks=1</code>; when a follower is struggling it
+         can be much more, which is a signal to fix the follower rather than to weaken <code>acks</code>.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Producer latency with <code>acks=all</code> spikes to 30 seconds for some partitions, then recovers on its own. What is happening?</summary>
+      <p>The number is the clue: 30 seconds is the default <code>replica.lag.time.max.ms</code>. The pattern fits a
+         follower that stopped fetching without dying.</p>
+      <p>While a follower is in the ISR, every <code>acks=all</code> write to that partition waits for it. If its
+         broker stalls — a long garbage-collection pause, a frozen VM, a disk so saturated that its fetch thread
+         blocks — it stops fetching but is still considered in sync. Writes wait. After
+         <code>replica.lag.time.max.ms</code> the leader removes it from the ISR, the pending writes complete with
+         the remaining replicas, and latency returns to normal. When the broker recovers and catches up, it rejoins.
+      </p>
+      <p>To confirm it, I would look at the broker logs for "Shrinking ISR" and "Expanding ISR" messages around
+         the spikes, the <code>IsrShrinksPerSec</code> metric, and which broker is named in them. Then look at that
+         broker: GC logs for long pauses, disk latency, CPU steal on the VM.</p>
+      <p>Only partitions with a replica on the stalled broker are affected, which is why it looks random from the
+         producer's side. The fix is to remove the stalls — tune the broker's garbage collector, move it off a
+         noisy host, fix the disk. Lowering <code>replica.lag.time.max.ms</code> would shorten each spike but make
+         replicas drop out on routine hiccups, and weakening <code>acks</code> trades a latency problem for a
+         durability one.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you do a rolling restart of a Kafka cluster without affecting producers?</summary>
+      <p>One broker at a time, with a health check between each, and with a clean shutdown every time.</p>
+      <p>Stop each broker with <code>SIGTERM</code>. A clean shutdown triggers controlled shutdown: the broker
+         moves leadership of its partitions to other in-sync replicas before it exits, so producers and consumers
+         see a quick leader change instead of timeouts. Killing the process skips this, and clients wait for the
+         controller to notice the broker is gone.</p>
+      <p>After restarting it, wait until the cluster reports <strong>zero under-replicated partitions</strong>
+         before touching the next broker. The restarted broker needs time to catch up on everything written while
+         it was down. If you restart the next broker before it has, some partitions have two of three replicas
+         unavailable at once: with <code>min.insync.replicas=2</code> they refuse writes, and with 1 they are running
+         on a single copy.</p>
+      <p>After the last broker, leadership may be unevenly spread, because each restart moved leaders away.
+         Automatic leader rebalancing fixes this within minutes, or you can run a preferred leader election
+         explicitly.</p>
+      <p>For this to be invisible to producers, the topics need replication factor 3 and
+         <code>min.insync.replicas=2</code>, producers need retries and a <code>delivery.timeout.ms</code> longer than
+         a leader change (the defaults are fine), and the restart tooling should check under-replicated partitions
+         automatically rather than relying on someone watching a dashboard.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> During a large outage, someone proposes enabling unclean leader election to bring partitions back. How do you decide?</summary>
+      <p>The decision is between availability now and acknowledged data later, and it should be made per topic
+         with the business owner, not cluster-wide under pressure.</p>
+      <p>First establish the situation. Partitions are offline because every ISR member is down; the surviving
+         replicas were out of sync, and each is missing some suffix of the log — anywhere from a few records to a
+         lot, depending on how far behind it was. Enabling unclean election makes one of them leader immediately,
+         and the records it lacks are gone for good: when the old ISR members return they truncate to match the new
+         leader. Producers that already had those writes acknowledged are never told.</p>
+      <p>Then look at the alternative: when does an ISR member come back? If the brokers are restarting and will
+         return in minutes, waiting costs minutes of unavailability and loses nothing. If a disk or machine is
+         permanently gone, waiting may mean forever, and the question becomes whether the lost suffix can be
+         reconstructed from elsewhere.</p>
+      <p>I would decide per topic. For metrics, logs and clickstream, losing a few seconds of data is acceptable
+         and availability matters: enable unclean election on those topics only (it can be set per topic). For
+         payments, orders or anything with an external side effect, keep it off and wait, or restore from a source
+         of truth. Whatever is enabled must be recorded and switched back off after the incident, because
+         leaving it on turns a future routine failure into silent data loss.</p>
+      <p><strong>Recommendation:</strong> never enable it cluster-wide in the moment; classify topics in advance
+         into "can lose a suffix" and "cannot", put that classification in the runbook, and enable unclean
+         election only for the first group, with the change logged and reverted afterwards. The long-term fix is to
+         make the situation rarer: replicas across zones, <code>min.insync.replicas=2</code>, and monitoring that
+         alerts when partitions sit at their minimum ISR.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a Kafka deployment that survives the loss of an availability zone without losing acknowledged data.</summary>
+      <p><strong>Three zones are the foundation.</strong> Brokers in three zones with <code>broker.rack</code> set
+         to the zone, so each partition's three replicas land in three different zones. Topics use replication
+         factor 3 and <code>min.insync.replicas=2</code>, and producers use <code>acks=all</code> with idempotence.
+         Losing a zone leaves two replicas of every partition, which meets the minimum ISR, so reads and writes
+         continue and every acknowledged record exists in at least one surviving zone.</p>
+      <p><strong>The controller quorum is placed the same way:</strong> three (or five) KRaft controllers, one per
+         zone, so losing a zone keeps a majority and the cluster can still elect leaders and change metadata.</p>
+      <p><strong>Capacity must absorb the loss.</strong> When a zone fails, its leaders move to the other two
+         zones, which now carry all the traffic with a third fewer brokers. If brokers run at 70% utilisation
+         normally, they cannot absorb that. I would size so the cluster runs comfortably on two-thirds of its
+         brokers — roughly 50–60% utilisation at peak. Clients need the same thought: consumers in the lost zone are
+         gone, and the remaining consumers must handle their partitions.</p>
+      <p><strong>Clients must survive a leader move:</strong> producers with default retries and a
+         <code>delivery.timeout.ms</code> well above leader-election time, consumers configured with
+         <code>client.rack</code> for follower fetching (so normal operation is cheap), and bootstrap lists that
+         include brokers in every zone.</p>
+      <p><strong>Test it.</strong> A zone outage is rare enough that the first real one will find whatever was not
+         tested: a topic created with RF 1, an internal topic with a low replication factor, a client with a
+         bootstrap list pointing at one zone. I would run a scheduled game day that blocks traffic to one zone and
+         check producer error rates and consumer lag.</p>
+      <p><strong>Recommendation:</strong> three zones, RF 3, min ISR 2, rack-aware placement, one controller per
+         zone, capacity for two-thirds operation, and a regular zone-failure test. If the region has only two zones,
+         say plainly that the design must choose between writes and two-copy durability during a zone loss, and
+         put a third-location tiebreaker in place for the controllers.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Run a three-broker cluster, create a replicated topic, stop a
+      broker and watch the ISR and leaders change.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# docker-compose.yml (one service shown; kafka-2 and kafka-3 differ only in NODE_ID and host names)
+services:
+  kafka-1:
+    image: apache/kafka:4.0.0
+    environment:
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw      # SAME on every node, or each formats its own cluster
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+</pre>
+<pre>
+$ kafka-topics.sh --bootstrap-server kafka-1:9092 --create --topic rep \
+    --partitions 3 --replication-factor 3 --config min.insync.replicas=2
+$ kafka-topics.sh --bootstrap-server kafka-1:9092 --describe --topic rep
+  Topic: rep  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3
+  Topic: rep  Partition: 1  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1
+  Topic: rep  Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1,2
+
+$ docker compose stop kafka-2
+$ kafka-topics.sh --bootstrap-server kafka-1:9092 --describe --topic rep
+  Topic: rep  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,3
+  Topic: rep  Partition: 1  Leader: 3  Replicas: 2,3,1  Isr: 3,1      ◄── leader moved from 2
+  Topic: rep  Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1
+</pre>
+      <p>The replica lists never change — they are the assignment. The ISR shrinks to the live replicas, and
+         partition 1's leadership moves to the next in-sync replica. With two in-sync replicas and a minimum of two,
+         all three partitions still accept <code>acks=all</code> writes.</p>
+      <p>Start <code>kafka-2</code> again and describe once more: it rejoins every ISR after catching up, but
+         partition 1 stays led by broker 3 until a preferred leader election (automatic within about five minutes,
+         or <code>kafka-leader-election.sh --election-type preferred --all-topic-partitions</code>).</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Stop two of three brokers and compare what <code>acks=all</code>
+      and <code>acks=1</code> producers experience.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker compose stop kafka-2 kafka-3
+$ kafka-topics.sh --bootstrap-server kafka-1:9092 --describe --under-min-isr-partitions
+  Topic: rep  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1
+  ...
+
+$ kafka-console-producer.sh --bootstrap-server kafka-1:9092 --topic rep --producer-property acks=all
+&gt; important
+WARN ... Got error produce response ... on topic-partition rep-0, retrying ...
+     Error: NOT_ENOUGH_REPLICAS
+(after delivery.timeout.ms) ERROR ... NotEnoughReplicasException
+
+$ kafka-console-producer.sh --bootstrap-server kafka-1:9092 --topic rep --producer-property acks=1
+&gt; less important        ◄── accepted immediately: held by broker 1 alone
+</pre>
+      <table class="tbl">
+        <tr><th>Producer</th><th>Result with ISR = {1}</th><th>If broker 1 now dies</th></tr>
+        <tr><td><code>acks=all</code>, min ISR 2</td><td>Refused, retried, eventually failed</td><td>Nothing acknowledged is lost</td></tr>
+        <tr><td><code>acks=1</code></td><td>Accepted</td><td>That record is lost</td></tr>
+      </table>
+      <p>Note that consumers can still read partitions led by broker 1 — <code>min.insync.replicas</code> never
+         blocks reads. "Writes failing, reads fine" is the signature of a partition below its minimum ISR, and the
+         right response is to restore brokers, not to switch producers to <code>acks=1</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Freeze one broker without stopping it and measure the effect
+      on <code>acks=all</code> latency.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kafka-producer-perf-test.sh --topic rep --num-records 100000000 --record-size 200 \
+    --throughput 2000 --producer-props bootstrap.servers=kafka-1:9092 acks=all &amp;
+5000 records sent, 1999.2 records/sec, 3.1 ms avg latency, 18.0 ms max latency.
+
+$ docker pause kafka-3          # the process is frozen, not stopped: no fetches, no shutdown
+5000 records sent, 1997.6 records/sec, 4.4 ms avg latency, 24.0 ms max latency.
+3212 records sent,  642.1 records/sec, 11204.7 ms avg latency, 29871.0 ms max latency.   ◄── stall
+5000 records sent, 1999.9 records/sec, 3.3 ms avg latency, 21.0 ms max latency.         ◄── recovered
+
+$ docker logs kafka-1 | grep -i 'shrinking isr'
+... Shrinking ISR from 1,2,3 to 1,2 ...
+</pre>
+      <p>For about 30 seconds (<code>replica.lag.time.max.ms</code>), writes to every partition with a replica on
+         the frozen broker waited for it. Then the leaders removed it from the ISR and writes completed with two
+         replicas. Partitions with no replica on broker 3 were unaffected throughout.</p>
+      <table class="tbl">
+        <tr><th>Failure</th><th>Effect on <code>acks=all</code> writes</th></tr>
+        <tr><td>Broker process stopped cleanly</td><td>A brief leader change; almost no latency impact</td></tr>
+        <tr><td>Broker frozen (GC pause, frozen VM, stuck disk)</td><td>Up to <code>replica.lag.time.max.ms</code> of stalled writes</td></tr>
+      </table>
+      <p>Run <code>docker unpause kafka-3</code> and watch the ISR expand again. The practical lesson is that
+         broker health for Kafka includes pause times: long GC pauses and stalled disks are latency incidents for
+         every producer writing to that broker's partitions, even though no broker ever "fails".</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Demonstrate the data unclean leader election loses.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kafka-topics.sh ... --create --topic unclean --partitions 1 --replication-factor 2 \
+    --config min.insync.replicas=1
+# leader = broker 1, follower = broker 2
+$ docker compose stop kafka-2                           # follower goes away: ISR = {1}
+$ seq 1 1000 | kafka-console-producer.sh ... --topic unclean --producer-property acks=all
+                                                        # all 1000 acknowledged by broker 1 alone
+$ docker compose stop kafka-1                           # the only ISR member dies
+$ docker compose start kafka-2
+$ kafka-topics.sh ... --describe --topic unclean
+  Topic: unclean  Partition: 0  Leader: none  Replicas: 1,2  Isr: 1      ◄── offline, by design
+
+$ kafka-configs.sh ... --alter --entity-type topics --entity-name unclean \
+    --add-config unclean.leader.election.enable=true
+$ kafka-topics.sh ... --describe --topic unclean
+  Topic: unclean  Partition: 0  Leader: 2  Replicas: 1,2  Isr: 2         ◄── back online
+$ kafka-get-offsets.sh ... --topic unclean
+unclean:0:0                                             ◄── the 1,000 acknowledged records are gone
+</pre>
+      <p>Every one of the 1,000 records was acknowledged under <code>acks=all</code>, and all are lost. Two
+         settings allowed it: <code>min.insync.replicas=1</code> let the leader acknowledge alone, and unclean
+         election let an out-of-date replica take over. When broker 1 returns, it truncates its log to match broker
+         2, so the records do not reappear.</p>
+      <table class="tbl">
+        <tr><th>Setting</th><th>Its role in the loss</th></tr>
+        <tr><td><code>min.insync.replicas=1</code></td><td>Allowed acknowledging with one copy</td></tr>
+        <tr><td><code>unclean.leader.election.enable=true</code></td><td>Allowed a replica missing those records to lead</td></tr>
+      </table>
+      <p>Repeat with <code>min.insync.replicas=2</code> and RF 3: the producer is refused once the ISR drops to
+         one, so there are no acknowledged-but-unreplicated records for unclean election to lose. Remember to remove
+         the unclean setting afterwards.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Add a fourth broker and move a share of partitions to it
+      without hurting client traffic.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat topics.json
+{"version":1,"topics":[{"topic":"orders"},{"topic":"payments"}]}
+$ kafka-reassign-partitions.sh --bootstrap-server kafka-1:9092 \
+    --topics-to-move-json-file topics.json --broker-list 1,2,3,4 --generate &gt; plan.txt
+# plan.txt contains the current assignment (SAVE IT: it is the rollback) and a proposed one
+</pre>
+      <p>Estimate the time before starting, because it decides the throttle:</p>
+<pre>
+data on moved replicas  ≈ 2.4 TB
+normal replication + client traffic per broker ≈ 150 MB/s of 400 MB/s disk/network headroom
+throttle                 = 80 MB/s  → 2,400,000 MB / 80 = 30,000 s ≈ 8.3 hours
+</pre>
+<pre>
+$ kafka-reassign-partitions.sh --bootstrap-server kafka-1:9092 \
+    --reassignment-json-file proposed.json --execute --throttle 80000000
+$ kafka-reassign-partitions.sh ... --reassignment-json-file proposed.json --verify
+Status of partition reassignment:
+Reassignment of partition orders-3 is still in progress.
+...
+(hours later)
+Reassignment of partition orders-3 is completed.
+Clearing broker-level throttles on brokers 1,2,3,4
+Clearing topic-level throttles on topic orders
+</pre>
+      <table class="tbl">
+        <tr><th>Practice</th><th>Why</th></tr>
+        <tr><td>Save the current assignment first</td><td>It is the rollback plan</td></tr>
+        <tr><td>Throttle from measured headroom</td><td>Unthrottled copies compete with producers and slow <code>acks=all</code></td></tr>
+        <tr><td>Move in batches (a few topics at a time)</td><td>Limits the blast radius and lets you watch the effect</td></tr>
+        <tr><td>Run <code>--verify</code> until complete</td><td>It is what removes the throttle</td></tr>
+        <tr><td>Watch producer latency and under-replicated partitions</td><td>Moving replicas are not in the ISR until they catch up</td></tr>
+      </table>
+      <p>For regular rebalancing at scale, tools such as Cruise Control compute balanced assignments from actual
+         load (disk, network, CPU) rather than partition counts, and apply them in throttled batches.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Your region has only two availability zones. Design the
+      replication settings and state exactly what happens when each zone fails.
+      <details class="solution"><summary>Solution</summary>
+      <p>With two zones, no layout keeps <em>both</em> writes and two acknowledged copies through the loss of
+         either zone. Make the trade explicit per topic:</p>
+<pre>
+brokers:  3 in zone A, 3 in zone B, broker.rack set
+topics:   RF 4 (2 replicas per zone, enforced by rack-aware placement)
+
+option D (durable):     min.insync.replicas = 3
+  zone lost → 2 replicas remain &lt; 3 → acks=all writes REFUSED; reads continue
+  every acknowledged record was on at least 3 replicas → at least 1 survives in the other zone
+
+option A (available):   min.insync.replicas = 2
+  zone lost → 2 replicas remain = 2 → writes CONTINUE on the surviving zone only
+  records acknowledged during the outage exist in one zone only until the other returns
+
+controllers: 3 voters — 1 in zone A, 1 in zone B, 1 in a THIRD location (another region or site)
+  without the third, losing the zone holding 2 controllers stops all metadata changes
+</pre>
+      <table class="tbl">
+        <tr><th>Topic class</th><th>Setting</th><th>During a zone loss</th></tr>
+        <tr><td>Payments, orders</td><td>RF 4, min ISR 3</td><td>Writes stop; nothing acknowledged is at risk</td></tr>
+        <tr><td>Clickstream, logs</td><td>RF 4, min ISR 2</td><td>Writes continue with single-zone durability</td></tr>
+        <tr><td>Internal topics (<code>__consumer_offsets</code>, transactions)</td><td>RF 4, min ISR 2 or 3 to match the most critical data</td><td>Consumer commits must keep working if consumers do</td></tr>
+      </table>
+      <p>State the consequences in the design document: producers of durable topics need to handle refusals
+         (buffer in an outbox, return errors, or degrade features) for the length of a zone outage; the cluster
+         needs enough capacity in one zone to carry everything; and replication between two zones doubles
+         cross-zone traffic compared with RF 2. If neither option is acceptable for a topic, the requirement is
+         really for a third zone or a second region, and the multi-region lesson covers that.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Followers replicate by fetching from the leader,</strong> and each fetch offset tells the leader how far that follower has come.</li>
+        <li><strong>The ISR is the leader plus followers caught up within <code>replica.lag.time.max.ms</code></strong> (30 s); <code>acks=all</code> waits for all of them.</li>
+        <li><strong>A stalled but living replica is the worst latency case:</strong> it holds up <code>acks=all</code> writes for up to 30 s before it is removed.</li>
+        <li><strong><code>min.insync.replicas</code> is what gives <code>acks=all</code> meaning;</strong> with the default of 1, "all" can be the leader alone.</li>
+        <li><strong>RF 3 with <code>min.insync.replicas=2</code> and <code>acks=all</code></strong> survives one broker loss for both writes and acknowledged data.</li>
+        <li><strong><code>min.insync.replicas</code> equal to RF stops writes on any single failure,</strong> including a routine restart.</li>
+        <li><strong>Below the minimum ISR, writes are refused but reads continue</strong> — the signature to recognise.</li>
+        <li><strong>Clean elections pick from the ISR and lose nothing;</strong> unclean election trades acknowledged data for availability and is off by default.</li>
+        <li><strong>Leader epochs let returning replicas truncate correctly;</strong> a truncation message on rejoin is normal.</li>
+        <li><strong>Preferred leader election restores balance</strong> after failures; it runs automatically every 5 minutes by default.</li>
+        <li><strong>"Acknowledged" means in the page cache of every in-sync replica,</strong> so replicas must sit in independent failure domains.</li>
+        <li><strong>Three zones, rack-aware placement and one controller per zone</strong> survive a zone loss with reads and writes intact.</li>
+        <li><strong>Two-zone regions force a choice</strong> between writes and two-copy durability, and need a third-location controller.</li>
+        <li><strong>In a rolling restart, wait for zero under-replicated partitions</strong> before touching the next broker.</li>
+        <li><strong>Throttle partition reassignments and finish with <code>--verify</code>,</strong> which is what removes the throttle.</li>
+        <li><strong>Alert on under-replicated, at-min-ISR and under-min-ISR partitions,</strong> not only on offline ones.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="consumers.html">← Consumers &amp; Consumer Groups</a>
+      <a href="quiz.html">Kafka Quizzes →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

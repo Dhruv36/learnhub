@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Producers: Batching, Keys &amp; Partitioners — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Producers: Batching, Keys &amp; Partitioners <span class="level-badge level-basic">Foundations</span></h1>
+    <p><strong>What you'll master:</strong> what really happens between <code>send()</code> and the broker's
+       acknowledgement — serializer, partitioner, the per-partition accumulator and the background sender thread;
+       <strong>why <code>send()</code> can block your request thread for 60 seconds</strong> even though it returns a
+       future; how <code>batch.size</code> and <code>linger.ms</code> form batches, and why a topic with many
+       partitions and modest traffic barely batches at all; compression codecs and what they cost; the timeout
+       hierarchy that bounds every send; the <strong>configuration that silently switches idempotence off</strong>;
+       why a slow callback stalls every send in the process; and a shutdown that does not drop buffered records.
+       Prerequisites: <a href="log-partitions.html">Topics, Partitions &amp; the Log</a>.</p>
+
+    <h2>Part 1 — The Journey of a Record Through <code>send()</code></h2>
+
+    <p>A producer is two halves: the part that runs on <em>your</em> thread when you call <code>send()</code>,
+       and a background I/O thread (the <em>sender</em>) that does the network work. Knowing which half does what
+       explains nearly every production issue with producers.</p>
+
+<pre>
+YOUR THREAD, inside send()                         SENDER THREAD (one per producer)
+──────────────────────────                         ─────────────────────────────────
+1. wait for topic metadata   ◄── can BLOCK          5. drain batches that are ready
+      (up to max.block.ms)                             (full, or lingered long enough)
+2. serialize key and value   ◄── errors THROW       6. group them by destination broker,
+3. choose a partition                                  one produce request per broker
+4. append to that partition's                      7. retry retriable failures until
+   batch in the ACCUMULATOR  ◄── can BLOCK            delivery.timeout.ms
+      when buffer.memory is full                    8. run your CALLBACK (on this thread!)
+return Future
+</pre>
+
+    <table class="tbl">
+      <tr><th>Stage</th><th>Runs on</th><th>How it fails</th></tr>
+      <tr><td>Metadata lookup</td><td>Your thread</td><td>Blocks up to <code>max.block.ms</code> (60 s), then throws <code>TimeoutException</code></td></tr>
+      <tr><td>Serialization</td><td>Your thread</td><td>Throws <code>SerializationException</code> straight out of <code>send()</code></td></tr>
+      <tr><td>Partitioning</td><td>Your thread</td><td>Rarely; a custom partitioner's bug throws here</td></tr>
+      <tr><td>Accumulator append</td><td>Your thread</td><td>Blocks up to <code>max.block.ms</code> when <code>buffer.memory</code> (32 MB) is full</td></tr>
+      <tr><td>Network send and retries</td><td>Sender thread</td><td>Reported only through the future or callback</td></tr>
+      <tr><td>Callback</td><td>Sender thread</td><td>A slow callback delays every other send in the producer</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong><code>send()</code> is asynchronous only once metadata is known and the buffer has
+       room.</strong> The first send to a topic, a send while the cluster is unreachable, or a send while the
+       buffer is full all block the calling thread — for up to a minute with the defaults. If that thread is
+       serving an HTTP request, the request hangs for a minute too. Lower <code>max.block.ms</code> for
+       latency-sensitive callers, and warm the metadata at startup with <code>partitionsFor(topic)</code> so the
+       first real request does not pay for it.</div>
+
+<pre>
+// Java: one producer, created once and shared — it is thread-safe
+Properties p = new Properties();
+p.put("bootstrap.servers", "kafka-1:9092,kafka-2:9092,kafka-3:9092");
+p.put("key.serializer",   "org.apache.kafka.common.serialization.StringSerializer");
+p.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+p.put("max.block.ms", "2000");                       // fail fast instead of hanging a request
+KafkaProducer&lt;String, String&gt; producer = new KafkaProducer&lt;&gt;(p);
+producer.partitionsFor("orders");                    // fetch metadata at startup
+
+producer.send(new ProducerRecord&lt;&gt;("orders", orderId, json), (meta, err) -&gt; {
+    if (err != null) log.error("send failed for {}", orderId, err);   // ALWAYS handle
+});
+</pre>
+
+    <p><strong>Create one producer and share it.</strong> A <code>KafkaProducer</code> is thread-safe, holds
+       connections to the brokers, a metadata cache and the batching buffer. A producer created per request pays
+       for connections and metadata every time, never batches anything, and leaks resources if it is not
+       closed. One per application — or one per distinct configuration — is the rule.</p>
+
+    <h2>Part 2 — How Batches Form</h2>
+
+    <p>The accumulator keeps one open batch per partition. The sender ships a batch when either of two things
+       happens first:</p>
+
+<pre>
+batch for orders-4:  [r1][r2][r3][r4] ...          ship when:
+                     ◄──── batch.size ────►         (a) the batch reaches batch.size (16 KB), or
+                                                     (b) the oldest record has waited linger.ms
+                                                         (5 ms by default since Kafka 4.0; 0 before)
+
+linger.ms = 0  →  ship as soon as the sender is free: at low traffic, often ONE record per batch
+linger.ms = 20 →  wait up to 20 ms to fill the batch: fewer, fuller, better-compressed requests
+</pre>
+
+    <p><strong>Batching happens per partition, so the per-partition rate is what matters.</strong> A producer
+       sending 10,000 keyed records per second sounds busy. Spread across 200 partitions, that is 50 records per
+       second per partition, or one record every 20 ms. With a 5 ms linger, most batches hold a single record.</p>
+
+<pre>
+10,000 records/s ÷ 200 partitions = 50 records/s per partition
+linger.ms = 5    → expected records per batch ≈ 50 × 0.005 = 0.25 → mostly 1-record batches
+linger.ms = 50   → ≈ 2.5 records per batch
+linger.ms = 200  → ≈ 10 records per batch, at up to 200 ms of added latency
+
+Unkeyed records avoid this: the sticky partitioner fills one partition's batch at a time.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>Raise it when</th><th>Cost</th></tr>
+      <tr><td><code>linger.ms</code></td><td>5 ms (4.0+), 0 before</td><td>Throughput matters more than a few ms of latency</td><td>Adds up to that much latency per record</td></tr>
+      <tr><td><code>batch.size</code></td><td>16,384 bytes</td><td>High per-partition rates; batches are filling before linger ends</td><td>More memory per partition in the accumulator</td></tr>
+      <tr><td><code>buffer.memory</code></td><td>32 MB</td><td>Many partitions, or bursts while brokers are slow</td><td>Memory; and more data lost if the process is killed</td></tr>
+      <tr><td><code>max.block.ms</code></td><td>60 s</td><td>(Usually lower it)</td><td>Lower means failing fast when the buffer is full</td></tr>
+    </table>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Calling <code>producer.send(record).get()</code> for every record.</strong> Each record waits
+         for its own acknowledgement before the next is sent, so there is never more than one record in a batch and
+         never more than one request in flight. Throughput falls to roughly one record per network round trip plus
+         replication — a few hundred per second instead of tens of thousands.</p>
+      <p>✅ <strong>Send asynchronously and handle the result in a callback.</strong> If the caller truly needs
+         confirmation (an API that must not respond until the event is durable), send the batch of records first
+         and wait on all of their futures together, or wait once with <code>flush()</code>. Exercise 2 measures
+         the difference.</p>
+    </div>
+
+    <h2>Part 3 — Compression</h2>
+
+    <p>Compression is applied per batch by the producer, stored unchanged by the broker (when the topic's
+       <code>compression.type</code> is <code>producer</code>, the default) and undone by the consumer. It reduces
+       network traffic, disk and page-cache use at the cost of producer and consumer CPU.</p>
+
+    <table class="tbl">
+      <tr><th>Codec</th><th>Ratio</th><th>CPU</th><th>Typical choice</th></tr>
+      <tr><td><code>none</code> (default)</td><td>1×</td><td>None</td><td>Payloads that are already compressed (images, encrypted data)</td></tr>
+      <tr><td><code>lz4</code></td><td>Good</td><td>Very low</td><td>A safe general default for high throughput</td></tr>
+      <tr><td><code>snappy</code></td><td>Good</td><td>Low</td><td>Similar to lz4; common in older setups</td></tr>
+      <tr><td><code>zstd</code></td><td>Best</td><td>Moderate, tunable</td><td>Network- or storage-bound clusters; cross-region links</td></tr>
+      <tr><td><code>gzip</code></td><td>High</td><td>High</td><td>Rarely the best choice today; zstd usually beats it</td></tr>
+    </table>
+
+    <p><strong>The ratio depends on batch size more than codec.</strong> Compression works by finding repetition,
+       and a batch of one JSON record has little to find; a batch of 200 similar records repeats every field name
+       200 times. Turning compression on while batches hold one record each is mostly wasted CPU — fix batching
+       first. Since Kafka 3.8 each codec's level is configurable (<code>compression.zstd.level</code> and similar),
+       which lets you trade more CPU for a better ratio on expensive links.</p>
+
+<pre>
+producer-metrics to read before and after a change:
+  batch-size-avg          average bytes per batch       ◄── tiny? fix linger/keys first
+  records-per-request-avg records per produce request
+  compression-rate-avg    compressed ÷ uncompressed     ◄── 0.25 means 4× smaller
+  record-queue-time-avg   ms a record waited in the accumulator (≈ added latency)
+  request-latency-avg     broker round trip, incl. replication for acks=all
+</pre>
+
+    <h2>Part 4 — Delivery: acks, Retries, Timeouts and Idempotence</h2>
+
+    <p>Once a batch leaves, the producer keeps retrying retriable errors until the batch succeeds or its time
+       runs out. Since Kafka 3.0 the defaults are safe: <code>acks=all</code>, effectively unlimited
+       <code>retries</code>, and <code>enable.idempotence=true</code>.</p>
+
+    <table class="tbl">
+      <tr><th><code>acks</code></th><th>Leader acknowledges when</th><th>Risk</th></tr>
+      <tr><td><code>0</code></td><td>Never waits — fire and forget</td><td>Any failure loses data silently; no retries possible</td></tr>
+      <tr><td><code>1</code></td><td>The leader has written it</td><td>Leader dies before followers copy it → acknowledged data lost</td></tr>
+      <tr><td><code>all</code> (default)</td><td>Every in-sync replica has it</td><td>Safe if <code>min.insync.replicas ≥ 2</code>; see the replication lesson</td></tr>
+    </table>
+
+    <p><strong>The timeout hierarchy.</strong> Several timeouts nest, and only one of them is the promise to
+       your code:</p>
+
+<pre>
+delivery.timeout.ms  (120 s)  ─ total time from send() to callback, including every retry
+  ├─ linger.ms        (5 ms)   ─ time spent waiting for the batch to fill
+  ├─ request.timeout.ms (30 s) ─ time to wait for ONE produce request's response
+  └─ retry.backoff.ms (100 ms, growing to retry.backoff.max.ms = 1 s) ─ pause between attempts
+
+The producer refuses to start if delivery.timeout.ms &lt; linger.ms + request.timeout.ms.
+When delivery.timeout.ms expires, the callback receives a TimeoutException and the record is DROPPED.
+</pre>
+
+    <p><strong>How idempotence works.</strong> The producer gets a producer id from the broker and numbers each
+       batch per partition. The broker remembers the last five sequence numbers per producer and partition, so a
+       retried batch that was already written is recognised and acknowledged again instead of written twice. The
+       same numbering keeps batches in order even with up to five requests in flight.</p>
+
+<pre>
+without idempotence, max.in.flight = 5, retries on:
+  batch A (seq 10) ──► fails (leader moved)                     ┐
+  batch B (seq 11) ──► succeeds, written at offset 500          ├─ log order: B, A   ◄── REORDERED
+  batch A retried  ──► succeeds, written at offset 501          ┘
+
+with idempotence:
+  broker sees seq 11 while expecting 10 → rejects B as out of order; producer retries in order
+  and a duplicate retry of A (seq 10 already written) is acknowledged without a second write
+</pre>
+
+    <div class="note">🔑 <strong>Idempotence is on by default, but conflicting settings switch it off without
+       an error.</strong> If you set <code>acks=1</code>, <code>retries=0</code>, or
+       <code>max.in.flight.requests.per.connection</code> above 5 and do not set <code>enable.idempotence</code>
+       yourself, the producer quietly disables idempotence to honour your setting. If you set
+       <code>enable.idempotence=true</code> explicitly alongside a conflicting value, it refuses to start instead.
+       So state it explicitly: <code>enable.idempotence=true</code> turns a silent downgrade into a startup
+       error.</div>
+
+    <p><strong>What idempotence does not cover:</strong> it removes duplicates caused by the producer's own
+       retries within one producer session. If your application crashes and a new producer resends records it is
+       not sure about, those are new sends with a new producer id, and they are duplicates. Surviving restarts
+       takes transactions with a stable <code>transactional.id</code>, or deduplication on the consumer side —
+       covered in the idempotence and transactions lesson.</p>
+
+    <h2>Part 5 — Errors and Callbacks</h2>
+
+    <p>Producer errors come out in two places, and code has to handle both:</p>
+
+    <table class="tbl">
+      <tr><th>Where</th><th>Examples</th><th>Handle by</th></tr>
+      <tr><td>Thrown from <code>send()</code></td><td><code>SerializationException</code>; <code>TimeoutException</code> from metadata or a full buffer; producer already closed</td><td>try/catch around the call; the record never entered the buffer</td></tr>
+      <tr><td>Callback / future, retriable</td><td><code>NotLeaderOrFollowerException</code>, network errors, <code>NotEnoughReplicasException</code></td><td>Retried automatically; you only see them if <code>delivery.timeout.ms</code> runs out</td></tr>
+      <tr><td>Callback / future, not retriable</td><td><code>RecordTooLargeException</code>, authorization failures, <code>TimeoutException</code> after the delivery timeout</td><td>Your code decides: log, dead-letter, fail the request, alert</td></tr>
+    </table>
+
+    <p><strong>Fire-and-forget is the most common producer bug.</strong> <code>producer.send(record)</code> with
+       no callback and no one reading the returned future means every failure after the record left your thread
+       disappears. There is no exception and no log line from your code; the only trace is the producer's
+       <code>record-error-rate</code> metric, if anyone graphs it.</p>
+
+<pre>
+// WRONG: failures vanish
+producer.send(new ProducerRecord&lt;&gt;("audit", userId, event));
+
+// RIGHT: every outcome is observed
+producer.send(new ProducerRecord&lt;&gt;("audit", userId, event), (meta, err) -&gt; {
+    if (err != null) {
+        failures.increment();
+        deadLetter.offer(event);          // hand off; do NOT block here
+    }
+});
+</pre>
+
+    <p><strong>Callbacks run on the sender thread.</strong> That thread is the only one moving data for this
+       producer. A callback that makes a database call, takes a contended lock, or sends to another blocking
+       system holds up every batch for every partition until it returns. Keep callbacks to counting, logging and
+       handing work to a queue that another thread drains.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Writing to a database inside the producer callback.</strong> It works in testing. Under
+         load the database slows to 50 ms per call, the sender thread spends its time waiting on it, batches
+         stop moving, the accumulator fills, and <code>send()</code> starts blocking every application thread for
+         up to <code>max.block.ms</code> — a database slowdown has become a Kafka outage in your service.</p>
+      <p>✅ <strong>Keep the callback trivial.</strong> Record the outcome into a concurrent queue or counter,
+         and let a separate worker do the slow follow-up. Exercise 4 shows the stall and the fix.</p>
+    </div>
+
+    <h2>Part 6 — Lifecycle, Shutdown and What You Can Lose</h2>
+
+    <p>Records in the accumulator exist only in your process's memory. Anything that ends the process before
+       those batches are acknowledged loses them, and nothing on the broker side knows they existed.</p>
+
+<pre>
+send() returned  ─►  record in accumulator (RAM)  ─►  sent  ─►  acknowledged
+                     ▲
+                     SIGKILL, OOM kill, or a container stopped before close() finishes
+                     = records gone, and the callbacks never run
+</pre>
+
+    <table class="tbl">
+      <tr><th>Call</th><th>What it does</th><th>Use it</th></tr>
+      <tr><td><code>flush()</code></td><td>Sends everything buffered and blocks until each record completes (success or failure)</td><td>Before committing input offsets, at a checkpoint, or before responding</td></tr>
+      <tr><td><code>close()</code></td><td>Flushes, then releases resources; without an argument it waits indefinitely</td><td>At shutdown</td></tr>
+      <tr><td><code>close(Duration)</code></td><td>Waits at most that long, then abandons what is left (those records fail)</td><td>At shutdown with a deadline shorter than your platform's kill timeout</td></tr>
+    </table>
+
+    <p><strong>Match the shutdown deadline to the platform.</strong> Kubernetes sends SIGTERM and kills the
+       container after <code>terminationGracePeriodSeconds</code> (30 s by default). If the brokers are
+       unreachable, <code>close()</code> would wait far longer than that, and the kill arrives first. Call
+       <code>close(Duration.ofSeconds(20))</code> in the shutdown hook, so any records that cannot be delivered
+       fail through their callbacks, where your code can log or persist them, instead of vanishing when the kill
+       arrives.</p>
+
+    <p><strong>If a record must never be lost, do not rely on the producer's buffer alone.</strong> A service
+       that writes to its database and then sends to Kafka can crash between the two. The durable pattern is the
+       transactional outbox: write the event to an outbox table in the same database transaction as the
+       business change, and relay the table to Kafka separately. The
+       <a href="../system-design/pubsub-queues.html">System Design queues lesson</a> covers it.</p>
+
+<pre>
+Runtime.getRuntime().addShutdownHook(new Thread(() -&gt; {
+    stopAcceptingRequests();                     // 1. no new sends
+    producer.close(Duration.ofSeconds(20));      // 2. flush with a deadline under the kill timeout
+}));
+</pre>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Creating a producer per request</td><td>New connections and metadata every time; no batching; leaks</td><td>One shared, thread-safe producer per application</td></tr>
+      <tr><td>Assuming <code>send()</code> never blocks</td><td>It blocks up to 60 s for metadata or a full buffer</td><td>Lower <code>max.block.ms</code>; warm metadata at startup</td></tr>
+      <tr><td><code>send().get()</code> per record</td><td>One record per batch, one request in flight; throughput collapses</td><td>Async sends with callbacks; wait on futures in bulk if needed</td></tr>
+      <tr><td>Fire-and-forget sends</td><td>Failures after <code>send()</code> returns are never seen</td><td>Always a callback that records the outcome</td></tr>
+      <tr><td>Slow work in the callback</td><td>The sender thread stalls; the buffer fills; every thread blocks</td><td>Hand off to another thread; keep callbacks trivial</td></tr>
+      <tr><td>Setting <code>acks=1</code> "for speed"</td><td>Idempotence silently turns off, and acknowledged data can be lost</td><td>Keep <code>acks=all</code>; state <code>enable.idempotence=true</code></td></tr>
+      <tr><td><code>max.in.flight</code> above 5 without idempotence</td><td>Retries can reorder batches</td><td>Leave it at 5 with idempotence on</td></tr>
+      <tr><td>Retrying failed sends by hand in a loop</td><td>Duplicates across producer sessions, and blocked threads</td><td>Let the producer retry; handle only final failures</td></tr>
+      <tr><td>Compressing one-record batches</td><td>CPU spent for almost no saving</td><td>Fix batching first, then compress</td></tr>
+      <tr><td><code>linger.ms=0</code> with many partitions and modest traffic</td><td>Mostly one-record batches and many small requests</td><td>A linger of 10–50 ms if the latency budget allows</td></tr>
+      <tr><td><code>delivery.timeout.ms</code> shorter than a broker failover</td><td>Records fail during a normal leader election</td><td>Keep it at or above the default 2 minutes</td></tr>
+      <tr><td>Calling <code>close()</code> with no deadline in containers</td><td>The platform kills the process first; buffered records vanish silently</td><td><code>close(Duration)</code> shorter than the kill timeout</td></tr>
+      <tr><td>Treating a successful <code>send()</code> call as delivered</td><td>It only means "buffered"</td><td>Delivered means the callback reported success</td></tr>
+      <tr><td>Relying on the producer buffer for must-not-lose events</td><td>A crash between the DB commit and the send loses the event</td><td>Transactional outbox</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What happens when you call <code>producer.send()</code>?</summary>
+      <p>On the calling thread, the producer makes sure it has metadata for the topic, serializes the key and
+         value, picks a partition, and appends the record to an in-memory batch for that partition in the record
+         accumulator. It then returns a <code>Future</code> — the record has been <em>buffered</em>, not
+         delivered.</p>
+      <p>A separate sender thread takes batches that are ready — full at <code>batch.size</code> or older than
+         <code>linger.ms</code> — groups them by the broker leading each partition, and sends one produce request
+         per broker. It retries retriable errors until <code>delivery.timeout.ms</code> expires, and when a batch
+         finally succeeds or fails it completes the futures and runs the callbacks, on the sender thread.</p>
+      <p>Two points follow. First, a successful return from <code>send()</code> tells you nothing about delivery;
+         you learn the outcome from the callback or the future. Second, <code>send()</code> is not always
+         non-blocking: waiting for metadata and waiting for buffer space both happen on your thread, for up to
+         <code>max.block.ms</code>, which is 60 seconds by default.</p>
+      <p>That split — your thread fills the buffer, one I/O thread empties it — is also why the producer is
+         thread-safe and meant to be shared: many application threads can feed one producer, and its batching gets
+         better the more records it sees.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What do <code>batch.size</code> and <code>linger.ms</code> control?</summary>
+      <p>They decide when a batch leaves the producer. Each partition has an open batch; it is sent when it
+         reaches <code>batch.size</code> bytes (16 KB by default) or when its oldest record has waited
+         <code>linger.ms</code> (5 ms by default since Kafka 4.0, 0 in earlier versions), whichever comes first.</p>
+      <p>Bigger batches mean fewer requests, less per-request overhead on the brokers and much better
+         compression. The cost is latency: with <code>linger.ms=20</code>, a record can wait up to 20 ms before it
+         is even sent.</p>
+      <p>The point that is easy to miss is that batching happens <em>per partition</em>. A producer sending
+         10,000 records per second across 200 partitions sends only 50 per second to each, so a 5 ms linger
+         collects well under one record per batch on average. For keyed traffic spread over many partitions, a
+         longer linger is often the only way to get real batches. Unkeyed traffic batches better because the sticky
+         partitioner fills one partition at a time.</p>
+      <p>I would tune them by looking at <code>batch-size-avg</code> and <code>record-queue-time-avg</code>: small
+         batches with a short queue time mean linger could be raised; batches at the size limit mean
+         <code>batch.size</code> is the constraint.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A web service calls <code>producer.send()</code> in its request handler, and during a Kafka outage every request hangs for a minute. Why, and how do you fix it?</summary>
+      <p>Because <code>send()</code> blocks in two situations, and an outage triggers both. If the producer does
+         not have current metadata for the topic's partitions, it waits for it. And once the brokers stop accepting
+         data, the sender cannot drain the accumulator, so after a few seconds <code>buffer.memory</code> fills and
+         every new <code>send()</code> waits for space. Both waits are bounded by <code>max.block.ms</code>, which
+         defaults to 60 seconds — on the request thread.</p>
+      <p>The fix starts with deciding what the service should do when Kafka is down, because that is a product
+         decision. If the event is optional (analytics), the request should succeed without it: set
+         <code>max.block.ms</code> low (a few hundred milliseconds), catch the <code>TimeoutException</code>, count
+         the drop and move on. If the event is required (an order placed), the request should fail quickly with a
+         clear error rather than hang — again a low <code>max.block.ms</code>, but returning an error.</p>
+      <p>If the event must not be lost and the request must not fail, the design needs a durable buffer that is
+         not Kafka: write the event to an outbox table in the same transaction as the business data, and relay it
+         to Kafka asynchronously. The request then depends only on the database.</p>
+      <p>Two supporting changes: fetch metadata at startup with <code>partitionsFor()</code> so the first request
+         after a deploy does not block, and alert on the producer's <code>buffer-available-bytes</code> and
+         <code>record-error-rate</code>, which show trouble before users do.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How does the idempotent producer prevent duplicates, and when does it not?</summary>
+      <p>When idempotence is enabled — the default since Kafka 3.0 — the producer obtains a producer id and epoch
+         from the broker, and numbers every batch it sends to each partition with a sequence number. The partition
+         leader remembers the recent sequence numbers for each producer. If a batch arrives with a sequence number
+         already written, the broker acknowledges it without writing it again; if one arrives out of order, the
+         broker rejects it so the producer retries in order.</p>
+      <p>That solves the classic retry duplicate: the produce request succeeded but its response was lost, the
+         producer retried, and without idempotence the record would be written twice. It also keeps ordering intact
+         with up to five requests in flight, where a non-idempotent producer with retries could reorder batches.
+      </p>
+      <p>It does not help in three situations. <strong>Across producer sessions:</strong> if the application
+         restarts and resends records it is unsure about, the new producer has a new id and the broker cannot
+         relate the two. <strong>Application-level resends:</strong> code that catches a failure and calls
+         <code>send()</code> again creates a new record, which idempotence treats as new. <strong>When it has been
+         silently disabled:</strong> setting <code>acks=1</code> or more than five in-flight requests without
+         explicitly enabling idempotence turns it off with no error.</p>
+      <p>So I would set <code>enable.idempotence=true</code> explicitly, so conflicting settings fail at startup,
+         and handle cross-session duplicates with transactions or idempotent consumers.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A producer's throughput is far below what the brokers can handle. How do you find the bottleneck?</summary>
+      <p>I would locate it by stage, using the producer's own metrics, before changing any setting.</p>
+      <p><strong>1. Is the application actually calling <code>send()</code> fast enough?</strong> If
+         <code>record-send-rate</code> matches what the application produces and the buffer is nearly empty
+         (<code>buffer-available-bytes</code> close to <code>buffer.memory</code>), the producer is not the limit —
+         the code feeding it is. A common cause is <code>send().get()</code> per record, which caps throughput at one
+         round trip per record.</p>
+      <p><strong>2. Are batches small?</strong> A low <code>batch-size-avg</code> and
+         <code>records-per-request-avg</code> mean many small requests: keyed records spread over many partitions
+         with a short linger. Raising <code>linger.ms</code> to 10–50 ms, if the latency budget allows, usually
+         gives the biggest single improvement, and makes compression effective.</p>
+      <p><strong>3. Is the producer waiting on the brokers?</strong> A high <code>request-latency-avg</code> with
+         full buffers points to the brokers or to replication: <code>acks=all</code> waits for the slowest in-sync
+         follower, so one struggling follower slows every produce request to its partitions. Broker-side request
+         metrics show whether time goes to the leader's disk, to waiting for followers, or to the network.</p>
+      <p><strong>4. Is the sender thread busy doing something else?</strong> If callbacks do real work, the one
+         I/O thread spends its time there instead of sending. Profiling the sender thread, or timing callbacks,
+         shows it.</p>
+      <p><strong>5. Is the producer CPU-bound?</strong> Compression, serialization and TLS all cost CPU; gzip in
+         particular. Switching to lz4 or zstd at a low level, or adding producer instances, helps here.</p>
+      <p><strong>Recommendation:</strong> measure with <code>kafka-producer-perf-test.sh</code> against the same
+         topic to establish what the cluster can accept, then compare the application's metrics against it. In my
+         experience the answer is usually batching (linger and keys) or a blocking pattern in application code, and
+         rarely the brokers.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design how a service publishes "order placed" events so that no committed order is ever missing from Kafka.</summary>
+      <p>The problem is that the order lives in a database and the event goes to Kafka, and no single operation
+         writes both. Every ordering of the two writes has a crash window: commit then send, and a crash between
+         them loses the event; send then commit, and a crash between them publishes an order that does not exist.
+         Producer settings cannot fix this, because the gap is between two systems.</p>
+      <p><strong>The design I would use is the transactional outbox.</strong> In the same database transaction
+         that inserts the order, insert a row into an <code>outbox</code> table containing the event. Now the event
+         exists if and only if the order does. A separate relay reads the outbox — by polling, or better by change
+         data capture of the outbox table with Debezium — sends each event to Kafka, and marks it sent only after
+         the producer's callback reports success.</p>
+      <p><strong>The relay's producer is configured for safety:</strong> <code>acks=all</code>,
+         <code>enable.idempotence=true</code> stated explicitly, default retries and <code>delivery.timeout.ms</code>,
+         and a callback that records failures without blocking. The topic has replication factor 3 and
+         <code>min.insync.replicas=2</code>, so an acknowledged event survives a broker loss.</p>
+      <p><strong>Duplicates are still possible</strong> — the relay can send an event and crash before marking
+         the row sent, then send it again after restart. So each event carries a stable id (the outbox row id or the
+         order id plus event type), and consumers deduplicate on it. Keying by order id keeps all of one order's
+         events in order within a partition.</p>
+      <p><strong>Recommendation:</strong> outbox plus CDC relay, safe producer defaults stated explicitly, RF 3
+         with <code>min.insync.replicas=2</code>, stable event ids, and idempotent consumers. The request path then
+         depends only on the database, a Kafka outage delays events rather than losing them, and "never missing" is
+         a property of the design rather than of hoping the process is not killed at the wrong moment.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure how <code>linger.ms</code> and compression change
+      throughput and latency with the producer performance tool.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kt --create --topic perf --partitions 12 --replication-factor 1
+$ for cfg in "linger.ms=0" "linger.ms=20" "linger.ms=20 compression.type=lz4"; do
+    echo "== $cfg"
+    kafka-producer-perf-test.sh --topic perf --num-records 1000000 --record-size 500 \
+      --throughput -1 --producer-props bootstrap.servers=localhost:9092 $cfg | tail -1
+  done
+== linger.ms=0
+1000000 records sent, 118343.2 records/sec (56.43 MB/sec), 312.40 ms avg latency, ...
+== linger.ms=20
+1000000 records sent, 204498.9 records/sec (97.51 MB/sec), 188.61 ms avg latency, ...
+== linger.ms=20 compression.type=lz4
+1000000 records sent, 284090.9 records/sec (135.46 MB/sec), 101.27 ms avg latency, ...
+</pre>
+      <p>Your numbers will differ with hardware; the direction is what matters. Two results surprise people.
+         Raising <code>linger.ms</code> <em>lowered</em> average latency here, because the tool sends as fast as it
+         can: with tiny batches, records queue behind each other waiting for requests, and fuller batches clear the
+         queue faster. And compression raised throughput, because the random-but-repetitive test payload compresses
+         well and the bottleneck was bytes, not CPU.</p>
+      <table class="tbl">
+        <tr><th>Change</th><th>Why it helped</th><th>When it would not</th></tr>
+        <tr><td><code>linger.ms</code> 0 → 20</td><td>Fuller batches, fewer requests</td><td>Low, steady traffic, where it only adds latency</td></tr>
+        <tr><td>lz4 compression</td><td>Fewer bytes through the network and to disk</td><td>Already-compressed payloads, or CPU-bound producers</td></tr>
+      </table>
+      <p>Repeat the run with <code>--throughput 1000</code> to model light traffic: now <code>linger.ms=20</code>
+         adds close to 20 ms of latency to every record, because batches never fill. Tuning depends on the traffic
+         you actually have.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Compare a synchronous send loop with asynchronous sends.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+long t0 = System.nanoTime();
+for (int i = 0; i &lt; 5_000; i++) {
+    producer.send(new ProducerRecord&lt;&gt;("perf", "k" + i, "v" + i)).get();   // waits every time
+}
+System.out.printf("sync:  %.0f rec/s%n", 5_000 / ((System.nanoTime() - t0) / 1e9));
+
+t0 = System.nanoTime();
+List&lt;Future&lt;RecordMetadata&gt;&gt; fs = new ArrayList&lt;&gt;();
+for (int i = 0; i &lt; 5_000; i++) {
+    fs.add(producer.send(new ProducerRecord&lt;&gt;("perf", "k" + i, "v" + i)));
+}
+for (Future&lt;RecordMetadata&gt; f : fs) f.get();                               // wait once, at the end
+System.out.printf("async: %.0f rec/s%n", 5_000 / ((System.nanoTime() - t0) / 1e9));
+</pre>
+<pre>
+sync:  612 rec/s
+async: 48210 rec/s
+</pre>
+      <p>The synchronous loop is bounded by one full round trip per record — the network plus, with
+         <code>acks=all</code>, the time for followers to replicate. Every batch holds one record. The asynchronous
+         version fills batches and keeps up to five requests in flight per broker.</p>
+      <p>Both versions confirm every record; the second just waits for all of them together. That is the pattern
+         for a caller that needs confirmation: send everything first, then wait on the futures (or call
+         <code>flush()</code>), rather than waiting between records.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Reproduce <code>send()</code> blocking a request thread
+      when the cluster is unreachable, and make it fail fast.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ docker stop kafka                               # cluster gone
+
+// a fresh producer that has never fetched metadata for "orders"
+long t0 = System.nanoTime();
+try {
+    producer.send(new ProducerRecord&lt;&gt;("orders", "k", "v"));
+} catch (org.apache.kafka.common.errors.TimeoutException e) {
+    System.out.printf("send() threw after %.1f s: %s%n", (System.nanoTime() - t0) / 1e9, e.getMessage());
+}
+</pre>
+<pre>
+send() threw after 60.0 s: Topic orders not present in metadata after 60000 ms.
+</pre>
+      <p>The call that "returns a future" held the thread for a full minute. With a web server's worker pool,
+         every in-flight request does the same, and the service stops responding. Now lower the bound:</p>
+<pre>
+p.put("max.block.ms", "500");
+...
+send() threw after 0.5 s: Topic orders not present in metadata after 500 ms.
+</pre>
+      <p>With metadata already cached (the producer had sent before the outage), the first sends succeed
+         immediately — into the buffer — and the block comes later, when <code>buffer.memory</code> fills. That
+         version throws <code>TimeoutException</code> with a message about failing to allocate memory within
+         <code>max.block.ms</code>. Both are handled the same way: a low bound, a catch, and a deliberate decision
+         about whether the request fails or proceeds without the event.</p>
+      <table class="tbl">
+        <tr><th>Cause of blocking</th><th>When</th><th>Bounded by</th></tr>
+        <tr><td>Waiting for metadata</td><td>First send to a topic; cluster unreachable</td><td><code>max.block.ms</code></td></tr>
+        <tr><td>Waiting for buffer space</td><td>Brokers slow or down; bursts</td><td><code>max.block.ms</code></td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show that a slow callback stalls every send in the
+      producer, then fix it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+AtomicLong done = new AtomicLong();
+Callback slow = (meta, err) -&gt; {
+    try { Thread.sleep(20); } catch (InterruptedException e) { }   // "write the audit row"
+    done.incrementAndGet();
+};
+long t0 = System.nanoTime();
+for (int i = 0; i &lt; 2_000; i++) producer.send(new ProducerRecord&lt;&gt;("perf", "k" + i, "v"), slow);
+producer.flush();
+System.out.printf("slow callback: %.1f s%n", (System.nanoTime() - t0) / 1e9);
+</pre>
+<pre>
+slow callback: 40.3 s          ◄── 2,000 × 20 ms, run one after another on the sender thread
+</pre>
+      <p>All callbacks run on the single sender thread, so their durations add up, and while the thread runs
+         them it is not sending anything. Under sustained load, the accumulator fills and <code>send()</code>
+         starts blocking the application's threads. Move the work off that thread:</p>
+<pre>
+ExecutorService followUp = Executors.newFixedThreadPool(8);
+Callback fast = (meta, err) -&gt; followUp.submit(() -&gt; writeAuditRow(meta, err));
+...
+fast callback: 0.4 s           ◄── sends finish at network speed; follow-up work runs elsewhere
+</pre>
+      <p>Bound the executor's queue in real code, and decide what happens when it is full — otherwise the
+         unbounded queue becomes the next memory problem. The rule stays simple: a callback records the outcome
+         and returns.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> A service shows occasional duplicate events after network
+      blips, although "idempotence is on by default". Find out why.
+      <details class="solution"><summary>Solution</summary>
+<p>The producer logs its effective configuration at startup. Search it:</p>
+<pre>
+$ grep -A200 'ProducerConfig values' app.log | grep -E 'acks|enable.idempotence|max.in.flight|retries'
+	acks = 1
+	enable.idempotence = false            ◄── switched off
+	max.in.flight.requests.per.connection = 5
+	retries = 2147483647
+</pre>
+      <p>Someone set <code>acks=1</code> for latency. Because <code>enable.idempotence</code> was not set
+         explicitly, the producer resolved the conflict by disabling idempotence — no error, one log line among
+         hundreds. From then on, a produce request whose response was lost during a network blip was retried and
+         written twice.</p>
+      <p>Prove it by making the conflict explicit:</p>
+<pre>
+p.put("acks", "1");
+p.put("enable.idempotence", "true");
+→ org.apache.kafka.common.config.ConfigException: Must set acks to all in order to use the idempotent producer.
+</pre>
+      <table class="tbl">
+        <tr><th>Configuration</th><th>Result</th></tr>
+        <tr><td><code>acks=all</code>, idempotence not set</td><td>Idempotent (default)</td></tr>
+        <tr><td><code>acks=1</code>, idempotence not set</td><td><strong>Silently not idempotent</strong></td></tr>
+        <tr><td><code>acks=1</code>, <code>enable.idempotence=true</code></td><td>Refuses to start</td></tr>
+        <tr><td><code>acks=all</code>, <code>enable.idempotence=true</code></td><td>Idempotent, and protected from future edits</td></tr>
+      </table>
+      <p>Fix: restore <code>acks=all</code> and set <code>enable.idempotence=true</code> explicitly so the next
+         "latency tweak" fails at startup instead of degrading silently. If the latency of <code>acks=all</code> is
+         the real complaint, look at the followers slowing it down — the replication lesson covers the ISR and why a
+         slow follower delays every <code>acks=all</code> request.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> A Kubernetes deployment loses a few hundred events on every
+      rollout. Diagnose it and design a shutdown that does not.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# what the pod does today
+main():
+    producer = new KafkaProducer(...)          # linger.ms=100 for throughput
+    serveHttp()                                # no shutdown hook
+
+# what Kubernetes does on rollout
+SIGTERM → (JVM exits: no hook, producer never closed) → buffered batches gone
+</pre>
+      <p>Without a shutdown hook, SIGTERM ends the JVM while up to 100 ms of records — at this service's rate,
+         a few hundred — sit in the accumulator. Their callbacks never run, so nothing is logged. The fix has three
+         steps, and the order matters:</p>
+<pre>
+Runtime.getRuntime().addShutdownHook(new Thread(() -&gt; {
+    http.stopAcceptingNewRequests();                 // 1. stop creating new events
+    http.awaitInFlightRequests(Duration.ofSeconds(5)); // 2. let requests that already sent finish
+    producer.close(Duration.ofSeconds(15));          // 3. flush, bounded under the kill timeout
+}));
+
+# deployment.yaml
+terminationGracePeriodSeconds: 30                    # 5 + 15 + margin, under 30
+</pre>
+      <table class="tbl">
+        <tr><th>Step</th><th>Prevents</th></tr>
+        <tr><td>Stop accepting requests first</td><td>New records arriving after the flush has begun</td></tr>
+        <tr><td><code>close(Duration)</code> under the grace period</td><td>SIGKILL arriving mid-flush; records that cannot be sent fail through callbacks, which log them</td></tr>
+        <tr><td>A readiness probe that fails on SIGTERM</td><td>The load balancer sending new traffic to a stopping pod</td></tr>
+      </table>
+      <p>This fixes rollouts. It does not fix crashes or OOM kills, which skip the hook entirely. If losing those
+         events is also unacceptable, move the durability boundary into the database with a transactional outbox, so
+         the producer's buffer is never the only copy.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong><code>send()</code> buffers; it does not deliver.</strong> The callback or future is the only report of the outcome.</li>
+        <li><strong><code>send()</code> blocks for metadata and for buffer space,</strong> for up to <code>max.block.ms</code> (60 s) — lower it on request paths.</li>
+        <li><strong>Serialization errors are thrown from <code>send()</code>;</strong> network and broker errors arrive later in the callback.</li>
+        <li><strong>Use one shared producer per application;</strong> it is thread-safe and batches better the more it sees.</li>
+        <li><strong>A batch ships at <code>batch.size</code> or after <code>linger.ms</code>,</strong> whichever comes first; the linger default became 5 ms in Kafka 4.0.</li>
+        <li><strong>Batching is per partition,</strong> so keyed traffic over many partitions barely batches without a longer linger.</li>
+        <li><strong><code>send().get()</code> per record collapses throughput</strong> to one round trip per record; wait on futures together instead.</li>
+        <li><strong>Compression ratio depends on batch size;</strong> fix batching before choosing a codec, and prefer lz4 or zstd.</li>
+        <li><strong><code>delivery.timeout.ms</code> is the promise:</strong> the total time from send to callback, including retries, after which the record is dropped.</li>
+        <li><strong>Idempotence is the default since 3.0</strong> and prevents duplicates from the producer's own retries, keeping order with up to 5 requests in flight.</li>
+        <li><strong><code>acks=1</code> or more than 5 in-flight requests silently disable idempotence</strong> unless <code>enable.idempotence=true</code> is set explicitly.</li>
+        <li><strong>Idempotence does not span producer restarts;</strong> use transactions or consumer-side deduplication for that.</li>
+        <li><strong>Callbacks run on the single sender thread;</strong> slow callbacks stall every send in the process.</li>
+        <li><strong>Buffered records die with the process,</strong> so close with a deadline shorter than the platform's kill timeout.</li>
+        <li><strong>Events that must never be lost need an outbox,</strong> because no producer setting closes the gap between a database commit and a send.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="log-partitions.html">← Topics, Partitions &amp; the Log</a>
+      <a href="consumers.html">Consumers &amp; Consumer Groups →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
