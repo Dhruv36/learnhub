@@ -69,6 +69,10 @@ REVIEWED_THIN = {
     "kafka/multi-region.html",       # 40KB, stretch vs replication, MM2, offset translation, DR
     "kafka/choosing-kafka.html",     # 39KB, decision framework, alternatives, managed vs self
 
+    # typescript, reviewed 2026-09-17. Written to the v4 recipe from scratch;
+    # every claim verified against tsc 7.0.2 locally.
+    "typescript/types-basics.html",  # 40KB, widening, unions, optionality, Record, type vs interface
+
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
     # than its neighbours, and everything it owes is present: the fiber-identity
