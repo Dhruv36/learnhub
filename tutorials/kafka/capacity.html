@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Partition Count &amp; Capacity Planning — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Partition Count &amp; Capacity Planning <span class="level-badge level-ultra">Operations</span></h1>
+    <p><strong>What you'll master:</strong> the four dimensions a Kafka cluster runs out of — network, disk
+       throughput, disk space and partition count — and which one you will hit first; <strong>the egress
+       arithmetic that surprises everyone</strong>, where replication and three consumer groups turn 100 MB/s in
+       into 500 MB/s out; storage sizing with replication, retention and real headroom; what each partition costs a
+       broker, and why recovery time grows with partition count; benchmarking that measures the right thing —
+       <strong>p99 under catch-up reads, not average throughput on a warm cache</strong>; sizing for a lost zone
+       rather than for a good day; and a cost model in which <strong>cross-zone traffic can exceed the
+       brokers</strong>. Prerequisites: <a href="kraft-cluster.html">Cluster Architecture &amp; KRaft</a> and the
+       partition-sizing material in <a href="log-partitions.html">Topics, Partitions &amp; the Log</a>.</p>
+
+    <h2>Part 1 — The Four Things You Run Out Of</h2>
+
+    <table class="tbl">
+      <tr><th>Dimension</th><th>Limit</th><th>Symptom when reached</th></tr>
+      <tr><td>Network</td><td>NIC bandwidth per broker, both directions</td><td>Produce latency rises; follower lag; ISR shrinks</td></tr>
+      <tr><td>Disk throughput</td><td>Sequential write + catch-up read rate</td><td>Request queue time grows; page cache thrashes</td></tr>
+      <tr><td>Disk space</td><td>Retention × rate × replication</td><td>A full log directory takes the broker offline</td></tr>
+      <tr><td>Partition count</td><td>Files, memory, fetcher work, recovery time per broker</td><td>Slow restarts, long leader elections, high idle CPU</td></tr>
+    </table>
+
+    <p><strong>Egress is the dimension people forget.</strong> Every byte produced is written once to the leader,
+       copied to each follower, and then read by every consumer group. The broker's outbound traffic is therefore a
+       multiple of the inbound:</p>
+
+<pre>
+ingress          100 MB/s produced to the cluster
+replication out  100 × (RF − 1) = 200 MB/s          leaders sending to followers
+consumer out     100 × 3 groups  = 300 MB/s          three groups each reading everything
+                 ─────────────────────────────
+total egress     500 MB/s across the cluster, against 100 MB/s in
+
+per broker, 6 brokers: ~17 MB/s in, ~83 MB/s out — plus catch-up reads, which are bursty
+a 10 Gb/s NIC is ~1.2 GB/s: fine here, but a fourth consumer group adds another 100 MB/s
+</pre>
+
+    <div class="note">🔑 <strong>Adding a consumer group is a capacity decision.</strong> It costs no storage and
+       no producer work, which makes it feel free — and it adds a full copy of the topic's traffic to broker egress
+       and, if the group is in another zone, to the cross-zone bill. A platform team that lets teams self-serve new
+       consumer groups should track egress per group, not just topic count.</div>
+
+    <h2>Part 2 — Sizing Storage</h2>
+
+<pre>
+daily volume        1.2 TB/day of compressed records (measure AFTER compression: producers compress)
+retention           7 days
+replication factor  3
+                    ─────────────────────────────────────
+raw log             1.2 × 7 × 3 = 25.2 TB
++ headroom          × 1.4  → ~35 TB          (bursts, a failed broker's partitions moving, reassignments)
+brokers             9      → ~3.9 TB usable per broker
+
+then check the OTHER limits for that shape:
+  9 brokers × 3.9 TB is easy to buy — but is 1.2 TB/day (14 MB/s) really why you need 9 brokers?
+  usually the answer is network, partitions or failure headroom, not space
+</pre>
+
+    <table class="tbl">
+      <tr><th>Factor</th><th>Effect on storage</th></tr>
+      <tr><td>Compression</td><td>Often 3–5× on JSON-like payloads; measure yours, and remember the broker stores what the producer sent</td></tr>
+      <tr><td>Replication factor</td><td>Multiplies everything: RF 3 means three copies of every byte</td></tr>
+      <tr><td>Compacted topics</td><td>Sized by keys × value size, not by write rate (see the compaction lesson)</td></tr>
+      <tr><td>Internal topics</td><td><code>__consumer_offsets</code> and changelogs are usually small but not zero</td></tr>
+      <tr><td>Tiered storage</td><td>Moves closed segments to object storage: local disk holds recent data only</td></tr>
+      <tr><td>A failed broker</td><td>Its partitions are re-replicated elsewhere: the survivors need room for them</td></tr>
+    </table>
+
+    <p><strong>A full log directory is an outage, not a warning.</strong> When a broker cannot write, the
+       affected log directory fails and its partitions go offline; with enough of them, the broker stops being
+       useful entirely. Disk alerts need to fire with days of margin, and the growth rate matters more than the
+       percentage — a steady climb means retention or compaction has stopped, as the compaction lesson describes.</p>
+
+    <h2>Part 3 — What a Partition Costs</h2>
+
+    <p>Partitions are the unit of parallelism, so more looks better. Each one is also a set of files, a
+       replication stream, a producer batch and an entry in every metadata view.</p>
+
+    <table class="tbl">
+      <tr><th>Cost</th><th>Where it lands</th></tr>
+      <tr><td>Open file handles</td><td>Several per segment (log, index, timeindex) per replica — a broker with tens of thousands of partitions needs a raised <code>nofile</code> limit</td></tr>
+      <tr><td>Page cache pressure</td><td>Every active partition writes to its own segment; more partitions means less sequential locality</td></tr>
+      <tr><td>Replication work</td><td>Fetcher threads multiplex partitions; more partitions means more per-fetch bookkeeping</td></tr>
+      <tr><td>Producer memory and batching</td><td><code>buffer.memory</code> divided across partitions: more partitions, smaller batches, worse compression</td></tr>
+      <tr><td>Recovery time</td><td>After an unclean shutdown, each log is checked and recovered — the dominant restart cost on partition-heavy brokers</td></tr>
+      <tr><td>Failover time</td><td>A broker's loss means electing leaders for every partition it led</td></tr>
+    </table>
+
+<pre>
+restart arithmetic after an unclean shutdown
+  4,000 partition replicas on the broker, log recovery ~25 ms per log with default threads
+  → ~100 s of recovery before it serves anything
+  num.recovery.threads.per.data.dir = 1 by default; raising it to the number of cores cuts this
+  (a clean shutdown avoids the check entirely — another reason never to SIGKILL a broker)
+</pre>
+
+    <p><strong>Keep a per-broker partition budget.</strong> KRaft raised how many partitions a cluster can
+       manage, but the per-broker costs above did not go away. Pick a number the team is comfortable operating —
+       thousands per broker rather than tens of thousands, then verified by testing restart and failover times —
+       and treat partition creation as spending from it. A topic with 200 partitions "because it might grow" spends
+       600 replicas of that budget at RF 3.</p>
+
+    <h2>Part 4 — Benchmarking That Means Something</h2>
+
+    <p>The built-in tools are enough, if they are pointed at the right question. The common mistake is
+       measuring average throughput on an empty cluster with data that fits in the page cache — a number that has
+       no relationship to production behaviour.</p>
+
+<pre>
+$ kafka-producer-perf-test.sh --topic bench --num-records 50000000 --record-size 900 \
+    --throughput -1 --producer-props bootstrap.servers=b1:9092 acks=all compression.type=lz4 \
+    linger.ms=20 batch.size=131072
+50000000 records sent, 214,204 records/sec (183.8 MB/sec), 41.2 ms avg latency,
+  892.0 ms max latency, 33 ms 50th, 96 ms 95th, 184 ms 99th, 402 ms 99.9th.
+
+$ kafka-consumer-perf-test.sh --bootstrap-server b1:9092 --topic bench --messages 50000000 --threads 4
+</pre>
+
+    <table class="tbl">
+      <tr><th>Do</th><th>Why</th></tr>
+      <tr><td>Use your real record size, compression and <code>acks</code></td><td>Each changes the answer by multiples</td></tr>
+      <tr><td>Run long enough to exceed page cache and to hit GC</td><td>A 30-second run measures RAM, not the system</td></tr>
+      <tr><td>Read p99 and p99.9, not the average</td><td>Users experience the tail; averages hide stalls</td></tr>
+      <tr><td>Include a catch-up reader</td><td>Cold reads evict the page cache and change tail latency for everyone</td></tr>
+      <tr><td>Test with the real partition count and consumer groups</td><td>Egress and batching both depend on them</td></tr>
+      <tr><td>Kill a broker mid-run</td><td>Failover behaviour under load is the number that matters in an incident</td></tr>
+    </table>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Capacity planning from a benchmark of tail reads only.</strong> The test produces and consumes
+         at the head of the log, everything is served from the page cache, and the cluster looks capable of three
+         times its eventual real load. In production a new consumer group starts from the beginning, or a consumer
+         recovers from an outage, and those cold reads pull old segments from disk — evicting the cache that tailing
+         consumers were using and pushing p99 up for everyone.</p>
+      <p>✅ <strong>Benchmark the bad day.</strong> Run the steady-state load, then start a consumer reading from
+         the earliest offset, and watch the tail latency of the healthy consumers. That number sets your real
+         headroom, and it is the reason clusters are sized well below their theoretical ceiling.</p>
+    </div>
+
+    <h2>Part 5 — Headroom: Size for the Failure, Not the Good Day</h2>
+
+<pre>
+three zones, 9 brokers, steady state 60% utilisation
+
+zone lost:
+  6 brokers carry what 9 carried  →  60% × 9/6 = 90% utilisation
+  plus: leaders that were in the lost zone move here   (more egress per surviving broker)
+  plus: consumers that were in the lost zone reconnect elsewhere
+  plus: when the zone returns, re-replication traffic competes with client traffic
+→ 90% is not survivable with those additions; the cluster needed ~45-55% steady-state utilisation
+</pre>
+
+    <table class="tbl">
+      <tr><th>Event</th><th>Extra load it creates</th><th>Plan for it by</th></tr>
+      <tr><td>Losing a zone</td><td>Traffic concentrated on the remaining brokers</td><td>Steady state at 50–60% of capacity</td></tr>
+      <tr><td>A broker replaced</td><td>Full re-replication of its partitions</td><td>Throttled reassignment; spare disk and network</td></tr>
+      <tr><td>A consumer group catching up</td><td>Cold reads from disk at maximum rate</td><td>Quotas on that group; headroom for the burst</td></tr>
+      <tr><td>A traffic spike</td><td>Ingress and egress rise together</td><td>Historical peak-to-average ratio, not the average</td></tr>
+      <tr><td>A rolling upgrade</td><td>One broker down at a time, leadership moving</td><td>Capacity for N−1 during maintenance</td></tr>
+    </table>
+
+    <p><strong>Peak, not average, is the input.</strong> A cluster sized on daily average will be at three times
+       that during the evening peak, and a cluster sized on the peak of a normal day has nothing left for the day a
+       batch job replays a month of history. Plan from the observed peak with a stated growth rate, and revisit the
+       numbers on a schedule.</p>
+
+    <h2>Part 6 — The Cost Model</h2>
+
+<pre>
+a mid-sized self-managed cluster, per month (illustrative shape, not a price list)
+  9 brokers (compute)                       largest single line, usually
+  storage (35 TB provisioned, replicated)   second
+  CROSS-ZONE NETWORK                        can rival or exceed compute — see below
+  controllers (3 small nodes)               minor
+  operational effort (upgrades, on-call)    real, and usually unaccounted
+
+cross-zone arithmetic (three zones, leaders spread evenly)
+  replication: ~2/3 of replication traffic crosses a zone
+  consumers:   ~2/3 of consumer fetches cross a zone — unless follower fetching is enabled
+  200 MB/s cross-zone × 2.6 M s/month ≈ 518 TB/month  → at $0.02/GB round trip ≈ $10,000/month
+</pre>
+
+    <table class="tbl">
+      <tr><th>Lever</th><th>Effect</th><th>Cost</th></tr>
+      <tr><td>Follower fetching (<code>client.rack</code>)</td><td>Removes most consumer cross-zone traffic</td><td>Slightly higher end-to-end latency</td></tr>
+      <tr><td>Compression (zstd/lz4 at the producer)</td><td>Shrinks network, disk and cross-zone bytes together</td><td>Producer and consumer CPU</td></tr>
+      <tr><td>Tiered storage</td><td>Long retention on object storage instead of broker disks</td><td>Not available for compacted topics; higher latency for old data</td></tr>
+      <tr><td>Fewer clusters</td><td>Shares headroom and operational effort</td><td>Weaker isolation; noisy-neighbour risk without quotas</td></tr>
+      <tr><td>Managed service</td><td>Removes operational effort and much of the risk</td><td>Higher unit price; less control over versions and tuning</td></tr>
+      <tr><td>Shorter retention</td><td>Directly cuts the largest storage term</td><td>Shorter replay window: an availability decision, not just a cost one</td></tr>
+    </table>
+
+    <p><strong>Track cost per unit of work</strong> — cost per TB ingested, or per million records — rather than
+       the absolute bill. Absolute cost grows with the business; the unit cost is what tells you whether the
+       platform is getting better or worse, and it makes the case for a change like follower fetching in a way a
+       total does not.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Sizing from ingress only</td><td>Egress is several times larger with replication and consumer groups</td><td>Compute egress explicitly, per group</td></tr>
+      <tr><td>Treating a new consumer group as free</td><td>A full extra copy of the topic's traffic, often cross-zone</td><td>Track egress per group; enable follower fetching</td></tr>
+      <tr><td>Sizing storage before compression is known</td><td>Estimates off by 3–5×</td><td>Measure compressed bytes on the wire</td></tr>
+      <tr><td>Forgetting replication in storage maths</td><td>The cluster needs RF copies of everything</td><td>× replication factor, then headroom</td></tr>
+      <tr><td>Disk alerts at a fixed percentage</td><td>A steady climb crosses it days after the cause</td><td>Alert on growth rate and days-to-full</td></tr>
+      <tr><td>"Partitions are cheap"</td><td>File handles, batching, recovery and failover all degrade</td><td>A per-broker partition budget, tested</td></tr>
+      <tr><td>Over-partitioning "for growth"</td><td>Smaller batches, worse compression, slower restarts</td><td>Size from measured throughput with modest headroom</td></tr>
+      <tr><td>Default <code>num.recovery.threads.per.data.dir</code> on partition-heavy brokers</td><td>Very slow restarts after an unclean shutdown</td><td>Raise it; and always shut down cleanly</td></tr>
+      <tr><td>Benchmarking with tiny records and short runs</td><td>Measures the page cache, not the cluster</td><td>Real record sizes, long runs, cold reads included</td></tr>
+      <tr><td>Reporting average latency</td><td>Hides the stalls users feel</td><td>p99 and p99.9</td></tr>
+      <tr><td>Planning to run at 80% utilisation</td><td>A zone loss takes it past 100%</td><td>50–60% steady state with three zones</td></tr>
+      <tr><td>Ignoring re-replication after a broker replacement</td><td>Recovery traffic starves clients</td><td>Throttle reassignments; keep network headroom</td></tr>
+      <tr><td>Sizing on daily averages</td><td>The evening peak is multiples of it</td><td>Plan from observed peaks plus growth</td></tr>
+      <tr><td>Ignoring cross-zone network in the budget</td><td>It can rival the brokers themselves</td><td>Model it; enable follower fetching and compression</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What resources does a Kafka broker run out of first?</summary>
+      <p>Usually network, then disk throughput, then disk space, with partition count as a fourth limit that shows
+         up as slow restarts and failovers rather than as saturation.</p>
+      <p>Network is first because Kafka multiplies traffic. Every produced byte is written to the leader, copied
+         to each follower, and read by every consumer group. With replication factor 3 and three consumer groups,
+         100 MB/s of ingress becomes about 500 MB/s of egress across the cluster.</p>
+      <p>Disk throughput matters mainly for reads that miss the page cache. Writes are sequential and cheap;
+         consumers that are caught up read from memory. It is the catch-up readers — a new consumer group, or one
+         recovering from an outage — that pull old segments from disk and compete with everything else.</p>
+      <p>Disk space is the most predictable: rate × retention × replication factor, plus headroom. It is the least
+         likely to surprise you, provided compaction and retention are actually working — and a full log directory
+         takes the broker offline rather than merely warning.</p>
+      <p>CPU is rarely the limit, unless TLS or broker-side recompression is in play, both of which add real
+         work.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How do you estimate storage for a topic?</summary>
+      <p>Bytes per day, times retention in days, times the replication factor, plus headroom.</p>
+      <p>The detail that matters most is measuring the <em>compressed</em> size, because the broker stores what the
+         producer sent, and JSON-like payloads often compress three to five times. Estimating from uncompressed
+         record sizes overshoots by a large factor; estimating from a single small record undershoots, because
+         compression works much better across a full batch.</p>
+      <p>Then the multipliers: replication factor 3 means three copies of every byte on the cluster's disks. I add
+         roughly 40% headroom, which covers bursts, the space needed when a failed broker's partitions are
+         re-replicated elsewhere, and partition reassignments.</p>
+      <p>Two exceptions are worth remembering. Compacted topics are sized by the number of keys and their value
+         size, not by the write rate, because superseded records are removed. And tiered storage, where available,
+         moves closed segments to object storage, so brokers only need space for recent data — though not for
+         compacted topics.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A cluster runs comfortably at 60% utilisation across three zones. Is that enough?</summary>
+      <p>No, if the goal is to survive a zone loss. With nine brokers across three zones, losing one zone leaves
+         six brokers carrying what nine carried: 60% becomes 90% before anything else is counted.</p>
+      <p>And other things are counted. Leadership for the lost zone's partitions moves to the survivors, so their
+         egress rises more than their share of ingress. Consumers that ran in the lost zone reconnect to brokers in
+         the others. When the zone returns, re-replication of everything written meanwhile competes with live
+         traffic. At 90% baseline, each of those pushes the cluster past its limits, and the failure becomes a
+         latency incident on top of the capacity event.</p>
+      <p>So for a three-zone cluster I size steady state at roughly 50–60% of capacity <em>measured at peak</em>,
+         not on the daily average — which usually means the honest question is whether that 60% was measured at
+         peak or on average, because those differ by a factor of two or three in most businesses.</p>
+      <p>I would verify it rather than calculate it: run a game day that blocks one zone, watch produce latency,
+         consumer lag and under-replicated partitions, and see whether the cluster is still within its SLOs. That
+         answer is worth more than any utilisation target.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you benchmark a Kafka cluster properly?</summary>
+      <p>Decide the question first, then make the test resemble production in the ways that change the answer.</p>
+      <p><strong>Match the workload:</strong> real record sizes, the compression the producers use, the same
+         <code>acks</code> and idempotence settings, the partition count the topic will have, and the number of
+         consumer groups — each of these moves throughput by multiples.</p>
+      <p><strong>Run long enough</strong> that the data exceeds the page cache and that garbage collection has
+         happened. A short run on an empty cluster measures RAM. <strong>Read the tail</strong>: p99 and p99.9 from
+         <code>kafka-producer-perf-test.sh</code>, not the average, because the average hides exactly the stalls
+         users notice.</p>
+      <p><strong>Include the bad day.</strong> Start a consumer from the earliest offset while the steady load
+         runs: those cold reads evict the page cache and show what happens to everyone else's tail latency. Kill a
+         broker mid-run and watch produce latency during the failover and the re-replication afterwards.</p>
+      <p>What I would not do is take a published throughput number and plan against it. Those benchmarks are
+         usually tail-read, large-batch, no-TLS, no-catch-up scenarios chosen to produce a big number; the useful
+         figure is what <em>your</em> workload sustains on <em>your</em> hardware with a failure in progress.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Plan capacity for a new platform: 500,000 records/s peak at 800 bytes, RF 3, 7-day retention, four consumer groups.</summary>
+      <p><strong>Traffic:</strong> 500,000 × 800 B = 400 MB/s ingress uncompressed; with lz4 on JSON-like data,
+         assume roughly 120 MB/s on the wire — and I would measure it rather than assume. Egress: replication
+         120 × 2 = 240 MB/s, consumers 120 × 4 = 480 MB/s, so about 720 MB/s across the cluster, plus catch-up
+         reads.</p>
+      <p><strong>Storage:</strong> 120 MB/s × 604,800 s = ~72 TB for 7 days, × 3 for replication = ~218 TB, × 1.4
+         headroom ≈ 300 TB.</p>
+      <p><strong>Brokers:</strong> with a 10 Gb/s NIC (~1.2 GB/s) I would target no more than ~300 MB/s of egress
+         per broker at steady state to leave failure headroom, so ~9 brokers on network grounds; 300 TB over 9
+         brokers is ~33 TB each, which argues for dense storage nodes or tiered storage for the older days.
+         Rounding to <strong>12 brokers across three zones</strong> gives the 50–60% utilisation that survives a
+         zone loss and keeps per-broker storage reasonable.</p>
+      <p><strong>Partitions:</strong> driven by the slowest consumer group's per-partition throughput, as the
+         partitions lesson sets out — measured with the real handler, then given growth headroom, and kept within a
+         per-broker partition budget verified by restart tests.</p>
+      <p><strong>Controllers:</strong> three dedicated, one per zone.</p>
+      <p><strong>Cost levers to apply from day one:</strong> follower fetching so consumer traffic stays in-zone,
+         producer-side compression, and tiered storage for the tail of retention if the platform supports it.</p>
+      <p><strong>Recommendation:</strong> 12 brokers plus 3 controllers across three zones, sized on measured
+         compressed throughput, validated by a benchmark that includes a catch-up reader and a broker failure, and
+         reviewed quarterly against actual peak growth.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> The Kafka bill doubled while traffic grew 20%. Where do you look?</summary>
+      <p>Traffic and cost have diverged, so something other than volume changed. I would decompose the bill before
+         touching anything: compute, storage, network, and which of them grew.</p>
+      <p><strong>Network is the usual answer,</strong> and specifically cross-zone transfer. New consumer groups
+         are the common cause: each one adds a full copy of the topic's egress, and two-thirds of it crosses zones
+         by default. Four groups instead of two doubles that line while ingress barely moves. The fix is follower
+         fetching with <code>client.rack</code>, which keeps consumer reads in-zone, plus a check that producers
+         actually compress.</p>
+      <p><strong>Storage next:</strong> a retention change, compaction that stopped (the cleaner health checks from
+         the compaction lesson), replication factor raised on a large topic, or a topic created with defaults that
+         nobody reviewed. Days-to-full and per-topic disk usage answer this quickly.</p>
+      <p><strong>Compute:</strong> brokers added to chase a latency problem whose real cause was something else —
+         for example catch-up reads evicting the page cache, which more brokers only partly help.</p>
+      <p><strong>And the non-technical causes:</strong> a cluster split in two for isolation, which duplicates
+         headroom and controllers; or a move to a managed service, where the unit price is higher and the saving is
+         in effort rather than on the bill.</p>
+      <p><strong>Recommendation:</strong> report cost per TB ingested alongside the absolute figure, attribute
+         egress per consumer group, and enable follower fetching. In my experience the combination of self-service
+         consumer groups and default leader-only fetching explains most cost surprises of this shape.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Compute a cluster's traffic and storage from requirements.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+given: 80,000 records/s peak, 1.5 KB each, RF 3, retention 5 days, 3 consumer groups,
+       measured compression ratio 4:1
+</pre>
+<pre>
+ingress uncompressed  80,000 × 1,500 B      = 120 MB/s
+ingress on the wire   120 ÷ 4               =  30 MB/s     ◄── what the cluster actually carries
+replication egress    30 × (3 − 1)          =  60 MB/s
+consumer egress       30 × 3 groups         =  90 MB/s
+total egress                                 = 150 MB/s
+
+storage  30 MB/s × 432,000 s (5 days)       = 12.9 TB
+         × RF 3                              = 38.8 TB
+         × 1.4 headroom                      = ~54 TB
+</pre>
+      <table class="tbl">
+        <tr><th>Per-broker figures</th><th>6 brokers</th><th>9 brokers</th></tr>
+        <tr><td>Ingress</td><td>5 MB/s</td><td>3.3 MB/s</td></tr>
+        <tr><td>Egress</td><td>25 MB/s</td><td>16.7 MB/s</td></tr>
+        <tr><td>Storage</td><td>9 TB</td><td>6 TB</td></tr>
+      </table>
+      <p>Neither network figure is remotely close to a modern NIC, which is the usual outcome: this cluster's
+         broker count will be decided by failure headroom, partition budget and storage density, not by throughput.
+         Say that explicitly in the plan, or someone will "optimise" it down to three brokers and discover the
+         zone-loss problem later.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Measure how <code>acks</code> and compression change
+      throughput and tail latency.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ for cfg in "acks=1" "acks=all" "acks=all compression.type=lz4" "acks=all compression.type=zstd"; do
+    echo "== $cfg"
+    kafka-producer-perf-test.sh --topic bench --num-records 5000000 --record-size 900 \
+      --throughput -1 --producer-props bootstrap.servers=b1:9092 linger.ms=20 $cfg | tail -1
+  done
+== acks=1
+5000000 records sent, 241,090 records/sec (206.8 MB/sec), 28.1 ms avg, 84 ms 95th, 131 ms 99th, 318 ms 99.9th
+== acks=all
+5000000 records sent, 198,412 records/sec (170.2 MB/sec), 39.4 ms avg, 102 ms 95th, 189 ms 99th, 456 ms 99.9th
+== acks=all compression.type=lz4
+5000000 records sent, 263,852 records/sec (226.3 MB/sec), 31.7 ms avg, 88 ms 95th, 158 ms 99th, 381 ms 99.9th
+== acks=all compression.type=zstd
+5000000 records sent, 284,900 records/sec (244.4 MB/sec), 30.2 ms avg, 85 ms 95th, 151 ms 99th, 366 ms 99.9th
+</pre>
+      <table class="tbl">
+        <tr><th>Change</th><th>Effect here</th><th>Why</th></tr>
+        <tr><td><code>acks=1</code> → <code>all</code></td><td>~18% less throughput, higher p99</td><td>Each batch waits for the slowest in-sync follower</td></tr>
+        <tr><td>Adding compression</td><td>More throughput than <code>acks=1</code> without it</td><td>Fewer bytes to replicate: the bottleneck was network, not CPU</td></tr>
+      </table>
+      <p>Your numbers will differ; the shape is the point. Compression recovering the cost of
+         <code>acks=all</code> is common on network-bound clusters, which makes "we disabled <code>acks=all</code>
+         for performance" a decision worth re-testing with compression enabled first.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Measure what partitions cost by creating a lot of them.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ for i in $(seq 1 100); do
+    kafka-topics.sh --bootstrap-server b1:9092 --create --topic load-$i \
+      --partitions 50 --replication-factor 3 &gt;/dev/null
+  done          # 5,000 partitions = 15,000 replicas across the cluster
+</pre>
+<pre>
+                              before        after
+open file handles (broker)     4,210        38,940      ◄── check `ulimit -n` and LimitNOFILE
+broker heap used               1.8 GB        2.6 GB
+idle CPU per broker              3%            9%       (fetcher and metadata work)
+produce p99 (unchanged load)    12 ms         21 ms
+clean restart time              18 s          47 s
+UNCLEAN restart (kill -9)       22 s         196 s      ◄── log recovery per partition
+</pre>
+      <table class="tbl">
+        <tr><th>Observation</th><th>Mitigation</th></tr>
+        <tr><td>File handle count scales with replicas × segments</td><td>Raise <code>LimitNOFILE</code>; fewer, larger partitions</td></tr>
+        <tr><td>Unclean restart time grows fastest</td><td><code>num.recovery.threads.per.data.dir</code>; always shut down cleanly</td></tr>
+        <tr><td>Produce p99 degrades before anything looks "full"</td><td>Keep a per-broker partition budget</td></tr>
+      </table>
+      <p>Delete the topics afterwards and confirm the numbers return. The restart figures are the ones to keep:
+         they are what turns a routine broker replacement into a long outage on a partition-heavy cluster.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Show a catch-up reader degrading everyone else's latency.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+steady state: producers at 150 MB/s, three consumer groups tailing the log
+  produce p99         14 ms
+  consumer e2e p99    28 ms
+  broker disk reads   ~0 MB/s          ◄── everything served from the page cache
+
+now start a fourth group from the beginning of a 20 TB topic:
+$ kafka-consumer-groups.sh ... --group backfill --reset-offsets --to-earliest --all-topics --execute
+  broker disk reads   780 MB/s
+  page cache hit rate falls
+  produce p99         63 ms            ◄── 4.5x
+  consumer e2e p99   210 ms            ◄── the TAILING consumers, which changed nothing
+</pre>
+      <table class="tbl">
+        <tr><th>Mitigation</th><th>Effect</th><th>Cost</th></tr>
+        <tr><td>Quota the backfill group's fetch rate</td><td>Bounds the disk read rate</td><td>The backfill takes longer</td></tr>
+        <tr><td>Run backfills off-peak</td><td>Uses idle capacity</td><td>Scheduling</td></tr>
+        <tr><td>Tiered storage</td><td>Old segments read from object storage, not broker disks</td><td>Higher latency for old data; not for compacted topics</td></tr>
+        <tr><td>More RAM per broker</td><td>Larger page cache; a longer tail stays cached</td><td>Hardware</td></tr>
+      </table>
+      <p>This is why capacity plans must include catch-up reads: the cluster was at 40% "utilisation" by every
+         dashboard, and one legitimate new consumer group took production latency past its SLO.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Run a zone-loss capacity test and size from the result.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+setup: 9 brokers / 3 zones, steady state at measured peak, three consumer groups, RF 3, min ISR 2
+test:  block network to zone C (security group, or iptables on those brokers)
+
+t+0     leaders in zone C are re-elected in A and B          (controller quorum: 2 of 3 → fine)
+t+5s    surviving brokers: egress 47 MB/s → 78 MB/s per broker
+        under-replicated partitions: 1,204 (every partition that had a replica in C)
+        produce p99: 18 ms → 41 ms                            (acks=all now waits on 2 of 2 live replicas)
+t+2m    consumers that were in zone C reconnect: +90 MB/s cross-zone egress
+t+10m   steady, degraded: CPU 71%, produce p99 44 ms, no errors      ◄── SURVIVED
+
+restore zone C
+t+0     brokers re-register; re-replication of 10 minutes of data begins
+        WITHOUT a throttle: produce p99 spikes to 380 ms      ◄── recovery hurt more than the failure
+        WITH --throttle 60000000: p99 stays under 60 ms, recovery takes ~25 minutes
+</pre>
+      <table class="tbl">
+        <tr><th>Finding</th><th>Action</th></tr>
+        <tr><td>Survived the loss, but at 71% CPU</td><td>Acceptable now; revisit when steady state passes ~65%</td></tr>
+        <tr><td>Recovery was worse than the outage</td><td>Make throttled re-replication the documented default</td></tr>
+        <tr><td>Consumers reconnecting added cross-zone egress</td><td>Confirm <code>client.rack</code> is set on every consumer</td></tr>
+        <tr><td>min ISR 2 with 2 live replicas: no margin</td><td>Any further broker loss stops writes — accepted, documented</td></tr>
+      </table>
+      <p>Write the numbers into the capacity document with the date. The value of the exercise is not the single
+         result but the trend: running it each quarter shows when growth has eaten the headroom, months before an
+         incident would.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build a cost model and decide whether tiered storage pays.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+current: 12 brokers, 30 MB/s ingress on the wire, RF 3, 30-day retention
+  storage on brokers   30 MB/s × 2.6 M s × 3 = 234 TB provisioned (with headroom ~330 TB)
+  the last 27 days of that data are read by: an occasional backfill, and nothing else
+</pre>
+      <table class="tbl">
+        <tr><th>Option</th><th>Local disk</th><th>Object storage</th><th>Notes</th></tr>
+        <tr><td>Keep 30 days local</td><td>~330 TB</td><td>—</td><td>Today's shape; storage dominates the bill</td></tr>
+        <tr><td>Tiered: 3 days local, 27 remote</td><td>~33 TB</td><td>~78 TB (RF 1 in object storage)</td><td>Object storage is far cheaper per TB and not replicated 3×</td></tr>
+        <tr><td>Cut retention to 7 days</td><td>~77 TB</td><td>—</td><td>Cheapest, but loses 23 days of replay</td></tr>
+      </table>
+<pre>
+tiering also changes behaviour, not just cost:
+  + brokers hold less data → faster re-replication, faster restarts, smaller failure blast radius
+  + catch-up reads of old data no longer evict the page cache (they go to object storage)
+  − reads of old data are slower and incur request costs
+  − NOT available for compacted topics: those stay entirely local
+  − another dependency in the read path, with its own failure modes to test
+</pre>
+      <p><strong>Recommendation:</strong> tier the large event topics, keep compacted state topics local, and treat
+         the retention cut as a separate conversation with the teams that replay — it is an availability decision
+         dressed as a cost one. Then re-run the model as cost per TB ingested, so the saving is visible even as
+         volume grows.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>A cluster runs out of network, disk throughput, disk space or partition count</strong> — usually in that order.</li>
+        <li><strong>Egress is ingress × (RF − 1) + ingress × consumer groups;</strong> 100 MB/s in can be 500 MB/s out.</li>
+        <li><strong>Every new consumer group is a capacity and cross-zone cost decision,</strong> not a free subscription.</li>
+        <li><strong>Size storage from compressed bytes,</strong> times retention, times replication factor, plus real headroom.</li>
+        <li><strong>A full log directory takes a broker offline;</strong> alert on growth rate and days-to-full, not a percentage.</li>
+        <li><strong>Compacted topics are sized by keys × value size,</strong> not by write rate.</li>
+        <li><strong>Each partition costs file handles, batching efficiency, fetcher work and recovery time.</strong></li>
+        <li><strong>Unclean restart time scales with partition count</strong> — a reason to shut down cleanly and to raise recovery threads.</li>
+        <li><strong>Keep a per-broker partition budget</strong> and treat topic creation as spending from it.</li>
+        <li><strong>Benchmark with real record sizes, compression, <code>acks</code> and partition counts,</strong> for long enough to leave the page cache.</li>
+        <li><strong>Read p99 and p99.9, and include a catch-up reader and a broker failure</strong> — that is the number capacity plans need.</li>
+        <li><strong>Cold reads evict the page cache and raise everyone's tail latency;</strong> quota backfills.</li>
+        <li><strong>Three-zone clusters should sit at 50–60% of capacity at peak,</strong> because a zone loss concentrates the rest.</li>
+        <li><strong>Recovery after a failure can hurt more than the failure;</strong> throttle re-replication by default.</li>
+        <li><strong>Cross-zone traffic can rival the brokers in cost;</strong> follower fetching and compression are the main levers.</li>
+        <li><strong>Track cost per TB ingested,</strong> not the absolute bill, to see whether the platform is improving.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="kraft-cluster.html">← Cluster Architecture &amp; KRaft</a>
+      <a href="performance.html">Performance: Throughput vs Latency →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

@@ -62,6 +62,8 @@ REVIEWED_THIN = {
     "kafka/connect-cdc.html",        # 44KB, converters, offsets, SMTs, Debezium slots
     "kafka/error-handling.html",     # 42KB, bad data vs bad dependency, DLQ design, replay
     "kafka/kraft-cluster.html",      # 41KB, metadata log, quorum sizing, fencing, upgrades
+    "kafka/capacity.html",           # 38KB, four limits, egress arithmetic, headroom, cost
+    "kafka/performance.html",        # 40KB, latency split, request breakdown, JVM/OS, TLS cost
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower

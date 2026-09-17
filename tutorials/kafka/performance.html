@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Performance: Throughput vs Latency — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Performance: Throughput vs Latency <span class="level-badge level-ultra">Operations</span></h1>
+    <p><strong>What you'll master:</strong> where end-to-end time actually goes, from <code>send()</code> to a
+       consumer's handler, and which setting moves each part; the producer's latency-throughput curve, and why
+       <strong>raising <code>linger.ms</code> can lower latency</strong> under load; <strong>the broker's
+       request-time breakdown</strong> — queue, local, remote, response — which turns "Kafka is slow" into a
+       specific component in one query; request handler and network idle ratios; consumer fetch tuning; the JVM and
+       OS settings that matter (and the heap size that quietly destroys throughput); what TLS really costs; and a
+       repeatable method for investigating a latency regression. Prerequisites:
+       <a href="capacity.html">Partition Count &amp; Capacity Planning</a>.</p>
+
+    <h2>Part 1 — Where the Time Goes</h2>
+
+<pre>
+producer.send() ──► [1] batching wait ──► [2] request + queue ──► [3] leader append
+                                                                        │
+                                              [4] replication to ISR ◄──┘   (acks=all)
+                                                        │
+                                          [5] high watermark advances
+                                                        │
+consumer poll() ◄── [7] fetch response ◄── [6] fetch wait (fetch.min.bytes / fetch.max.wait.ms)
+       │
+       └──► [8] your processing
+</pre>
+
+    <table class="tbl">
+      <tr><th>Stage</th><th>Typical contribution</th><th>Controlled by</th></tr>
+      <tr><td>[1] Batching wait</td><td>0–<code>linger.ms</code></td><td><code>linger.ms</code>, <code>batch.size</code>, per-partition rate</td></tr>
+      <tr><td>[2] Request queueing on the broker</td><td>Microseconds when healthy; tens of ms when saturated</td><td><code>num.io.threads</code>, load, TLS CPU</td></tr>
+      <tr><td>[3] Leader append</td><td>Sub-millisecond (page cache)</td><td>Disk only when the cache is under pressure</td></tr>
+      <tr><td>[4] Replication</td><td>One follower fetch round trip; cross-zone adds its RTT</td><td><code>acks</code>, follower health, <code>num.replica.fetchers</code></td></tr>
+      <tr><td>[5] High watermark advance</td><td>Bounded by the slowest in-sync follower</td><td>ISR health</td></tr>
+      <tr><td>[6] Consumer fetch wait</td><td>0–<code>fetch.max.wait.ms</code> (500 ms default!)</td><td><code>fetch.min.bytes</code>, <code>fetch.max.wait.ms</code></td></tr>
+      <tr><td>[8] Processing</td><td>Usually the largest term in a real pipeline</td><td>Your code, and consumer parallelism</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Most "Kafka is slow" reports are not Kafka.</strong> In a healthy cluster,
+       stages 2–5 total single-digit milliseconds. The large terms are the ones your configuration chose —
+       <code>linger.ms</code> on the producer, <code>fetch.min.bytes</code> with a 500 ms maximum wait on the
+       consumer — and the processing time in the handler. Measure the end-to-end split before tuning brokers, or
+       you will spend a week on a component contributing 3% of the latency.</div>
+
+    <h2>Part 2 — The Producer's Latency-Throughput Curve</h2>
+
+    <p>Batching trades latency for throughput, but not monotonically. Under load, larger batches mean fewer
+       requests, less per-request overhead and less queueing — so latency can <em>fall</em> as
+       <code>linger.ms</code> rises.</p>
+
+<pre>
+fixed offered load, 200,000 records/s, 500-byte records, acks=all, lz4
+
+linger.ms   achieved rec/s   p99 latency   requests/s   avg batch
+  0            118,000          412 ms       41,200        3 records    ◄── queueing: cannot keep up
+  5            186,000          118 ms       12,400       15 records
+ 20            200,000           47 ms        3,900       51 records    ◄── best of both here
+100            200,000          121 ms          820      244 records    ◄── now the linger wait dominates
+</pre>
+
+    <table class="tbl">
+      <tr><th>Situation</th><th>Effect of raising <code>linger.ms</code></th></tr>
+      <tr><td>Producer is keeping up easily (low rate)</td><td>Adds latency, roughly the linger value; no throughput gain</td></tr>
+      <tr><td>Producer is near its limit</td><td><strong>Lowers</strong> latency and raises throughput: fewer, fuller requests</td></tr>
+      <tr><td>Many partitions, keyed traffic</td><td>Larger effect, because per-partition batches are otherwise tiny</td></tr>
+    </table>
+
+<pre>
+producer metrics that tell you which side of the curve you are on
+  record-queue-time-avg     time a record waited in the accumulator  (≈ the linger you are paying)
+  batch-size-avg            bytes per batch                          (tiny? raise linger)
+  requests-in-flight        near max.in.flight? the broker is the constraint, not batching
+  request-latency-avg       broker round trip, incl. replication for acks=all
+</pre>
+
+    <h2>Part 3 — Reading the Broker's Request Breakdown</h2>
+
+    <p>This is the most useful diagnostic Kafka exposes, and it is underused. Every request type reports where
+       its time was spent, and each component points at a different cause.</p>
+
+<pre>
+kafka.network:type=RequestMetrics,name=*,request=Produce   (mean / 99th percentile)
+
+  RequestQueueTimeMs    waiting for a request handler thread    → handlers saturated, or CPU starved
+  LocalTimeMs           leader processing: append to the log    → disk or page cache trouble
+  RemoteTimeMs          waiting for OTHER BROKERS (acks=all)    → a slow follower; the usual culprit
+  ThrottleTimeMs        held back by a quota                    → the client is over its quota
+  ResponseQueueTimeMs   waiting for a network thread            → network threads saturated
+  ResponseSendTimeMs    writing the response                    → client slow to read, or network
+  TotalTimeMs           the sum
+</pre>
+
+    <table class="tbl">
+      <tr><th>Dominant component</th><th>Means</th><th>First action</th></tr>
+      <tr><td><code>RemoteTimeMs</code></td><td>The leader is waiting for in-sync followers</td><td>Find the slow broker: ISR shrinks, its disk and GC</td></tr>
+      <tr><td><code>RequestQueueTimeMs</code></td><td>Not enough request handler capacity</td><td>Check <code>RequestHandlerAvgIdlePercent</code>; raise <code>num.io.threads</code> or find the CPU hog</td></tr>
+      <tr><td><code>LocalTimeMs</code></td><td>Log append is slow</td><td>Disk latency, page cache pressure, catch-up reads</td></tr>
+      <tr><td><code>ResponseQueueTimeMs</code> / <code>ResponseSendTimeMs</code></td><td>Network threads or the client are the bottleneck</td><td><code>NetworkProcessorAvgIdlePercent</code>; client-side receive buffers</td></tr>
+      <tr><td><code>ThrottleTimeMs</code></td><td>Quotas are doing their job</td><td>Confirm the quota is intentional for that principal</td></tr>
+    </table>
+
+<pre>
+the two idle ratios, and what they mean
+  kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent
+  kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent
+
+  1.0 = completely idle,  0.0 = saturated
+  below ~0.3 sustained → that thread pool is the constraint; alert on it
+</pre>
+
+    <p><strong>Purgatory is not a problem.</strong> Requests waiting deliberately — <code>acks=all</code> produce
+       requests awaiting replication, fetch requests waiting for <code>fetch.min.bytes</code> — sit in a delayed
+       operation purgatory, and its size grows with normal load. A large purgatory alongside healthy latency is
+       expected; it is <code>RemoteTimeMs</code> that says whether the waiting is excessive.</p>
+
+    <h2>Part 4 — Consumer-Side Latency</h2>
+
+    <p>The consumer's default fetch settings are tuned for efficiency, and they can add hundreds of milliseconds
+       to a lightly loaded topic.</p>
+
+<pre>
+fetch.min.bytes = 1        (default)  → the broker replies as soon as ANY data exists: low latency
+fetch.max.wait.ms = 500    (default)  → if no data, the broker holds the fetch up to 500 ms
+
+raising fetch.min.bytes to 64 KB on a low-volume topic:
+  the broker waits until 64 KB accumulates OR 500 ms passes
+  at 2 KB/s that is the full 500 ms, every time → +500 ms of latency for fewer requests
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Raise it for</th><th>Cost</th></tr>
+      <tr><td><code>fetch.min.bytes</code></td><td>Fewer, larger fetches on high-volume topics</td><td>Up to <code>fetch.max.wait.ms</code> of latency when data is sparse</td></tr>
+      <tr><td><code>max.partition.fetch.bytes</code></td><td>Faster catch-up on large backlogs</td><td>Consumer memory (the catch-up arithmetic from the consumers lesson)</td></tr>
+      <tr><td><code>max.poll.records</code></td><td>Fewer loop iterations</td><td>Longer batches against the poll deadline</td></tr>
+      <tr><td><code>client.rack</code> (follower fetching)</td><td>Cross-zone cost</td><td>Slightly higher latency: the follower learns the high watermark a moment later</td></tr>
+    </table>
+
+    <p><strong>Consumer parallelism is the other half.</strong> If the handler takes 20 ms per record, one
+       consumer on one partition can do 50 per second whatever the broker does. The fixes are the ones from the
+       consumers lesson — batch the work, parallelise by key, add partitions — and no broker tuning substitutes
+       for them.</p>
+
+    <h2>Part 5 — JVM, OS and the Physical Layer</h2>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Guidance</th><th>Why</th></tr>
+      <tr><td>Broker heap</td><td>A few GB (commonly ~6 GB), <em>not</em> most of the machine</td><td>Kafka caches in the page cache; a huge heap starves it and lengthens GC pauses</td></tr>
+      <tr><td>Garbage collector</td><td>G1 with a modest pause target; look at pause <em>duration</em>, not count</td><td>A pause longer than <code>replica.lag.time.max.ms</code> or the session timeout causes ISR churn and fencing</td></tr>
+      <tr><td><code>vm.swappiness</code></td><td>Very low (1), not 0</td><td>Swapping a broker's memory produces multi-second stalls</td></tr>
+      <tr><td>Dirty page ratios</td><td>Lower the background ratio so writeback is continuous</td><td>Large flushes cause latency spikes when the kernel writes back in bulk</td></tr>
+      <tr><td>Filesystem</td><td>XFS is the common choice; <code>noatime</code></td><td>Fewer metadata writes on every read</td></tr>
+      <tr><td><code>num.replica.fetchers</code></td><td>Raise on brokers with many partitions or high volume</td><td>One fetcher thread per source broker can become the replication bottleneck</td></tr>
+      <tr><td>Socket buffers</td><td>Raise for high bandwidth-delay links (cross-region)</td><td>The default buffer caps throughput over long-RTT links</td></tr>
+      <tr><td>File handles</td><td>Tens of thousands</td><td>Segments × partitions, as the capacity lesson counts</td></tr>
+    </table>
+
+<pre>
+bandwidth-delay product: why a cross-region replica is slow with default buffers
+  link 1 Gb/s (125 MB/s), RTT 80 ms
+  in flight needed = 125 MB/s × 0.08 s = 10 MB
+  default socket buffer ~100 KB → the link is idle most of the time, no matter how fast it is
+</pre>
+
+    <p><strong>TLS has a real cost, and it is not only CPU.</strong> Encryption happens in user space, so the
+       broker can no longer use <code>sendfile</code> to move data from the page cache straight to the socket — the
+       zero-copy path from the first lesson. Expect a measurable throughput reduction and higher CPU; measure it on
+       your hardware rather than trusting a published percentage, and budget CPU for it rather than treating
+       security as free.</p>
+
+    <h2>Part 6 — A Method for Latency Investigations</h2>
+
+<pre>
+1. WHOSE latency?      produce, consume, or end-to-end? Get the percentile from the CLIENT.
+2. SPLIT it.           producer request-latency-avg vs consumer fetch latency vs handler time.
+                       If handler time dominates, stop: it is the application.
+3. BROKER BREAKDOWN.   RequestMetrics for Produce and Fetch: which component grew?
+4. FOLLOW THAT LEAD.
+     RemoteTime  → which follower? ISR shrink events, that broker's disk/GC
+     QueueTime   → handler/network idle ratios, CPU, TLS
+     LocalTime   → disk latency, page cache hit rate, catch-up readers
+5. CROSS-CHECK the usual suspects: a GC pause, a backfill consumer, a reassignment
+                       in progress, a quota throttling, a zone failover.
+6. CONFIRM by changing ONE thing and measuring the same percentile again.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Observation</th><th>Likely cause</th></tr>
+      <tr><td>p99 spikes every few minutes, p50 flat</td><td>GC pauses, or segment rolls plus writeback bursts</td></tr>
+      <tr><td>Latency rose after a new consumer group started</td><td>Catch-up reads evicting the page cache</td></tr>
+      <tr><td>Only produce latency rose; consume is fine</td><td>Replication: a slow follower, or a cross-zone ISR member</td></tr>
+      <tr><td>Everything slower on one broker</td><td>That broker's disk, CPU steal, or leadership concentration</td></tr>
+      <tr><td>Latency correlates with a scheduled job</td><td>A backfill, a reassignment, or a snapshot competing for I/O</td></tr>
+      <tr><td>Client-side latency high, broker metrics fine</td><td>Client batching settings, or the client's own GC and threads</td></tr>
+    </table>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Tuning broker configuration first.</strong> A team reports a latency regression, and the
+         response is to raise <code>num.io.threads</code>, add brokers and adjust flush settings. The numbers do not
+         move, because the actual change was a consumer group that started a backfill, pulling old segments from
+         disk and evicting the page cache that tailing consumers relied on.</p>
+      <p>✅ <strong>Measure the split before changing anything.</strong> The request breakdown names the
+         component in minutes, and the client-side percentiles say whether the broker is involved at all. Tuning
+         without that is guessing, and every change makes the next measurement harder to interpret.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Tuning brokers before measuring the split</td><td>Effort spent on a component contributing a fraction of the latency</td><td>Client percentiles, then the request breakdown</td></tr>
+      <tr><td><code>linger.ms=0</code> for "low latency" under load</td><td>More, smaller requests; queueing raises latency</td><td>Measure the curve: a small linger often lowers p99</td></tr>
+      <tr><td>Raising <code>fetch.min.bytes</code> on low-volume topics</td><td>Every fetch waits <code>fetch.max.wait.ms</code> — up to 500 ms</td><td>Leave it at 1 unless the topic is busy</td></tr>
+      <tr><td>Ignoring <code>RemoteTimeMs</code></td><td>The slow follower behind produce latency stays unfound</td><td>Read the breakdown per request type</td></tr>
+      <tr><td>Treating purgatory size as a problem</td><td>Chasing a metric that grows with healthy load</td><td>Judge by latency components, not purgatory</td></tr>
+      <tr><td>Large broker heaps</td><td>Page cache starved; longer GC pauses</td><td>A few GB of heap; leave RAM to the OS</td></tr>
+      <tr><td>Watching GC count instead of pause duration</td><td>Long pauses cause ISR churn and fencing</td><td>Alert on pause duration against the session timeout</td></tr>
+      <tr><td>Leaving swap enabled at defaults</td><td>Multi-second stalls when a broker's pages are swapped</td><td><code>vm.swappiness=1</code></td></tr>
+      <tr><td>Default socket buffers over long-RTT links</td><td>Replication cannot fill the pipe</td><td>Size buffers from the bandwidth-delay product</td></tr>
+      <tr><td>One replica fetcher on a partition-heavy broker</td><td>Replication falls behind; ISR shrinks under load</td><td>Raise <code>num.replica.fetchers</code></td></tr>
+      <tr><td>Enabling TLS without CPU budget</td><td>Zero-copy lost and CPU up; throughput falls unexpectedly</td><td>Measure it and size for it</td></tr>
+      <tr><td>Blaming Kafka for handler time</td><td>The largest term is often the application's own processing</td><td>Instrument the handler separately</td></tr>
+      <tr><td>Changing several settings at once</td><td>No way to attribute the result</td><td>One change, one measurement</td></tr>
+      <tr><td>Benchmarking only the happy path</td><td>Tail latency under catch-up reads and failover is what hurts</td><td>Include both, as the capacity lesson sets out</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What contributes to end-to-end latency in Kafka?</summary>
+      <p>Working forwards: the producer's batching wait (up to <code>linger.ms</code>), the produce request
+         itself including any queueing on the broker, the leader's append, replication to the in-sync replicas when
+         <code>acks=all</code>, the high watermark advancing so consumers may read the record, the consumer's fetch
+         wait, and finally the application's own processing.</p>
+      <p>In a healthy cluster the broker-side parts total single-digit milliseconds. The large, adjustable terms
+         are usually the ones configuration chose: <code>linger.ms</code> on the producer, and on the consumer
+         <code>fetch.min.bytes</code> together with <code>fetch.max.wait.ms</code>, which defaults to 500
+         milliseconds — so a consumer on a quiet topic can wait half a second for a record that already exists.</p>
+      <p>And in most real pipelines the largest term is the handler: a database write or an API call per record
+         dwarfs everything Kafka does.</p>
+      <p>That is why the first step in any latency investigation is splitting the measurement rather than tuning:
+         the client-side percentiles and the broker's request-time breakdown say within minutes which part to work
+         on.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> Does raising <code>linger.ms</code> always increase latency?</summary>
+      <p>No — that is the counter-intuitive part. At low load it does: the producer waits up to the linger value
+         before sending, and the record's latency rises by roughly that amount.</p>
+      <p>Under heavy load the opposite can happen. With <code>linger.ms=0</code> the producer sends many small
+         requests; each has fixed overhead on the broker, the request handler threads queue, and the queueing delay
+         grows. Raising the linger produces fewer, fuller batches, so the same volume moves in far fewer requests,
+         queueing falls, and the p99 can improve substantially — while throughput also goes up.</p>
+      <p>Compression interacts with it too: bigger batches compress much better, so a larger linger can reduce the
+         bytes on the wire, which helps when the bottleneck is network or replication.</p>
+      <p>The way to know which side you are on is the producer's own metrics: a very small
+         <code>batch-size-avg</code> with high request rates means batching is not happening, and a
+         <code>record-queue-time-avg</code> near the configured linger with low throughput means you are simply
+         paying the wait. I would test a few values against a fixed offered load rather than reasoning about it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Produce latency has risen to 400 ms at p99 while consumers are fine. How do you find the cause?</summary>
+      <p>Produce-only points at the write path, and specifically at replication, since consumption is healthy.</p>
+      <p>I would start with the broker's request-time breakdown for Produce requests — queue, local, remote,
+         response — at the 99th percentile. If <strong><code>RemoteTimeMs</code></strong> dominates, the leader is
+         waiting for in-sync followers, which is the most common cause of exactly this pattern with
+         <code>acks=all</code>. Then I would find which follower: ISR shrink and expand events in the broker logs
+         name the broker, and that broker's disk latency, CPU steal and GC pauses usually explain it. This is the
+         stalled-replica case from the replication lesson, where a broker that is alive but slow holds up every
+         acknowledgement.</p>
+      <p>If <strong><code>RequestQueueTimeMs</code></strong> dominates instead, the request handler pool is
+         saturated: <code>RequestHandlerAvgIdlePercent</code> near zero, often because of a CPU increase such as
+         newly enabled TLS or broker-side recompression. If <strong><code>LocalTimeMs</code></strong> dominates, the
+         append itself is slow — disk saturation or page cache pressure, frequently caused by a catch-up consumer
+         pulling old segments.</p>
+      <p>I would also check the obvious external causes: a partition reassignment running without a throttle, a
+         zone failover concentrating leadership, or quotas producing <code>ThrottleTimeMs</code>.</p>
+      <p>Then fix the specific cause and re-measure the same percentile. What I would avoid is weakening
+         <code>acks</code> to make the number look better: that trades a latency problem for a durability one.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why should a Kafka broker have a small heap?</summary>
+      <p>Because Kafka does not cache data in the JVM. Records are written to the page cache and read from it, so
+         the operating system's cache is what keeps consumers off the disk. Memory given to the heap is memory taken
+         from that cache.</p>
+      <p>A broker on a 64 GB machine with a 48 GB heap leaves the kernel very little to cache with, so fetches
+         that would have been served from memory become disk reads, and tail latency rises for everyone. The same
+         machine with a 6 GB heap has nearly 58 GB of page cache and behaves completely differently.</p>
+      <p>The second reason is garbage collection. Kafka's heap usage is mostly short-lived request buffers, which
+         a modest heap handles with short pauses. A very large heap produces longer pauses, and a pause that exceeds
+         <code>replica.lag.time.max.ms</code> or the broker session timeout has consequences beyond latency: the
+         broker drops out of ISRs or is fenced by the controller, moving partitions and causing churn.</p>
+      <p>So the guidance is a few gigabytes of heap — commonly around six — with the rest of RAM left to the OS,
+         and monitoring of GC <em>pause duration</em> rather than collection counts.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design an end-to-end latency budget of 200 ms at p99 for an order pipeline.</summary>
+      <p>I would allocate the budget across the stages, leave margin, and then choose settings to fit — rather
+         than tuning first and hoping.</p>
+      <table class="tbl">
+        <tr><th>Stage</th><th>Budget</th><th>Setting or design choice</th></tr>
+        <tr><td>Producer batching</td><td>10 ms</td><td><code>linger.ms=10</code>, sized batches; measured under peak load</td></tr>
+        <tr><td>Produce + replication (<code>acks=all</code>)</td><td>25 ms</td><td>RF 3 in one region; healthy ISR; alert on <code>RemoteTimeMs</code></td></tr>
+        <tr><td>Consumer fetch</td><td>10 ms</td><td><code>fetch.min.bytes=1</code>; no follower fetching on this path if it adds latency</td></tr>
+        <tr><td>Processing</td><td>100 ms</td><td>The application's own budget: a database write plus business logic</td></tr>
+        <tr><td>Margin</td><td>55 ms</td><td>GC pauses, failovers, retries — the events that create the p99</td></tr>
+      </table>
+      <p><strong>Design consequences.</strong> Cross-region replication in the synchronous path would consume the
+         whole budget, so this pipeline stays in one region with three zones. Exactly-once transactions add the
+         commit interval to consumer-visible latency, so if it is needed the commit interval must be small and
+         accounted for. Any batching in the handler — grouping database writes — must fit the 100 ms allocation.</p>
+      <p><strong>Then measure end to end, not per component:</strong> stamp the event's creation time in the
+         payload, and have the consumer report the difference at processing time as a histogram. That single metric
+         is the SLO, and it catches everything, including causes nobody predicted.</p>
+      <p><strong>Recommendation:</strong> publish the budget table with the service's documentation, alert on the
+         end-to-end p99 rather than on component metrics, and treat any change that adds a synchronous hop — a new
+         join, a cross-region replica, a transactional boundary — as a change to the budget that has to be
+         re-approved.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A cluster's p99 doubled after enabling TLS. What is happening, and what are the options?</summary>
+      <p>Two effects, one of which surprises people.</p>
+      <p><strong>The expected one:</strong> encryption and decryption cost CPU on brokers and clients, and the TLS
+         handshake adds work on every new connection — significant for clients that reconnect often.</p>
+      <p><strong>The surprising one:</strong> TLS removes the zero-copy path. Without it, a broker can send data
+         straight from the page cache to the socket with <code>sendfile</code>, never copying it into user space.
+         With TLS, every byte must be read into the JVM, encrypted and written out, which costs both CPU and memory
+         bandwidth. Fetch-heavy clusters feel this most, because that path carried the bulk of their traffic.</p>
+      <p>I would confirm it with the request breakdown — <code>RequestQueueTimeMs</code> and
+         <code>ResponseSendTimeMs</code> rising, <code>RequestHandlerAvgIdlePercent</code> and
+         <code>NetworkProcessorAvgIdlePercent</code> falling — and with broker CPU.</p>
+      <p><strong>Options, in the order I would consider them:</strong> add CPU or brokers, since the work is real
+         and security is not optional; make sure clients reuse connections rather than reconnecting; check the
+         cipher suite, because hardware-accelerated AES-GCM is far cheaper than some alternatives; reduce the bytes
+         flowing through TLS with better producer compression; and use follower fetching so cross-zone consumer
+         traffic disappears entirely.</p>
+      <p><strong>Recommendation:</strong> budget the capacity rather than removing TLS. Where a specific internal
+         path genuinely cannot afford it — replication between brokers on a private network, for example — that is a
+         risk decision to make explicitly with security, not a tuning knob to turn quietly.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Measure the latency-throughput curve for <code>linger.ms</code>.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ for l in 0 5 20 100; do
+    echo "== linger.ms=$l"
+    kafka-producer-perf-test.sh --topic bench --num-records 3000000 --record-size 500 \
+      --throughput -1 --producer-props bootstrap.servers=b1:9092 acks=all compression.type=lz4 \
+      linger.ms=$l | tail -1
+  done
+== linger.ms=0
+3000000 records sent, 118,203 rec/s (56.4 MB/s), 89.1 ms avg, 214 ms 95th, 412 ms 99th
+== linger.ms=5
+3000000 records sent, 186,441 rec/s (88.9 MB/s), 42.7 ms avg,  96 ms 95th, 118 ms 99th
+== linger.ms=20
+3000000 records sent, 201,338 rec/s (96.0 MB/s), 21.4 ms avg,  39 ms 95th,  47 ms 99th
+== linger.ms=100
+3000000 records sent, 202,104 rec/s (96.4 MB/s), 74.8 ms avg, 112 ms 99th, 121 ms 99th
+</pre>
+      <table class="tbl">
+        <tr><th><code>linger.ms</code></th><th>Throughput</th><th>p99</th><th>Why</th></tr>
+        <tr><td>0</td><td>Lowest</td><td><strong>Worst</strong></td><td>Tiny batches; request queueing dominates</td></tr>
+        <tr><td>20</td><td>Highest</td><td>Best</td><td>Full batches, few requests, little queueing</td></tr>
+        <tr><td>100</td><td>Same as 20</td><td>Worse again</td><td>Batches already full; the extra wait is pure latency</td></tr>
+      </table>
+      <p>Now repeat with <code>--throughput 5000</code> (a light, fixed load): the curve inverts, and
+         <code>linger.ms=0</code> gives the lowest latency because batches never fill. Tune for the load you
+         actually have at peak.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show <code>fetch.min.bytes</code> adding half a second of
+      latency.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+low-volume topic: one 200-byte record every 2 seconds
+consumer stamps (now − record.timestamp()) on receipt
+
+fetch.min.bytes=1 (default)
+  e2e latency: 3-6 ms                    ◄── the broker replies as soon as the record exists
+
+fetch.min.bytes=65536
+  e2e latency: 497-500 ms                ◄── every fetch waits the full fetch.max.wait.ms
+  broker fetch request rate: 2/s → 0.06/s (the efficiency gain nobody needed here)
+
+fetch.min.bytes=65536, fetch.max.wait.ms=50
+  e2e latency: 48-52 ms                  ◄── the wait is now bounded by the smaller value
+</pre>
+      <table class="tbl">
+        <tr><th>Topic profile</th><th>Sensible setting</th></tr>
+        <tr><td>Low volume, latency matters</td><td><code>fetch.min.bytes=1</code> (the default)</td></tr>
+        <tr><td>High volume, throughput matters</td><td>Raise <code>fetch.min.bytes</code>: data accumulates instantly, so the wait never applies</td></tr>
+        <tr><td>High volume with idle periods</td><td>Raise <code>fetch.min.bytes</code> and lower <code>fetch.max.wait.ms</code> to bound the idle-time penalty</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Use the request breakdown to find a slow follower.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+symptom: produce p99 400 ms; consumers healthy
+
+$ # JMX, per broker: kafka.network:type=RequestMetrics,request=Produce
+broker  TotalTime p99   RequestQueue   LocalTime   RemoteTime   ResponseSend
+b1          412 ms          1.2 ms       2.1 ms      405 ms        0.8 ms     ◄── waiting on followers
+b2          398 ms          1.1 ms       1.9 ms      392 ms        0.7 ms
+b3            9 ms          0.9 ms       1.7 ms        5 ms        0.6 ms     ◄── leads few affected partitions
+</pre>
+<pre>
+$ grep -i 'shrinking isr' /var/log/kafka/server.log | tail -3
+... Shrinking ISR from 1,2,4 to 1,2 ...   (partition orders-11)
+... Shrinking ISR from 2,4,3 to 2,3 ...   (partition payments-4)
+                       ▲ broker 4 appears in every event
+
+$ # broker 4: disk latency and GC
+await (device)      38 ms      ◄── normally 0.6 ms
+GC pause p99        180 ms
+</pre>
+      <table class="tbl">
+        <tr><th>Step</th><th>Finding</th></tr>
+        <tr><td>Request breakdown</td><td><code>RemoteTimeMs</code> is ~98% of produce time</td></tr>
+        <tr><td>ISR events</td><td>Broker 4 is the replica falling behind</td></tr>
+        <tr><td>Broker 4's host</td><td>Disk latency 60× normal — a failing device or a noisy neighbour</td></tr>
+      </table>
+      <p>The fix is on broker 4, not in Kafka's configuration. Note how little the cluster-wide dashboards said:
+         two brokers showed high produce latency, and the cause was a third broker that led almost nothing but was
+         an in-sync replica for many partitions.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Diagnose saturated request handlers.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+symptom: all request types slow; RequestQueueTimeMs dominates on every broker
+
+kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent   0.04   ◄── saturated
+kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent           0.71   (fine)
+broker CPU: 94%, mostly user time
+</pre>
+      <p>The handler pool is the constraint, and the CPU is busy — so the question is what it is busy with:</p>
+      <table class="tbl">
+        <tr><th>Candidate</th><th>Check</th><th>Fix</th></tr>
+        <tr><td>TLS encryption</td><td>Profile, or compare with a plaintext listener</td><td>More CPU or brokers; efficient cipher; fewer bytes via compression</td></tr>
+        <tr><td>Broker recompression</td><td>Topic <code>compression.type</code> differs from producers'</td><td>Set topics to <code>producer</code></td></tr>
+        <tr><td>Too few handler threads</td><td>Idle ratio near zero with CPU headroom</td><td>Raise <code>num.io.threads</code></td></tr>
+        <tr><td>Very high request rate</td><td><code>requests/s</code> vs bytes/s: many tiny requests</td><td>Producer batching (<code>linger.ms</code>), consumer <code>fetch.min.bytes</code></td></tr>
+      </table>
+<pre>
+here: topic "events" had compression.type=snappy while producers sent lz4
+  → every batch decompressed and recompressed on the broker
+$ kafka-configs.sh --bootstrap-server b1:9092 --alter --entity-type topics --entity-name events \
+    --add-config compression.type=producer
+  broker CPU 94% → 38%,  RequestHandlerAvgIdlePercent 0.04 → 0.62,  produce p99 210 ms → 14 ms
+</pre>
+      <p>Raising <code>num.io.threads</code> would have added threads competing for an already-saturated CPU.
+         The idle ratio says <em>which</em> pool is the constraint; it does not say the pool is too small.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Attribute periodic p99 spikes to GC pauses.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+symptom: produce p99 spikes to 600 ms every 2-4 minutes; p50 unchanged at 3 ms
+
+# enable GC logging on the brokers
+-Xlog:gc*,safepoint:file=/var/log/kafka/gc.log:time,uptime:filecount=10,filesize=50M
+
+$ grep 'Pause Full\|Pause Young' /var/log/kafka/gc.log | awk '{print $NF}' | sort -n | tail -3
+612.418ms
+598.203ms
+571.884ms                       ◄── pauses matching the latency spikes exactly
+</pre>
+      <table class="tbl">
+        <tr><th>Cause</th><th>Evidence</th><th>Fix</th></tr>
+        <tr><td>Heap far too large</td><td>-Xmx32g on a 64 GB machine; long young collections</td><td>Reduce to ~6 GB; the page cache benefits twice over</td></tr>
+        <tr><td>Very high allocation rate</td><td>Tiny requests: many small buffers per second</td><td>Producer batching; fewer, larger requests</td></tr>
+        <tr><td>Swapping</td><td><code>vm.swappiness</code> at default; <code>si/so</code> non-zero in vmstat</td><td><code>vm.swappiness=1</code></td></tr>
+      </table>
+<pre>
+after reducing the heap to 6 GB:
+  GC pause p99      612 ms → 24 ms
+  produce p99       spikes gone; steady 4-6 ms
+  page cache        26 GB → 54 GB → disk reads during backfills fell by half
+  ISR shrink events 14/day → 0            ◄── the pauses had been dropping the broker out of ISRs
+</pre>
+      <p>The ISR line is the important one: a GC pause long enough to matter is not only a latency problem, it is
+         a durability and stability problem, because a paused broker stops fetching and is eventually fenced by the
+         controller.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Build and defend an end-to-end latency SLO.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+requirement: "order confirmation within 1 second of checkout, 99% of the time"
+
+instrument the whole path, not the components:
+  producer stamps occurredAt in the payload (event time, as the event design lesson advises)
+  the final consumer records (now − occurredAt) as a histogram, tagged by stage
+</pre>
+      <table class="tbl">
+        <tr><th>Stage</th><th>p99 measured</th><th>Budget</th><th>Note</th></tr>
+        <tr><td>Checkout service → produce ack</td><td>28 ms</td><td>50 ms</td><td>linger 10 ms, acks=all, RF 3 in-region</td></tr>
+        <tr><td>Kafka visibility (HW advance)</td><td>6 ms</td><td>20 ms</td><td>Watch <code>RemoteTimeMs</code></td></tr>
+        <tr><td>Consumer fetch</td><td>9 ms</td><td>30 ms</td><td><code>fetch.min.bytes=1</code></td></tr>
+        <tr><td>Enrichment (Streams, EOS)</td><td>140 ms</td><td>300 ms</td><td>Includes the 100 ms commit interval</td></tr>
+        <tr><td>Notification handler</td><td>310 ms</td><td>400 ms</td><td>Provider API call: the largest term</td></tr>
+        <tr><td><strong>End to end</strong></td><td><strong>510 ms</strong></td><td><strong>1,000 ms</strong></td><td>490 ms of margin for failures</td></tr>
+      </table>
+<pre>
+what eats the margin, and what it costs:
+  a rebalance (deploy)           +2-20 s for affected partitions  → static membership, cooperative assignment
+  a broker failover              +1-3 s                            → acceptable within the 99th percentile budget
+  a GC pause on a broker         +0.2-0.6 s                        → heap sizing, monitored
+  a catch-up consumer            +50-200 ms for everyone           → quota backfills, schedule off-peak
+</pre>
+      <p><strong>Defend the SLO by owning the margin.</strong> The measured 510 ms leaves room for exactly the
+         events above, which is why the budget is not spent on a cross-region hop or a longer transaction commit
+         interval. Any proposal that adds a synchronous step — a second join, a remote call in the handler, EOS on
+         another stage — comes out of that margin, and I would require it to be measured before it ships rather than
+         discovered when the SLO breaks during an ordinary deploy.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Split the latency before tuning:</strong> batching, request, replication, fetch wait and processing are separate terms with separate fixes.</li>
+        <li><strong>In a healthy cluster the broker-side terms are single-digit milliseconds;</strong> the big ones are usually configuration and handler time.</li>
+        <li><strong>Raising <code>linger.ms</code> can lower p99 under load</strong> by replacing many small requests with few full ones.</li>
+        <li><strong>The broker request breakdown names the component:</strong> queue, local, remote, throttle, response.</li>
+        <li><strong><code>RemoteTimeMs</code> dominating means a slow in-sync follower</strong> — the most common cause of produce-only latency.</li>
+        <li><strong>Request handler and network idle ratios below ~0.3 mean that pool is the constraint;</strong> a saturated CPU means finding the work, not adding threads.</li>
+        <li><strong>Purgatory size grows with healthy load</strong> and is not itself a problem.</li>
+        <li><strong><code>fetch.min.bytes</code> on a quiet topic costs up to <code>fetch.max.wait.ms</code></strong> — 500 ms by default.</li>
+        <li><strong>Consumer parallelism, not broker tuning, fixes slow handlers.</strong></li>
+        <li><strong>Give brokers a small heap and the rest of RAM to the page cache;</strong> large heaps starve the cache and lengthen pauses.</li>
+        <li><strong>Watch GC pause duration, not count:</strong> a long pause causes ISR churn and fencing, not just latency.</li>
+        <li><strong>Set <code>vm.swappiness</code> very low</strong> — swapping a broker produces multi-second stalls.</li>
+        <li><strong>Size socket buffers from the bandwidth-delay product</strong> for cross-region links.</li>
+        <li><strong>TLS costs CPU and removes zero-copy;</strong> budget capacity for it rather than disabling it.</li>
+        <li><strong>Change one thing and re-measure the same percentile;</strong> simultaneous changes make attribution impossible.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="capacity.html">← Partition Count &amp; Capacity Planning</a>
+      <a href="monitoring.html">Monitoring &amp; Debugging →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
