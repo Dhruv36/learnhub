@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Monitoring &amp; Debugging — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Monitoring &amp; Debugging <span class="level-badge level-ultra">Operations</span></h1>
+    <p><strong>What you'll master:</strong> which signals to alert on and which to keep for diagnosis, and why
+       the distinction decides whether anyone trusts the pager; the handful of cluster alerts that matter, including
+       <strong><code>ActiveControllerCount</code>, which must sum to exactly one across the cluster</strong>;
+       consumer lag measured the way it actually predicts trouble — per partition and in time — and the
+       <strong>stalled consumer that reports zero lag</strong>; the client metrics that explain a producer or
+       consumer without guessing; metric cardinality, which can cost more than the cluster; a triage flow for
+       "the consumer is not receiving anything"; and the log files that reconstruct an incident timeline.
+       Prerequisites: <a href="performance.html">Performance: Throughput vs Latency</a>.</p>
+
+    <h2>Part 1 — Alert on Symptoms, Diagnose with Causes</h2>
+
+    <p>Kafka exposes hundreds of metrics, and a monitoring setup that alerts on many of them trains people to
+       ignore the pager. The split that works: <strong>page on what users feel</strong>, and keep everything else on
+       dashboards for when someone is already investigating.</p>
+
+    <table class="tbl">
+      <tr><th>Layer</th><th>Symptom (alert)</th><th>Cause metrics (dashboard)</th></tr>
+      <tr><td>End-to-end</td><td>Event age at processing above the SLO</td><td>Per-stage latency breakdown</td></tr>
+      <tr><td>Consumers</td><td>Time lag per group beyond its budget</td><td>Records lag per partition, rebalance rate, poll interval</td></tr>
+      <tr><td>Producers</td><td>Record error rate above zero; send failures</td><td>Retry rate, buffer available, request latency</td></tr>
+      <tr><td>Cluster durability</td><td>Under-min-ISR or offline partitions</td><td>ISR shrink rate, under-replicated count, per-broker health</td></tr>
+      <tr><td>Cluster control plane</td><td>No active controller; quorum below majority</td><td>Voter lag, controller election rate</td></tr>
+      <tr><td>Capacity</td><td>Days-to-full below a week</td><td>Disk growth rate, partition counts, cleaner health</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The end-to-end age of a record is the one metric that catches everything.</strong>
+       Stamp the event time in the payload, and have the final consumer report <code>now − occurredAt</code> as a
+       histogram. Every failure mode in this track — a stuck partition, a rebalance storm, a slow follower, a
+       paused consumer, a hanging transaction — shows up in it, and it is expressed in the units the business cares
+       about. Component alerts tell you where to look; this one tells you whether anything is actually wrong.</div>
+
+    <h2>Part 2 — The Cluster Alerts That Matter</h2>
+
+    <table class="tbl">
+      <tr><th>Metric</th><th>Alert when</th><th>Means</th></tr>
+      <tr><td><code>OfflinePartitionsCount</code> (controller)</td><td>&gt; 0</td><td>Partitions with no leader: unavailable for reads and writes</td></tr>
+      <tr><td><code>UnderMinIsrPartitionCount</code></td><td>&gt; 0</td><td>Those partitions are refusing <code>acks=all</code> writes right now</td></tr>
+      <tr><td><code>UnderReplicatedPartitions</code></td><td>&gt; 0 for more than a few minutes</td><td>Durability is degraded; a broker is behind or down</td></tr>
+      <tr><td><code>ActiveControllerCount</code></td><td>Cluster-wide sum ≠ 1</td><td>0 = no controller; 2 = split brain. Sum across nodes, never per node</td></tr>
+      <tr><td>KRaft quorum voters present</td><td>&lt; majority</td><td>Metadata frozen: a latent outage, as the KRaft lesson describes</td></tr>
+      <tr><td><code>IsrShrinksPerSec</code></td><td>Sustained above ~0</td><td>Replicas repeatedly falling behind: GC, disk or network</td></tr>
+      <tr><td><code>RequestHandlerAvgIdlePercent</code></td><td>&lt; 0.3 sustained</td><td>Request handlers saturated</td></tr>
+      <tr><td>Log cleaner: <code>time-since-last-run-ms</code>, <code>uncleanable-partitions-count</code></td><td>Growing / &gt; 0</td><td>Compaction stopped; disks will fill</td></tr>
+      <tr><td>Disk days-to-full (derived)</td><td>&lt; 7 days</td><td>Retention, compaction or growth needs attention</td></tr>
+      <tr><td>Broker count in the cluster</td><td>Below expected</td><td>A broker is fenced or down</td></tr>
+    </table>
+
+    <p><strong><code>ActiveControllerCount</code> is the classic mis-monitored metric.</strong> Each node reports
+       1 if it is the active controller and 0 otherwise, so a per-node alert on "equals 0" fires on every healthy
+       follower. The meaningful signal is the <em>sum across all controller nodes</em>: it must be exactly 1. Zero
+       means no controller is active; two means two nodes believe they are, which is a serious condition.</p>
+
+<pre>
+sum(kafka_controller_kafkacontroller_activecontrollercount) != 1   for 1m   → page
+
+and for the KRaft quorum specifically:
+  the voter count reported by kafka-metadata-quorum.sh, or its JMX equivalent, below majority → page
+  a voter's lag growing steadily → warn (a slow disk on that controller)
+</pre>
+
+    <h2>Part 3 — Consumer Lag, Measured Properly</h2>
+
+    <p>Lag is the single most useful consumer signal, and the way it is usually measured hides the failures that
+       matter.</p>
+
+    <table class="tbl">
+      <tr><th>Measurement</th><th>Problem</th><th>Better</th></tr>
+      <tr><td>Total lag per group</td><td>One stuck partition is invisible among healthy ones</td><td><strong>Max lag across partitions</strong>, and alert on that</td></tr>
+      <tr><td>Lag in records</td><td>50,000 means nothing without the rate</td><td><strong>Lag in time</strong>: how old is the record being processed</td></tr>
+      <tr><td>Lag from committed offsets only</td><td>A consumer that processes but never commits looks stuck</td><td>Compare committed with the group's position and the log end</td></tr>
+      <tr><td>Lag alone</td><td>A group with no members reports whatever it last committed</td><td>Alert on <strong>member count = 0</strong> for groups that should always run</td></tr>
+    </table>
+
+<pre>
+the stalled consumer that reports ZERO lag
+
+$ kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group nightly
+Consumer group 'nightly' has no active members.
+GROUP    TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+nightly  payments  0          8812044         8812044         0        ◄── "caught up"
+
+the group is not running at all. Its offsets happen to equal the log end because it last ran
+when the topic was quiet — or because auto.offset.reset=latest moved it to the end (lesson 1).
+Lag alone cannot distinguish "finished" from "not running".
+</pre>
+
+    <p><strong>Time lag is derivable</strong> if your tooling does not provide it: the consumer reports the
+       timestamp of the record it is processing, so <code>now − recordTimestamp</code> is the honest number. Failing
+       that, estimate it from records lag divided by the partition's recent append rate. Tools such as Burrow
+       evaluate lag trends rather than thresholds, which avoids alerting on a brief spike during a rebalance.</p>
+
+    <p><strong>Transactional topics need care.</strong> A <code>read_committed</code> consumer stops at the last
+       stable offset, and control records occupy offsets, so record lag on a transactional topic includes markers
+       and can never quite reach zero. Compare the consumer's progress against the LSO rather than the log end
+       offset, or accept a small constant offset in the number — and remember the hanging-transaction case from the
+       transactions lesson, where lag grows while everything else looks healthy.</p>
+
+    <h2>Part 4 — Client Metrics and What They Answer</h2>
+
+    <table class="tbl">
+      <tr><th>Producer metric</th><th>Answers</th></tr>
+      <tr><td><code>record-error-rate</code></td><td>Are sends failing permanently? Should be zero — alert on it</td></tr>
+      <tr><td><code>record-retry-rate</code></td><td>Transient trouble: leader changes, timeouts</td></tr>
+      <tr><td><code>buffer-available-bytes</code></td><td>Is the buffer filling? Near zero means <code>send()</code> is about to block</td></tr>
+      <tr><td><code>request-latency-avg</code></td><td>Broker round trip including replication</td></tr>
+      <tr><td><code>batch-size-avg</code>, <code>compression-rate-avg</code></td><td>Is batching working? Is compression effective?</td></tr>
+      <tr><td><code>record-queue-time-avg</code></td><td>How much latency <code>linger.ms</code> is costing</td></tr>
+    </table>
+
+    <table class="tbl">
+      <tr><th>Consumer metric</th><th>Answers</th></tr>
+      <tr><td><code>records-lag-max</code></td><td>Worst partition lag this consumer holds</td></tr>
+      <tr><td><code>time-between-poll-avg</code> / <code>-max</code></td><td>How close the loop is to <code>max.poll.interval.ms</code></td></tr>
+      <tr><td><code>last-poll-seconds-ago</code></td><td>Is the loop alive right now?</td></tr>
+      <tr><td><code>commit-latency-avg</code>, <code>commit-rate</code></td><td>Commit cost and frequency</td></tr>
+      <tr><td><code>rebalance-rate-per-hour</code>, <code>failed-rebalance-total</code></td><td>Group stability (the rebalancing lesson's alert)</td></tr>
+      <tr><td><code>fetch-latency-avg</code>, <code>fetch-size-avg</code></td><td>Whether fetch settings suit the topic's volume</td></tr>
+    </table>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Exporting every Kafka client metric with every dimension.</strong> Client metrics carry
+         <code>client-id</code>, and many carry <code>topic</code> and <code>partition</code>. A platform with 400
+         client instances, 300 topics and 12 partitions each produces millions of time series — the metrics bill
+         exceeds the Kafka cluster's, dashboards time out, and nobody can find anything.</p>
+      <p>✅ <strong>Choose the dimensions deliberately.</strong> Keep per-partition series only for lag, where
+         they are the point; aggregate the rest to client and topic level; drop per-partition request metrics
+         entirely unless an investigation needs them temporarily. A JMX exporter's allowlist is the cheapest place
+         to enforce this, and it is worth reviewing whenever a new client fleet is onboarded.</p>
+    </div>
+
+    <h2>Part 5 — A Triage Flow, and the Tools</h2>
+
+<pre>
+"the consumer is not receiving anything"
+
+1. Is data being produced?          kafka-get-offsets.sh --time -1   (log end offsets moving?)
+                                     no  → the problem is upstream: check the producer's error rate
+2. Does the group exist and have members?
+                                     kafka-consumer-groups.sh --describe --group G --members
+                                     no members → the application is not running, or cannot join
+3. Is it assigned the partitions?    --members --verbose: a member with 0 partitions means more
+                                     consumers than partitions, or a subscription mismatch (topic name!)
+4. Where is its offset?              --describe: CURRENT-OFFSET vs LOG-END-OFFSET
+                                     at the end → it IS caught up; the records it expects are elsewhere
+                                     (wrong topic, wrong partition key, filtered upstream)
+5. Is it failing before your code?   consumer logs: RecordDeserializationException, auth failures
+6. Is it stuck in processing?        time-between-poll-max, last-poll-seconds-ago, thread dump
+7. Is the data there but invisible?  read_committed + an open transaction → kafka-transactions.sh
+</pre>
+
+    <table class="tbl">
+      <tr><th>Tool</th><th>Use</th></tr>
+      <tr><td><code>kafka-consumer-groups.sh</code></td><td>Lag, members, assignments, offset resets</td></tr>
+      <tr><td><code>kafka-get-offsets.sh</code></td><td>Earliest and latest offsets: is the topic moving?</td></tr>
+      <tr><td><code>kafka-topics.sh --describe</code></td><td><code>--under-replicated-partitions</code>, <code>--under-min-isr-partitions</code>, <code>--unavailable-partitions</code></td></tr>
+      <tr><td><code>kafka-log-dirs.sh</code></td><td>Per-partition sizes: skew, growth, which disk</td></tr>
+      <tr><td><code>kafka-dump-log.sh</code></td><td>What is actually in a segment: batches, timestamps, control records</td></tr>
+      <tr><td><code>kafka-metadata-quorum.sh</code></td><td>Controller quorum status and voter lag</td></tr>
+      <tr><td><code>kafka-transactions.sh</code></td><td>Open and hanging transactions holding the LSO</td></tr>
+      <tr><td><code>kafka-configs.sh --describe</code></td><td>Effective topic and broker configuration, including overrides</td></tr>
+    </table>
+
+    <p><strong>The broker's log files are the incident timeline.</strong> <code>server.log</code> holds ISR
+       shrink and expand events, log cleaner errors and shutdown sequences; <code>controller.log</code> holds leader
+       elections, broker registration and fencing; <code>state-change.log</code> records each partition's leadership
+       transitions. During an incident, grepping ISR events and leader changes across brokers by timestamp
+       reconstructs what happened far faster than metric dashboards, because it names the partitions and brokers
+       involved.</p>
+
+    <h2>Part 6 — Making Monitoring Hold Up</h2>
+
+    <table class="tbl">
+      <tr><th>Practice</th><th>Why</th></tr>
+      <tr><td>Every alert links to a runbook with the first three commands</td><td>Pages arrive at 3 a.m. to people who did not build the pipeline</td></tr>
+      <tr><td>Separate dashboards for platform and application teams</td><td>An application team needs lag, errors and end-to-end age — not <code>RemoteTimeMs</code></td></tr>
+      <tr><td>SLOs stated in business terms</td><td>"Orders confirmed within 1 s, 99% of the time" survives re-orgs; "p99 &lt; 40 ms produce latency" does not</td></tr>
+      <tr><td>Test the alerts</td><td>Inject a poison record, pause a consumer, stop a broker in staging — and check the right alert fires</td></tr>
+      <tr><td>Track capacity trends, not just current values</td><td>Days-to-full, partition budget used, peak-to-average ratio</td></tr>
+      <tr><td>Review alert noise monthly</td><td>Any alert that fired without action is a candidate for deletion or a threshold change</td></tr>
+    </table>
+
+    <p><strong>Ownership is part of monitoring.</strong> A dead-letter topic with no owner, a consumer group
+       nobody claims, an alert routed to a team that disbanded — each is a silent failure waiting to happen. A
+       simple inventory (topic, owner, consumers, SLO, runbook) does more for reliability than another dashboard,
+       and it is what makes "who do we call?" answerable during an incident.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Alerting on total group lag</td><td>A single stuck partition stays invisible</td><td>Alert on max lag across partitions</td></tr>
+      <tr><td>Lag thresholds in records</td><td>Meaningless across topics with different rates</td><td>Lag in time, per group</td></tr>
+      <tr><td>Trusting lag alone</td><td>A group with no members reports zero lag</td><td>Also alert on member count and last-poll age</td></tr>
+      <tr><td>Per-node alert on <code>ActiveControllerCount</code></td><td>Fires on every healthy follower</td><td>Alert on the cluster-wide sum ≠ 1</td></tr>
+      <tr><td>No alert on under-min-ISR</td><td>Producers are being refused while dashboards look normal</td><td>Alert on it; it means writes are failing now</td></tr>
+      <tr><td>Ignoring the log cleaner</td><td>Compacted topics grow until disks fill</td><td>Alert on cleaner run age and uncleanable partitions</td></tr>
+      <tr><td>Disk alerts at a fixed percentage</td><td>Crossed days after the cause</td><td>Days-to-full from the growth rate</td></tr>
+      <tr><td>Exporting every metric with every dimension</td><td>Cardinality explosion: cost and unusable dashboards</td><td>An allowlist; per-partition only where it matters</td></tr>
+      <tr><td>Alerting on purgatory size or GC count</td><td>Normal values page people</td><td>Alert on latency and pause duration instead</td></tr>
+      <tr><td>Only broker dashboards</td><td>Client-side problems — batching, rebalances, handler time — are invisible</td><td>Collect producer and consumer metrics too</td></tr>
+      <tr><td>No end-to-end measurement</td><td>Every component looks fine while users wait</td><td>Event age at processing, as the primary SLO</td></tr>
+      <tr><td>Alerts without runbooks</td><td>Pages nobody can act on</td><td>Link the first three diagnostic commands</td></tr>
+      <tr><td>Never testing alerts</td><td>They fail in the incident they were built for</td><td>Inject failures in staging on a schedule</td></tr>
+      <tr><td>Unowned topics and groups</td><td>Nobody responds when they fail</td><td>An inventory with owners and SLOs</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What would you monitor on a Kafka cluster?</summary>
+      <p>I would separate what pages someone from what helps diagnose.</p>
+      <p><strong>Pages:</strong> offline partitions (unavailable data), under-min-ISR partitions (writes being
+         refused right now), the controller — the cluster-wide sum of <code>ActiveControllerCount</code> must equal
+         one — the KRaft quorum having a majority, consumer lag in time beyond each group's budget, producer error
+         rates above zero, and disk days-to-full.</p>
+      <p><strong>Dashboards for diagnosis:</strong> under-replicated partitions and ISR shrink rate, the broker
+         request-time breakdown, request handler and network idle ratios, per-partition lag, rebalance rates, log
+         cleaner health, and per-broker resource usage.</p>
+      <p>Above all I would measure <strong>end-to-end record age</strong>: the time between the event's timestamp
+         and when the final consumer processed it. Every failure in the system shows up there, and it is in the units
+         the business understands, so it makes a good SLO.</p>
+      <p>And monitoring includes the clients, not just brokers. Most incidents I have seen were consumer-side —
+         rebalances, slow handlers, poison records — and a broker-only dashboard shows a perfectly healthy
+         cluster throughout.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How should consumer lag be measured?</summary>
+      <p>Per partition, and in time rather than in records.</p>
+      <p><strong>Per partition</strong>, because a group's total lag hides the failure that matters. One stuck
+         partition among twelve adds a slowly rising total that looks like mild growth, while that partition is
+         completely stalled. Alerting on the maximum lag across a group's partitions catches it immediately.</p>
+      <p><strong>In time</strong>, because a lag of 50,000 records is nothing on a topic doing 100,000 per second
+         and a disaster on one doing ten per minute. Time lag — how old is the record being processed — means the
+         same thing everywhere, and maps directly to a business requirement.</p>
+      <p>Lag also needs a companion signal, because a consumer group with no members reports whatever it last
+         committed, which can look like zero lag. I alert on member count for groups that should always be running,
+         and on how long ago the consumer last polled.</p>
+      <p>On transactional topics there is a wrinkle: control records take offsets and <code>read_committed</code>
+         consumers stop at the last stable offset, so lag never reaches exactly zero and an open transaction can
+         make it grow while everything else is healthy.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A consumer group reports zero lag, but the downstream system is missing data. What do you check?</summary>
+      <p>Zero lag means the group's committed offsets are at the end of the log. That is consistent with several
+         situations that are not "everything is fine".</p>
+      <p><strong>1. Is the group actually running?</strong> <code>--describe --members</code>: a group with no
+         members still reports its last committed offsets. If it stopped hours ago, lag reflects history, not
+         health.</p>
+      <p><strong>2. Did it skip data?</strong> If the group's offsets expired, or it hit an out-of-range offset
+         with <code>auto.offset.reset=latest</code>, it jumped to the end of the log and committed there — the silent
+         skip from the first lesson. The consumer log shows an offset reset, and the gap is visible by comparing
+         what was produced with what the sink holds.</p>
+      <p><strong>3. Is it consuming but discarding?</strong> A filter, a schema mismatch handled by skipping, or a
+         dead-letter path that nobody monitors. Records are consumed — so lag is zero — and dropped afterwards. The
+         DLT rate and the handler's own counters answer this.</p>
+      <p><strong>4. Is it committing without processing?</strong> Auto-commit with asynchronous handoff, the case
+         from the offsets lesson: offsets advance while records sit in a queue that is lost on restart.</p>
+      <p><strong>5. Is the data where you think?</strong> A key change or a repartition can send records to
+         partitions this group does not read, or to a different topic entirely.</p>
+      <p>The check that settles it quickly is a reconciliation count: records produced in a window versus records
+         the sink recorded for the same window, which turns "missing data" into a number and a time range.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Your metrics bill for Kafka clients exceeds the cluster's cost. What happened and what do you do?</summary>
+      <p>Cardinality. Kafka client metrics are tagged with <code>client-id</code>, and many are also per topic and
+         per partition. Multiply a few hundred client instances by a few hundred topics and their partitions, and the
+         number of time series runs into millions — each one stored, indexed and queried.</p>
+      <p>I would start by measuring which metric families produce the most series, which most monitoring systems
+         can report. Typically it is per-partition client metrics and per-topic request metrics from brokers.</p>
+      <p><strong>Then reduce deliberately rather than uniformly.</strong> Keep per-partition series for consumer
+         lag, because that is exactly where per-partition detail is the point. Aggregate producer and consumer
+         throughput and latency metrics to the client and topic level. Drop per-partition broker request metrics
+         entirely, keeping the per-request-type breakdown that the performance lesson relies on. Shorten retention
+         for high-cardinality series, and keep aggregated ones long for trends.</p>
+      <p>A JMX exporter allowlist is the practical place to enforce it, checked into the same repository as the
+         deployment so a new client fleet cannot quietly multiply the bill.</p>
+      <p>The trade-off to state openly is that dropped dimensions cannot be recovered retroactively. For the ones
+         that matter occasionally — per-partition request times, say — I would keep a documented way to enable them
+         temporarily during an investigation rather than collecting them always.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the monitoring and alerting for a platform with 40 teams' pipelines.</summary>
+      <p><strong>Two audiences, two sets of signals.</strong> The platform team owns the cluster: offline and
+         under-min-ISR partitions, the controller and quorum, broker saturation, cleaner health, disk trends,
+         capacity. Application teams own their pipelines: end-to-end record age, consumer lag in time, producer
+         error rate, DLT rate, rebalance rate. Each team's alerts route to that team, not to the platform.</p>
+      <p><strong>Standardise the application-side instrumentation</strong> so those signals exist without each team
+         inventing them: a shared client library or sidecar configuration that emits end-to-end age, lag in time,
+         handler duration and DLT counts with consistent names. Without that, half the teams will have no usable
+         signal and the platform team becomes the default responder for everything.</p>
+      <p><strong>An inventory is part of the design:</strong> topic, owner, consumers, retention, SLO, runbook.
+         It answers "who owns this?" during an incident, and it makes unowned topics and groups visible before they
+         fail.</p>
+      <p><strong>Alert hygiene:</strong> every alert has a runbook with the first commands to run; alerts that fire
+         without action are reviewed monthly and deleted or re-thresholded; and the alerts themselves are tested by
+         injecting failures in staging on a schedule — a poison record, a paused consumer, a stopped broker.</p>
+      <p><strong>Trends, not just states:</strong> partition budget used per broker, days-to-full, peak-to-average
+         ratios, cost per TB ingested. Those drive quarterly capacity decisions rather than emergency ones.</p>
+      <p><strong>Recommendation:</strong> symptom-based paging split by ownership, standardised client
+         instrumentation, an inventory with SLOs and runbooks, cardinality controlled by an allowlist, and scheduled
+         alert testing. The goal is a pager that is quiet and trusted — which is a property of what you choose not to
+         alert on as much as what you do.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Reconstruct an incident: for 20 minutes, some producers saw timeouts and some consumers stalled, then it recovered by itself.</summary>
+      <p>A partial, self-resolving incident is usually one broker misbehaving, and the reconstruction comes from
+         logs more than from dashboards, because logs name partitions and brokers.</p>
+      <p><strong>1. Establish the window and the blast radius.</strong> Which producers, which topics, which
+         partitions. If the affected partitions share a broker — as leader or as an in-sync replica — that broker is
+         the suspect.</p>
+      <p><strong>2. Read the cluster's own account.</strong> <code>controller.log</code> for leader elections,
+         broker registrations and fencing events in that window; <code>server.log</code> across brokers for
+         "Shrinking ISR" and "Expanding ISR"; <code>state-change.log</code> for the leadership transitions. A broker
+         that was fenced and re-registered, with ISR shrinks naming it on both sides of the window, is the story.</p>
+      <p><strong>3. Correlate with that broker's host.</strong> GC pause logs, disk latency, CPU steal, network
+         errors. A pause or disk stall longer than the session timeout explains fencing; the recovery explains why it
+         resolved itself.</p>
+      <p><strong>4. Explain the client symptoms.</strong> Producers with <code>acks=all</code> saw
+         <code>RemoteTimeMs</code> rise while that replica was in the ISR but stalled, then timeouts when leadership
+         moved. Consumers of partitions it led stalled until a new leader was elected, and any consumer group whose
+         coordinator was on that broker rebalanced.</p>
+      <p><strong>5. Write the timeline with evidence, then decide what to change.</strong> Usually: fix the host
+         cause, and add the detection that would have caught it early — ISR shrink rate, GC pause duration, per-broker
+         disk latency — plus an alert on end-to-end age so the next occurrence is noticed by the platform before the
+         teams report it.</p>
+      <p>The wider point is that self-resolving incidents are the ones most often left uninvestigated, and they
+         are the cheapest to learn from: the same broker will do it again, usually at a worse moment.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Expose broker metrics and verify the controller signal.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# JMX exporter as a Java agent on every broker and controller
+KAFKA_OPTS="-javaagent:/opt/jmx_prometheus_javaagent.jar=7071:/etc/kafka/jmx-exporter.yaml"
+
+# jmx-exporter.yaml: an ALLOWLIST, not everything
+rules:
+  - pattern: kafka.server&lt;type=ReplicaManager, name=(UnderReplicatedPartitions|UnderMinIsrPartitionCount)><>Value
+  - pattern: kafka.controller&lt;type=KafkaController, name=(ActiveControllerCount|OfflinePartitionsCount)><>Value
+  - pattern: kafka.network&lt;type=RequestMetrics, name=(TotalTimeMs|RemoteTimeMs|RequestQueueTimeMs),
+             request=(Produce|Fetch)><>(\d+)thPercentile
+  - pattern: ".*"
+    action: drop                      ◄── everything else dropped: cardinality controlled at the source
+</pre>
+<pre>
+$ curl -s localhost:7071/metrics | grep activecontrollercount
+kafka_controller_kafkacontroller_activecontrollercount 1.0      # on the active controller
+# on the other two:
+kafka_controller_kafkacontroller_activecontrollercount 0.0
+
+# the alert expression is the SUM across nodes
+sum(kafka_controller_kafkacontroller_activecontrollercount) != 1
+</pre>
+      <table class="tbl">
+        <tr><th>Alert written as</th><th>Result</th></tr>
+        <tr><td><code>activecontrollercount == 0</code> per node</td><td>Fires constantly on healthy followers</td></tr>
+        <tr><td><code>sum(...) != 1</code></td><td>Fires only for no controller or split brain</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Turn record lag into time lag.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# option A (best): the consumer reports the age of what it is processing
+histogram: record_age_ms = now − record.timestamp()     tagged by group, topic
+
+# option B: derive it from lag and the append rate
+lag_seconds = max_over_partitions(records_lag) / rate(log_end_offset[5m])
+</pre>
+<pre>
+two groups, same records lag, completely different situations:
+
+group        max records lag   append rate    time lag     verdict
+analytics        180,000        6,000/s        30 s        fine: catches up in half a minute
+billing              900            0.4/s      37 min      ◄── 37 minutes behind on payments
+</pre>
+      <table class="tbl">
+        <tr><th>Alert</th><th>Threshold example</th></tr>
+        <tr><td>Billing time lag</td><td>&gt; 5 minutes for 2 minutes → page</td></tr>
+        <tr><td>Analytics time lag</td><td>&gt; 2 hours for 15 minutes → ticket</td></tr>
+        <tr><td>Any group: members == 0</td><td>For groups expected to run continuously → page</td></tr>
+      </table>
+      <p>The same alert expression now works for every group, with a per-group threshold that is a business
+         statement rather than a guess about record counts.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Work the "consumer receives nothing" triage to a
+      conclusion.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic orders --time -1
+orders:0:8812044   orders:1:8790321  ...                    ◄── moving: production is fine
+
+$ kafka-consumer-groups.sh ... --describe --group fulfilment --members --verbose
+GROUP       CONSUMER-ID       HOST        #PARTITIONS  ASSIGNMENT
+fulfilment  consumer-1-9f2…   /10.2.0.7   0                              ◄── ZERO partitions
+fulfilment  consumer-2-a11…   /10.2.0.8   0
+
+$ kafka-consumer-groups.sh ... --describe --group fulfilment
+Consumer group 'fulfilment' has no committed offsets.
+</pre>
+      <p>Members exist, but hold no partitions and have no offsets — so they joined a group that is subscribed to
+         something that does not match. The consumer's log settles it:</p>
+<pre>
+INFO [Consumer clientId=consumer-1, groupId=fulfilment] Subscribed to topic(s): order
+                                                                               ▲ "order", not "orders"
+WARN ... Error while fetching metadata with correlation id 12 : {order=UNKNOWN_TOPIC_OR_PARTITION}
+</pre>
+      <table class="tbl">
+        <tr><th>Symptom</th><th>Cause</th></tr>
+        <tr><td>Members with 0 partitions</td><td>Subscription matches no existing topic, or more consumers than partitions</td></tr>
+        <tr><td><code>UNKNOWN_TOPIC_OR_PARTITION</code></td><td>Wrong topic name — and with broker auto-creation on, it may even create the wrong topic</td></tr>
+      </table>
+      <p>Two prevention notes: disable topic auto-creation so a typo fails loudly instead of creating an empty
+         topic that reports zero lag forever, and alert on "group has members but zero assigned partitions", which
+         is always wrong for a group that is supposed to be working.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Cut metric cardinality without losing diagnostic power.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+before: 4.1 M active series
+  consumer per-partition metrics      1.9 M   (400 instances × 300 topics × partitions)
+  broker per-topic request metrics    1.4 M
+  producer per-topic metrics          0.6 M
+  everything else                     0.2 M
+</pre>
+      <table class="tbl">
+        <tr><th>Family</th><th>Decision</th><th>Series after</th></tr>
+        <tr><td>Consumer lag per partition</td><td><strong>Keep</strong> — this is where detail matters</td><td>0.4 M (lag only, not all fetch metrics)</td></tr>
+        <tr><td>Other consumer per-partition metrics</td><td>Aggregate to client + topic</td><td>0.05 M</td></tr>
+        <tr><td>Broker per-topic request metrics</td><td>Drop; keep per-request-type</td><td>0.01 M</td></tr>
+        <tr><td>Producer per-topic metrics</td><td>Keep error and retry rates; aggregate the rest</td><td>0.08 M</td></tr>
+      </table>
+<pre>
+after: ~0.6 M series (−85%)
+what was preserved: every alert in Part 2, per-partition lag, the request-time breakdown by type,
+                    producer error rates
+what was lost:      per-topic request latency on the broker — re-enable temporarily when investigating
+</pre>
+      <p>Write down what was dropped and how to turn it back on. The failure mode of aggressive cardinality
+         cutting is an investigation that stalls because the needed dimension was removed a year ago and nobody
+         remembers how to get it back.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Write the alert set for one critical pipeline.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+pipeline: checkout → orders topic → fulfilment consumer → warehouse API
+SLO: 99% of orders reach the warehouse within 60 seconds
+</pre>
+      <table class="tbl">
+        <tr><th>Alert</th><th>Condition</th><th>Severity</th><th>Runbook first step</th></tr>
+        <tr><td>SLO breach</td><td>p99 record age &gt; 60 s for 3 min</td><td>Page</td><td>Check group lag and DLT rate</td></tr>
+        <tr><td>Group stopped</td><td>members == 0 for 2 min</td><td>Page</td><td>Deployment status; consumer logs</td></tr>
+        <tr><td>Stuck partition</td><td>max partition lag rising 10 min while others flat</td><td>Page</td><td>Poison record: consumer logs, DLT</td></tr>
+        <tr><td>Dead letters</td><td>DLT rate &gt; 0 for 5 min</td><td>Page</td><td>Read DLT headers: exception class</td></tr>
+        <tr><td>Producer failures</td><td>record-error-rate &gt; 0 for 2 min</td><td>Page</td><td>Broker health; under-min-ISR</td></tr>
+        <tr><td>Writes refused</td><td>UnderMinIsrPartitionCount &gt; 0</td><td>Page (platform)</td><td>Which brokers are down</td></tr>
+        <tr><td>Rebalance storm</td><td>rebalance-rate-per-hour &gt; 6 outside deploys</td><td>Ticket</td><td>Poll interval, GC, autoscaling</td></tr>
+        <tr><td>Retention risk</td><td>days-to-full &lt; 7</td><td>Ticket</td><td>Growth rate; cleaner health</td></tr>
+      </table>
+<pre>
+deliberately NOT alerts (dashboard only):
+  under-replicated partitions during a planned rolling restart   (expected; the restart tooling waits on it)
+  purgatory size                                                 (grows with healthy load)
+  GC collection count                                            (pause DURATION is the signal)
+  per-broker CPU                                                 (a cause, not a symptom)
+</pre>
+      <p>Note the ordering: the first alert is the SLO itself, and the rest exist to shorten diagnosis. If only
+         one alert could survive, it would be the record-age one, because it is the only one that is wrong exactly
+         when users are affected.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Reconstruct an incident timeline from logs.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+report: "between 14:05 and 14:25, some orders were slow; it fixed itself"
+
+$ grep -h 'Shrinking ISR\|Expanding ISR' /var/log/kafka/server.log \
+  | awk '$1" "$2 >= "2026-09-17 14:00" && $1" "$2 <= "2026-09-17 14:30"' | head
+14:06:12 ... Shrinking ISR from 2,5,7 to 2,5 (partition orders-3)
+14:06:12 ... Shrinking ISR from 5,7,1 to 5,1 (partition payments-8)
+14:06:13 ... [dozens more, every one removing broker 7]
+14:23:41 ... Expanding ISR from 2,5 to 2,5,7 (partition orders-3)
+
+$ grep -h 'Fenced\|Unfenced\|registered' /var/log/kafka/controller.log | sed -n '/14:0/,/14:3/p'
+14:06:41 Broker 7 fenced (session timeout)
+14:07:02 Broker 7 unfenced after re-registration
+14:07:02 [state-change.log] Leader election for 214 partitions: broker 7 relinquishes leadership
+
+$ # broker 7's host, same window
+14:05:58  GC pause 11.4 s          ◄── far beyond broker.session.timeout.ms (9 s)
+14:06:41  swap in/out non-zero
+</pre>
+      <table class="tbl">
+        <tr><th>Time</th><th>Event</th><th>Client effect</th></tr>
+        <tr><td>14:05:58</td><td>11.4 s GC pause on broker 7</td><td><code>acks=all</code> produce latency spikes on its partitions</td></tr>
+        <tr><td>14:06:12</td><td>Leaders shrink the ISR, removing broker 7</td><td>Latency recovers for those partitions</td></tr>
+        <tr><td>14:06:41</td><td>Controller fences broker 7</td><td>214 partitions elect new leaders: brief errors, clients retry</td></tr>
+        <tr><td>14:07:02</td><td>Broker 7 re-registers</td><td>Recovery begins; replication catches up</td></tr>
+        <tr><td>14:23:41</td><td>ISR expands again</td><td>Fully healthy</td></tr>
+      </table>
+<pre>
+actions from the timeline
+  cause:      swap enabled + oversized heap on broker 7 → vm.swappiness=1, heap reduced (performance lesson)
+  detection:  alert on GC pause duration > 2 s, and on IsrShrinksPerSec sustained
+  resilience: producers already retried correctly; delivery.timeout.ms was adequate — no change
+</pre>
+      <p>Twenty minutes of degradation, entirely explained from three log files and one host metric. The value of
+         writing it down is the third row: the response is not only "fix broker 7" but "this class of event should
+         page us in 90 seconds next time".</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Alert on symptoms users feel; keep causes on dashboards</strong> — that split is what keeps a pager trusted.</li>
+        <li><strong>End-to-end record age is the one metric that catches every failure mode</strong> and states it in business units.</li>
+        <li><strong>Page on offline partitions, under-min-ISR, controller presence and quorum majority.</strong></li>
+        <li><strong><code>ActiveControllerCount</code> must be alerted as a cluster-wide sum of exactly 1,</strong> never per node.</li>
+        <li><strong>Alert on log cleaner health and days-to-full,</strong> not on a fixed disk percentage.</li>
+        <li><strong>Measure lag per partition, not per group</strong> — one stuck partition hides in a total.</li>
+        <li><strong>Express lag in time,</strong> so one threshold means the same thing on every topic.</li>
+        <li><strong>A group with no members reports zero lag;</strong> alert on member count and last-poll age too.</li>
+        <li><strong>Transactional topics never show exactly zero lag</strong> because control records take offsets.</li>
+        <li><strong>Collect client metrics:</strong> most incidents are consumer-side and invisible on broker dashboards.</li>
+        <li><strong>Metric cardinality can cost more than the cluster;</strong> allowlist at the exporter and keep per-partition detail only for lag.</li>
+        <li><strong>Use the triage order:</strong> is data produced, does the group have members, is it assigned partitions, where is its offset, is it failing before your code.</li>
+        <li><strong>Broker logs are the incident timeline</strong> — ISR events, controller fencing and state changes name the partitions and brokers.</li>
+        <li><strong>Every alert needs a runbook and an owner,</strong> and an inventory of topics, consumers and SLOs.</li>
+        <li><strong>Test alerts by injecting failures in staging;</strong> untested alerts fail in the incident they were written for.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="performance.html">← Performance: Throughput vs Latency</a>
+      <a href="security.html">Security: TLS, SASL, ACLs &amp; Quotas →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

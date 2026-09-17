@@ -64,6 +64,8 @@ REVIEWED_THIN = {
     "kafka/kraft-cluster.html",      # 41KB, metadata log, quorum sizing, fencing, upgrades
     "kafka/capacity.html",           # 38KB, four limits, egress arithmetic, headroom, cost
     "kafka/performance.html",        # 40KB, latency split, request breakdown, JVM/OS, TLS cost
+    "kafka/monitoring.html",         # 41KB, symptom alerts, lag in time, cardinality, triage
+    "kafka/security.html",           # 40KB, listeners, principals, ACLs, quotas, rotation
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
