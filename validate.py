@@ -59,6 +59,7 @@ REVIEWED_THIN = {
     "kafka/retention-compaction.html", # 43KB, cleaner internals, tombstones, sizing, cleaner health
     "kafka/kafka-streams.html",      # 42KB, tasks, KStream/KTable, state restore, repartition
     "kafka/windowing-joins.html",    # 42KB, stream time, window types, grace, join sizing
+    "kafka/connect-cdc.html",        # 44KB, converters, offsets, SMTs, Debezium slots
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
