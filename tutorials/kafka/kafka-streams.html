@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kafka Streams: KStream, KTable &amp; State — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Kafka Streams: KStream, KTable &amp; State <span class="level-badge level-adv">Processing &amp; Integration</span></h1>
+    <p><strong>What you'll master:</strong> what Kafka Streams actually is — a library whose parallelism is your
+       input partitions, not a cluster you operate; the difference between a <strong>KStream, a KTable and a
+       GlobalKTable</strong>, and why choosing wrongly changes your results rather than your performance; state
+       stores, their compacted changelog topics, and the <strong>restore time that decides how long a failover
+       takes</strong>; the operations that silently create a repartition topic, and co-partitioning for joins;
+       record caches and commit intervals, which control how many intermediate results downstream sees;
+       <strong>the unnamed operator whose auto-generated store name changes when you add a step</strong>, resetting
+       state on deploy; and RocksDB memory living outside the JVM heap. Prerequisites:
+       <a href="retention-compaction.html">Retention &amp; Log Compaction</a> and
+       <a href="exactly-once.html">Idempotence &amp; Transactions</a>.</p>
+
+    <h2>Part 1 — A Library, Not a Cluster</h2>
+
+    <p>Kafka Streams is a Java library. There is no processing cluster, no job manager and no separate
+       deployment model: you write a <code>main</code> method, and you scale by running more copies of your
+       application. Everything it needs — coordination, state, fault tolerance — it gets from Kafka itself.</p>
+
+<pre>
+your application (3 instances)                        Kafka
+┌──────────────────────────────┐
+│ StreamsBuilder topology      │   consumes ──────►   input topics
+│  num.stream.threads = 2      │   produces ──────►   output topics
+│  tasks 0_0 0_3 ...           │   state  ────────►   compacted CHANGELOG topics
+│  RocksDB state stores (local)│   membership ────►   a consumer group named application.id
+└──────────────────────────────┘
+</pre>
+
+    <table class="tbl">
+      <tr><th>Concept</th><th>Meaning</th><th>Consequence</th></tr>
+      <tr><td><code>application.id</code></td><td>The consumer group id, and the prefix of every internal topic</td><td>Changing it restarts processing from scratch under a new identity</td></tr>
+      <tr><td>Task</td><td>One partition of the topology's input, with its share of the state</td><td>Maximum parallelism = the largest input topic's partition count</td></tr>
+      <tr><td><code>num.stream.threads</code></td><td>Threads per instance (default 1)</td><td>Tasks are spread over threads across all instances</td></tr>
+      <tr><td>Sub-topology</td><td>A section of the topology separated by a repartition step</td><td>Each sub-topology's tasks are scheduled independently</td></tr>
+      <tr><td>Internal topics</td><td><code>&lt;application.id&gt;-&lt;name&gt;-changelog</code> / <code>-repartition</code></td><td>Created automatically; they count towards cluster partition budgets</td></tr>
+    </table>
+
+    <p><strong>Streams is the right tool when the input and output are both Kafka.</strong> It gives you
+       exactly-once processing (<code>processing.guarantee=exactly_once_v2</code>) over the consume-transform-produce
+       loop from the transactions lesson, plus joins, aggregations and windows that would otherwise be hand-written
+       state management. When the output is a database or an API, a plain consumer — or Kafka Connect — is usually
+       simpler.</p>
+
+<pre>
+Properties p = new Properties();
+p.put(StreamsConfig.APPLICATION_ID_CONFIG, "order-enricher");     // group id AND internal topic prefix
+p.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+p.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2);
+
+StreamsBuilder b = new StreamsBuilder();
+KStream&lt;String, Order&gt; orders = b.stream("orders", Consumed.with(Serdes.String(), orderSerde));
+orders.filter((k, o) -&gt; o.total() &gt; 10_000)
+      .mapValues(Order::toAlert)                                   // mapValues: no repartition
+      .to("large-orders", Produced.with(Serdes.String(), alertSerde));
+
+KafkaStreams streams = new KafkaStreams(b.build(), p);
+streams.start();
+Runtime.getRuntime().addShutdownHook(new Thread(streams::close));   // close() commits and leaves the group
+</pre>
+
+    <h2>Part 2 — KStream, KTable and GlobalKTable</h2>
+
+    <p>The same topic can be read three ways, and they mean different things. This is the distinction that
+       decides whether your results are right.</p>
+
+    <table class="tbl">
+      <tr><th></th><th>KStream</th><th>KTable</th><th>GlobalKTable</th></tr>
+      <tr><td>A record means</td><td>An event happened</td><td>The latest value for this key (an upsert)</td><td>The same, but fully replicated</td></tr>
+      <tr><td>A null value means</td><td>An ordinary record with no value</td><td><strong>Delete this key</strong> (tombstone)</td><td>Delete this key</td></tr>
+      <tr><td>Each instance holds</td><td>Its assigned partitions</td><td>Its assigned partitions' keys</td><td><strong>Every partition, on every instance</strong></td></tr>
+      <tr><td>Joins need co-partitioning</td><td>Yes</td><td>Yes</td><td>No — any key can be looked up locally</td></tr>
+      <tr><td>Typical source</td><td>Event topic (<code>delete</code> policy)</td><td>State topic (<code>compact</code>)</td><td>Small reference data: currencies, feature flags</td></tr>
+    </table>
+
+<pre>
+input topic "clicks":  (u1, 1)  (u1, 1)  (u1, 1)
+
+as a KStream, counted:    u1 → 3        "three click events happened"
+as a KTable,  counted:    u1 → 1        "u1's current value was set three times; there is ONE u1"
+
+input topic "profiles":  (u1, {…})  (u1, null)
+as a KTable: u1 is DELETED by the null; a KStream would pass the null through as a record
+</pre>
+
+    <div class="note">🔑 <strong>Read events as a KStream and state as a KTable.</strong> A KTable's semantics
+       — latest value per key, null deletes — match a compacted topic exactly, which is why state topics are
+       compacted. Reading an event topic as a KTable silently collapses events that happen to share a key; reading
+       a state topic as a KStream turns tombstones into records your code must special-case. The
+       <a href="event-design.html">Event Design lesson</a> makes the same split at the topic level.</div>
+
+    <p><strong>GlobalKTable trades memory for freedom from co-partitioning.</strong> Every instance reads every
+       partition of the topic into local state, so a stream can be joined against it by any field, not just by the
+       stream's key, and no repartition is needed. The costs are real: each instance stores the whole table, and
+       each instance must load it fully at start-up before processing begins. It suits small, slowly changing
+       reference data — a few thousand currencies or feature flags — and not a 40-million-row catalogue.</p>
+
+    <h2>Part 3 — State Stores, Changelogs and Restore Time</h2>
+
+    <p>Stateful operations — <code>count</code>, <code>aggregate</code>, <code>reduce</code>, joins, windows —
+       keep their state in a local store, RocksDB by default, on the instance's disk. That state is backed up to a
+       <strong>changelog topic</strong> in Kafka: a compacted topic written to on every update.</p>
+
+<pre>
+task 0_5 processes partition 5 of "orders"
+   local store: /tmp/kafka-streams/order-enricher/0_5/rocksdb/orders-by-customer/
+   changelog:   order-enricher-orders-by-customer-changelog, partition 5 (compacted)
+
+instance dies → the task moves to another instance → that instance REBUILDS the store
+   by reading the changelog partition from the beginning
+   restore rate is bounded by network and RocksDB write speed
+</pre>
+
+<pre>
+restore arithmetic
+  store size 100 GB, restore at ~50 MB/s → 100,000 MB / 50 = 2,000 s ≈ 33 minutes
+  during which that task processes NOTHING — its partitions' lag grows
+
+num.standby.replicas = 1
+  a second instance keeps a warm copy of the store, following the changelog continuously
+  failover becomes seconds instead of half an hour, at the cost of a second copy of the state
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>Effect</th></tr>
+      <tr><td><code>num.standby.replicas</code></td><td>0</td><td>Warm copies of each store; the single biggest lever on failover time</td></tr>
+      <tr><td><code>acceptable.recovery.lag</code></td><td>10,000 records</td><td>How close a warm copy must be before a task is moved to it</td></tr>
+      <tr><td><code>max.warmup.replicas</code></td><td>2</td><td>How many tasks may be warming up at once after a scale-out</td></tr>
+      <tr><td><code>probing.rebalance.interval.ms</code></td><td>10 min</td><td>How often Streams checks whether warm-ups are ready to take over</td></tr>
+      <tr><td><code>state.dir</code></td><td>Temp directory</td><td>Put it on a persistent volume, or every restart is a full restore</td></tr>
+    </table>
+
+    <p><strong>Persistent volumes matter as much as standbys.</strong> The default state directory lives under
+       the system temp directory; in a container that means the store is lost on every restart and rebuilt from the
+       changelog. A StatefulSet with a persistent volume, plus static membership from the rebalancing lesson, turns
+       a routine deploy from "restore everything" into "resume from where the local store stopped".</p>
+
+    <h2>Part 4 — Repartitioning and Co-Partitioning</h2>
+
+    <p>Any operation that may change a record's key marks the stream for <strong>repartitioning</strong>: Streams
+       writes the records to an internal topic keyed by the new key, then reads them back, so that the downstream
+       operation's state is correctly partitioned.</p>
+
+    <table class="tbl">
+      <tr><th>Operation</th><th>Repartitions?</th><th>Use instead</th></tr>
+      <tr><td><code>mapValues</code>, <code>filter</code>, <code>flatMapValues</code>, <code>peek</code></td><td>No — the key cannot change</td><td>—</td></tr>
+      <tr><td><code>map</code>, <code>flatMap</code>, <code>selectKey</code>, <code>transform</code></td><td>Yes, if a stateful step follows</td><td><code>mapValues</code> when only the value changes</td></tr>
+      <tr><td><code>groupBy</code></td><td>Yes — it selects a new key</td><td><code>groupByKey</code> when the key is already right</td></tr>
+      <tr><td><code>join</code> between two KStreams / KTables</td><td>Requires co-partitioning; repartitions if needed</td><td>Match partition counts, or use a GlobalKTable</td></tr>
+    </table>
+
+<pre>
+orders.map((k, v) -&gt; KeyValue.pair(v.customerId(), v))     // key CHANGED → repartition topic
+      .groupByKey().count();                               // every record: written to Kafka and read back
+
+orders.mapValues(Order::enrich)                            // key untouched → no extra topic
+      .groupByKey().count();
+</pre>
+
+    <p>A repartition costs a full round trip through Kafka for every record: produce, replicate, fetch. On a
+       high-volume stream that can double or triple the topic traffic the application generates, and it adds
+       latency. It is often necessary — grouping by a different field genuinely requires it — but an accidental
+       one, caused by using <code>map</code> where <code>mapValues</code> would do, is pure waste.</p>
+
+    <p><strong>Co-partitioning</strong> is the requirement for KStream-KStream and KStream-KTable joins: both
+       sides must have the same number of partitions and be keyed the same way with the same partitioner, so that
+       matching keys land on the same task. Streams checks partition counts and fails at start-up if they differ;
+       it cannot check that both sides used the same partitioner, which is where the librdkafka mismatch from the
+       partitions lesson resurfaces as a join that silently matches nothing.</p>
+
+<pre>
+$ topology.describe()     // print it in CI and review changes to it
+Topologies:
+   Sub-topology: 0
+    Source: KSTREAM-SOURCE-0000000000 (topics: [orders])
+      --&gt; KSTREAM-KEY-SELECT-0000000001
+    Processor: KSTREAM-KEY-SELECT-0000000001 (stores: [])
+      --&gt; KSTREAM-FILTER-0000000004
+    Sink: KSTREAM-SINK-0000000003 (topic: order-enricher-KSTREAM-AGGREGATE-STATE-STORE-0000000002-repartition)
+   Sub-topology: 1
+    Source: KSTREAM-SOURCE-0000000005 (topics: [order-enricher-...-repartition])
+      --&gt; KSTREAM-AGGREGATE-0000000006
+</pre>
+
+    <h2>Part 5 — Caches, Commits and What Downstream Sees</h2>
+
+    <p>Streams does not emit every intermediate result. A record cache in front of each state store deduplicates
+       updates for the same key, and the cache is flushed when it fills or when the application commits.</p>
+
+<pre>
+1,000 updates to key "u1" within one commit interval
+
+statestore.cache.max.bytes = 10 MB (default), commit.interval.ms = 30 s (at_least_once)
+   downstream receives: ONE record for u1 per flush — not 1,000
+
+statestore.cache.max.bytes = 0
+   downstream receives: 1,000 records, every intermediate count
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>Raising it</th><th>Lowering it</th></tr>
+      <tr><td><code>commit.interval.ms</code></td><td>30 s (100 ms under exactly-once)</td><td>Fewer commits, more reprocessing after a crash</td><td>Fresher output, more coordinator traffic</td></tr>
+      <tr><td><code>statestore.cache.max.bytes</code></td><td>10 MB</td><td>Fewer downstream updates, more memory</td><td>Every update emitted: useful when debugging, expensive in production</td></tr>
+      <tr><td><code>processing.guarantee</code></td><td><code>at_least_once</code></td><td><code>exactly_once_v2</code>: atomic output + offsets, 100 ms commits</td><td>—</td></tr>
+    </table>
+
+    <p><strong>The cache changes what consumers see, not what is correct.</strong> Final values are always
+       emitted eventually; caching only suppresses intermediate ones. Code downstream must therefore treat a
+       KTable's output as a sequence of states — the "latest value wins" rule again — and never assume it receives
+       one output record per input record.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Testing a topology with the cache disabled and deploying with it enabled.</strong> The test
+         asserts one output record per input record and passes. In production the cache collapses updates, a
+         downstream service that counted records sees far fewer, and an alert based on "output rate ≈ input rate"
+         fires constantly.</p>
+      <p>✅ <strong>Treat the cache as part of the contract.</strong> Test with production settings for anything
+         that depends on output cadence, and design downstream consumers to be idempotent and state-based. If a
+         step genuinely needs every intermediate value, that is a KStream operation, not a KTable one.</p>
+    </div>
+
+    <h2>Part 6 — Operating Streams Applications</h2>
+
+    <p><strong>Name your operators.</strong> Without explicit names, Streams generates them by position —
+       <code>KSTREAM-AGGREGATE-STATE-STORE-0000000002</code> — and the store's name becomes part of its changelog
+       topic's name. Insert one new operator earlier in the topology and every later number shifts: new store
+       names, new changelog topics, and an application that starts with empty state while the old changelogs sit
+       unused.</p>
+
+<pre>
+release 1   .groupByKey().count()                            store KSTREAM-AGGREGATE-STATE-STORE-0000000002
+release 2   .filter(...).groupByKey().count()                store KSTREAM-AGGREGATE-STATE-STORE-0000000003
+            → different changelog topic → counts restart from ZERO after the deploy
+
+fix, from day one:
+   .groupByKey().count(Materialized.as("orders-per-customer"))    // stable name, stable changelog
+   .filter(..., Named.as("drop-internal"))
+</pre>
+
+    <table class="tbl">
+      <tr><th>Concern</th><th>Mechanism</th></tr>
+      <tr><td>A record that cannot be deserialized</td><td>The deserialization exception handler — <code>LogAndFailExceptionHandler</code> by default; <code>LogAndContinue</code> skips, or write one that dead-letters</td></tr>
+      <tr><td>A record that cannot be produced</td><td>The production exception handler: fail, or drop and continue</td></tr>
+      <tr><td>An uncaught exception in a thread</td><td><code>setUncaughtExceptionHandler</code>: <code>REPLACE_THREAD</code>, <code>SHUTDOWN_CLIENT</code> or <code>SHUTDOWN_APPLICATION</code></td></tr>
+      <tr><td>Reprocessing from scratch</td><td><code>kafka-streams-application-reset.sh</code>, plus deleting local state directories</td></tr>
+      <tr><td>Querying state from outside</td><td>Interactive queries: read a task's store directly, with metadata to find which instance holds a key</td></tr>
+    </table>
+
+    <p><strong>RocksDB memory is not JVM heap.</strong> Each store's block cache, memtables and index blocks are
+       native allocations, so a container sized from <code>-Xmx</code> alone is killed by the kernel with no Java
+       error — the exit-137 case from the Docker track. With many partitions the effect multiplies: 64 tasks, each
+       with a store, each with its own buffers. Bound it with a <code>RocksDBConfigSetter</code> that shares one
+       block cache and one write-buffer manager across stores, and size the container for heap plus that budget
+       plus overhead.</p>
+
+<pre>
+memory budget for one instance
+  JVM heap                      2 GB
+  RocksDB shared block cache    1 GB      ← set explicitly in a RocksDBConfigSetter
+  write buffers (shared)      512 MB
+  JVM non-heap, threads, other ~512 MB
+  container limit               4.5–5 GB  (not 2 GB + a little)
+</pre>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Reading an event topic as a KTable</td><td>Events sharing a key collapse into one "current value"</td><td>KStream for events, KTable for state</td></tr>
+      <tr><td>Reading a compacted state topic as a KStream</td><td>Tombstones arrive as null-valued records to special-case</td><td>KTable, where null means delete</td></tr>
+      <tr><td>GlobalKTable for large data</td><td>Every instance stores and loads the whole table</td><td>KTable with co-partitioning, or a foreign-key join</td></tr>
+      <tr><td><code>num.standby.replicas=0</code> with large stores</td><td>Failover waits for a full changelog restore</td><td>At least one standby for latency-sensitive apps</td></tr>
+      <tr><td>State directory on ephemeral storage</td><td>Every restart restores everything</td><td>Persistent volumes, plus static membership</td></tr>
+      <tr><td><code>map</code> where <code>mapValues</code> would do</td><td>An unnecessary repartition topic: extra traffic and latency</td><td><code>mapValues</code>/<code>filter</code> when the key is unchanged</td></tr>
+      <tr><td><code>groupBy</code> when the key is already correct</td><td>Same: a needless repartition</td><td><code>groupByKey</code></td></tr>
+      <tr><td>Joining topics with different partition counts</td><td>Start-up failure, or a hidden repartition</td><td>Co-partition both sides deliberately</td></tr>
+      <tr><td>Joining topics keyed by different clients' partitioners</td><td>Joins match nothing, with no error</td><td>One partitioner across all producers</td></tr>
+      <tr><td>Unnamed stateful operators</td><td>Adding a step renames stores; state resets on deploy</td><td><code>Materialized.as</code> and <code>Named.as</code> everywhere</td></tr>
+      <tr><td>Changing <code>application.id</code> to "reset"</td><td>New group and new internal topics; old ones linger</td><td>The application reset tool, then delete local state</td></tr>
+      <tr><td>Expecting one output record per input record</td><td>Record caches collapse updates</td><td>Design downstream for sequences of states</td></tr>
+      <tr><td>Sizing containers from heap only</td><td>RocksDB native memory causes OOM kills</td><td>Bound RocksDB explicitly and budget for it</td></tr>
+      <tr><td>Default exception handlers in production</td><td>One bad record stops the application</td><td>Dead-letter handling, chosen deliberately</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is Kafka Streams, and how does it scale?</summary>
+      <p>It is a Java library for processing Kafka topics: you build a topology of sources, processors and sinks
+         inside your own application, and run it wherever you run that application. There is no separate processing
+         cluster — coordination, fault tolerance and state backup all use Kafka.</p>
+      <p>It scales by <strong>tasks</strong>. Streams creates one task per partition of the input, and distributes
+         tasks across the threads of all running instances, using a consumer group named after the
+         <code>application.id</code>. Adding an instance moves some tasks to it; the maximum useful parallelism is
+         the input topic's partition count, exactly as for a plain consumer group.</p>
+      <p>Its value over a plain consumer is the stateful work it handles for you: aggregations, joins and windows,
+         with local state stores backed by compacted changelog topics so a failed instance's state can be rebuilt
+         elsewhere. It also supports exactly-once processing across the read-process-write cycle.</p>
+      <p>Its limit is that both ends should be Kafka. If the destination is a database or an API, a plain consumer
+         or Kafka Connect is usually the better fit.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between a KStream and a KTable?</summary>
+      <p>A <strong>KStream</strong> is a stream of independent records: every record is an event that happened, and
+         two records with the same key are two separate facts. A <strong>KTable</strong> is a changelog: each record
+         is the latest value for its key, replacing any previous one, and a record with a null value deletes the
+         key.</p>
+      <p>The difference shows up immediately in results. Counting a KStream of three clicks by <code>u1</code>
+         gives three. Counting the same topic read as a KTable gives one, because the three records are read as
+         three updates to the same entity.</p>
+      <p>The rule I follow is that event topics — clicks, orders, payments — are KStreams, and compacted state
+         topics — profiles, prices, configuration — are KTables. That matches the topic's cleanup policy: KTable
+         semantics and log compaction are the same idea, one in the application and one in the broker.</p>
+      <p>There is also a GlobalKTable, which is a KTable replicated in full to every instance. It removes the
+         co-partitioning requirement for joins and lets you look up any key locally, at the cost of every instance
+         holding and loading the whole table — so it is for small reference data.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A Streams application takes 30 minutes to recover after an instance dies. Why, and what would you change?</summary>
+      <p>Almost certainly state restoration. When a task moves to another instance, its state store must be rebuilt
+         by reading that task's changelog topic from the beginning. A large store — tens or hundreds of gigabytes —
+         restores at the speed the network and RocksDB allow, and the task processes nothing until it finishes.</p>
+      <p><strong>The main fix is standby replicas.</strong> With <code>num.standby.replicas=1</code>, another
+         instance continuously follows each changelog and keeps a warm copy, so failover becomes seconds. The cost is
+         a second copy of the state and the traffic to keep it current.</p>
+      <p><strong>Persistent local state</strong> helps for the common case, which is a restart rather than a
+         hardware loss: if <code>state.dir</code> is on a persistent volume, a restarting instance reuses its store
+         and only catches up the tail of the changelog. Combined with static membership, an ordinary deploy stops
+         triggering restores at all.</p>
+      <p><strong>Smaller state also helps:</strong> more partitions means smaller per-task stores and faster
+         parallel restores; shorter retention on windowed state reduces size; and storing only what the application
+         needs rather than whole records.</p>
+      <p>I would measure first — the restore progress is reported per task — and start with standbys plus
+         persistent volumes, since those address both failure and deploys.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is a repartition topic, and how do you avoid unnecessary ones?</summary>
+      <p>When an operation may change a record's key and a stateful operation follows, Streams must move records so
+         that all records for a key end up on the same task. It does this by writing them to an internal
+         <code>-repartition</code> topic keyed by the new key and reading them back.</p>
+      <p>That is a full round trip through Kafka for every record — produce, replicate, fetch — so it adds latency
+         and can double the traffic an application generates. It is necessary when you genuinely group by a
+         different field, and wasteful when it is triggered by accident.</p>
+      <p>The accidental cases are easy to spot: using <code>map</code> when only the value changes (use
+         <code>mapValues</code>), using <code>flatMap</code> instead of <code>flatMapValues</code>, or calling
+         <code>groupBy</code> with a key selector that returns the existing key instead of <code>groupByKey</code>.
+         Streams marks a stream for repartitioning as soon as a key-changing operation is used, even if the key is
+         not actually modified, because it cannot inspect the lambda.</p>
+      <p>I check by printing <code>topology.describe()</code> and looking for repartition sinks and sub-topology
+         boundaries — and I keep that output in a test, so a change that introduces a new repartition shows up in
+         code review rather than in the traffic graphs.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> After a routine deploy, a Streams application's aggregates reset to zero. What happened?</summary>
+      <p>The state stores changed identity, so Streams created new, empty ones. Two causes produce this.</p>
+      <p><strong>Auto-generated operator names.</strong> If stateful operators are not named, Streams names them by
+         position — <code>KSTREAM-AGGREGATE-STATE-STORE-0000000002</code> — and the store name becomes part of the
+         changelog topic name. Adding or removing any operator earlier in the topology shifts every later number, so
+         after the deploy the application looks for changelogs that do not exist, creates them, and starts from
+         empty state while the old changelogs remain, unused, holding the real data.</p>
+      <p><strong>A changed <code>application.id</code>.</strong> It prefixes every internal topic and is the
+         consumer group, so changing it is a complete restart under a new identity.</p>
+      <p><strong>Recovery</strong> depends on the aggregate. If it can be rebuilt from the input topic and the
+         input is still retained, reset the application (the reset tool plus deleting local state) and reprocess
+         from the beginning, with output consumers able to tolerate the replay. If not — for example the input has
+         aged out — the old changelog topic still holds the state, and it can be copied into the new changelog
+         topic's name, which is delicate and needs the application stopped.</p>
+      <p><strong>Prevention:</strong> name every stateful operator explicitly with <code>Materialized.as</code> and
+         <code>Named.as</code> from day one; assert the output of <code>topology.describe()</code> in a test so any
+         change to names or sub-topology boundaries fails the build; and treat topology changes as migrations that
+         are reviewed, not as ordinary code changes.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> When would you choose Kafka Streams over a plain consumer, or over Flink?</summary>
+      <p><strong>Against a plain consumer:</strong> Streams earns its place when the work is stateful — joins,
+         aggregations, windows, deduplication — or when exactly-once processing between Kafka topics is required.
+         Writing that by hand means managing local state, its backup, its restoration after a failover, and the
+         transactional loop; Streams does all of it. For stateless work, or when the sink is a database, a plain
+         consumer is simpler to reason about and to operate, and Kafka Connect may remove the code entirely.</p>
+      <p><strong>Against Flink:</strong> the trade is operational model against capability. Streams is a library:
+         no cluster, deployed like any other service, scaled like any other service, and limited to Kafka on both
+         ends. Flink is a distributed runtime with its own cluster and job lifecycle, richer windowing and
+         event-time handling, checkpointed state that can be very large, savepoints for versioned upgrades, SQL, and
+         many connectors beyond Kafka.</p>
+      <p>I would choose Streams when a team already runs JVM services on Kubernetes, the pipelines are
+         Kafka-to-Kafka, and state per instance is modest. I would choose Flink when the processing is the product —
+         complex event-time logic, very large state, multiple sources and sinks — and a platform team can own the
+         cluster.</p>
+      <p><strong>Recommendation:</strong> start with a plain consumer for stateless transformations, Streams for
+         stateful Kafka-to-Kafka work, and move to Flink when the requirements — state size, event-time semantics,
+         non-Kafka sources — outgrow what a library inside your service can reasonably do. Migrating later is real
+         work, so the honest question at the start is how stateful and how big this will become.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Build a counting topology and find the internal topics it
+      creates.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+StreamsBuilder b = new StreamsBuilder();
+b.stream("orders", Consumed.with(Serdes.String(), Serdes.String()))
+ .groupByKey()
+ .count(Materialized.as("orders-per-key"))          // NAME the store
+ .toStream()
+ .to("orders-counted", Produced.with(Serdes.String(), Serdes.Long()));
+// application.id = order-counter
+</pre>
+<pre>
+$ kafka-topics.sh --bootstrap-server localhost:9092 --list | grep order-counter
+order-counter-orders-per-key-changelog
+
+$ kafka-topics.sh ... --describe --topic order-counter-orders-per-key-changelog | head -1
+Topic: order-counter-orders-per-key-changelog  PartitionCount: 6  ReplicationFactor: 1  Configs: cleanup.policy=compact
+</pre>
+      <table class="tbl">
+        <tr><th>Observation</th><th>Why</th></tr>
+        <tr><td>One changelog topic, compacted</td><td>The store's backup keeps the latest value per key</td></tr>
+        <tr><td>Same partition count as <code>orders</code></td><td>One task per input partition, each with its own state</td></tr>
+        <tr><td>No repartition topic</td><td><code>groupByKey</code> kept the existing key</td></tr>
+      </table>
+      <p>Replace <code>groupByKey()</code> with <code>groupBy((k, v) -&gt; v.substring(0, 3))</code> and list the
+         topics again: a <code>-repartition</code> topic appears, because the key changed.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Count the same topic as a KStream and as a KTable and explain
+      the difference.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+input topic "signals":  (u1,a) (u1,b) (u2,c) (u1,null)
+
+// as a KStream
+b.stream("signals").groupByKey().count(Materialized.as("as-stream"))
+// as a KTable
+b.table("signals",  Materialized.as("as-table")).groupBy((k, v) -&gt; KeyValue.pair(k, v))
+ .count(Materialized.as("as-table-count"))
+</pre>
+<pre>
+as-stream       u1 → 4      every record counted, including the null-valued one
+as-table-count  u1 → 0      the null DELETED u1; u2 → 1
+</pre>
+      <table class="tbl">
+        <tr><th>Record</th><th>KStream sees</th><th>KTable sees</th></tr>
+        <tr><td>(u1, a)</td><td>An event</td><td>u1 is now "a"</td></tr>
+        <tr><td>(u1, b)</td><td>Another event</td><td>u1 is now "b" (replacing "a")</td></tr>
+        <tr><td>(u1, null)</td><td>An event with a null value</td><td><strong>u1 deleted</strong></td></tr>
+      </table>
+      <p>Neither is wrong; they answer different questions. "How many signals did u1 send?" is a KStream count.
+         "How many users currently have a signal?" is a KTable count. Picking the wrong one produces a plausible
+         number that is silently answering the other question.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Find and remove an accidental repartition.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+// before
+orders.map((k, o) -&gt; KeyValue.pair(k, enrich(o)))      // key is returned UNCHANGED, but map() marks it
+      .groupByKey()
+      .aggregate(...);
+
+$ System.out.println(builder.build().describe());
+   Sub-topology: 0 ... Sink: ... (topic: app-KSTREAM-AGGREGATE-STATE-STORE-0000000003-repartition)
+   Sub-topology: 1 ... Source: ... (topics: [app-...-repartition])        ◄── a full round trip per record
+</pre>
+<pre>
+// after
+orders.mapValues(this::enrich)                          // cannot change the key
+      .groupByKey()
+      .aggregate(...);
+
+   Sub-topology: 0 only — no repartition sink, no second source
+</pre>
+      <table class="tbl">
+        <tr><th>Version</th><th>Kafka traffic per input record</th><th>Sub-topologies</th></tr>
+        <tr><td><code>map</code></td><td>1 produce + 1 fetch extra, plus replication</td><td>2</td></tr>
+        <tr><td><code>mapValues</code></td><td>None extra</td><td>1</td></tr>
+      </table>
+      <p>Streams cannot see inside the lambda, so any key-changing operator marks the stream for repartitioning
+         even when the key is untouched. Keep <code>topology.describe()</code> in a golden-file test: the diff makes
+         an accidental repartition visible in review.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Measure failover with and without a standby replica.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+setup: 2 instances, 12 partitions, ~8 GB of state per instance, steady input
+
+run A: num.standby.replicas = 0
+  kill instance 2 →
+  rebalance (seconds) → surviving instance restores 6 tasks' stores from their changelogs
+  restore logs: "Restoration in progress for 6 partitions ..." → completes after ~9 minutes
+  output lag during restore: grows to ~9 minutes of data
+
+run B: num.standby.replicas = 1
+  kill instance 2 →
+  the standby copies are already warm (within acceptable.recovery.lag)
+  tasks activate in seconds; output lag peaks at a few seconds
+</pre>
+      <table class="tbl">
+        <tr><th></th><th>No standby</th><th>One standby</th></tr>
+        <tr><td>Time to resume processing</td><td>Minutes, proportional to state size</td><td>Seconds</td></tr>
+        <tr><td>Extra storage</td><td>None</td><td>A second copy of every store</td></tr>
+        <tr><td>Extra traffic</td><td>None in steady state</td><td>Changelog consumption on standby instances</td></tr>
+      </table>
+      <p>Also check <code>state.dir</code>: on a persistent volume, restarting an instance (rather than losing it)
+         reuses its local store and only catches up the changelog tail, which is the common case during deploys.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Reproduce the state reset caused by an unnamed operator, and
+      migrate an application that already has the problem.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+release 1:  stream("orders").groupByKey().count()
+            store: KSTREAM-AGGREGATE-STATE-STORE-0000000002
+            changelog: app-KSTREAM-AGGREGATE-STATE-STORE-0000000002-changelog     (48 GB of counts)
+
+release 2:  stream("orders").filter(...).groupByKey().count()      // one operator added
+            store: KSTREAM-AGGREGATE-STATE-STORE-0000000003        ◄── shifted by one
+            changelog: app-...-0000000003-changelog                 (new, EMPTY)
+            → counts start from zero; the 48 GB changelog is orphaned
+</pre>
+      <p>Migrating an application that is already unnamed, without losing the aggregate:</p>
+      <table class="tbl">
+        <tr><th>Option</th><th>How</th><th>When</th></tr>
+        <tr><td>Rebuild from input</td><td>Name the stores, reset the application, reprocess the input topic from the start</td><td>Input still retained; downstream tolerates a replay</td></tr>
+        <tr><td>Copy the changelog</td><td>Stop the app; copy records from the old changelog topic to the new store's changelog topic name (a small MirrorMaker or console pipeline); start with the named store</td><td>Input no longer retained; needs care and a stopped app</td></tr>
+        <tr><td>Dual run</td><td>Run release 2 under a new <code>application.id</code> writing to a new output topic; cut consumers over when it has caught up</td><td>Safest for critical pipelines; costs double resources for a while</td></tr>
+      </table>
+<pre>
+# reset path
+$ kafka-streams-application-reset.sh --bootstrap-server kafka:9092 --application-id app \
+    --input-topics orders --to-earliest
+$ rm -rf /var/lib/streams/app                      # local state on EVERY instance
+</pre>
+      <p>Whichever path is taken, the fix that prevents recurrence is naming: <code>Materialized.as</code> for every
+         store, <code>Named.as</code> for operators, and a test asserting <code>topology.describe()</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> A Streams pod is OOM-killed with no Java exception. Budget its
+      memory.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+symptoms: exit code 137, no OutOfMemoryError in the log, heap graphs look fine at 1.2/2 GB
+container limit 2.5 GB, -Xmx2g, 24 tasks on this instance, each with a state store
+</pre>
+      <p>RocksDB allocates outside the heap: a block cache, memtables (write buffers) and index/filter blocks per
+         store. With 24 stores at default settings, that is easily a gigabyte or more that the JVM never reports.
+         Bound it explicitly so the total is predictable:</p>
+<pre>
+public class BoundedRocksDBConfig implements RocksDBConfigSetter {
+    private static final Cache CACHE = new LRUCache(512 * 1024 * 1024);            // shared: 512 MB
+    private static final WriteBufferManager WBM = new WriteBufferManager(256L * 1024 * 1024, CACHE);
+    public void setConfig(String storeName, Options options, Map&lt;String, Object&gt; configs) {
+        BlockBasedTableConfig t = (BlockBasedTableConfig) options.tableFormatConfig();
+        t.setBlockCache(CACHE);
+        t.setCacheIndexAndFilterBlocks(true);        // count index/filter memory against the cache
+        options.setTableFormatConfig(t);
+        options.setWriteBufferManager(WBM);          // shared write-buffer budget across stores
+        options.setMaxWriteBufferNumber(2);
+    }
+    public void close(String storeName, Options options) { }
+}
+props.put(StreamsConfig.ROCKSDB_CONFIG_SETTER_CLASS_CONFIG, BoundedRocksDBConfig.class);
+</pre>
+      <table class="tbl">
+        <tr><th>Component</th><th>Budget</th></tr>
+        <tr><td>JVM heap (<code>-Xmx</code>)</td><td>2 GB</td></tr>
+        <tr><td>RocksDB block cache (shared, incl. index/filter)</td><td>512 MB</td></tr>
+        <tr><td>Write buffers (shared)</td><td>256 MB</td></tr>
+        <tr><td>Streams record caches (<code>statestore.cache.max.bytes</code>)</td><td>Inside the heap</td></tr>
+        <tr><td>JVM non-heap, threads, native</td><td>~512 MB</td></tr>
+        <tr><td><strong>Container limit</strong></td><td><strong>3.5–4 GB</strong></td></tr>
+      </table>
+      <p>Verify with a soak test at full task count rather than in a single-partition development run: the memory
+         that kills the pod scales with the number of stores on the instance, which is why it appears only after a
+         rebalance concentrates tasks on fewer instances.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Kafka Streams is a library, not a cluster;</strong> you scale it by running more instances of your application.</li>
+        <li><strong>Parallelism is bounded by input partitions,</strong> one task per partition, spread across instances and threads.</li>
+        <li><strong><code>application.id</code> is the consumer group and the prefix of every internal topic;</strong> changing it starts over.</li>
+        <li><strong>A KStream is events; a KTable is the latest value per key,</strong> where a null value deletes.</li>
+        <li><strong>Counting the same topic as a stream or a table gives different, both-plausible answers.</strong></li>
+        <li><strong>GlobalKTable removes co-partitioning</strong> at the cost of every instance holding and loading the whole table.</li>
+        <li><strong>State stores are local and backed by compacted changelog topics,</strong> which is how a task recovers elsewhere.</li>
+        <li><strong>Restore time is proportional to state size</strong> — roughly 33 minutes for 100 GB at 50 MB/s — and standby replicas turn it into seconds.</li>
+        <li><strong>Put <code>state.dir</code> on a persistent volume,</strong> or every restart is a full restore.</li>
+        <li><strong>Key-changing operators create repartition topics;</strong> <code>mapValues</code> and <code>groupByKey</code> avoid the needless ones.</li>
+        <li><strong>Joins require co-partitioning,</strong> and a partitioner mismatch makes joins match nothing without error.</li>
+        <li><strong>Record caches collapse intermediate updates,</strong> so downstream must expect a sequence of states, not one output per input.</li>
+        <li><strong>Unnamed operators get positional store names;</strong> adding a step renames them and resets state on deploy.</li>
+        <li><strong>Name every store and operator, and assert <code>topology.describe()</code> in a test.</strong></li>
+        <li><strong>RocksDB memory is native, not heap;</strong> bound it with a config setter and size containers for it.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="retention-compaction.html">← Retention &amp; Log Compaction</a>
+      <a href="quiz.html">Kafka Quizzes →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
