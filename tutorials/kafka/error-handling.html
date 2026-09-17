@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Errors, Retries &amp; Dead Letter Topics — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Errors, Retries &amp; Dead Letter Topics <span class="level-badge level-adv">Processing &amp; Integration</span></h1>
+    <p><strong>What you'll master:</strong> the classification that decides every other choice — <strong>bad data
+       or bad dependency</strong> — and why treating one as the other causes the worst outages; head-of-line
+       blocking, and the arithmetic of what one poison record costs; in-place retries and
+       <strong>the sleep that exceeds <code>max.poll.interval.ms</code> and triggers a rebalance</strong>; retry
+       topics, the delay mechanics behind them, and the ordering they trade away; what a dead-letter record must
+       carry to be replayable, and why the payload should be raw bytes; <strong>the downstream outage that fills
+       the DLQ with perfectly good records</strong>, and pausing instead; and the replay path that makes a DLQ
+       worth having. Prerequisites: <a href="connect-cdc.html">Kafka Connect &amp; CDC</a>; the Spring Boot
+       <a href="../springboot/messaging.html">Messaging lesson</a> shows one framework's implementation.</p>
+
+    <h2>Part 1 — Classify the Failure First</h2>
+
+    <p>Every error-handling decision follows from one question: <strong>will retrying this record ever
+       succeed?</strong> If the record is malformed, no number of retries helps, and retrying blocks everything
+       behind it. If a database is down, the record is fine and dead-lettering it throws away valid work.</p>
+
+    <table class="tbl">
+      <tr><th>Failure</th><th>Class</th><th>Retry helps?</th><th>Correct response</th></tr>
+      <tr><td>Deserialization failure, schema mismatch</td><td>Bad data</td><td>Never</td><td>Dead-letter immediately; alert</td></tr>
+      <tr><td>Validation failure (missing field, impossible value)</td><td>Bad data</td><td>Never</td><td>Dead-letter; often a producer bug</td></tr>
+      <tr><td>Business rejection (unknown account)</td><td>Ambiguous</td><td>Sometimes — the account may arrive later</td><td>Bounded retry, then dead-letter</td></tr>
+      <tr><td>Database timeout, connection refused</td><td>Bad dependency</td><td>Yes</td><td>Retry with backoff; <strong>pause</strong> if it persists</td></tr>
+      <tr><td>HTTP 429 / rate limited</td><td>Bad dependency</td><td>Yes, after waiting</td><td>Backoff and pause; never dead-letter</td></tr>
+      <tr><td>HTTP 500 from a downstream service</td><td>Bad dependency</td><td>Usually</td><td>Retry; circuit-break if widespread</td></tr>
+      <tr><td>Out of memory, disk full in the consumer</td><td>Bad consumer</td><td>No</td><td>Fail the instance; let it restart</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The two classes need opposite responses, and the failure is symmetrical.</strong>
+       Dead-lettering a bad dependency means valid records pile into the DLQ while the real problem is a database
+       restart. Retrying bad data forever means one record blocks its partition indefinitely. A consumer that treats
+       every exception the same way will do one of these, and usually finds out during an incident.</div>
+
+    <p><strong>Deserialization failures are special</strong> because they happen inside <code>poll()</code>,
+       before your code sees the record. A naive loop cannot even catch them usefully: the consumer throws, the
+       loop restarts, and the same record fails again. Modern clients raise
+       <code>RecordDeserializationException</code> carrying the partition and offset precisely so the loop can log
+       the record, publish its raw bytes to a DLQ and seek past it.</p>
+
+    <h2>Part 2 — Head-of-Line Blocking, Quantified</h2>
+
+<pre>
+topic "payments", 12 partitions, 6,000 records/s, one consumer per partition
+
+one poison record on partition 7, retried forever:
+  partition 7 stops:      500 records/s never processed
+  capacity lost:          1/12 = 8.3%    — and lag on partition 7 grows at 500/s
+  after 1 hour:           1.8 M records behind on that partition alone
+  other partitions:       perfectly healthy, which is why dashboards look fine
+
+the group's TOTAL lag looks like a modest rise; the per-partition view shows a cliff
+</pre>
+
+    <p>This is the argument for per-partition lag alerting from the <a href="consumers.html">consumers
+       lesson</a>: a stuck partition is invisible in aggregate metrics until it is very large. It is also the
+       argument for bounding every retry: "retry until it works" is indistinguishable from "stop processing this
+       partition" when the record can never succeed.</p>
+
+    <table class="tbl">
+      <tr><th>Strategy</th><th>Ordering</th><th>Blocking</th><th>Data loss risk</th></tr>
+      <tr><td>Retry in place, unbounded</td><td>Preserved</td><td>Total, for that partition</td><td>None — but nothing progresses</td></tr>
+      <tr><td>Retry in place, bounded, then dead-letter</td><td>Preserved</td><td>Only during the retries</td><td>Only if the DLQ is ignored</td></tr>
+      <tr><td>Skip and log</td><td>Preserved</td><td>None</td><td><strong>High</strong> — the record is gone</td></tr>
+      <tr><td>Retry topics</td><td><strong>Lost for retried records</strong></td><td>None</td><td>Only if the DLQ is ignored</td></tr>
+      <tr><td>Pause the partition</td><td>Preserved</td><td>Deliberate, while a dependency recovers</td><td>None</td></tr>
+    </table>
+
+    <h2>Part 3 — Retrying Without Breaking the Poll Loop</h2>
+
+    <p>The obvious implementation of "retry with backoff" is a sleep inside the processing loop. It works in
+       testing and fails in production, because the consumer must call <code>poll()</code> within
+       <code>max.poll.interval.ms</code> or it is removed from the group.</p>
+
+<pre>
+for (var record : records) {
+    for (int attempt = 1; attempt &lt;= 5; attempt++) {
+        try { handle(record); break; }
+        catch (TransientException e) { Thread.sleep(attempt * 10_000L); }   // 10+20+30+40 = 100 s
+    }
+}
+// 500 records × up to 100 s ... the next poll() is far beyond max.poll.interval.ms (5 min)
+// → the consumer is kicked out, its partitions move, the batch is reprocessed elsewhere,
+//   and the commit fails with CommitFailedException
+</pre>
+
+    <p><strong>The correct in-place pattern is pause, poll, resume.</strong> Pausing stops fetching for those
+       partitions while the loop keeps calling <code>poll()</code> — which returns nothing but keeps the consumer
+       in the group and its liveness intact.</p>
+
+<pre>
+if (needsBackoff) {
+    consumer.pause(consumer.assignment());
+    retryAt = System.currentTimeMillis() + backoffMs;
+}
+while (running) {
+    var records = consumer.poll(Duration.ofMillis(200));     // still polling: the group stays healthy
+    if (consumer.paused().size() &gt; 0 &amp;&amp; System.currentTimeMillis() &gt;= retryAt) {
+        consumer.resume(consumer.paused());
+        consumer.seek(tp, failedOffset);                     // reprocess from the failed record
+    }
+    ...
+}
+</pre>
+
+    <table class="tbl">
+      <tr><th>Backoff approach</th><th>Keeps the consumer alive?</th><th>Use for</th></tr>
+      <tr><td><code>Thread.sleep</code> in the loop</td><td>Only if total time stays well inside the poll interval</td><td>Very short retries (milliseconds)</td></tr>
+      <tr><td>Pause + poll + resume</td><td>Yes, indefinitely</td><td>Waiting out a dependency; ordering preserved</td></tr>
+      <tr><td>Retry topics</td><td>Yes: the record leaves the main flow</td><td>Per-record retries where ordering can be given up</td></tr>
+    </table>
+
+    <p><strong>Retry topics</strong> move the failed record to another topic and let the main flow continue. A
+       tiered arrangement gives increasing delays:</p>
+
+<pre>
+payments ──fail──► payments.retry.5s ──fail──► payments.retry.1m ──fail──► payments.retry.10m ──► payments.DLT
+
+each retry topic has its own consumer, which works out the delay itself:
+  read a record → if (now − record.timestamp) &lt; delay → PAUSE the partition and seek back,
+                  sleep-by-polling until due, then resume and process
+(Kafka has no delayed delivery; every "delay topic" implementation is this pattern underneath)
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Adding retry topics to an order-lifecycle consumer.</strong> <code>OrderPaid</code> fails
+         once and goes to the 5-second retry topic; <code>OrderShipped</code>, right behind it in the same
+         partition, succeeds immediately. The two events are now processed in the wrong order, and the order's state
+         machine ends up in "shipped" then "paid" — a bug that appears only under transient failures and is nearly
+         impossible to reproduce.</p>
+      <p>✅ <strong>Retry topics are for independent records.</strong> When per-key ordering matters, retry in
+         place with pause and backoff, so the partition waits with the record rather than overtaking it. If
+         throughput cannot tolerate that wait, the fix is to make the failure less likely — timeouts, capacity,
+         idempotent downstream calls — not to reorder the business events.</p>
+    </div>
+
+    <h2>Part 4 — What a Dead-Letter Record Must Carry</h2>
+
+    <p>A dead-letter topic is only useful if its records can be understood and replayed. That requires the
+       original bytes and the circumstances, and it requires the DLQ write itself never to fail.</p>
+
+<pre>
+DLT record
+  key    = the ORIGINAL key bytes          (so a replay keeps the same partition and ordering)
+  value  = the ORIGINAL value bytes        ◄── raw, NOT re-serialized: the record may be undeserializable
+  headers:
+    dlt.original.topic      payments
+    dlt.original.partition  7
+    dlt.original.offset     918273
+    dlt.original.timestamp  1789200000042
+    dlt.exception.class     com.acme.ValidationException
+    dlt.exception.message   currency "EURO" is not an ISO 4217 code
+    dlt.exception.stack     (truncated)
+    dlt.attempts            4
+    dlt.consumer.group      billing
+    dlt.failed.at           2026-09-17T09:14:22Z
+</pre>
+
+    <table class="tbl">
+      <tr><th>Choice</th><th>Why</th></tr>
+      <tr><td>Raw bytes as the value</td><td>The record may have failed <em>because</em> it cannot be deserialized; re-serializing it would fail too</td></tr>
+      <tr><td>Original key preserved</td><td>A replay lands in the same partition, so per-key ordering survives the round trip</td></tr>
+      <tr><td>Metadata in headers</td><td>The payload stays byte-identical to the original</td></tr>
+      <tr><td>Original topic, partition and offset</td><td>The record can be found and re-read from the source if the DLQ ages out</td></tr>
+      <tr><td>Long retention on the DLT</td><td>Investigations happen days later; a 7-day DLT loses the evidence</td></tr>
+      <tr><td>One DLT per consumer group, not per topic</td><td>Two groups reading one topic fail on different records for different reasons</td></tr>
+    </table>
+
+    <p><strong>A DLQ nobody reads is data loss with extra steps.</strong> The pattern that works is: alert on the
+       DLT's record rate (any sustained non-zero rate is an incident), give every DLT an owner, and build the
+       replay path <em>before</em> you need it — a small tool that reads the DLT, filters by exception class or time
+       range, and re-produces the original bytes to the original topic once the bug is fixed.</p>
+
+    <h2>Part 5 — Downstream Outages: Pause, Don't Dead-Letter</h2>
+
+    <p>The worst DLQ failure mode is systemic. When a downstream dependency fails, every record fails, and a
+       consumer that dead-letters after N retries will move the entire stream into the DLQ at full speed.</p>
+
+<pre>
+payments consumer, 6,000 records/s, 3 retries then DLT
+database fails over (takes 4 minutes)
+
+with per-record dead-lettering:
+  4 min × 6,000/s = 1.44 M VALID records in the DLT
+  replaying them = a second incident: ordering lost, duplicates, and a manual operation
+
+with circuit breaking:
+  error ratio over a 30 s window &gt; 50% → pause ALL assigned partitions
+  keep polling (stay in the group), probe the dependency every 10 s
+  database returns → resume; the 1.44 M records are simply processed, in order, a few minutes late
+  DLT records: ZERO
+</pre>
+
+    <table class="tbl">
+      <tr><th>Signal</th><th>Interpretation</th><th>Action</th></tr>
+      <tr><td>A few failures, scattered keys</td><td>Bad data</td><td>Bounded retry, then dead-letter</td></tr>
+      <tr><td>Nearly every record failing</td><td>Bad dependency</td><td>Pause and probe; do not dead-letter</td></tr>
+      <tr><td>Failures on one partition only</td><td>A poison record, or a hot key</td><td>Dead-letter that record; check the key</td></tr>
+      <tr><td>Failures rising with load</td><td>Capacity or rate limits</td><td>Backoff and pause; reduce concurrency</td></tr>
+    </table>
+
+    <p><strong>Retries multiply load on a struggling dependency.</strong> Three retries per record against a
+       database that is failing turns 6,000 requests per second into 24,000 — the retry storm from the
+       <a href="../springboot/microservices.html">Spring Boot microservices lesson</a>. Pausing removes the load
+       entirely, which is usually what a recovering dependency needs most.</p>
+
+    <p><strong>Side effects make retries non-neutral.</strong> At-least-once delivery means every retry repeats
+       whatever the handler already did before failing — a charge, an email, a partial database write. Split the
+       handler so the effects are idempotent (keyed upserts, idempotency keys on API calls) or ordered so the
+       retryable part comes first, as the <a href="offsets.html">offsets lesson</a> describes for transactional
+       sinks.</p>
+
+    <h2>Part 6 — Operating It</h2>
+
+    <table class="tbl">
+      <tr><th>Metric</th><th>Alert when</th><th>Because</th></tr>
+      <tr><td>Lag per partition</td><td>One partition diverges from its peers</td><td>The signature of a stuck partition</td></tr>
+      <tr><td>DLT record rate</td><td>Any sustained non-zero rate</td><td>Records are being abandoned</td></tr>
+      <tr><td>Retry topic depth</td><td>Growing</td><td>Failures are outpacing recovery</td></tr>
+      <tr><td>Handler error ratio</td><td>Above a threshold over a window</td><td>Distinguishes bad data from a bad dependency</td></tr>
+      <tr><td>Paused-partition time</td><td>Sustained</td><td>A dependency has been down long enough to page someone</td></tr>
+      <tr><td>Oldest unprocessed record age</td><td>Beyond the business SLA</td><td>The number that actually matters to users</td></tr>
+    </table>
+
+    <p><strong>Rehearse the failure.</strong> Produce a deliberately malformed record into a staging topic and
+       watch what happens: does the consumer dead-letter it and continue, or does the partition stall? Does the DLT
+       record contain enough to explain itself? Does an alert fire? Teams that have run this drill respond to the
+       real thing in minutes; teams that have not discover during an incident that the DLT is missing headers and
+       nobody owns it.</p>
+
+    <p><strong>Keep the policy in one place.</strong> Error handling scattered across handlers drifts: one
+         swallows exceptions, another retries forever, a third dead-letters silently. A single shared component —
+         classify, retry with backoff, pause on systemic failure, dead-letter with full context, count everything —
+         makes the behaviour uniform and reviewable, and is what frameworks such as Spring Kafka provide out of the
+         box.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Treating every exception the same</td><td>Either poison records block forever, or valid records are abandoned</td><td>Classify: bad data versus bad dependency</td></tr>
+      <tr><td>Unbounded in-place retries</td><td>One record stops its partition indefinitely</td><td>Bound the attempts, then dead-letter</td></tr>
+      <tr><td><code>Thread.sleep</code> for backoff in the poll loop</td><td>Exceeds <code>max.poll.interval.ms</code>: rebalance, failed commit, reprocessing</td><td>Pause, keep polling, resume when due</td></tr>
+      <tr><td>Catching and ignoring exceptions</td><td>Silent data loss; offsets advance past unprocessed records</td><td>Dead-letter and count every failure</td></tr>
+      <tr><td>Retry topics on ordered data</td><td>Retried records overtake later ones for the same key</td><td>In-place retry with pause when order matters</td></tr>
+      <tr><td>Dead-lettering during a downstream outage</td><td>Millions of valid records in the DLQ</td><td>Circuit-break and pause on a high error ratio</td></tr>
+      <tr><td>Retrying hard into a failing dependency</td><td>The retry storm prevents its recovery</td><td>Backoff, jitter, then pause entirely</td></tr>
+      <tr><td>Re-serializing the payload into the DLT</td><td>Undeserializable records cannot be dead-lettered at all</td><td>Write the original bytes</td></tr>
+      <tr><td>DLT records without context headers</td><td>A topic of bytes nobody can explain or replay</td><td>Original coordinates, exception, attempts, timestamp</td></tr>
+      <tr><td>Short retention on the DLT</td><td>Evidence expires before anyone investigates</td><td>Weeks, not days</td></tr>
+      <tr><td>One DLT shared by every consumer of a topic</td><td>Unrelated failures mixed; replay hits the wrong consumers</td><td>One DLT per consumer group</td></tr>
+      <tr><td>No replay path</td><td>Records sit in the DLT forever after the bug is fixed</td><td>Build the replay tool with the DLQ</td></tr>
+      <tr><td>Ignoring deserialization errors as "impossible"</td><td>One wrong producer stalls every consumer of the topic</td><td>Handle <code>RecordDeserializationException</code>: dead-letter and seek past</td></tr>
+      <tr><td>No drill</td><td>The DLQ's gaps are discovered mid-incident</td><td>Inject a poison record in staging regularly</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is a poison pill, and why is it worse in Kafka than in a queue?</summary>
+      <p>A poison pill is a record a consumer can never process successfully — malformed bytes, a schema the
+         consumer cannot read, or data that fails validation every time.</p>
+      <p>In a traditional queue, the broker tracks each message: a message that fails repeatedly can be moved to a
+         dead-letter queue automatically while the others keep flowing. Kafka has no per-message state; a consumer
+         group tracks one offset per partition. So the consumer cannot acknowledge the records after the bad one
+         without acknowledging the bad one too. If it keeps retrying, the partition stops: every record behind it
+         waits, and the lag grows at the full production rate.</p>
+      <p>The impact is partial, which makes it easy to miss. With twelve partitions, one stuck partition is about
+         8% of capacity, and the group's total lag rises only gradually — so per-partition lag is the alert that
+         catches it.</p>
+      <p>Handling it means deciding what to do with a record that cannot be processed: publish it to a dead-letter
+         topic with enough context to investigate, and move the offset past it so the partition continues. The
+         important half is that someone must look at the dead-letter topic, or the record is simply lost.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What belongs in a dead-letter record?</summary>
+      <p>Enough to explain the failure and to replay the record later. In practice that is the original key and
+         the original value as <strong>raw bytes</strong>, plus metadata in headers.</p>
+      <p>The bytes must be the originals, not a re-serialized object, because a common reason for dead-lettering
+         is that the record could not be deserialized in the first place — re-serializing would fail the same way.
+         Keeping the original key matters too: a replay then lands in the same partition, so per-key ordering
+         survives.</p>
+      <p>The headers should carry the original topic, partition, offset and timestamp; the exception class and
+         message; how many attempts were made; the consumer group; and when it failed. That is what turns a
+         dead-letter topic from a pile of bytes into something an engineer can triage — and what lets a replay tool
+         filter, for example, "everything that failed with ValidationException between 09:00 and 10:00".</p>
+      <p>Two operational details complete it: retention long enough that the evidence outlives the investigation —
+         weeks rather than the default week — and one dead-letter topic per consumer group, since two groups reading
+         the same topic fail on different records for different reasons.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you implement retries with backoff without being kicked out of the consumer group?</summary>
+      <p>The constraint is that the consumer must call <code>poll()</code> within
+         <code>max.poll.interval.ms</code> — five minutes by default. Sleeping inside the processing loop eats that
+         budget, and a batch of 500 records with a few seconds of backoff each blows through it: the consumer is
+         removed, its partitions are reassigned, the commit fails and the batch is reprocessed elsewhere.</p>
+      <p><strong>The in-place pattern is pause, poll, resume.</strong> When a record needs a backoff, pause the
+         assigned partitions and record the time to retry. Keep calling <code>poll()</code> in the loop — with
+         everything paused it returns no records, but it maintains the consumer's membership and liveness. When the
+         backoff expires, resume the partitions and <code>seek()</code> back to the failed record. Ordering is
+         preserved, because the partition waits rather than skipping ahead.</p>
+      <p><strong>The alternative is retry topics:</strong> publish the failed record to a separate topic with its
+         own consumer and delay, and let the main flow continue. That keeps throughput up but reorders records for a
+         key, so it suits independent records — notifications, enrichment — and not lifecycle events.</p>
+      <p>Either way the retries must be bounded, with jitter on the backoff so a fleet of consumers does not
+         synchronise its retries into a spike, and with a terminal dead-letter step so nothing retries forever.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Your consumer dead-lettered 1.4 million records during a database failover. What went wrong, and what is the fix?</summary>
+      <p>The consumer treated a dependency failure as bad data. Every record failed because the database was
+         unavailable, the retry budget was exhausted within seconds, and each perfectly valid record was routed to
+         the dead-letter topic at full production rate.</p>
+      <p>The damage is worse than the outage itself. Replaying 1.4 million records means reordering them relative
+         to everything processed since, re-running side effects for any that partly succeeded, and doing it as a
+         manual operation under pressure.</p>
+      <p><strong>The fix is to distinguish systemic failures from per-record ones.</strong> Track the error ratio
+         over a short window: when nearly every record in a window fails, this is not bad data. At that point the
+         consumer should stop consuming rather than dead-lettering — pause all assigned partitions, keep polling to
+         stay in the group, and probe the dependency periodically. When it recovers, resume; the backlog is then
+         simply processed, in order, a few minutes late, and the dead-letter topic stays empty.</p>
+      <p>Two supporting changes: only exceptions classified as permanent should reach the dead-letter path at all,
+         and pausing also protects the dependency, since retrying 6,000 records per second into a database that is
+         recovering is the retry storm that prevents recovery.</p>
+      <p><strong>Recovery now:</strong> replay the dead-lettered records with a tool that preserves the original
+         keys, after confirming the handler is idempotent, and reconcile against the source system.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design error handling for a payments consumer with strict ordering per account.</summary>
+      <p>Ordering per account rules out retry topics for anything that changes account state, so the design
+         centres on retrying in place and on being precise about which failures are terminal.</p>
+      <p><strong>Classification, decided up front and encoded in one component:</strong> deserialization and
+         validation failures are terminal — dead-letter immediately, because they will never succeed and a payments
+         producer sending malformed data is itself an incident. Downstream timeouts, connection failures and 5xx
+         responses are transient. Business rejections are terminal after a bounded wait, because the referenced
+         account may still be in flight.</p>
+      <p><strong>Transient handling:</strong> pause the partition, keep polling, retry with exponential backoff
+         and jitter up to a few minutes. Above a 50% error ratio over 30 seconds, treat it as systemic: pause all
+         partitions and probe, so the dead-letter topic never fills with valid payments and the dependency is not
+         hammered while recovering.</p>
+      <p><strong>Terminal handling:</strong> dead-letter with the original key and bytes plus full context
+         headers, into a per-group DLT with a month's retention, and alert on any record appearing in it — for
+         payments, one abandoned record deserves a page, not a dashboard.</p>
+      <p><strong>Side effects:</strong> every handler idempotent on the payment id, with the ledger write and the
+         offset in one database transaction, so retries cannot double-apply. Non-idempotent external calls carry an
+         idempotency key.</p>
+      <p><strong>Recommendation:</strong> in-place retry with pause, a circuit breaker on error ratio, terminal
+         dead-lettering only for permanent failures, idempotent effects, per-partition lag and DLT alerts, and a
+         rehearsed replay tool. And a stated SLO — "no payment unprocessed for more than 15 minutes" — so the team
+         knows when pausing has stopped being the safe choice and must be escalated.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A bug caused a consumer to dead-letter 40,000 records over two days. The bug is fixed. Plan the replay.</summary>
+      <p>A replay is a production operation, so I would plan it like a deployment rather than running a script
+         against the DLT.</p>
+      <p><strong>1. Scope it.</strong> Read the DLT and group the records by exception class and time: confirm
+         that all 40,000 failed for the reason that was fixed, and not that two bugs are mixed together. The context
+         headers make this a filter rather than an investigation.</p>
+      <p><strong>2. Check what the handler will do now.</strong> Some of these records may have partly succeeded
+         before failing — a row written, an email sent. Reprocessing repeats whatever was not idempotent, so I would
+         verify the handler is idempotent on the business key, and check downstream state for a sample.</p>
+      <p><strong>3. Decide the destination.</strong> Re-producing to the original topic keeps keys and ordering
+         relative to each other, and every consumer group of that topic sees the records again — which may be wrong
+         for groups that processed them fine. If only this group needs them, a dedicated replay topic consumed by
+         this group alone is safer.</p>
+      <p><strong>4. Control the rate.</strong> 40,000 records injected at full speed can starve live traffic or
+         overwhelm the downstream that just recovered. Replay at a bounded rate, outside peak hours, with the
+         consumer's lag watched.</p>
+      <p><strong>5. Track and verify.</strong> Mark replayed records — a header, or a separate topic — count what
+         was replayed against what was in the DLT, and reconcile the business outcome afterwards. Records that fail
+         again go to the DLT with a new attempt count, and the loop is not repeated blindly.</p>
+      <p><strong>Recommendation:</strong> a replay tool built alongside the DLQ, run at a controlled rate, into a
+         replay topic where possible, with idempotency confirmed first and reconciliation afterwards. The two-day
+         gap between the failure and the fix is itself worth a look: the alert on DLT rate should have made that
+         hours, not days.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Stall a partition with a poison record, then recover
+      automatically.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# produce a record whose value is not valid for the consumer's deserializer
+$ echo 'k9:{"broken"' | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic payments \
+    --property parse.key=true --property key.separator=:
+
+consumer log, repeating every poll:
+  org.apache.kafka.common.errors.RecordDeserializationException: Error deserializing key/value for
+  partition payments-7 at offset 918273. If needed, please seek past the record to continue consumption.
+
+$ kafka-consumer-groups.sh ... --describe --group billing | awk 'NR==1 || $6 > 1000'
+GROUP    TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+billing  payments  7          918273          1046512         128239      ◄── ONE partition stuck
+</pre>
+<pre>
+// recovery inside the loop: dead-letter the raw bytes and step over it
+try {
+    records = consumer.poll(Duration.ofMillis(500));
+} catch (RecordDeserializationException e) {
+    TopicPartition tp = e.topicPartition();
+    dlt.send(new ProducerRecord&lt;&gt;("payments.DLT", null, rawKeyOf(e), rawValueOf(e), contextHeaders(e)));
+    consumer.seek(tp, e.offset() + 1);                 // step over exactly one record
+    return;                                            // next poll continues normally
+}
+</pre>
+      <table class="tbl">
+        <tr><th>Before</th><th>After</th></tr>
+        <tr><td>Partition 7 lag growing at the production rate</td><td>Lag drains; one record in the DLT with its context</td></tr>
+        <tr><td>Other partitions healthy — total lag looks mild</td><td>Alert fires on DLT rate instead</td></tr>
+      </table>
+      <p>Seek to <code>offset + 1</code>, never further: skipping a whole batch to "get moving" discards valid
+         records that were never attempted.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show a sleeping retry loop losing its partitions, and fix it
+      with pause/resume.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+props: max.poll.interval.ms=60000 (shortened for the demo), max.poll.records=100
+handler: throws TransientException for every record; retry 3 times with 5 s sleeps
+</pre>
+<pre>
+100 records × 3 retries × 5 s = 1,500 s of sleeping before the next poll()
+
+WARN  consumer poll timeout has expired. This means the time between subsequent calls to poll()
+      was longer than the configured max.poll.interval.ms ...
+ERROR CommitFailedException: Offset commit cannot be completed since the consumer is not part of an
+      active group ...
+→ partitions reassigned; another member reprocesses the same batch; it also stalls. The group thrashes.
+</pre>
+<pre>
+// fixed: the waiting happens in poll(), not in sleep()
+catch (TransientException e) {
+    consumer.pause(consumer.assignment());
+    retryAt = System.currentTimeMillis() + backoffWithJitter(attempt);
+    consumer.seek(tp, record.offset());        // reprocess this record when we resume
+    break;                                     // leave the batch; the loop keeps polling
+}
+</pre>
+      <table class="tbl">
+        <tr><th></th><th>Sleep in the loop</th><th>Pause + poll</th></tr>
+        <tr><td>Group membership</td><td>Lost after the poll interval</td><td>Maintained indefinitely</td></tr>
+        <tr><td>Ordering</td><td>Preserved, then destroyed by reprocessing elsewhere</td><td>Preserved</td></tr>
+        <tr><td>Backoff length possible</td><td>Under the poll interval, total</td><td>Any length</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Demonstrate the ordering that retry topics cost.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+partition 3 of "orders", one key o-42, handler fails ONCE on OrderPaid (a transient blip)
+
+with retry topics (5 s delay):
+  t=0.00  OrderPlaced   → processed
+  t=0.10  OrderPaid     → fails → published to orders.retry.5s
+  t=0.20  OrderShipped  → processed          ◄── SHIPPED before PAID
+  t=5.10  OrderPaid     → processed from the retry topic
+
+resulting state machine transitions: PLACED → SHIPPED → PAID
+</pre>
+<pre>
+with in-place pause and retry:
+  t=0.00  OrderPlaced   → processed
+  t=0.10  OrderPaid     → fails → pause partition, seek back, keep polling
+  t=5.10  OrderPaid     → processed
+  t=5.11  OrderShipped  → processed
+transitions: PLACED → PAID → SHIPPED ✔ (the partition waited, 5 s of latency for everything behind it)
+</pre>
+      <table class="tbl">
+        <tr><th>Records</th><th>Retry topics</th><th>In-place retry</th></tr>
+        <tr><td>Independent (notifications, enrichment)</td><td>Correct and non-blocking</td><td>Unnecessarily blocking</td></tr>
+        <tr><td>Ordered per key (lifecycle events)</td><td><strong>Reorders state transitions</strong></td><td>Correct</td></tr>
+      </table>
+      <p>A middle path exists for mixed topics: retry in place for keys whose ordering matters and use retry
+         topics for the rest, decided by event type. It is more code, and it needs the classification to be explicit
+         in the event — which is another argument for naming event types rather than emitting generic updates.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Add a circuit breaker so a dependency outage does not fill
+      the DLQ.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+// rolling window of outcomes
+Deque&lt;Boolean&gt; window = new ArrayDeque&lt;&gt;();          // true = failure, last 30 s
+boolean systemic() { return window.size() &gt;= 50 &amp;&amp; failureRatio(window) &gt; 0.5; }
+
+catch (TransientException e) {
+    window.add(true);
+    if (systemic()) {
+        consumer.pause(consumer.assignment());
+        state = PAUSED; probeAt = now() + 10_000;      // probe the dependency every 10 s
+    } else if (++attempts[record.offset()] &gt; 3) {
+        deadLetter(record, e);                          // per-record failure: terminal
+    } else {
+        backoffInPlace(record);
+    }
+}
+</pre>
+<pre>
+simulated 4-minute database outage at 6,000 records/s
+
+without the breaker:  1,442,000 records dead-lettered; lag 0; a replay operation to plan
+with the breaker:     0 dead-lettered; partitions paused for 4 min; lag peaks at 1.44 M and drains
+                      in ~3 min once the database returns
+</pre>
+      <table class="tbl">
+        <tr><th>Threshold</th><th>Too low</th><th>Too high</th></tr>
+        <tr><td>Failure ratio</td><td>Pauses on ordinary bad data</td><td>Dead-letters valid records during an outage</td></tr>
+        <tr><td>Window size</td><td>Noisy; flaps</td><td>Slow to react; more records lost</td></tr>
+        <tr><td>Probe interval</td><td>Hammers a recovering dependency</td><td>Recovery detected late</td></tr>
+      </table>
+      <p>Alert separately on "paused for longer than N minutes": pausing is the right automatic response, but it
+         is not a resolution — someone still has to fix the dependency before the lag exceeds the business SLA.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Build the replay path for a dead-letter topic.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# 1. triage: what is in there, and why
+$ kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic payments.DLT --from-beginning \
+    --property print.headers=true --timeout-ms 10000 \
+  | grep -o 'dlt.exception.class:[^,]*' | sort | uniq -c | sort -rn
+  38112 dlt.exception.class:com.acme.CurrencyValidationException
+     47 dlt.exception.class:java.net.SocketTimeoutException
+</pre>
+<pre>
+// 2. replay, filtered, rate-limited, preserving keys and marking the records
+var rate = RateLimiter.create(500);                         // records/s
+for (var r : dltConsumer.poll(...)) {
+    if (!headerEquals(r, "dlt.exception.class", targetClass)) continue;
+    if (tsOf(r) &lt; from || tsOf(r) &gt; to) continue;
+    rate.acquire();
+    var out = new ProducerRecord&lt;&gt;("payments.replay", null, r.key(), r.value());   // raw bytes
+    out.headers().add("replay.of.offset", headerValue(r, "dlt.original.offset"));
+    out.headers().add("replay.run", runId.getBytes(UTF_8));
+    producer.send(out, this::countOutcome);
+}
+</pre>
+      <table class="tbl">
+        <tr><th>Decision</th><th>Choice here</th><th>Why</th></tr>
+        <tr><td>Destination</td><td>A dedicated <code>payments.replay</code> topic, consumed by this group only</td><td>Other consumer groups already processed these records successfully</td></tr>
+        <tr><td>Keys</td><td>The original key bytes</td><td>Keeps per-key ordering within the replay</td></tr>
+        <tr><td>Payload</td><td>The original bytes, unmodified</td><td>The record must reach the handler exactly as it was</td></tr>
+        <tr><td>Rate</td><td>Bounded, off-peak</td><td>Live traffic and the recovered dependency come first</td></tr>
+        <tr><td>Marking</td><td><code>replay.run</code> header</td><td>Lets downstream and audits distinguish replays</td></tr>
+      </table>
+      <p>Finish by reconciling: the count replayed, the count that succeeded, and the count that failed again
+         (now in the DLT with a fresh attempt count). A replay that is not reconciled is an assumption, not a
+         recovery.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Write the error-handling matrix for a notifications consumer
+      and justify each row.
+      <details class="solution"><summary>Solution</summary>
+      <p>Notifications send emails and push messages: side effects that cannot be un-sent, and records that are
+         independent of each other — the opposite trade-offs from payments.</p>
+      <table class="tbl">
+        <tr><th>Failure</th><th>Action</th><th>Justification</th></tr>
+        <tr><td>Deserialization / schema error</td><td>DLT immediately; page during business hours</td><td>Never succeeds; indicates a producer bug</td></tr>
+        <tr><td>Unknown template id</td><td>DLT after 1 attempt</td><td>A deployment-order problem; the record is valid but unusable now</td></tr>
+        <tr><td>Recipient unsubscribed</td><td>Drop, count as a normal outcome</td><td>Not an error: a business rule. It must not pollute the DLT</td></tr>
+        <tr><td>Email provider 429</td><td>Retry topics with 1 m / 10 m / 1 h tiers</td><td>Independent records: reordering is harmless, and throughput is preserved</td></tr>
+        <tr><td>Email provider 5xx, widespread</td><td>Circuit-break: pause and probe</td><td>Systemic; retry topics would just move the whole stream</td></tr>
+        <tr><td>Provider accepted but returned no id</td><td>Treat as sent; log for reconciliation</td><td>Retrying risks a duplicate email, which is worse than a missing id</td></tr>
+        <tr><td>Consumer OOM</td><td>Crash and restart</td><td>Bad consumer: the instance cannot be trusted to decide anything</td></tr>
+      </table>
+<pre>
+duplicate protection, since retries re-send:
+  idempotency key = notificationId, passed to the provider's API
+  a dedup store (notificationId → sentAt, 7-day TTL) checked before sending
+SLO: 99% of notifications sent within 2 minutes of the event; DLT records: 0 per day expected,
+     any sustained rate is an incident
+</pre>
+      <p>The interesting row is "unsubscribed": treating an expected business outcome as an error is a common way
+         to make a DLT useless, because the genuine failures are then buried in thousands of routine ones. An
+         outcome that the system expects belongs in a counter, not in a dead-letter topic.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Classify first: bad data or bad dependency.</strong> The two need opposite responses.</li>
+        <li><strong>Retrying bad data blocks a partition forever;</strong> dead-lettering a bad dependency abandons valid records.</li>
+        <li><strong>One poison record costs a full partition of capacity</strong> and is invisible in aggregate lag.</li>
+        <li><strong>Deserialization failures happen inside <code>poll()</code></strong> — catch <code>RecordDeserializationException</code>, dead-letter the raw bytes, seek past exactly one record.</li>
+        <li><strong>Sleeping for backoff blows the <code>max.poll.interval.ms</code> budget</strong> and gets the consumer removed from the group.</li>
+        <li><strong>Pause, keep polling, resume</strong> is how to wait for any length of time while staying in the group.</li>
+        <li><strong>Retry topics keep throughput but reorder records for a key,</strong> so they suit independent records only.</li>
+        <li><strong>Kafka has no delayed delivery;</strong> every delay topic is pause-and-seek underneath.</li>
+        <li><strong>Dead-letter records must carry the original key and raw bytes,</strong> because the record may be undeserializable.</li>
+        <li><strong>Context headers — topic, partition, offset, exception, attempts — are what make a DLT triageable.</strong></li>
+        <li><strong>One DLT per consumer group, with retention measured in weeks.</strong></li>
+        <li><strong>A systemic failure means pause, not dead-letter:</strong> a 4-minute outage can otherwise abandon over a million valid records.</li>
+        <li><strong>Retries multiply load on a failing dependency;</strong> pausing is what helps it recover.</li>
+        <li><strong>Every retry repeats side effects,</strong> so handlers need idempotency keys or transactional sinks.</li>
+        <li><strong>Build the replay tool with the DLQ, and rehearse a poison record in staging</strong> — a DLQ nobody reads or replays is data loss with extra steps.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="connect-cdc.html">← Kafka Connect &amp; CDC</a>
+      <a href="kraft-cluster.html">Cluster Architecture &amp; KRaft →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

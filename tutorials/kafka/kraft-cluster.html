@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cluster Architecture &amp; KRaft — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Cluster Architecture &amp; KRaft <span class="level-badge level-ultra">Operations</span></h1>
+    <p><strong>What you'll master:</strong> what the controller actually owns, and why Kafka 4.0 removed
+       ZooKeeper entirely; <strong>metadata as a replicated log</strong> — the <code>__cluster_metadata</code>
+       topic, the Raft quorum that writes it, and brokers as observers applying deltas; dedicated versus combined
+       mode, and how many controllers to run; forming a cluster, cluster ids, and the mismatch error that stops a
+       broker dead; <strong>what still works when the controller quorum is lost</strong>, which is more than people
+       expect and less than they need; broker fencing and session timeouts; rolling upgrades and the
+       <code>metadata.version</code> feature flag that is not freely reversible; and what migrating from ZooKeeper
+       demanded. Prerequisites: <a href="replication.html">Replication, ISR &amp; acks</a>.</p>
+
+    <h2>Part 1 — What the Controller Owns</h2>
+
+    <p>A Kafka cluster needs one component that decides things: which brokers exist, who leads each partition,
+       which replicas are in sync, what topics and configurations exist, and which ACLs apply. That is the
+       <strong>controller</strong>, and every cluster has exactly one active at a time.</p>
+
+    <table class="tbl">
+      <tr><th>The controller decides</th><th>Consequence when it cannot</th></tr>
+      <tr><td>Partition leadership</td><td>A failed broker's partitions stay leaderless — offline</td></tr>
+      <tr><td>ISR membership changes</td><td>Durability state freezes; <code>acks=all</code> behaviour drifts from reality</td></tr>
+      <tr><td>Broker registration and fencing</td><td>New brokers cannot join; dead ones are not replaced</td></tr>
+      <tr><td>Topic and partition creation, deletion, reassignment</td><td>Administrative operations hang or fail</td></tr>
+      <tr><td>Dynamic configuration and ACLs</td><td>Changes do not take effect</td></tr>
+    </table>
+
+    <p><strong>Before KRaft</strong>, this state lived in ZooKeeper, and one broker acted as controller by
+       winning a ZooKeeper election. The arrangement worked for a decade, but it had structural problems: two
+       distributed systems to operate and secure, controller failover that meant reloading all metadata from
+       ZooKeeper (slow on large clusters), and metadata propagated to brokers as full snapshots in RPCs, which
+       limited how many partitions a cluster could manage.</p>
+
+    <p><strong>KRaft</strong> (Kafka Raft) replaced it. Metadata became a Kafka log, replicated by a Raft quorum
+       of controller nodes. KRaft was production-ready in 3.3, and <strong>Kafka 4.0 removed ZooKeeper support
+       completely</strong> — a 4.x cluster is KRaft or nothing.</p>
+
+    <h2>Part 2 — Metadata as a Replicated Log</h2>
+
+<pre>
+controllers (a Raft quorum of 3)                 brokers (observers)
+┌───────────────────────────────┐
+│ controller-1  ACTIVE (leader) │◄── writes metadata records
+│ controller-2  follower        │     to __cluster_metadata
+│ controller-3  follower        │
+└───────────────┬───────────────┘
+                │ brokers FETCH the metadata log, like consumers
+     ┌──────────┼──────────┐
+     ▼          ▼          ▼
+  broker-1   broker-2   broker-3      each applies records in order into its in-memory metadata cache
+                                      each periodically writes a SNAPSHOT so replay is bounded
+</pre>
+
+    <p>Metadata changes are now events: "broker 4 registered", "partition orders-7 has leader 2, ISR 2,3",
+       "topic payments created". Brokers replay them in order, which means every broker converges on the same view
+       and a lagging broker is visibly behind — a measurable quantity rather than a mystery.</p>
+
+    <table class="tbl">
+      <tr><th>Property</th><th>ZooKeeper era</th><th>KRaft</th></tr>
+      <tr><td>Metadata store</td><td>An external ZooKeeper ensemble</td><td>A Kafka log, replicated by Raft</td></tr>
+      <tr><td>Controller failover</td><td>Reload all metadata from ZooKeeper</td><td>A follower already has the log: failover is fast</td></tr>
+      <tr><td>Propagation to brokers</td><td>Full-state RPCs</td><td>Incremental records, plus snapshots</td></tr>
+      <tr><td>Operational surface</td><td>Two systems, two security models</td><td>One</td></tr>
+      <tr><td>Practical partition ceiling</td><td>Limited by full-state propagation</td><td>Substantially higher</td></tr>
+    </table>
+
+<pre>
+$ kafka-metadata-quorum.sh --bootstrap-controller controller-1:9093 describe --status
+ClusterId:              4L6g3nShT-eMCtK--X86sw
+LeaderId:               1
+LeaderEpoch:            17
+HighWatermark:          4821993
+CurrentVoters:          [1,2,3]
+CurrentObservers:       [101,102,103]        ◄── the brokers
+
+$ kafka-metadata-quorum.sh --bootstrap-controller controller-1:9093 describe --replication
+NodeId  LogEndOffset  Lag  LastFetchTimestamp  Status
+1       4821994       0    ...                 Leader
+2       4821994       0    ...                 Follower
+3       4820102       1892 ...                 Follower      ◄── this one is behind: investigate
+</pre>
+
+    <h2>Part 3 — How Many Controllers, and Where</h2>
+
+    <p>The quorum needs a majority to commit metadata, so the count determines the failure tolerance, and the
+       placement determines which failures are survivable.</p>
+
+    <table class="tbl">
+      <tr><th>Voters</th><th>Majority</th><th>Tolerates</th><th>Use</th></tr>
+      <tr><td>1</td><td>1</td><td>Nothing</td><td>Development only</td></tr>
+      <tr><td>3</td><td>2</td><td>1 controller loss</td><td>The standard production choice</td></tr>
+      <tr><td>5</td><td>3</td><td>2 controller losses</td><td>Large or highly critical clusters; more replication work per write</td></tr>
+      <tr><td>Even numbers</td><td>—</td><td>No better than the odd number below</td><td>Never</td></tr>
+    </table>
+
+<pre>
+3 zones, 3 controllers, one per zone
+  zone lost → 2 of 3 remain → majority holds → leader elections and topic changes continue ✔
+
+3 controllers, 2 in zone A and 1 in zone B
+  zone A lost → 1 of 3 → NO majority → metadata frozen ✘
+</pre>
+
+    <table class="tbl">
+      <tr><th>Deployment</th><th><code>process.roles</code></th><th>When</th></tr>
+      <tr><td>Dedicated controllers</td><td><code>controller</code> on 3 nodes, <code>broker</code> on the rest</td><td>Production: controllers isolated from broker load and restarts</td></tr>
+      <tr><td>Combined</td><td><code>broker,controller</code> on the same nodes</td><td>Development, tests, small clusters; a broker's load can disturb the quorum</td></tr>
+    </table>
+
+    <p><strong>Dedicated controllers are small but not unimportant.</strong> They hold the metadata log, so they
+       need a fast, reliable disk and low-latency links to each other, but little CPU or RAM compared with brokers.
+       Putting them on the same machines as busy brokers means a broker's garbage collection pause or disk
+       saturation becomes a metadata-availability problem.</p>
+
+    <p><strong>Voter membership.</strong> Classic KRaft lists the voters statically in
+       <code>controller.quorum.voters</code>, so changing the set means a coordinated restart. Kafka 4.0 supports
+       dynamic quorums (KIP-853), where voters are added and removed at runtime and clients use
+       <code>controller.quorum.bootstrap.servers</code> — check what your version and tooling support before
+       planning a controller replacement.</p>
+
+    <h2>Part 4 — Forming a Cluster and Keeping It Consistent</h2>
+
+    <p>Every node's storage is stamped with the cluster id at format time. That is what prevents a broker from
+       joining the wrong cluster — and what produces one of the most common first-run errors.</p>
+
+<pre>
+$ kafka-storage.sh random-uuid
+4L6g3nShT-eMCtK--X86sw
+
+# on EVERY node, with the SAME cluster id
+$ kafka-storage.sh format --cluster-id 4L6g3nShT-eMCtK--X86sw --config /etc/kafka/server.properties
+Formatting /var/lib/kafka/data with metadata.version 4.0-IV3.
+</pre>
+
+<pre>
+# controller node
+process.roles=controller
+node.id=1
+controller.quorum.voters=1@c1:9093,2@c2:9093,3@c3:9093
+listeners=CONTROLLER://:9093
+controller.listener.names=CONTROLLER
+
+# broker node
+process.roles=broker
+node.id=101
+controller.quorum.voters=1@c1:9093,2@c2:9093,3@c3:9093      # brokers must know the quorum
+listeners=PLAINTEXT://:9092
+advertised.listeners=PLAINTEXT://broker-1.internal:9092     # the address clients must reach
+broker.rack=eu-west-1a
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Formatting each node with its own generated cluster id.</strong> Every node starts, and then
+         brokers refuse to join with <code>InconsistentClusterIdException</code>, or the cluster appears to come up
+         with a quorum that no broker recognises. It is the usual outcome of copying a runbook that ends at
+         <code>kafka-storage.sh random-uuid</code> without saying to reuse the output.</p>
+      <p>✅ <strong>Generate the cluster id once and format every node with it.</strong> Keep it in the
+         deployment configuration, not in someone's terminal history — and when a node is rebuilt, format it with
+         the cluster's existing id, which <code>kafka-metadata-quorum.sh describe --status</code> will tell
+         you.</p>
+    </div>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>Effect</th></tr>
+      <tr><td><code>broker.heartbeat.interval.ms</code></td><td>2 s</td><td>How often a broker tells the controller it is alive</td></tr>
+      <tr><td><code>broker.session.timeout.ms</code></td><td>9 s</td><td>Silence for this long and the broker is <em>fenced</em>: its partitions move</td></tr>
+      <tr><td><code>controlled.shutdown.enable</code></td><td>true</td><td>A clean stop hands leadership over before exiting</td></tr>
+      <tr><td><code>metadata.log.dir</code></td><td>The first log dir</td><td>Put the metadata log on a fast, reliable disk</td></tr>
+    </table>
+
+    <p><strong>Fencing is the mechanism behind "my broker left the cluster".</strong> A broker that stops
+       heartbeating — a long GC pause, a saturated disk, a network problem — is fenced by the controller: it stops
+       being a leader, its partitions move, and it must re-register and catch up before serving again. That is
+       correct behaviour, and it means broker pause times matter as much here as they did for the ISR.</p>
+
+    <h2>Part 5 — What Breaks When the Quorum Breaks</h2>
+
+    <p>Losing the controller quorum is less catastrophic than it sounds and more dangerous than it looks,
+       because the cluster keeps serving traffic while being unable to react to anything.</p>
+
+<pre>
+quorum LOST (2 of 3 controllers down)
+
+still works:                                  does NOT work:
+  produce and consume on existing leaders       leader election for a failing broker
+  replication between existing replicas         broker registration (no new/restarted brokers)
+  consumer group coordination on live brokers   topic creation, deletion, partition changes
+                                                config and ACL changes
+                                                ISR changes being recorded
+
+so: the cluster looks healthy — until anything else fails, and then those partitions stay offline
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Likely cause</th><th>First check</th></tr>
+      <tr><td>Admin operations hang; produce/consume fine</td><td>Quorum lost or unstable</td><td><code>kafka-metadata-quorum.sh describe --status</code></td></tr>
+      <tr><td>One controller's lag growing</td><td>Slow disk or network on that node</td><td><code>describe --replication</code>; the node's disk latency</td></tr>
+      <tr><td>Brokers repeatedly fenced and re-registering</td><td>Pauses or network exceeding the session timeout</td><td>GC logs; <code>broker.session.timeout.ms</code></td></tr>
+      <tr><td>Partitions offline after a broker loss</td><td>No quorum to elect new leaders</td><td>Controller quorum status before anything else</td></tr>
+      <tr><td>A broker refuses to start</td><td>Cluster id mismatch, or a stale formatted directory</td><td>The startup exception; <code>meta.properties</code></td></tr>
+    </table>
+
+    <p><strong>Alert on the quorum itself</strong> — the number of current voters, the active controller's
+       identity changing frequently, and each voter's lag — rather than inferring cluster health from producer
+       metrics. The failure mode that hurts is exactly the one where producers are fine.</p>
+
+    <h2>Part 6 — Upgrades, Feature Flags and the ZooKeeper Migration</h2>
+
+    <p>A KRaft cluster carries a <code>metadata.version</code> feature flag that gates which metadata record
+       types are in use. Upgrading Kafka is therefore two steps: roll the software, then raise the feature
+       version once every node is running the new release.</p>
+
+<pre>
+$ kafka-features.sh --bootstrap-server kafka:9092 describe
+Feature: metadata.version  SupportedMinVersion: 3.3-IV3  SupportedMaxVersion: 4.0-IV3  FinalizedVersionLevel: 3.9-IV0
+
+# only AFTER every controller and broker runs the new release
+$ kafka-features.sh --bootstrap-server kafka:9092 upgrade --metadata 4.0
+</pre>
+
+    <table class="tbl">
+      <tr><th>Step</th><th>Rule</th></tr>
+      <tr><td>Roll the software</td><td>One node at a time, in the order the release notes specify; wait for zero under-replicated partitions between brokers</td></tr>
+      <tr><td>Raise <code>metadata.version</code></td><td>Only when every node supports it — a node that does not cannot join afterwards</td></tr>
+      <tr><td>Downgrades</td><td>Limited and version-dependent; treat a finalized metadata version as a one-way door unless the notes say otherwise</td></tr>
+      <tr><td>Client compatibility</td><td>Older clients keep working; 4.0 removed support for very old client protocol versions, so check the oldest client in the estate</td></tr>
+    </table>
+
+    <p><strong>The ZooKeeper migration</strong> mattered to anyone still on 3.x: a ZooKeeper-based cluster had to
+       be migrated to KRaft <em>on a 3.x release</em> — 3.9 being the last bridge — before it could run 4.x. The
+       process registered KRaft controllers alongside ZooKeeper, ran a dual-write phase while metadata was copied
+       and verified, then cut brokers over to KRaft mode. Clusters that skipped it found that 4.0 simply would not
+       start.</p>
+
+    <p><strong>What changed operationally</strong> is worth knowing even on a cluster that was always KRaft,
+       because most material online predates it: there is no <code>zookeeper-shell</code> and no
+       <code>--zookeeper</code> flag, every tool takes <code>--bootstrap-server</code> (or
+       <code>--bootstrap-controller</code> for quorum tools), ACLs and dynamic configs live in metadata rather than
+       ZooKeeper znodes, and controller failover no longer involves reloading everything.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Different cluster ids per node</td><td><code>InconsistentClusterIdException</code>; brokers never join</td><td>Generate once, format every node with it</td></tr>
+      <tr><td>Even numbers of controllers</td><td>No more tolerance than the odd number below, more replication cost</td><td>3, or 5 for large clusters</td></tr>
+      <tr><td>Controllers concentrated in one or two zones</td><td>Losing a zone loses the majority</td><td>One controller per zone</td></tr>
+      <tr><td>Combined mode in production</td><td>Broker pauses and load destabilise the quorum</td><td>Dedicated controller nodes</td></tr>
+      <tr><td>Metadata log on a slow or shared disk</td><td>Voter lag; unstable elections</td><td>A fast, dedicated disk for <code>metadata.log.dir</code></td></tr>
+      <tr><td>Inferring cluster health from producer metrics</td><td>A lost quorum is invisible until something else fails</td><td>Alert on voters, active-controller changes and voter lag</td></tr>
+      <tr><td>Ignoring repeated broker fencing</td><td>Partitions move back and forth; latency spikes</td><td>Fix pauses and network before raising timeouts</td></tr>
+      <tr><td>Killing brokers instead of stopping them</td><td>No controlled shutdown: clients see errors and recovery is slower</td><td>SIGTERM and wait</td></tr>
+      <tr><td>Raising <code>metadata.version</code> before all nodes are upgraded</td><td>Older nodes cannot rejoin</td><td>Finalize only after the full roll</td></tr>
+      <tr><td>Assuming a metadata version can be rolled back</td><td>Downgrade paths are limited</td><td>Treat it as one-way; test in staging first</td></tr>
+      <tr><td>Following ZooKeeper-era guides on 4.x</td><td>Flags and tools that no longer exist</td><td>KRaft documentation for your version</td></tr>
+      <tr><td>Planning a 3.x→4.0 jump without migrating off ZooKeeper</td><td>4.0 will not start</td><td>Migrate to KRaft on 3.x first</td></tr>
+      <tr><td>Forgetting brokers need <code>controller.quorum.voters</code></td><td>Brokers cannot find the controllers</td><td>Configure the quorum on every node</td></tr>
+      <tr><td>Reformatting a node to "fix" a start-up error</td><td>Its replicas are wiped and must be rebuilt from leaders</td><td>Read the exception first; reformat only deliberately</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is KRaft, and why did Kafka move away from ZooKeeper?</summary>
+      <p>KRaft is Kafka's built-in consensus mechanism for cluster metadata. Instead of storing metadata in a
+         separate ZooKeeper ensemble, a small quorum of controller nodes maintains it as a Kafka log —
+         <code>__cluster_metadata</code> — replicated with the Raft protocol. Brokers follow that log like
+         consumers and apply the changes to their own view of the cluster.</p>
+      <p>The move solved several problems at once. Operationally, a Kafka cluster needed two distributed systems,
+         each with its own configuration, security model, monitoring and upgrade cycle. Technically, controller
+         failover meant loading all metadata out of ZooKeeper, which was slow on large clusters, and metadata was
+         pushed to brokers as full state, which limited how many partitions a cluster could handle.</p>
+      <p>With KRaft, a controller failover is fast because the other voters already have the log; metadata reaches
+         brokers as incremental records with periodic snapshots; and there is one system to run.</p>
+      <p>The practical consequence today is that <strong>Kafka 4.0 removed ZooKeeper support entirely</strong>.
+         A cluster still on ZooKeeper had to be migrated to KRaft on a 3.x release before upgrading, and a great
+         deal of documentation and tutorials online still describe the old world.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How many controllers should a cluster have, and where should they run?</summary>
+      <p>Three for most production clusters, five for large or especially critical ones. The quorum needs a
+         majority to commit a metadata change, so three voters tolerate losing one and five tolerate losing two.
+         Even numbers are pointless: four voters need three for a majority, the same as five, while adding
+         replication work.</p>
+      <p>Placement matters as much as the count. With three availability zones, one controller per zone means
+         losing a zone leaves two of three — a majority — so leader elections and administrative changes continue.
+         Putting two of three controllers in the same zone means losing that zone freezes metadata.</p>
+      <p>In production I would run <strong>dedicated</strong> controller nodes: <code>process.roles=controller</code>
+         on small machines with fast disks, separate from the brokers. Combined mode, where a node is both broker
+         and controller, is convenient for development and small clusters, but a broker's garbage collection pause
+         or disk saturation then becomes a metadata problem.</p>
+      <p>Controllers need little CPU or memory compared with brokers, but they do need low-latency storage and
+         network, because every metadata change is a Raft write that a majority must acknowledge.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What happens if the controller quorum loses its majority?</summary>
+      <p>The cluster keeps serving existing traffic and loses the ability to change anything — which is a
+         dangerous combination, because it looks healthy.</p>
+      <p><strong>Still working:</strong> producers and consumers on partitions whose leaders are alive, replication
+         between existing replicas, and consumer group coordination handled by live brokers. Clients notice
+         nothing.</p>
+      <p><strong>Not working:</strong> anything requiring a metadata write. No new partition leaders can be
+         elected, so if a broker fails while the quorum is down, its partitions simply go offline and stay there. No
+         broker can register, so a restarted broker cannot rejoin. Topic creation, partition reassignment,
+         configuration and ACL changes all fail or hang. ISR changes cannot be recorded.</p>
+      <p>So the risk is a second failure. The cluster is running without its ability to heal, and the first broker
+         problem becomes an outage of those partitions.</p>
+      <p>I would detect it by alerting on the quorum directly — current voters, voter lag, and how often the active
+         controller changes — because producer-side metrics stay green. Recovery is to restore controller nodes;
+         since they hold the metadata log, a returning voter catches up from the leader and the majority is
+         restored.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Walk through upgrading a KRaft cluster.</summary>
+      <p>It is two phases: roll the software, then raise the metadata feature version. Mixing them is where
+         upgrades go wrong.</p>
+      <p><strong>Preparation:</strong> read the release notes for the specific hop, because the order of
+         controllers and brokers and any removed configuration or protocol support differ between releases. Check
+         the oldest client in the estate against the version's supported protocol range — 4.0 removed support for
+         very old clients. Confirm the cluster is healthy first: zero under-replicated partitions, a stable
+         quorum.</p>
+      <p><strong>Rolling:</strong> one node at a time. Stop cleanly with SIGTERM so controlled shutdown moves
+         leadership, start the new version, and wait for zero under-replicated partitions before the next broker —
+         the rule from the replication lesson. For controllers, verify the quorum is complete and lag is zero before
+         moving on.</p>
+      <p><strong>Finalizing:</strong> once every node runs the new release, raise <code>metadata.version</code>
+         with <code>kafka-features.sh upgrade --metadata</code>. Doing it earlier means nodes still on the old
+         release can no longer participate. Treat it as a one-way door: downgrade paths for metadata versions are
+         limited and version-specific, so I would rehearse the whole sequence in staging, including a rollback of
+         the software before finalizing.</p>
+      <p><strong>Afterwards:</strong> watch for clients failing on removed protocol versions, check the quorum and
+         under-replicated partitions, and leave the cluster a release behind the very latest unless a specific
+         feature is needed — upgrades are risk, and there is no prize for being first.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the cluster topology for a platform serving 40 teams across three availability zones.</summary>
+      <p><strong>Controllers:</strong> three dedicated nodes, one per zone, on small instances with fast local
+         disks. Five only if the cluster becomes very large; three tolerates a zone loss, which is the failure I am
+         designing for.</p>
+      <p><strong>Brokers:</strong> a multiple of three, spread evenly across zones with <code>broker.rack</code>
+         set, sized so the cluster runs comfortably on two-thirds of its capacity — when a zone goes, its traffic and
+         leadership move to the remaining two. Topic defaults of replication factor 3 and
+         <code>min.insync.replicas=2</code>, with auto-creation disabled.</p>
+      <p><strong>One cluster or several?</strong> With 40 teams I would start with one well-run cluster and split
+         only for specific reasons: hard isolation for regulated data, wildly different SLAs (a batch-analytics
+         workload next to payments), or geography. Each additional cluster multiplies the operational work —
+         upgrades, monitoring, ACLs, client configuration — and cross-cluster data then needs replication tooling.
+         Multi-tenancy inside one cluster is handled with quotas and ACLs rather than with separate clusters.</p>
+      <p><strong>Multi-tenancy controls:</strong> per-principal produce, consume and request-rate quotas so one
+         team cannot starve the rest; ACLs per topic prefix per team; a naming convention that encodes ownership;
+         and partition-count governance, since partitions are a shared cluster resource.</p>
+      <p><strong>Operability:</strong> automated rolling restarts that wait for zero under-replicated partitions,
+         quorum alerting, per-broker and per-partition metrics, capacity headroom reviewed quarterly, and a tested
+         zone-failure game day.</p>
+      <p><strong>Recommendation:</strong> three dedicated controllers across three zones, brokers in multiples of
+         three with rack awareness and 50–60% peak utilisation, one cluster with quotas and ACLs for tenancy, and a
+         second cluster only when a concrete isolation requirement appears — documented, so the decision is revisited
+         deliberately rather than by accretion.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Admin commands hang while producers and consumers are fine. Diagnose it.</summary>
+      <p>That split — data plane healthy, control plane stuck — points at the controller quorum, and I would check
+         it before anything else.</p>
+      <p><strong>1. Quorum status.</strong> <code>kafka-metadata-quorum.sh describe --status</code> shows the
+         current voters, the leader and the high watermark. If fewer than a majority are present, no metadata can be
+         committed, which is exactly "admin operations hang while traffic flows". <code>describe --replication</code>
+         shows each voter's lag: a single voter far behind suggests a slow disk or a network problem on that node
+         rather than a lost majority.</p>
+      <p><strong>2. Controller stability.</strong> Frequent changes of active controller — visible in the leader
+         epoch climbing and in controller logs — indicate an unstable quorum: voters timing out because of disk
+         latency, garbage collection or packet loss. The symptom is the same, because each election interrupts
+         metadata writes.</p>
+      <p><strong>3. Connectivity.</strong> Brokers reach controllers on the controller listener; a firewall or
+         security-group change affecting port 9093 leaves brokers serving data from their cached metadata while
+         being unable to participate in changes.</p>
+      <p><strong>4. The controller nodes themselves:</strong> disk full on the metadata log directory, or a
+         node that failed to start after a restart.</p>
+      <p><strong>Recovery</strong> is to restore a majority — usually restarting a failed controller, which
+         catches up from the log. <strong>Prevention:</strong> alert on voter count, voter lag and active-controller
+         changes; keep the metadata log on fast, dedicated disks; and run controllers on nodes that are not also
+         busy brokers, so a broker's bad day cannot take the control plane with it.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Format and start a KRaft cluster, then inspect its quorum.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ CLUSTER_ID=$(kafka-storage.sh random-uuid) &amp;&amp; echo $CLUSTER_ID
+4L6g3nShT-eMCtK--X86sw
+
+# on each of c1, c2, c3 (controllers) and b1, b2, b3 (brokers) — the SAME id
+$ kafka-storage.sh format --cluster-id $CLUSTER_ID --config /etc/kafka/server.properties
+$ systemctl start kafka
+
+$ kafka-metadata-quorum.sh --bootstrap-controller c1:9093 describe --status
+ClusterId:        4L6g3nShT-eMCtK--X86sw
+LeaderId:         1
+CurrentVoters:    [1,2,3]
+CurrentObservers: [101,102,103]
+
+$ kafka-broker-api-versions.sh --bootstrap-server b1:9092 | head -1
+b1:9092 (id: 101 rack: eu-west-1a) -> ( ... )
+</pre>
+      <table class="tbl">
+        <tr><th>Role</th><th>Appears as</th></tr>
+        <tr><td>Controllers</td><td><code>CurrentVoters</code> — they replicate the metadata log</td></tr>
+        <tr><td>Brokers</td><td><code>CurrentObservers</code> — they fetch it but do not vote</td></tr>
+      </table>
+      <p>Inspect the metadata log itself to see that it is an ordinary Kafka log of records:</p>
+<pre>
+$ kafka-metadata-shell.sh --snapshot /var/lib/kafka/data/__cluster_metadata-0/*.checkpoint
+&gt;&gt; ls /brokers
+101  102  103
+&gt;&gt; cat /topics/orders/0/data
+{"partitionId":0,"leader":101,"leaderEpoch":4,"isr":[101,102,103], ...}
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Kill the active controller and measure the failover.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kafka-metadata-quorum.sh --bootstrap-controller c1:9093 describe --status | grep LeaderId
+LeaderId:  1
+
+# produce continuously, then stop controller 1
+$ kafka-producer-perf-test.sh --topic t --num-records 2000000 --record-size 200 \
+    --throughput 5000 --producer-props bootstrap.servers=b1:9092 acks=all &
+$ systemctl stop kafka   # on c1
+
+$ kafka-metadata-quorum.sh --bootstrap-controller c2:9093 describe --status | grep -E 'LeaderId|CurrentVoters'
+LeaderId:       2                    ◄── a new active controller within a second or two
+CurrentVoters:  [1,2,3]              (1 is a voter, currently unreachable)
+</pre>
+      <table class="tbl">
+        <tr><th>Observation</th><th>Why</th></tr>
+        <tr><td>Producer throughput unaffected</td><td>Partition leaders did not change; the data plane is independent</td></tr>
+        <tr><td>New active controller in seconds</td><td>The remaining voters already hold the metadata log</td></tr>
+        <tr><td>Admin commands keep working</td><td>2 of 3 voters is still a majority</td></tr>
+      </table>
+      <p>Compare that with the ZooKeeper era, where a new controller had to load all metadata from ZooKeeper
+         before it could act — a pause that grew with the number of partitions.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Lose the quorum deliberately and map exactly what still
+      works.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ systemctl stop kafka    # on c1 AND c2 — only one voter left of three
+
+$ kafka-console-producer.sh --bootstrap-server b1:9092 --topic t
+&gt; still accepted                       ◄── existing leaders keep serving
+$ kafka-console-consumer.sh --bootstrap-server b1:9092 --topic t --from-beginning --max-messages 5
+... 5 records                          ◄── consuming works
+
+$ kafka-topics.sh --bootstrap-server b1:9092 --create --topic newtopic --partitions 3 --replication-factor 3
+Error while executing topic command : Timed out waiting for a node assignment. Call: createTopics
+
+$ systemctl stop kafka    # on b2, a broker
+$ kafka-topics.sh --bootstrap-server b1:9092 --describe --topic t | grep -c 'Leader: none'
+4                                      ◄── b2's partitions are OFFLINE and stay offline
+</pre>
+      <table class="tbl">
+        <tr><th>Operation</th><th>With quorum lost</th></tr>
+        <tr><td>Produce/consume on live leaders</td><td>Works</td></tr>
+        <tr><td>Create/delete topics, change configs</td><td>Times out</td></tr>
+        <tr><td>Elect a new leader after a broker fails</td><td><strong>Impossible: partitions stay offline</strong></td></tr>
+        <tr><td>Restarted broker rejoining</td><td>Cannot register</td></tr>
+      </table>
+      <p>Restart one controller and the majority returns: the offline partitions get leaders within seconds and
+         the backlog drains. The lesson is that a lost quorum is a latent outage — everything looks fine until the
+         next failure, which is why the quorum needs its own alert.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Reproduce and fix a cluster id mismatch.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# the mistake: a new broker formatted with a FRESH id
+$ kafka-storage.sh format --cluster-id $(kafka-storage.sh random-uuid) --config server.properties
+$ systemctl start kafka
+
+ERROR Exiting Kafka due to fatal exception (kafka.Kafka$)
+kafka.common.InconsistentClusterIdException: The Cluster ID aBcD... doesn't match stored clusterId
+Some(4L6g3nShT-eMCtK--X86sw) in meta.properties. The broker is trying to join the wrong cluster.
+</pre>
+<pre>
+# find the real cluster id
+$ kafka-metadata-quorum.sh --bootstrap-controller c1:9093 describe --status | grep ClusterId
+ClusterId:  4L6g3nShT-eMCtK--X86sw
+$ cat /var/lib/kafka/data/meta.properties
+cluster.id=aBcD...        ◄── the wrong one, written at format time
+
+# fix: this node holds no real data yet, so reformat with the correct id
+$ rm -rf /var/lib/kafka/data/*
+$ kafka-storage.sh format --cluster-id 4L6g3nShT-eMCtK--X86sw --config server.properties
+$ systemctl start kafka
+</pre>
+      <table class="tbl">
+        <tr><th>Situation</th><th>Safe action</th></tr>
+        <tr><td>A brand-new node with no replicas</td><td>Wipe and reformat with the correct id</td></tr>
+        <tr><td>An existing broker that fails this check after a config change</td><td><strong>Do not wipe.</strong> The id it stores is the truth; find why the configuration points at another cluster</td></tr>
+      </table>
+      <p>The second row is the important one: reformatting a broker that holds replicas destroys them, and they
+         must be rebuilt from the leaders — hours of replication traffic, and a real risk if other replicas are
+         already unavailable.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Plan and rehearse a minor-version upgrade.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+pre-flight
+  [ ] release notes read for THIS hop: node order, removed configs, client protocol changes
+  [ ] oldest client version in the estate identified and checked
+  [ ] cluster healthy: UnderReplicatedPartitions = 0, quorum complete, voter lag ~0
+  [ ] rollback plan: software downgrade is possible ONLY before metadata.version is raised
+  [ ] rehearsed end to end in staging, including the rollback
+</pre>
+<pre>
+roll (one node at a time, in the documented order)
+  systemctl stop kafka                      # SIGTERM: controlled shutdown moves leadership
+  (install the new Kafka package)
+  systemctl start kafka
+  wait: UnderReplicatedPartitions == 0 cluster-wide
+  for controllers: kafka-metadata-quorum.sh describe --replication → all voters lag ~0
+
+finalize (only when EVERY node runs the new release)
+  $ kafka-features.sh --bootstrap-server b1:9092 describe        # confirm SupportedMaxVersion everywhere
+  $ kafka-features.sh --bootstrap-server b1:9092 upgrade --metadata 4.0
+</pre>
+      <table class="tbl">
+        <tr><th>Mistake</th><th>Consequence</th></tr>
+        <tr><td>Finalizing metadata before the roll completes</td><td>Nodes still on the old release cannot rejoin</td></tr>
+        <tr><td>Restarting the next broker too early</td><td>Two replicas of a partition down: writes refused at min ISR 2</td></tr>
+        <tr><td>Skipping the client check</td><td>Old clients fail after removed protocol support</td></tr>
+        <tr><td>No staging rehearsal</td><td>The first attempt at the sequence happens in production</td></tr>
+      </table>
+      <p>Keep the cluster at the previous software version for a soak period before finalizing the metadata
+         version: that window is when a software rollback is still simple, and it is the cheapest insurance in the
+         whole procedure.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> One cluster or several? Decide for a platform with four
+      distinct workloads.
+      <details class="solution"><summary>Solution</summary>
+      <table class="tbl">
+        <tr><th>Workload</th><th>Needs</th><th>Placement</th></tr>
+        <tr><td>Payments (regulated, strict SLA)</td><td>Isolation, audited access, conservative upgrades</td><td><strong>Own cluster</strong>: the regulatory and blast-radius argument is concrete</td></tr>
+        <tr><td>Product events (30 teams)</td><td>Fan-out, replay, moderate SLA</td><td>Shared cluster with quotas and per-prefix ACLs</td></tr>
+        <tr><td>Analytics ingestion (bursty, huge volume)</td><td>Throughput; tolerant of latency</td><td>Shared cluster <em>with quotas</em>, or its own if bursts disturb others</td></tr>
+        <tr><td>Log aggregation (very high volume, low value)</td><td>Cheap storage, short retention</td><td>Own cluster: different hardware profile, and its volume would dominate quotas</td></tr>
+      </table>
+<pre>
+cost of each additional cluster
+  upgrades, patching and testing         × N
+  monitoring, alerting, runbooks         × N
+  ACLs, quotas, client configuration     × N
+  cross-cluster data movement            replication tooling, its lag and failure modes (multi-region lesson)
+  spare capacity for a zone loss         × N  ◄── often the biggest hidden cost
+</pre>
+      <p><strong>The decision rule I would write down:</strong> split when there is a concrete isolation
+         requirement — regulation, a blast-radius limit for a critical workload, or a hardware profile that does not
+         fit — and not for organisational tidiness. Everything else is multi-tenancy: quotas so one tenant cannot
+         starve another, ACLs per topic prefix, a naming convention encoding ownership, and partition-count
+         governance.</p>
+      <p>Revisit it yearly with data: per-tenant volume, quota throttling events, and incidents where one tenant
+         affected another. Those numbers say whether the shared cluster is still the right call far better than the
+         instinct that separate clusters feel safer.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>The controller owns leadership, ISR changes, registration, topics, configs and ACLs;</strong> without it the cluster cannot change.</li>
+        <li><strong>KRaft stores metadata as a replicated Kafka log</strong> written by a Raft quorum of controllers.</li>
+        <li><strong>Kafka 4.0 removed ZooKeeper entirely;</strong> ZooKeeper clusters had to migrate on a 3.x release first.</li>
+        <li><strong>Brokers are observers of the metadata log,</strong> applying incremental records instead of receiving full state.</li>
+        <li><strong>Three controllers tolerate one loss, five tolerate two;</strong> even numbers add nothing.</li>
+        <li><strong>One controller per availability zone,</strong> or losing a zone loses the majority.</li>
+        <li><strong>Use dedicated controller nodes in production</strong> so broker load cannot destabilise the quorum.</li>
+        <li><strong>Every node is formatted with the same cluster id;</strong> a mismatch stops a broker with <code>InconsistentClusterIdException</code>.</li>
+        <li><strong>Never reformat a broker that holds replicas</strong> to clear a start-up error.</li>
+        <li><strong>Brokers are fenced after <code>broker.session.timeout.ms</code></strong> (9 s) of silence, so pauses move partitions.</li>
+        <li><strong>A lost quorum still serves traffic</strong> but cannot elect leaders, register brokers or change anything — a latent outage.</li>
+        <li><strong>Alert on the quorum itself</strong> — voter count, voter lag, active-controller changes — not on producer health.</li>
+        <li><strong>Upgrades are two phases:</strong> roll the software, then raise <code>metadata.version</code> once every node supports it.</li>
+        <li><strong>Treat a finalized metadata version as one-way;</strong> soak before finalizing, while software rollback is still simple.</li>
+        <li><strong>Split clusters for concrete isolation requirements,</strong> not tidiness: every extra cluster multiplies operational cost.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="error-handling.html">← Errors, Retries &amp; Dead Letter Topics</a>
+      <a href="capacity.html">Partition Count &amp; Capacity Planning →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

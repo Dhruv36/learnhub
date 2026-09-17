@@ -60,6 +60,8 @@ REVIEWED_THIN = {
     "kafka/kafka-streams.html",      # 42KB, tasks, KStream/KTable, state restore, repartition
     "kafka/windowing-joins.html",    # 42KB, stream time, window types, grace, join sizing
     "kafka/connect-cdc.html",        # 44KB, converters, offsets, SMTs, Debezium slots
+    "kafka/error-handling.html",     # 42KB, bad data vs bad dependency, DLQ design, replay
+    "kafka/kraft-cluster.html",      # 41KB, metadata log, quorum sizing, fencing, upgrades
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
