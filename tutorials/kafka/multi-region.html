@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-Region &amp; Disaster Recovery — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Multi-Region &amp; Disaster Recovery <span class="level-badge level-ultra">Architecture</span></h1>
+    <p><strong>What you'll master:</strong> the four different reasons to go multi-region, and why each implies a
+       different design; stretch clusters versus replication between clusters, and <strong>the cross-region round
+       trip that lands in every <code>acks=all</code> write</strong>; how MirrorMaker 2 works — its three
+       connectors, remote topic naming, and the heartbeat and checkpoint topics; <strong>why offsets do not match
+       between clusters</strong> and what offset translation can and cannot promise; active-passive and
+       active-active topologies, including cycle prevention; a failover runbook in which <strong>replication lag
+       is your RPO</strong>; and failback, which is the part most plans omit. Prerequisites:
+       <a href="security.html">Security: TLS, SASL, ACLs &amp; Quotas</a>; the AWS track's
+       <a href="../aws/resilience-dr.html">Resilience &amp; DR lesson</a> covers RPO and RTO generally.</p>
+
+    <h2>Part 1 — Four Reasons, Four Designs</h2>
+
+    <table class="tbl">
+      <tr><th>Goal</th><th>What it needs</th><th>What it does not need</th></tr>
+      <tr><td>Disaster recovery</td><td>A copy of the data in another region, and a tested failover</td><td>Clients in both regions during normal operation</td></tr>
+      <tr><td>Data locality / latency</td><td>Producers and consumers near their users, per region</td><td>Every topic everywhere</td></tr>
+      <tr><td>Data residency</td><td>Some topics that never leave a jurisdiction</td><td>Global replication of those topics — the opposite</td></tr>
+      <tr><td>Aggregation</td><td>Regional clusters feeding one analytical cluster</td><td>Bidirectional replication</td></tr>
+      <tr><td>Migration</td><td>Temporary replication and a cut-over plan</td><td>A permanent topology</td></tr>
+    </table>
+
+    <p><strong>Start from RPO and RTO,</strong> stated as numbers by the business: how much data may be lost
+       (recovery point) and how long recovery may take (recovery time). "No data loss and instant failover" across
+       regions is not purchasable at reasonable cost, and the honest conversation is which of the two to relax.
+       Asynchronous replication means a non-zero RPO, always — and the size of it is the replication lag at the
+       moment the region dies.</p>
+
+    <h2>Part 2 — Stretch Cluster or Two Clusters?</h2>
+
+<pre>
+STRETCH: one cluster whose brokers span regions
+  broker.rack = region; replicas spread across regions; acks=all waits for a remote follower
+  + no separate replication tooling, offsets are the same everywhere, failover is just leader election
+  − EVERY acks=all produce pays the cross-region round trip
+  − needs 3 locations for the controller quorum and for min ISR to survive one loss
+  → viable only between nearby regions or availability zones with low, stable RTT
+
+TWO CLUSTERS + replication (MirrorMaker 2 or a vendor tool)
+  + regional latency unaffected; clusters upgrade and fail independently
+  − asynchronous: a non-zero RPO
+  − offsets differ between clusters; consumer failover needs translation
+  − a second cluster to operate, and cross-region bandwidth to pay for
+</pre>
+
+    <table class="tbl">
+      <tr><th>Question</th><th>Stretch</th><th>Replicated</th></tr>
+      <tr><td>Produce latency</td><td>Includes the inter-region RTT with <code>acks=all</code></td><td>Local</td></tr>
+      <tr><td>Data loss on region failure</td><td>None for acknowledged writes</td><td>Replication lag at that moment</td></tr>
+      <tr><td>Failover mechanism</td><td>Leader election — automatic</td><td>A procedure: promote, repoint clients, translate offsets</td></tr>
+      <tr><td>Offsets</td><td>Identical: one cluster</td><td><strong>Different per cluster</strong></td></tr>
+      <tr><td>Operational load</td><td>One cluster, but a delicate one</td><td>Two clusters plus replication</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>The RTT is the whole argument.</strong> Two zones 1 ms apart and two regions 80 ms
+       apart are not variations of the same design. At 80 ms, an <code>acks=all</code> write to a partition whose
+       ISR spans regions cannot complete faster than 80 ms, and <code>min.insync.replicas</code> decides whether
+       losing the remote region stops writes. Stretch clusters belong between nearby, well-connected locations;
+       across distant regions, replication between separate clusters is the standard answer.</div>
+
+    <h2>Part 3 — How MirrorMaker 2 Works</h2>
+
+    <p>MirrorMaker 2 is built on Kafka Connect and runs three connectors. Understanding which does what explains
+       most of its behaviour.</p>
+
+    <table class="tbl">
+      <tr><th>Connector</th><th>Job</th><th>Produces</th></tr>
+      <tr><td><code>MirrorSourceConnector</code></td><td>Copies records and topic configuration</td><td>Remote topics on the target, plus an <code>offset-syncs</code> topic</td></tr>
+      <tr><td><code>MirrorCheckpointConnector</code></td><td>Translates consumer group offsets</td><td><code>&lt;source&gt;.checkpoints.internal</code>, and optionally writes into the target's <code>__consumer_offsets</code></td></tr>
+      <tr><td><code>MirrorHeartbeatConnector</code></td><td>Emits heartbeats through the link</td><td>A <code>heartbeats</code> topic: the liveness and lag signal</td></tr>
+    </table>
+
+<pre>
+# mm2.properties
+clusters = us, eu
+us.bootstrap.servers = kafka-us:9092
+eu.bootstrap.servers = kafka-eu:9092
+
+us->eu.enabled = true
+us->eu.topics = orders|payments|customers          # a regex; be explicit, not ".*"
+us->eu.emit.heartbeats.enabled = true
+us->eu.sync.group.offsets.enabled = true           # write translated offsets into eu's __consumer_offsets
+replication.factor = 3
+</pre>
+
+<pre>
+default topic naming (DefaultReplicationPolicy): the SOURCE ALIAS is prefixed
+  us cluster:  orders            →   eu cluster:  us.orders
+
+this is what prevents replication cycles in active-active:
+  eu's "us.orders" is not matched by the rule replicating eu's own "orders" back to us
+
+IdentityReplicationPolicy keeps the SAME name (orders → orders)
+  simpler for active-passive failover, because clients need no topic rename
+  but you must prevent cycles yourself, and aggregation from several sources collides
+</pre>
+
+    <p><strong>Offsets do not match between clusters, and cannot.</strong> The target topic is a different log:
+       it starts at its own offset, and records arrive as a copy whose numbering has no reason to align. A consumer
+       failing over cannot simply reuse its source-cluster offsets.</p>
+
+<pre>
+source us.orders-0:  ... 918,273 918,274 918,275 ...
+target eu us.orders-0: ...  4,012   4,013   4,014 ...     same records, different offsets
+
+MirrorCheckpointConnector records pairs (source offset ↔ target offset) periodically, so a group's
+committed offset can be TRANSLATED at failover — approximately, to the nearest checkpoint.
+"Approximately" means the failed-over consumer reprocesses a little, or in some cases skips:
+idempotent consumers are a requirement of any Kafka DR plan, not an optimisation.
+</pre>
+
+    <h2>Part 4 — Topologies</h2>
+
+    <table class="tbl">
+      <tr><th>Topology</th><th>Shape</th><th>Watch out for</th></tr>
+      <tr><td>Active-passive</td><td>One region serves; the other receives a copy</td><td>The passive side is never exercised unless you drill it</td></tr>
+      <tr><td>Active-active</td><td>Both regions produce; each replicates to the other</td><td>Cycles, duplicate processing, and conflicting writes to the same key</td></tr>
+      <tr><td>Hub and spoke</td><td>Regional clusters replicate into one aggregate</td><td>The hub's capacity; topic name collisions without prefixes</td></tr>
+      <tr><td>Fan-out</td><td>One source replicated to many read-only clusters</td><td>Bandwidth multiplied per target</td></tr>
+    </table>
+
+    <p><strong>Active-active is harder than it looks.</strong> Two regions both accepting writes for the same
+       entity means the same key can change in both places at once, and Kafka has no conflict resolution — both
+       versions exist, in different orders, in different clusters. It works when writes are naturally partitioned
+       by region (European customers write in Europe), and it is a source of subtle bugs when they are not.</p>
+
+<pre>
+active-active with prefixed topics: each side reads BOTH its local and the remote topic
+
+eu consumers subscribe to:  orders  AND  us.orders
+us consumers subscribe to:  orders  AND  eu.orders
+
+  ✔ no cycles: a record copied from us arrives as "us.orders" and is not replicated back
+  ✔ each side sees everything
+  ✘ consumers must handle two topics, and per-key ordering holds only WITHIN each source
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Active-active with <code>IdentityReplicationPolicy</code> and no cycle protection.</strong>
+         <code>orders</code> in the US replicates to <code>orders</code> in the EU, which matches the EU's own
+         replication rule and comes straight back. Each record loops, multiplying on every pass, until the topics
+         fill and the link saturates.</p>
+      <p>✅ <strong>Prevent cycles structurally.</strong> Prefixed remote topics do it by construction — a
+         replicated topic's name can never match the rule that replicates local topics. If identity naming is
+         required, restrict each direction to an explicit list of locally produced topics, and verify with the
+         heartbeat topics that nothing echoes.</p>
+    </div>
+
+    <h2>Part 5 — Failover: the Runbook and the Arithmetic</h2>
+
+<pre>
+1. DETECT        region unreachable; confirm it is the region, not the monitoring
+2. DECIDE        failover is a business decision: it accepts the current RPO
+                 replication lag NOW = the data you are choosing to lose
+3. PROMOTE       stop replication INTO the target (or it will overwrite);
+                 for identity naming, nothing to rename; for prefixed naming, consumers
+                 must switch to the prefixed topic names
+4. TRANSLATE     apply checkpointed offsets for each consumer group (or sync.group.offsets)
+5. REPOINT       clients' bootstrap.servers → the DR cluster (config, DNS or service discovery)
+6. VERIFY        producers accepted, consumer lag draining, business metrics recovering
+7. RECORD        the exact time and offsets of the cut, for reconciliation and failback
+</pre>
+
+    <table class="tbl">
+      <tr><th>Number</th><th>Where it comes from</th><th>Typical</th></tr>
+      <tr><td>RPO</td><td>Replication lag at failure — measure it continuously from heartbeats</td><td>Seconds to minutes, if the link is healthy</td></tr>
+      <tr><td>RTO</td><td>Detection + decision + the steps above, measured in a drill</td><td>Dominated by the decision and by client repointing, not by Kafka</td></tr>
+      <tr><td>Duplicate window</td><td>Checkpoint interval: offsets translate to the nearest checkpoint</td><td>Whatever <code>emit.checkpoints.interval.seconds</code> is</td></tr>
+    </table>
+
+    <p><strong>Client repointing is usually the slowest step,</strong> and it is not a Kafka problem. If
+       bootstrap servers are baked into images, failover means redeploying every producer and consumer. A DNS name
+       or a configuration service that can be changed in one place turns hours into minutes — decide this before
+       the incident, and test that clients actually reconnect when the name changes.</p>
+
+    <p><strong>Failback is the part plans omit.</strong> After the original region returns, it holds stale data,
+       and the DR region holds everything written during the outage. Returning means replicating in the reverse
+       direction until the original catches up, then performing the same cut-over again — ideally during a planned
+       window. Teams that never rehearse failback end up running permanently in their DR region, which quietly
+       becomes the primary with no DR of its own.</p>
+
+    <h2>Part 6 — Alternatives, Cost and Drills</h2>
+
+    <table class="tbl">
+      <tr><th>Option</th><th>Offsets preserved?</th><th>Notes</th></tr>
+      <tr><td>MirrorMaker 2</td><td>No — translated approximately</td><td>Open source, Connect-based; the default answer</td></tr>
+      <tr><td>Vendor replication (for example Confluent Cluster Linking)</td><td>Yes, byte-for-byte with offsets</td><td>Much simpler failover; commercial, and ties you to that platform</td></tr>
+      <tr><td>Stretch cluster</td><td>Not applicable — one cluster</td><td>Only across low-RTT locations</td></tr>
+      <tr><td>Application dual-write</td><td>No</td><td>Two writes with no atomicity: avoid, for the reasons in the producers lesson</td></tr>
+      <tr><td>Backup and restore from object storage</td><td>No</td><td>Very long RTO; useful as a last resort, not as DR</td></tr>
+    </table>
+
+<pre>
+cost of cross-region replication
+  every replicated byte crosses a region boundary, priced per GB — usually far above cross-zone
+  100 MB/s replicated = 260 TB/month  → a significant line item on its own
+
+reduce it by replicating SELECTIVELY:
+  which topics genuinely need to survive a region loss?  (orders yes, debug logs no)
+  compressed producers (the bytes replicate as stored)
+  shorter retention on the target if it is only a failover landing zone
+</pre>
+
+    <p><strong>An untested DR plan is a document, not a capability.</strong> The drill is the deliverable: once
+       or twice a year, fail over a real workload, measure the actual RPO and RTO, and fail back. Every plan I have
+       seen tested for the first time discovered something — an unreplicated internal topic, a client with a
+       hard-coded bootstrap list, missing ACLs on the DR cluster, a consumer group that could not translate because
+       checkpoints were not enabled for it.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Stretching a cluster across distant regions</td><td>Every <code>acks=all</code> write pays the RTT</td><td>Separate clusters with replication</td></tr>
+      <tr><td>Expecting offsets to match after replication</td><td>Consumers fail over to meaningless positions</td><td>Checkpoint translation, and idempotent consumers</td></tr>
+      <tr><td>Assuming zero RPO from asynchronous replication</td><td>The lag at failure is lost data</td><td>Measure lag continuously; state the RPO</td></tr>
+      <tr><td>Active-active with identity naming and no cycle protection</td><td>Records loop and multiply</td><td>Prefixed remote topics, or explicit per-direction topic lists</td></tr>
+      <tr><td>Active-active for entities written in both regions</td><td>Conflicting versions with no resolution</td><td>Partition writes by region, or accept a single writer</td></tr>
+      <tr><td>Replicating everything with <code>.*</code></td><td>Internal topics, test topics and cost</td><td>An explicit list of topics that must survive</td></tr>
+      <tr><td>Bootstrap servers baked into images</td><td>Failover means redeploying everything</td><td>DNS or configuration that changes in one place</td></tr>
+      <tr><td>Forgetting to stop replication into the promoted cluster</td><td>Stale source data overwrites new writes</td><td>Make it step one of promotion</td></tr>
+      <tr><td>No checkpoints for some groups</td><td>Those consumers cannot translate offsets at failover</td><td>Enable checkpointing for every group that must fail over</td></tr>
+      <tr><td>DR cluster without the same ACLs, quotas and schemas</td><td>Clients fail to connect during the incident</td><td>Provision it from the same automation</td></tr>
+      <tr><td>Schema registry not replicated</td><td>Consumers cannot decode anything in DR</td><td>Replicate the registry's backing topic, or run a linked registry</td></tr>
+      <tr><td>Never drilling failover</td><td>The plan's gaps are found during the outage</td><td>Scheduled drills with measured RPO and RTO</td></tr>
+      <tr><td>No failback plan</td><td>The DR region silently becomes the permanent primary</td><td>Rehearse the return, in a planned window</td></tr>
+      <tr><td>Treating DR as Kafka's problem alone</td><td>Databases, caches and services fail over separately</td><td>A whole-system plan; Kafka is one participant</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is MirrorMaker 2 and what does it do?</summary>
+      <p>It is Kafka's tool for replicating data between clusters, built on Kafka Connect. It runs three
+         connectors: one copies records and topic configuration, one translates consumer group offsets between the
+         clusters, and one emits heartbeats so you can see that the link is alive and how far behind it is.</p>
+      <p>By default it renames replicated topics with the source cluster's alias — <code>orders</code> from the
+         "us" cluster appears as <code>us.orders</code> on the target. That is not cosmetic: it is what prevents
+         replication loops in active-active setups, because a topic that arrived from elsewhere can never match the
+         rule that replicates local topics.</p>
+      <p>Replication is <strong>asynchronous</strong>, so the target is always slightly behind, and that lag is
+         your recovery point objective if the source region is lost.</p>
+      <p>The detail that catches people is offsets: the target topic is a separate log with its own numbering, so
+         a consumer cannot reuse its source offsets after failover. MirrorMaker records checkpoints that map source
+         offsets to target offsets, but the translation is approximate, which is why consumers that fail over must
+         be idempotent.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is the difference between a stretch cluster and cluster replication?</summary>
+      <p>A <strong>stretch cluster</strong> is one Kafka cluster whose brokers are spread across locations, with
+         rack awareness placing a partition's replicas in different ones. There is no replication tooling: it is
+         ordinary Kafka replication, so offsets are identical everywhere and failover is just leader election.</p>
+      <p>The cost is latency. With <code>acks=all</code>, every write waits for replicas in other locations, so
+         the round trip between them is added to every produce. That is fine between availability zones a
+         millisecond apart and unacceptable between regions 80 milliseconds apart.</p>
+      <p><strong>Cluster replication</strong> runs two independent clusters and copies data between them
+         asynchronously. Local writes stay local and fast, the clusters upgrade and fail independently, and you
+         accept a non-zero recovery point — the replication lag — plus the complexity of translating offsets and
+         repointing clients at failover.</p>
+      <p>So the rule of thumb is: stretch across zones or very close regions; replicate between distant regions.
+         The deciding number is the round-trip time, not the word "region".</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why can't a consumer just use its old offsets after failing over to the DR cluster?</summary>
+      <p>Because the DR cluster's topic is a different log. Records were copied into it by a producer — the
+         replication tool — and its offsets start wherever that topic started and advance independently. Offset
+         918,273 on the source and offset 4,013 on the target may be the same record, or may be nothing alike.</p>
+      <p>MirrorMaker's checkpoint connector exists for this: it periodically records the correspondence between
+         source and target offsets for each consumer group, so at failover a group's committed position can be
+         translated to the nearest checkpointed equivalent. With <code>sync.group.offsets.enabled</code> it can even
+         write those translated offsets directly into the target cluster's <code>__consumer_offsets</code>, so a
+         failed-over consumer simply starts in roughly the right place.</p>
+      <p><strong>"Roughly" is the operative word.</strong> The translation is as precise as the checkpoint
+         interval, so a consumer typically reprocesses some records and, in edge cases around the cut, could miss
+         some. That is why idempotent consumers are a requirement of any Kafka DR design rather than a nicety.</p>
+      <p>Some commercial replication products preserve offsets byte-for-byte, which removes this problem
+         entirely and is a genuine reason teams pay for them.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> How do you measure your actual RPO for a Kafka DR setup?</summary>
+      <p>RPO is the replication lag at the moment the source is lost, so it has to be measured continuously, not
+         estimated once.</p>
+      <p>The direct method uses the heartbeat topic MirrorMaker emits: each heartbeat carries a timestamp from the
+         source, so the difference between now and the newest heartbeat on the target is the age of the freshest
+         data that has arrived. That single number is the current RPO, and it belongs on a dashboard with an alert
+         when it exceeds the agreed objective.</p>
+      <p>A second measurement compares end offsets: the source topic's latest offset against what has been
+         mirrored, converted to time using the topic's append rate. It is less direct but catches per-topic
+         differences — a large topic can lag while small ones keep up.</p>
+      <p>What makes the number move is usually bandwidth or the replication tool's capacity: a burst of traffic, a
+         backfill, or a network problem between regions. So I would also track it during a load test, not only at
+         idle, because the RPO that matters is the one during a busy period — which is exactly when a region is
+         most likely to be lost and most expensive to lose.</p>
+      <p>Finally, I would verify the measurement in a drill: fail over deliberately, then reconcile what the DR
+         cluster had against what the source had, and compare it with what the metric claimed.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design DR for a payments platform with an RPO of 5 minutes and an RTO of 30 minutes.</summary>
+      <p>Those numbers are achievable with asynchronous replication between two clusters, and they rule out
+         needing a stretch cluster — which is good, because a stretch cluster would put a cross-region round trip
+         into every payment write.</p>
+      <p><strong>Topology:</strong> active-passive. The primary region serves all traffic; a DR cluster in a second
+         region receives replication for the topics that must survive — payments, orders, the outbox topics, the
+         schema registry's backing topic and consumer offsets via checkpoints. Debug and analytics topics are not
+         replicated, which cuts cost significantly.</p>
+      <p><strong>Meeting the RPO:</strong> measure replication lag continuously from the heartbeat topic and alert
+         at 2 minutes — well inside the 5-minute objective, so there is time to react before an outage would breach
+         it. Provision cross-region bandwidth for peak, not average, because lag grows exactly when traffic does.</p>
+      <p><strong>Meeting the RTO:</strong> the 30 minutes will be spent on detection, decision and client
+         repointing, not on Kafka. So: automated detection with a clear escalation path, a documented decision
+         owner, clients that read their bootstrap servers from a config service or DNS name that changes in one
+         place, and the DR cluster provisioned by the same automation as production so its ACLs, quotas, topics and
+         schemas are already correct.</p>
+      <p><strong>Correctness at failover:</strong> every consumer idempotent, because offset translation is
+         approximate; every payment carrying a stable id; and a reconciliation job that compares the DR cluster's
+         data against the source of truth once the source region returns.</p>
+      <p><strong>Recommendation:</strong> active-passive replication with selective topics, lag alerting at 2
+         minutes, one-place client repointing, identical provisioning of both clusters, idempotent consumers, and a
+         twice-yearly drill that measures RPO and RTO and includes failback. And I would write down explicitly that
+         payments accepted in the final minutes before a region loss may be lost — that is what a 5-minute RPO
+         means, and the business should agree to it in advance rather than during the incident.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Your company wants active-active across two regions so both can serve writes. What do you tell them?</summary>
+      <p>That it is achievable, that Kafka will replicate the data happily, and that the hard part is the
+         application semantics — which is where these projects usually fail.</p>
+      <p><strong>What Kafka handles:</strong> bidirectional replication with MirrorMaker, cycle prevention through
+         prefixed remote topic names, and consumers in each region reading both their local topic and the remote
+         one.</p>
+      <p><strong>What it does not handle:</strong> conflicts. If the same entity can be written in both regions,
+         the two versions exist in both clusters in different orders, and nothing resolves them. Per-key ordering
+         holds only within each source, so a consumer merging both streams sees an interleaving that differs between
+         regions. Kafka has no last-writer-wins, no vector clocks, no conflict resolution at all.</p>
+      <p><strong>So the design question is whether writes can be partitioned.</strong> If European customers are
+         always written in Europe and American customers in America, active-active is straightforward: each region
+         owns its keys, and the replication is for read locality and DR rather than for shared ownership. If any
+         entity can be written in either region, you need application-level conflict handling — a version per
+         entity with a deterministic resolution rule, or a designated owning region per key — and that is a
+         significant piece of design, not a Kafka configuration.</p>
+      <p><strong>I would also ask what problem active-active is solving,</strong> because the usual answers have
+         cheaper solutions: lower write latency for distant users (route users to their region, with
+         region-partitioned ownership), faster failover (active-passive with a drilled runbook is often within the
+         same RTO), or using the second region's capacity (usually not worth the correctness cost).</p>
+      <p><strong>Recommendation:</strong> active-active only with region-partitioned key ownership, prefixed
+         topics and consumers that read both streams; otherwise active-passive with a well-rehearsed failover. And
+         whichever is chosen, the duplicate and reordering behaviour must be handled by idempotent, version-aware
+         consumers, as the event design lesson sets out.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Replicate a topic between two clusters and inspect what
+      MirrorMaker creates.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ cat mm2.properties
+clusters = us, eu
+us.bootstrap.servers = kafka-us:9092
+eu.bootstrap.servers = kafka-eu:9092
+us->eu.enabled = true
+us->eu.topics = orders
+us->eu.emit.heartbeats.enabled = true
+replication.factor = 1
+
+$ connect-mirror-maker.sh mm2.properties
+</pre>
+<pre>
+$ kafka-topics.sh --bootstrap-server kafka-eu:9092 --list
+us.orders                        ◄── the replicated topic, prefixed with the source alias
+us.checkpoints.internal          ◄── offset translation data
+heartbeats
+us.heartbeats
+mm2-offsets.us.internal          ◄── Connect's own internal topics for the MM2 cluster
+mm2-status.us.internal
+mm2-configs.us.internal
+</pre>
+      <table class="tbl">
+        <tr><th>Topic</th><th>Written by</th><th>Purpose</th></tr>
+        <tr><td><code>us.orders</code></td><td>MirrorSourceConnector</td><td>The replicated data</td></tr>
+        <tr><td><code>us.checkpoints.internal</code></td><td>MirrorCheckpointConnector</td><td>Source-to-target offset mappings per group</td></tr>
+        <tr><td><code>us.heartbeats</code></td><td>MirrorHeartbeatConnector</td><td>Liveness and lag measurement</td></tr>
+      </table>
+      <p>Produce to <code>orders</code> on the US cluster and consume <code>us.orders</code> on the EU cluster to
+         confirm the flow. The heartbeat topic is the one to graph: the age of its newest record is your live
+         RPO.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Show that offsets differ between source and target.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# produce 100 records to the source AFTER the target topic already holds some data
+$ kafka-get-offsets.sh --bootstrap-server kafka-us:9092 --topic orders
+orders:0:918373
+
+$ kafka-get-offsets.sh --bootstrap-server kafka-eu:9092 --topic us.orders
+us.orders:0:4113                 ◄── same records, completely different numbering
+
+# consume the last record from each and compare payloads
+$ kafka-console-consumer.sh --bootstrap-server kafka-us:9092 --topic orders \
+    --partition 0 --offset 918372 --max-messages 1
+{"orderId":"o-77412", ...}
+$ kafka-console-consumer.sh --bootstrap-server kafka-eu:9092 --topic us.orders \
+    --partition 0 --offset 4112 --max-messages 1
+{"orderId":"o-77412", ...}       ◄── identical record, offset 918372 vs 4112
+</pre>
+      <table class="tbl">
+        <tr><th>Consequence</th><th>Handling</th></tr>
+        <tr><td>A failed-over consumer cannot reuse committed offsets</td><td>Checkpoint translation, or <code>sync.group.offsets.enabled</code></td></tr>
+        <tr><td>Translation is approximate</td><td>Idempotent consumers</td></tr>
+        <tr><td>Offsets in application state (audit records, keys) are meaningless in DR</td><td>Never store Kafka offsets as business identifiers — use event ids</td></tr>
+      </table>
+      <p>The last row catches teams that logged "processed up to offset N" as an audit trail: after failover,
+         that number refers to nothing.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Fail a consumer group over and measure what it reprocesses.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+us->eu.sync.group.offsets.enabled = true
+us->eu.emit.checkpoints.interval.seconds = 30      # the duplicate window
+
+# on the source, group "billing" is at offset 918,300 and still consuming
+# simulate a region loss: stop the US cluster, start the consumer against EU with the same group id
+</pre>
+<pre>
+$ kafka-consumer-groups.sh --bootstrap-server kafka-eu:9092 --describe --group billing
+GROUP    TOPIC      PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+billing  us.orders  0          4085            4113            28     ◄── translated, ~28 records behind
+
+records reprocessed after failover: 22 of the last 30 seconds' worth
+(the checkpoint was 30 s old; everything after it is replayed)
+</pre>
+      <table class="tbl">
+        <tr><th>Checkpoint interval</th><th>Duplicate window</th><th>Cost</th></tr>
+        <tr><td>5 s</td><td>Small</td><td>More checkpoint traffic and target writes</td></tr>
+        <tr><td>30 s (shown)</td><td>Tens of records per partition</td><td>Reasonable default</td></tr>
+        <tr><td>5 min</td><td>Potentially thousands</td><td>Cheap, but a long replay at failover</td></tr>
+      </table>
+      <p>Verify the consumer is genuinely idempotent by checking the sink after failover: the 22 reprocessed
+         records should have changed nothing. If they double-counted anything, the DR plan has a correctness bug
+         that only appears during a disaster — the worst time to find it.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> Create and then prevent a replication cycle.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+# the broken configuration: identity naming, both directions, same topic list
+us->eu.enabled = true
+eu->us.enabled = true
+us->eu.topics = orders
+eu->us.topics = orders
+replication.policy.class = org.apache.kafka.connect.mirror.IdentityReplicationPolicy
+</pre>
+<pre>
+produce ONE record to orders in us:
+  us.orders → replicated to eu.orders → matches eu->us rule → back to us.orders → ...
+
+$ kafka-get-offsets.sh --bootstrap-server kafka-us:9092 --topic orders
+orders:0:184220          ◄── after a few seconds, from ONE produced record
+link bandwidth: saturated;  both topics growing without bound
+</pre>
+      <table class="tbl">
+        <tr><th>Prevention</th><th>How it works</th></tr>
+        <tr><td>Default prefixed naming</td><td><code>us.orders</code> on the EU side cannot match a rule replicating <code>orders</code></td></tr>
+        <tr><td>Explicit per-direction topic lists</td><td>Each direction replicates only topics produced locally</td></tr>
+        <tr><td>Heartbeat verification</td><td>A heartbeat that returns to its origin proves a cycle exists</td></tr>
+      </table>
+<pre>
+the fixed active-active configuration
+  replication.policy.class = (default: DefaultReplicationPolicy)
+  us->eu.topics = orders          # eu receives "us.orders"
+  eu->us.topics = orders          # us receives "eu.orders"
+  consumers in each region subscribe to BOTH the local and remote topic
+</pre>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Run a failover drill and record the real numbers.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+drill plan (staging, with production-like load)
+  T-0    baseline: replication lag, consumer lag, produce rate recorded
+  T+0    block network to the primary cluster (simulate region loss)
+  T+?    detection: when did the alert fire?
+  T+?    decision: who decided, and how long did it take?
+  T+?    promotion: stop replication into DR, translate offsets
+  T+?    repoint: change the config service entry; clients reconnect
+  T+?    verified: producers accepted, consumer lag draining
+</pre>
+<pre>
+results from a first drill (illustrative of what these find)
+  detection            1m40s   (alert fired correctly)
+  decision             9m      ◄── nobody was sure who could authorise it
+  promotion            2m
+  offset translation   FAILED for 2 of 7 groups  ◄── checkpoints were not enabled for them
+  client repointing    18m     ◄── 3 services had bootstrap servers baked into their images
+  total RTO            31m     (objective: 30m — missed)
+  measured RPO         42s     (objective: 5m — comfortably met)
+</pre>
+      <table class="tbl">
+        <tr><th>Finding</th><th>Action</th></tr>
+        <tr><td>Decision took longer than the technical work</td><td>Name the decision owner and the criteria in advance</td></tr>
+        <tr><td>Two groups could not translate offsets</td><td>Enable checkpointing for every group; add a check to the DR provisioning</td></tr>
+        <tr><td>Hard-coded bootstrap servers</td><td>Config service or DNS, enforced by a platform check</td></tr>
+        <tr><td>RPO comfortably met</td><td>Keep the lag alert at 2 minutes to preserve the margin</td></tr>
+      </table>
+      <p>Note that none of the failures were Kafka's. That is typical: replication usually works, and the drill's
+         value is in finding the organisational and client-side gaps that no configuration review would have
+         surfaced.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Plan the failback after a real failover.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+situation: ran in the DR region (eu) for 3 days. The primary (us) is healthy again but holds
+           data only up to the moment it failed. Three days of writes exist only in eu.
+</pre>
+<pre>
+phase 1  REVERSE replication:  eu -> us for the topics that matter
+         us receives "eu.orders" — a SEPARATE topic from its own stale "orders"
+phase 2  WAIT for the reverse link to catch up; measure lag as before
+phase 3  DECIDE how us consumers will read the merged history
+         option A: consumers in us read BOTH "orders" (old) and "eu.orders" (recent) — no data moved
+         option B: replay eu's data into a fresh topic "orders.v2" in us and cut consumers over
+phase 4  PLANNED cut-over in a quiet window: stop producers in eu, wait for lag 0,
+         repoint clients to us, restore the original us -> eu replication direction
+phase 5  VERIFY and reconcile: counts per day against the business source of truth
+</pre>
+      <table class="tbl">
+        <tr><th>Trap</th><th>Mitigation</th></tr>
+        <tr><td>Restoring us→eu replication too early</td><td>It would copy stale <code>orders</code> over the authoritative data; reverse first, cut over, then restore</td></tr>
+        <tr><td>The stale <code>orders</code> topic in us still exists</td><td>Decide explicitly whether consumers read it, and mark it clearly; do not silently merge</td></tr>
+        <tr><td>Offsets translate again on the way back</td><td>Another duplicate window: idempotency matters in both directions</td></tr>
+        <tr><td>Nobody wants to schedule the cut-over</td><td>Set the date during the failover itself, or DR quietly becomes primary forever</td></tr>
+      </table>
+      <p>The deeper lesson is to design for symmetry: if both regions are provisioned identically and replication
+         can run either way, failback is the same procedure as failover. Plans that treat DR as a one-way trip make
+         the return a bespoke project, which is why so many teams never take it.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Decide why you are going multi-region</strong> — DR, locality, residency, aggregation or migration — because each implies a different design.</li>
+        <li><strong>State RPO and RTO as numbers first;</strong> asynchronous replication always means a non-zero RPO.</li>
+        <li><strong>A stretch cluster puts the inter-location round trip into every <code>acks=all</code> write,</strong> so it suits zones and nearby regions only.</li>
+        <li><strong>Separate clusters plus replication keep writes local</strong> at the cost of lag, offset translation and a second cluster.</li>
+        <li><strong>MirrorMaker 2 runs three connectors:</strong> source, checkpoint and heartbeat.</li>
+        <li><strong>Remote topics are prefixed with the source alias by default,</strong> which is what prevents replication cycles.</li>
+        <li><strong>Offsets never match between clusters;</strong> checkpoints translate them approximately.</li>
+        <li><strong>Idempotent consumers are a requirement of Kafka DR,</strong> not an optimisation.</li>
+        <li><strong>Replication lag is your live RPO</strong> — measure it from the heartbeat topic and alert well inside the objective.</li>
+        <li><strong>Active-active needs region-partitioned key ownership;</strong> Kafka resolves no conflicts.</li>
+        <li><strong>Replicate selectively:</strong> cross-region bytes are expensive, and not every topic must survive.</li>
+        <li><strong>Provision the DR cluster from the same automation</strong> — ACLs, quotas, schemas and topics must already be right.</li>
+        <li><strong>Client repointing is usually the slowest step;</strong> bootstrap servers must be changeable in one place.</li>
+        <li><strong>Stop replication into a cluster before promoting it,</strong> or stale data overwrites new writes.</li>
+        <li><strong>Drill failover and failback;</strong> untested plans fail on organisational and client-side gaps, not on Kafka.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="security.html">← Security: TLS, SASL, ACLs &amp; Quotas</a>
+      <a href="choosing-kafka.html">Kafka vs the Alternatives →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

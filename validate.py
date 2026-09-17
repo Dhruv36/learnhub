@@ -66,6 +66,8 @@ REVIEWED_THIN = {
     "kafka/performance.html",        # 40KB, latency split, request breakdown, JVM/OS, TLS cost
     "kafka/monitoring.html",         # 41KB, symptom alerts, lag in time, cardinality, triage
     "kafka/security.html",           # 40KB, listeners, principals, ACLs, quotas, rotation
+    "kafka/multi-region.html",       # 40KB, stretch vs replication, MM2, offset translation, DR
+    "kafka/choosing-kafka.html",     # 39KB, decision framework, alternatives, managed vs self
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
