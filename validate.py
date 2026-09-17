@@ -42,6 +42,13 @@ REVIEWED_THIN = {
     "system-design/estimation.html",             # 30KB, narrow topic, fully worked
     "system-design/interview-framework.html",    # 42KB, technique, not a subject
     "system-design/tradeoff-driven-design.html", # 44KB, technique, not a subject
+
+    # kafka, reviewed 2026-09-14. Written to the v4 recipe from scratch;
+    # depth.py at target (6 parts, 6 IQ, 6 ex, 14 mistakes, 15-16 takeaways).
+    "kafka/rebalancing.html",        # 44KB, triggers, eager/coop, static, KIP-848, autoscaling
+    "kafka/schemas.html",            # 43KB, formats, registry wire format, modes, migrations
+    "kafka/event-design.html",       # 43KB, keys, topic granularity, payloads, envelope, PII
+    "kafka/retention-compaction.html", # 43KB, cleaner internals, tombstones, sizing, cleaner health
     "system-design/cap-theorem.html",            # 41KB, PACELC, tunable consistency
     "system-design/consistent-hashing.html",     # 42KB, vnodes, keys-not-load
     "system-design/distributed-consensus.html",  # 42KB, Raft, why reads are harder

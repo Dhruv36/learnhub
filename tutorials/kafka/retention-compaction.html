@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Retention &amp; Log Compaction — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Retention &amp; Log Compaction <span class="level-badge level-adv">Data Design</span></h1>
+    <p><strong>What you'll master:</strong> the three cleanup policies and when each is right; how the log
+       cleaner actually compacts a partition — the clean tail, the dirty head and the <strong>in-memory offset
+       map that caps how many keys one pass can handle</strong>; why compaction "isn't working" on most new topics
+       (the active segment and the dirty ratio); tombstones, <code>delete.retention.ms</code>, and the
+       <strong>consumer that was away too long and never learns a record was deleted</strong>; exactly what
+       compaction guarantees and what it does not; sizing a compacted topic; and the log cleaner thread that
+       can <strong>die silently and let a compacted topic grow until the disk fills</strong>. Prerequisites:
+       <a href="event-design.html">Event Design</a> and the segment material in
+       <a href="log-partitions.html">Topics, Partitions &amp; the Log</a>.</p>
+
+    <h2>Part 1 — Three Cleanup Policies</h2>
+
+    <p>Every topic has a <code>cleanup.policy</code> that decides how old data leaves the log. The choice
+       follows from what the topic <em>means</em>: a history of events, or the current state of a set of
+       entities.</p>
+
+    <table class="tbl">
+      <tr><th>Policy</th><th>Removes</th><th>Keeps</th><th>Right for</th></tr>
+      <tr><td><code>delete</code> (default)</td><td>Whole segments older than <code>retention.ms</code> or beyond <code>retention.bytes</code></td><td>Everything within the window</td><td>Event histories: orders, clicks, logs</td></tr>
+      <tr><td><code>compact</code></td><td>Older records for a key once a newer one exists</td><td>At least the latest record for every key, forever</td><td>Current state: customers, prices, configuration, changelogs</td></tr>
+      <tr><td><code>compact,delete</code></td><td>Both: superseded records, and anything older than retention</td><td>The latest value per key, within the window</td><td>"Latest state of entities active recently"</td></tr>
+    </table>
+
+<pre>
+delete (history)                              compact (state)
+offset  key  value                            offset  key  value
+  0     c1   tier=silver                        —      (removed: superseded by 5)
+  1     c2   tier=gold                          1      c2   tier=gold
+  2     c3   tier=bronze                        —      (removed: tombstone at 6)
+  3     c1   tier=gold                          —      (removed: superseded by 5)
+  ...                                           5      c1   tier=platinum
+  5     c1   tier=platinum                      6      c3   (null)  ← tombstone, kept for delete.retention.ms
+  6     c3   (null)
+after 7 days: segments 0..N deleted,          after compaction: one record per key, OFFSETS UNCHANGED
+regardless of key
+</pre>
+
+    <p>The internal topics show both at work: <code>__consumer_offsets</code> and
+       <code>__transaction_state</code> are compacted, because they hold the latest value per key (per group
+       partition, per transactional id). Kafka Streams state stores are backed by compacted <em>changelog</em>
+       topics for the same reason.</p>
+
+    <p>Retention on a <code>delete</code> topic was covered in the partitions lesson: it works on closed
+       segments, is checked every <code>log.retention.check.interval.ms</code> (5 minutes), uses the segment's
+       largest timestamp, and <code>retention.bytes</code> applies <em>per partition</em>. The rest of this lesson
+       is about compaction, where most of the surprises are.</p>
+
+    <h2>Part 2 — How the Log Cleaner Compacts a Partition</h2>
+
+    <p>Compaction is done by background <em>log cleaner</em> threads on each broker
+       (<code>log.cleaner.threads</code>, 1 by default). A compacted partition is divided into a part that has
+       already been cleaned and a part that has not:</p>
+
+<pre>
+compacted partition
+┌─────────────── CLEAN TAIL ───────────────┬──────── DIRTY HEAD ────────┬─ ACTIVE SEGMENT ─┐
+│ at most one record per key (as of the    │ written since the last     │ never cleaned     │
+│ last clean); offsets have gaps           │ clean; duplicates per key  │                   │
+└──────────────────────────────────────────┴────────────────────────────┴───────────────────┘
+
+one cleaning pass on this partition:
+1. scan the DIRTY head; build an OFFSET MAP: hash(key) → latest offset seen for that key
+2. rewrite every segment (tail AND head) into new segments, keeping a record only if
+   it is the latest for its key (offset ≥ the map's offset for that key, or key not in the map)
+3. swap the new segments in; the cleaned point moves to the end of the old dirty head
+</pre>
+
+    <p><strong>The offset map is the cleaner's working memory, and it is bounded.</strong> Each entry takes 24
+       bytes (a 16-byte hash of the key and an 8-byte offset). The broker's
+       <code>log.cleaner.dedupe.buffer.size</code> (128 MB by default, shared among cleaner threads) therefore
+       holds roughly 5 million keys at the default load factor. If a partition's dirty head contains more distinct
+       keys than that, one pass can only deduplicate part of it, and the partition needs several passes to be
+       fully compacted.</p>
+
+<pre>
+128 MB × 0.9 load factor ÷ 24 bytes per entry ≈ 5.0 million keys per pass (one cleaner thread)
+
+compacted topic, 40 M keys over 24 partitions → ~1.7 M keys per partition   ✔ one pass each
+compacted topic, 40 M keys over 2 partitions  → ~20 M keys per partition    ✘ ~4 passes each
+</pre>
+
+    <table class="tbl">
+      <tr><th>Setting</th><th>Default</th><th>What it controls</th></tr>
+      <tr><td><code>log.cleaner.threads</code></td><td>1</td><td>Parallel cleaning across partitions</td></tr>
+      <tr><td><code>log.cleaner.dedupe.buffer.size</code></td><td>128 MB</td><td>Offset-map memory, shared by all cleaner threads</td></tr>
+      <tr><td><code>min.cleanable.dirty.ratio</code></td><td>0.5</td><td>Clean a partition only when the dirty head is at least this share of the log</td></tr>
+      <tr><td><code>min.compaction.lag.ms</code></td><td>0</td><td>A record is left alone until it is at least this old</td></tr>
+      <tr><td><code>max.compaction.lag.ms</code></td><td>Unlimited</td><td>A record becomes eligible for compaction after at most this long, whatever the ratio</td></tr>
+      <tr><td><code>delete.retention.ms</code></td><td>24 hours</td><td>How long tombstones survive after their segment is cleaned</td></tr>
+    </table>
+
+    <div class="note">🔑 <strong>Compaction is eventual, and "eventual" can be a long time.</strong> A partition
+       is cleaned only when its dirty share reaches <code>min.cleanable.dirty.ratio</code>, only closed segments are
+       eligible, and cleaner threads work through partitions one at a time. A consumer reading a compacted topic
+       will routinely see several records for the same key. Compaction is a storage optimisation that bounds the
+       topic's size — never a promise that a key appears once.</div>
+
+    <h2>Part 3 — Why Compaction "Isn't Working"</h2>
+
+    <p>The most common report about a new compacted topic is that it still holds every record. Usually nothing
+       is broken; the defaults simply mean compaction has not been allowed to start.</p>
+
+<pre>
+new compacted topic, 20 MB of updates per day, defaults everywhere
+
+active segment: rolls at 1 GiB OR 7 days (segment.ms)  → 20 MB/day never reaches 1 GiB
+                → the segment rolls after 7 days
+                → until then EVERYTHING is in the active segment, which is never cleaned
+day 7:          first segment closes; dirty ratio 100% ≥ 0.5 → cleaned
+                → the new active segment again holds 7 days of duplicates
+
+A consumer reading from the start sees 7 days of repeated updates for every key.
+</pre>
+
+    <table class="tbl">
+      <tr><th>Symptom</th><th>Cause</th><th>Setting to change</th></tr>
+      <tr><td>Nothing compacted on a low-volume topic</td><td>The active segment has not rolled</td><td>Lower <code>segment.ms</code> (e.g. 1 hour)</td></tr>
+      <tr><td>Compaction runs rarely on a large topic</td><td>Dirty share stays below 50%</td><td>Lower <code>min.cleanable.dirty.ratio</code> (e.g. 0.1–0.2)</td></tr>
+      <tr><td>A deleted key must disappear within a deadline</td><td>No bound on when a record is compacted</td><td>Set <code>max.compaction.lag.ms</code></td></tr>
+      <tr><td>Consumers need to see every update for a while</td><td>Compaction removes intermediate values quickly</td><td>Set <code>min.compaction.lag.ms</code></td></tr>
+      <tr><td>Very many keys per partition</td><td>The offset map cannot hold one pass's keys</td><td>Larger dedupe buffer, or more partitions</td></tr>
+    </table>
+
+    <p><strong>Lower ratios and shorter segments cost I/O.</strong> Each cleaning pass rewrites the whole
+       partition's log, clean tail included. A ratio of 0.1 on a large topic means rewriting it every time 10% of
+       it is new data. Choose the values from what consumers need — how many duplicates they can tolerate when
+       reading from the beginning, and any deadline for deletions — rather than making compaction as aggressive as
+       possible.</p>
+
+    <h2>Part 4 — Tombstones and <code>delete.retention.ms</code></h2>
+
+    <p>To delete a key from a compacted topic, produce a <strong>tombstone</strong>: a record with that key and a
+       <code>null</code> value. Compaction then removes every earlier record for the key. The tombstone itself is
+       kept for <code>delete.retention.ms</code> (24 hours) after the segment containing it has been cleaned, so that
+       consumers get a chance to see the deletion; after that it is removed too.</p>
+
+<pre>
+t0        produce (c3, null)                        tombstone written
+t0 + x    cleaner compacts: c3's older values gone  tombstone KEPT
+t0 + x + 24h (delete.retention.ms)                 tombstone removed: c3 no longer appears at all
+
+consumer A, reading continuously       sees the tombstone → deletes c3 from its local copy ✔
+consumer B, reading from the beginning after the tombstone is removed
+                                        never sees c3 at all → correct: c3 does not exist ✔
+consumer C, offline for 3 days with c3 in its LOCAL STATE, resumes from its old offset
+                                        c3's tombstone was removed while C was away
+                                        → C never learns c3 was deleted → keeps it FOREVER ✘
+</pre>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>A service that caches a compacted topic locally, and is sometimes stopped for days.</strong>
+         Each record it has seen lives in its local store; tombstones are how it learns about deletions. After an
+         outage longer than <code>delete.retention.ms</code>, it resumes from its committed offset past where the
+         tombstones used to be. Deleted customers, revoked permissions or withdrawn prices stay in its cache with no
+         error — and the one-day default makes this a realistic outcome of a long weekend.</p>
+      <p>✅ <strong>Make <code>delete.retention.ms</code> longer than any consumer's plausible downtime,</strong>
+         and give stateful consumers a rule: if they have been away longer than that, rebuild local state from the
+         beginning of the topic instead of resuming. Kafka Streams applications restoring from changelogs follow the
+         same logic. Exercise 3 reproduces the stale entry.</p>
+    </div>
+
+    <p><strong>Compacted topics require keys.</strong> A record with a null key has no identity to compact on,
+       and the broker rejects it with an error that the compacted topic cannot accept a message without a key.
+       Producers writing to compacted topics must always set one.</p>
+
+    <h2>Part 5 — What Compaction Guarantees, and Sizing a Compacted Topic</h2>
+
+    <table class="tbl">
+      <tr><th>Guaranteed</th><th>Not guaranteed</th></tr>
+      <tr><td>A consumer reading from the start sees at least the latest value of every key that has not been deleted</td><td>That it sees <em>only</em> the latest value — the dirty head and active segment hold duplicates</td></tr>
+      <tr><td>Records keep their original offsets and order</td><td>That offsets are consecutive</td></tr>
+      <tr><td>A tombstone is visible for at least <code>delete.retention.ms</code> after cleaning</td><td>That a deleted key disappears by any particular time (unless <code>max.compaction.lag.ms</code> is set)</td></tr>
+      <tr><td>Any consumer that keeps up sees every update</td><td>That a consumer far behind sees intermediate updates — they may have been compacted away</td></tr>
+    </table>
+
+    <p><strong>Compacted consumers must be built for "latest value wins".</strong> Because intermediate values
+       can vanish, a consumer of a compacted topic must not depend on seeing every change — it sees a sequence of
+       states, some skipped. That suits snapshots of state and does not suit events that must each be acted on (a
+       payment, a notification). The event design lesson's rule applies directly: compacted topics carry
+       <em>state</em>, not deltas.</p>
+
+    <p><strong>Sizing</strong> depends on the number of keys, not on the write rate:</p>
+
+<pre>
+live data     = distinct keys × average record size
+worst case    ≈ live data ÷ (1 − min.cleanable.dirty.ratio)   (dirty head grows until cleaned)
+              + the active segment + tombstones within delete.retention.ms
+
+40 M products × 2 KB = 80 GB live
+with ratio 0.5: up to ~160 GB before a clean, per replica set
+× replication factor 3 = up to ~480 GB of disk
+</pre>
+
+    <p><strong>compact,delete</strong> adds a time bound: records older than <code>retention.ms</code> are
+       removed even if they are the latest for their key. It suits state that is only relevant while active —
+       sessions, device heartbeats, carts — where an entity untouched for a month should simply disappear. It does
+       not suit a product catalogue, where a product that has not changed for a year must still be present.</p>
+
+    <p><strong>Tiered storage does not help here.</strong> Moving old segments to object storage (KIP-405) is
+       supported for <code>delete</code> topics; compacted topics stay entirely on local broker disks, so their
+       size has to fit the brokers.</p>
+
+    <h2>Part 6 — Operating Compaction: The Cleaner That Dies Silently</h2>
+
+    <p>The log cleaner is a background thread, and if it hits an error it cannot handle, it can stop cleaning
+       — historically by dying, and in newer versions by marking the problem partition as <em>uncleanable</em>
+       and skipping it. Either way, producers and consumers carry on normally, and the compacted topic simply
+       starts to grow without limit.</p>
+
+<pre>
+server log:   ERROR [kafka-log-cleaner-thread-0]: Error due to ...   (or: marking partition uncleanable)
+effect:       compacted topics (including __consumer_offsets!) stop being cleaned
+              disk use on the affected brokers climbs steadily; nothing else looks wrong
+days later:   disk full → the broker stops → partitions offline
+</pre>
+
+    <table class="tbl">
+      <tr><th>Metric</th><th>Healthy</th><th>Meaning when unhealthy</th></tr>
+      <tr><td><code>max-dirty-percent</code> (LogCleanerManager)</td><td>Stays around the dirty ratio</td><td>Climbing past it: cleaning is falling behind or stopped</td></tr>
+      <tr><td><code>time-since-last-run-ms</code> (LogCleaner)</td><td>Small</td><td>Growing: the cleaner thread is not running</td></tr>
+      <tr><td><code>uncleanable-partitions-count</code></td><td>0</td><td>Partitions the cleaner has given up on</td></tr>
+      <tr><td><code>max-clean-time-secs</code></td><td>Stable</td><td>Rising: partitions too large, or too many keys per pass</td></tr>
+      <tr><td>Disk use of compacted topics</td><td>Roughly flat</td><td>Linear growth: the cleaner is not keeping up</td></tr>
+    </table>
+
+    <p>Because <code>__consumer_offsets</code> is a compacted topic, a stopped cleaner eventually affects every
+       consumer group: the offsets topic grows, and coordinator failover — which loads a group's offsets by reading
+       its partition of that topic — gets slower. Alert on the cleaner's health on every cluster, not only those
+       where you have created compacted topics yourself.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>Monitoring broker disk only as a percentage threshold.</strong> A stopped cleaner produces a
+         slow, steady climb that crosses 80% days after the cause, when the log line explaining it has long since
+         scrolled away. The team adds disk, the climb continues, and the cause is found only when someone reads the
+         cleaner metrics.</p>
+      <p>✅ <strong>Alert on the cause, not the consequence:</strong> <code>time-since-last-run-ms</code> growing,
+         <code>uncleanable-partitions-count</code> above zero, or <code>max-dirty-percent</code> far above the dirty
+         ratio. Exercise 5 walks through finding and fixing an uncleanable partition.</p>
+    </div>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Compaction for event histories</td><td>Intermediate events disappear; consumers miss actions</td><td><code>delete</code> for events; <code>compact</code> for state</td></tr>
+      <tr><td>Expecting one record per key</td><td>The dirty head and active segment hold duplicates</td><td>Consumers apply "latest value wins"</td></tr>
+      <tr><td>Default <code>segment.ms</code> on low-volume compacted topics</td><td>Nothing is compacted for a week</td><td>Shorter <code>segment.ms</code></td></tr>
+      <tr><td>Aggressive dirty ratio on huge topics</td><td>The whole log is rewritten constantly</td><td>A ratio chosen from how many duplicates readers can accept</td></tr>
+      <tr><td>Relying on compaction for deletion deadlines</td><td>No bound on when a key disappears</td><td><code>max.compaction.lag.ms</code>, plus <code>delete.retention.ms</code></td></tr>
+      <tr><td>Short <code>delete.retention.ms</code> with stateful consumers</td><td>Consumers away longer never see deletions</td><td>Longer than any plausible downtime; rebuild after long outages</td></tr>
+      <tr><td>Producing null keys to a compacted topic</td><td>Records rejected by the broker</td><td>Always set the entity id as key</td></tr>
+      <tr><td>Deltas on compacted topics</td><td>Compaction drops intermediate deltas; state is wrong</td><td>Full state per key</td></tr>
+      <tr><td>Very many keys in few partitions</td><td>Several cleaner passes per clean; slow compaction</td><td>More partitions or a larger dedupe buffer</td></tr>
+      <tr><td><code>compact,delete</code> for data that must persist</td><td>Unchanged entities disappear after retention</td><td><code>compact</code> only</td></tr>
+      <tr><td>Planning to tier compacted topics to object storage</td><td>Tiered storage does not support them</td><td>Size local disks for their full live data</td></tr>
+      <tr><td>No cleaner monitoring</td><td>A stopped cleaner fills disks over days</td><td>Alert on cleaner metrics</td></tr>
+      <tr><td>Assuming a far-behind consumer sees every update</td><td>Intermediate values may be compacted away</td><td>Design consumers for sequences of states</td></tr>
+      <tr><td>Sizing compacted topics by write rate</td><td>Wrong: size depends on keys and value size</td><td>Keys × size ÷ (1 − dirty ratio) × RF</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What is log compaction, and when would you use it?</summary>
+      <p>Log compaction is a cleanup policy that keeps at least the most recent record for each key and removes
+         older records for that key, instead of deleting data by age. A compacted topic therefore behaves like a
+         table of current values: read it from the beginning and you end up with the latest value of every key.</p>
+      <p>It is the right choice when a topic represents <strong>state</strong> rather than a history: the current
+         profile of each customer, the current price of each product, configuration values, or the changelog of a
+         Kafka Streams state store. Kafka uses it for its own internal state, including committed consumer
+         offsets.</p>
+      <p>It is the wrong choice for <strong>events</strong> that each matter — orders, payments, clicks — because
+         compaction discards all but the latest record for a key, so intermediate events would disappear.</p>
+      <p>Two properties are worth stating: records keep their original offsets, so compacted topics have gaps;
+         and compaction is eventual, so consumers still see several records for the same key and must treat the
+         latest one as the truth.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How do you delete a key from a compacted topic?</summary>
+      <p>Produce a tombstone: a record with the key and a <code>null</code> value. When the log cleaner next
+         compacts that part of the log, it removes every earlier record for the key. The tombstone itself is kept
+         for <code>delete.retention.ms</code> — 24 hours by default — so consumers reading the topic see that the key
+         was deleted, and then it is removed as well.</p>
+      <p>The retention period matters for consumers that keep local copies. A consumer that is reading
+         continuously sees the tombstone and deletes the key locally. But a consumer that was stopped for longer
+         than <code>delete.retention.ms</code> resumes after the tombstone has gone, never learns about the deletion,
+         and keeps the stale value.</p>
+      <p>So the practical rules are: set <code>delete.retention.ms</code> longer than any consumer's plausible
+         downtime, and have stateful consumers rebuild from the start of the topic if they have been away longer
+         than that.</p>
+      <p>Also note that deletion is not immediate: the key disappears only after compaction runs, which depends
+         on the dirty ratio and segment rolling. If there is a deadline, <code>max.compaction.lag.ms</code> bounds
+         it.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> A new compacted topic still contains every update after several days. Why?</summary>
+      <p>Usually because compaction has not been allowed to start, not because it is broken.</p>
+      <p>The log cleaner never touches the <strong>active segment</strong>. A segment only closes at
+         <code>segment.bytes</code> (1 GiB) or after <code>segment.ms</code> (7 days). A topic receiving a few
+         megabytes a day keeps everything in its active segment for a week, so for that week nothing can be
+         compacted.</p>
+      <p>Second, a partition is only cleaned when the dirty portion — data written since the last clean — reaches
+         <code>min.cleanable.dirty.ratio</code> of the log, 50% by default. On a large topic receiving a modest
+         share of updates, that can take a long time.</p>
+      <p>Third, less often, the cleaner may be unable to keep up or may have stopped: I would check
+         <code>time-since-last-run-ms</code>, <code>max-dirty-percent</code> and
+         <code>uncleanable-partitions-count</code>, and the broker logs for cleaner errors.</p>
+      <p>For the first two, the fixes are a shorter <code>segment.ms</code> (an hour, for example) and a lower
+         dirty ratio, chosen from how many duplicates readers can tolerate when replaying, and
+         <code>max.compaction.lag.ms</code> if there is a deadline. Each makes the cleaner rewrite logs more often,
+         so the cost is extra disk I/O.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> What is the offset map in the log cleaner, and why does it matter?</summary>
+      <p>When the cleaner compacts a partition, it first scans the dirty part of the log and builds an in-memory
+         map from each key's hash to the latest offset where that key appears. It then rewrites the log, keeping a
+         record only if it is the latest for its key according to the map.</p>
+      <p>The map's memory is fixed by <code>log.cleaner.dedupe.buffer.size</code>, 128 MB by default and shared among
+         the cleaner threads. Each entry takes 24 bytes, so the default buffer holds roughly 5 million keys. If a
+         partition's dirty section contains more distinct keys than that, one pass covers only part of them, and the
+         partition needs several passes to be fully compacted.</p>
+      <p>This matters for topics with very many keys in few partitions: a compacted topic with 40 million keys in
+         two partitions has 20 million keys per partition and compacts slowly, while the same data over 24
+         partitions fits in one pass per partition. The fixes are more partitions, a larger dedupe buffer (which uses
+         broker heap), or more cleaner threads (which divide the same buffer unless it is also increased).</p>
+      <p>It is a good example of a Kafka limit that is invisible until a topic grows past it: compaction slows,
+         <code>max-clean-time-secs</code> rises, and disk use creeps up without any error.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design a compacted topic that distributes a 40-million-product catalogue to many services.</summary>
+      <p><strong>Model:</strong> a <code>products</code> topic with <code>cleanup.policy=compact</code>, keyed by the
+         immutable product id, each record carrying the full current product state and a version. Deleted products
+         are tombstones. Services build a local copy by reading from the beginning and then follow updates.</p>
+      <p><strong>Partitions and sizing:</strong> 40 million keys at about 2 KB is 80 GB of live data. With the
+         default dirty ratio the log can reach roughly twice that before a clean, and with replication factor 3 that
+         is up to about 480 GB of disk — which must fit on local broker disks, because tiered storage does not cover
+         compacted topics. I would use 24 or more partitions, which keeps each partition to well under the offset
+         map's capacity per pass, and lets consuming services bootstrap in parallel.</p>
+      <p><strong>Cleaner settings:</strong> <code>segment.ms</code> of an hour or so, so compaction is not delayed
+         by the active segment; a dirty ratio around 0.3 so bootstrapping consumers read fewer duplicates; and
+         <code>delete.retention.ms</code> of several days — longer than any service could plausibly be down — so
+         deletions are never missed.</p>
+      <p><strong>Consumers:</strong> each applies records by version ("latest value wins"), handles tombstones by
+         deleting locally, and rebuilds from scratch if it has been offline longer than
+         <code>delete.retention.ms</code>. Bootstrapping 80 GB takes time, so services should persist their local
+         copy and resume rather than rebuild on every restart.</p>
+      <p><strong>Operations:</strong> alerts on cleaner health and on the topic's disk growth, and producers keyed
+         consistently with full-state records.</p>
+      <p><strong>Recommendation:</strong> a compacted, well-partitioned topic with shortened segments, a long
+         tombstone retention, versioned full-state records and cleaner monitoring. And I would consider whether every
+         service needs all 40 million products: if most need a subset, a filtered derived topic per use case keeps
+         bootstrap times and local storage down.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Disk use on three brokers has been growing steadily for a week. The topics on them have not changed. Investigate.</summary>
+      <p>Steady growth without a change in traffic suggests something that normally removes data has stopped. I
+         would look at both removal mechanisms.</p>
+      <p><strong>Compaction first.</strong> The log cleaner may have stopped or given up on partitions. The metrics
+         show it: <code>time-since-last-run-ms</code> growing, <code>uncleanable-partitions-count</code> above zero,
+         <code>max-dirty-percent</code> well above the configured ratio. The broker logs will have an error from the
+         cleaner thread. Because <code>__consumer_offsets</code> is compacted, this can happen on a cluster with no
+         user-created compacted topics at all. <code>kafka-log-dirs.sh --describe</code> shows which partitions are
+         growing.</p>
+      <p><strong>Retention second.</strong> For <code>delete</code> topics, the causes of stalled deletion from the
+         partitions lesson apply: a record with a far-future timestamp pinning old segments, a quiet topic whose
+         segments never close, or a <code>retention.bytes</code> that is per partition and therefore much larger in
+         total than intended. The oldest segment's timestamps and the log start offsets show whether deletion has
+         stopped moving.</p>
+      <p><strong>Also check the unusual ones:</strong> a partition reassignment that left extra replicas behind, or a
+         topic whose configuration was changed at the topic level to override the broker defaults.</p>
+      <p><strong>Remediation</strong> depends on the cause — restarting the cleaner and fixing or removing the
+         record it cannot process; deleting records up to an offset for a pinned segment. <strong>Prevention</strong>
+         is monitoring the mechanisms rather than the disk: cleaner metrics, the age of the oldest segment per
+         partition, and disk growth rate as a trend rather than a threshold.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Create a compacted topic configured to compact quickly and
+      watch it keep only the latest value per key.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kt --create --topic prices --partitions 1 --replication-factor 1 \
+    --config cleanup.policy=compact \
+    --config segment.ms=10000 \
+    --config min.cleanable.dirty.ratio=0.01 \
+    --config delete.retention.ms=100
+
+$ for i in $(seq 1 5); do for sku in a b c; do echo "$sku:price-$i"; done; done | \
+    kafka-console-producer.sh --bootstrap-server localhost:9092 --topic prices \
+    --property parse.key=true --property key.separator=:
+# wait ~30 s, then produce one more record so the segment holding the others rolls
+$ echo "z:roll" | kafka-console-producer.sh ... --topic prices --property parse.key=true --property key.separator=:
+
+$ kafka-console-consumer.sh ... --topic prices --from-beginning --timeout-ms 5000 \
+    --property print.key=true --property print.offset=true
+Offset:12  a  price-5
+Offset:13  b  price-5
+Offset:14  c  price-5
+Offset:15  z  roll
+</pre>
+      <p>Fifteen updates became three records, each at its original offset. Before the extra record was
+         produced, the updates were all in the active segment, which the cleaner never touches — the most common
+         reason compaction appears not to work.</p>
+      <table class="tbl">
+        <tr><th>Setting in this exercise</th><th>Why</th></tr>
+        <tr><td><code>segment.ms=10000</code></td><td>Close segments quickly so they become eligible</td></tr>
+        <tr><td><code>min.cleanable.dirty.ratio=0.01</code></td><td>Clean as soon as there is anything to clean</td></tr>
+        <tr><td><code>delete.retention.ms=100</code></td><td>Lets exercise 2 see tombstones disappear quickly — never in production</td></tr>
+      </table>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Delete a key with a tombstone and watch the tombstone
+      itself disappear.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ echo "b:NULL" | kafka-console-producer.sh --bootstrap-server localhost:9092 --topic prices \
+    --property parse.key=true --property key.separator=: --property null.marker=NULL
+$ echo "z:roll2" | kafka-console-producer.sh ... (roll the segment again)
+
+# shortly after the next clean
+$ kafka-console-consumer.sh ... --topic prices --from-beginning --timeout-ms 5000 \
+    --property print.key=true --property print.value=true
+a  price-5
+b  null                ◄── the tombstone: b's older values are gone
+c  price-5
+...
+
+# after delete.retention.ms (100 ms here) and another clean
+a  price-5
+c  price-5             ◄── b no longer appears at all
+</pre>
+      <table class="tbl">
+        <tr><th>Stage</th><th>What a consumer reading from the start sees for <code>b</code></th></tr>
+        <tr><td>Before the tombstone</td><td>Its latest price</td></tr>
+        <tr><td>Tombstone written, not yet cleaned</td><td>Older prices, then <code>null</code></td></tr>
+        <tr><td>Cleaned, within <code>delete.retention.ms</code></td><td>Only <code>null</code></td></tr>
+        <tr><td>After <code>delete.retention.ms</code></td><td>Nothing</td></tr>
+      </table>
+      <p>The console producer's <code>null.marker</code> property turns the text <code>NULL</code> into a real null
+         value. A producer that sends an empty string instead has written a record with an empty value, which is
+         not a tombstone and deletes nothing.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Show a stateful consumer keeping a deleted key after being
+      offline longer than <code>delete.retention.ms</code>, and fix it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+local cache consumer (group "pricecache"): reads prices, applies records to a local map, commits
+  cache after catching up: {a: price-5, b: price-5, c: price-5}
+stop the consumer
+produce tombstone for b; roll; wait for clean + delete.retention.ms (100 ms here; 24 h by default)
+start the consumer: resumes from its committed offset
+  cache: {a: price-5, b: price-5, c: price-5}           ◄── b still present, forever
+</pre>
+      <p>The tombstone was written, cleaned and removed while the consumer was stopped. When it resumed, there was
+         nothing left in the log to tell it that <code>b</code> had been deleted.</p>
+<pre>
+fix in the consumer:
+  on startup: lastRun = read the time this consumer last committed (store it with the cache)
+  if now − lastRun &gt; topic's delete.retention.ms:
+       clear the local cache and seekToBeginning — rebuild from the compacted topic
+  else:
+       resume from the committed offset
+</pre>
+      <table class="tbl">
+        <tr><th>Away for</th><th>Safe to resume?</th></tr>
+        <tr><td>Less than <code>delete.retention.ms</code></td><td>Yes: any tombstone is still there to read</td></tr>
+        <tr><td>More than <code>delete.retention.ms</code></td><td>No: rebuild from the beginning</td></tr>
+      </table>
+      <p>And raise <code>delete.retention.ms</code> on topics like this to a week or more, which makes the rebuild
+         path rare rather than a routine consequence of a long weekend.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> A compacted <code>customers</code> topic (1 update per
+      customer per day on average, 6 GB of live data) still holds three weeks of duplicates. Tune it.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+$ kafka-configs.sh --bootstrap-server kafka:9092 --describe --entity-type topics --entity-name customers
+  cleanup.policy=compact   (everything else default)
+
+partition size today ≈ 6 GB live + 3 weeks of updates ≈ 6 GB × (1 + 21 × daily-change-share)
+dirty ratio default 0.5: cleaning starts only when the dirty head equals the clean tail in size
+</pre>
+      <table class="tbl">
+        <tr><th>Setting</th><th>From</th><th>To</th><th>Effect</th></tr>
+        <tr><td><code>segment.ms</code></td><td>7 days</td><td>6 hours</td><td>Recent updates become eligible within hours</td></tr>
+        <tr><td><code>min.cleanable.dirty.ratio</code></td><td>0.5</td><td>0.2</td><td>Cleans when 20% is dirty: fewer duplicates for readers</td></tr>
+        <tr><td><code>max.compaction.lag.ms</code></td><td>unlimited</td><td>2 days</td><td>A superseded record is compacted within two days, whatever the ratio</td></tr>
+        <tr><td><code>delete.retention.ms</code></td><td>1 day</td><td>7 days</td><td>Stateful consumers survive a week's outage</td></tr>
+      </table>
+<pre>
+$ kafka-configs.sh ... --alter --entity-type topics --entity-name customers \
+    --add-config segment.ms=21600000,min.cleanable.dirty.ratio=0.2,max.compaction.lag.ms=172800000,delete.retention.ms=604800000
+</pre>
+      <p>Then watch the cost: cleaner time and broker disk I/O rise, because each clean rewrites the partition. If
+         the brokers host many compacted topics, check <code>max-clean-time-secs</code> and consider a second cleaner
+         thread (with a larger dedupe buffer, since threads share it).</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Disk on one broker grows linearly; the cleaner has given up on
+      a partition. Find it and recover.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+metrics (broker 2):
+  kafka.log:type=LogCleaner,name=time-since-last-run-ms          small (the thread is alive)
+  kafka.log:type=LogCleanerManager,name=uncleanable-partitions-count   1
+  kafka.log:type=LogCleanerManager,name=max-dirty-percent        97
+
+$ grep -i 'uncleanable\|log-cleaner' /var/log/kafka/server.log | tail -3
+... [kafka-log-cleaner-thread-0]: Unexpected exception thrown when cleaning log Log(dir=.../customers-7, ...).
+    Marking its partition (customers-7) as uncleanable ...
+
+$ kafka-log-dirs.sh --bootstrap-server kafka:9092 --describe --topic-list customers \
+  | grep '^{' | jq -r '.brokers[].logDirs[].partitions[] | "\(.partition) \(.size)"' | sort -k2 -n | tail -2
+customers-3   6412003221
+customers-7  71880433120        ◄── ten times the others
+</pre>
+      <p>One partition is no longer cleaned; everything written to it accumulates. The log line gives the
+         exception and usually the segment. Recovery options, from least to most disruptive:</p>
+      <table class="tbl">
+        <tr><th>Option</th><th>When</th></tr>
+        <tr><td>Upgrade to a version where the underlying bug is fixed, then restart the broker</td><td>The exception matches a known cleaner bug</td></tr>
+        <tr><td>Move leadership away and rebuild this replica from the others (reassign it off the broker and back)</td><td>A corrupt segment on this broker only</td></tr>
+        <tr><td>Delete records below a safe offset (<code>kafka-delete-records.sh</code>) if the bad data is old</td><td>A bad record in an old segment every replica shares</td></tr>
+      </table>
+      <p>Check the other replicas of <code>customers-7</code> too: if their cleaners have given up as well, the
+         problem is in the data (every replica has the same record), not in one broker's disk. And add an alert on
+         <code>uncleanable-partitions-count &gt; 0</code>, which would have caught this on the first day.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Choose the cleanup policy and settings for four topics.
+      <details class="solution"><summary>Solution</summary>
+      <table class="tbl">
+        <tr><th>Topic</th><th>Policy</th><th>Key settings</th><th>Reason</th></tr>
+        <tr><td><code>payments</code> (every payment event, audited)</td><td><code>delete</code></td><td><code>retention.ms</code> = 30 days, tiered storage for older data</td><td>Every event matters; history, not state</td></tr>
+        <tr><td><code>product-catalogue</code> (current product data)</td><td><code>compact</code></td><td><code>segment.ms</code> 1 h, dirty ratio 0.3, <code>delete.retention.ms</code> 7 days</td><td>State: latest value per product, forever</td></tr>
+        <tr><td><code>device-heartbeats</code> (last seen per device)</td><td><code>compact,delete</code></td><td><code>retention.ms</code> 30 days, <code>segment.ms</code> 1 h</td><td>Latest per device, but silent devices should vanish</td></tr>
+        <tr><td><code>inventory-changes</code> (±quantity per warehouse)</td><td><code>delete</code></td><td>7 days</td><td>Deltas: compaction would drop changes and corrupt totals</td></tr>
+      </table>
+<pre>
+sizing check for product-catalogue: 5 M products × 4 KB = 20 GB live
+  ÷ (1 − 0.3) ≈ 29 GB worst case per replica set, × RF 3 ≈ 86 GB — local disk, no tiering
+  12 partitions → ~420 k keys per partition: one cleaner pass each
+</pre>
+      <p>The inventory topic is the instructive one: it looks like state ("stock per warehouse"), but its records
+         are changes. If a current-stock view is needed, derive a second, compacted topic of full stock levels —
+         keyed by warehouse and SKU, with the resulting quantity — from the change events, for example with Kafka
+         Streams. Keep the deltas on a <code>delete</code> topic, and give consumers the state on a compacted
+         one.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong><code>delete</code> is for histories, <code>compact</code> for state,</strong> and <code>compact,delete</code> for state that should expire when inactive.</li>
+        <li><strong>Compaction keeps at least the latest record per key</strong> and leaves offsets unchanged, with gaps.</li>
+        <li><strong>The cleaner builds an offset map of the dirty head,</strong> 24 bytes per key: about 5 million keys per pass with the default 128 MB buffer.</li>
+        <li><strong>Too many keys per partition means several passes;</strong> add partitions or buffer.</li>
+        <li><strong>The active segment is never compacted,</strong> so low-volume topics need a shorter <code>segment.ms</code>.</li>
+        <li><strong>A partition is cleaned only when its dirty share reaches <code>min.cleanable.dirty.ratio</code></strong> (0.5 by default).</li>
+        <li><strong>Compaction is eventual;</strong> consumers always see some duplicates and must apply "latest value wins".</li>
+        <li><strong><code>max.compaction.lag.ms</code> is the only bound on when a record is compacted.</strong></li>
+        <li><strong>A tombstone is a null value;</strong> an empty string deletes nothing.</li>
+        <li><strong>Tombstones survive for <code>delete.retention.ms</code> after cleaning</strong> (24 h by default), then vanish.</li>
+        <li><strong>A stateful consumer away longer than <code>delete.retention.ms</code> never sees deletions;</strong> rebuild from the beginning in that case.</li>
+        <li><strong>Compacted topics require keys</strong> and must carry full state, never deltas.</li>
+        <li><strong>Size compacted topics by keys × record size ÷ (1 − dirty ratio) × replication factor.</strong></li>
+        <li><strong>Tiered storage does not apply to compacted topics;</strong> they must fit on broker disks.</li>
+        <li><strong>A stopped or blocked cleaner lets compacted topics — including <code>__consumer_offsets</code> — grow until disks fill;</strong> alert on cleaner metrics.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="event-design.html">← Event Design: Keys, Ordering &amp; Payloads</a>
+      <a href="quiz.html">Kafka Quizzes →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>

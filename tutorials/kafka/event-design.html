@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Event Design: Keys, Ordering &amp; Payloads — Apache Kafka — LearnHub</title>
+<link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="logo" href="../../index.html">Learn<span>Hub</span></a>
+  <nav><a href="../../index.html">Home</a><a href="quiz.html">Quizzes</a><a href="../system-design/index.html">System Design</a></nav>
+</header>
+
+<div class="tutorial-layout">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <main class="content">
+    <h1>Event Design: Keys, Ordering &amp; Payloads <span class="level-badge level-adv">Data Design</span></h1>
+    <p><strong>What you'll master:</strong> the difference between events, commands and state, and why it
+       decides how a topic behaves; choosing a key as the <strong>unit of ordering</strong> — and why a key built
+       from a mutable field silently splits an entity across partitions; <strong>one topic per aggregate versus
+       one topic per event type</strong>, and the reordering that the second choice causes; full-state versus
+       delta payloads, and why <strong>deltas turn every duplicate into data corruption</strong>; the metadata
+       envelope every event needs, and what belongs in headers; making consumers correct under duplicates and
+       out-of-order arrival with version checks; and the anti-patterns — god topics, events as RPC, personal data
+       retained forever. Prerequisites: <a href="schemas.html">Serialization &amp; Schema Evolution</a>; the
+       <a href="../system-design/pubsub-queues.html">System Design queues lesson</a> covers ordering at the
+       architecture level.</p>
+
+    <h2>Part 1 — Events, Commands and State</h2>
+
+    <p>Records on a topic can mean very different things, and mixing them up leads to designs that fight
+       Kafka's model.</p>
+
+    <table class="tbl">
+      <tr><th>Kind</th><th>Example</th><th>Meaning</th><th>Consumers</th></tr>
+      <tr><td>Event (a fact)</td><td><code>OrderPlaced</code>, <code>PaymentCaptured</code></td><td>Something happened; it cannot be refused</td><td>Any number, each deciding what to do</td></tr>
+      <tr><td>Command (a request)</td><td><code>ChargeCard</code>, <code>SendEmail</code></td><td>Please do this; it may fail or be refused</td><td>Exactly one intended handler</td></tr>
+      <tr><td>State (a snapshot)</td><td><code>Customer</code> with every current field</td><td>This is the current value of an entity</td><td>Anyone needing the latest value; compaction fits</td></tr>
+    </table>
+
+    <p><strong>Kafka is built for events and state.</strong> Facts published once and read by many, and
+       compacted snapshots of current values, use exactly what the log is good at: fan-out, replay and ordering
+       per key. Commands fit less well: they have one intended recipient, need a response, and often need
+       per-message retry — queue features (see <a href="index.html">What Kafka Actually Is</a>).</p>
+
+    <p><strong>Name events in the past tense, from the domain.</strong> <code>OrderPlaced</code>,
+       <code>OrderCancelled</code>, <code>AddressChanged</code> say what happened. <code>OrderUpdated</code> says
+       only that a row changed; every consumer must diff the payload to find out what the business event was,
+       and each will reconstruct it slightly differently.</p>
+
+<pre>
+event notification          "OrderPlaced {orderId}"                 consumers call back for details
+event-carried state         "OrderPlaced {orderId, items, total…}"  consumers need nothing else
+state snapshot (compacted)  "Order {every current field}"           latest value per key; history not kept
+event sourcing              the events ARE the source of truth; state is rebuilt by replaying them
+</pre>
+
+    <h2>Part 2 — The Key Is the Unit of Ordering</h2>
+
+    <p>A record's key decides its partition, and Kafka orders records only within a partition. So the key is
+       not a label: it defines <strong>which records are guaranteed to be processed in order relative to each
+       other</strong>. Choose it from the question "which events must never be seen out of order?"</p>
+
+    <table class="tbl">
+      <tr><th>Key</th><th>Ordered together</th><th>Risk</th></tr>
+      <tr><td>Order id</td><td>All events for one order</td><td>None for per-order logic; nothing ordered across a customer's orders</td></tr>
+      <tr><td>Customer id</td><td>Everything a customer does</td><td>Large customers make hot partitions</td></tr>
+      <tr><td>Account id (payments)</td><td>Every movement on one balance</td><td>What balance consumers need; skew if a few accounts dominate</td></tr>
+      <tr><td>No key</td><td>Nothing</td><td>Only for truly independent events (logs, metrics)</td></tr>
+      <tr><td>Random or per-request id</td><td>Nothing useful</td><td>Looks like ordering; guarantees none</td></tr>
+    </table>
+
+    <p><strong>A key must never change for the life of the entity.</strong> If the key is derived from a field
+       that can change — an email address, a region, a status — then the entity's events move to a different
+       partition when the field changes, and its old and new events are no longer ordered relative to each
+       other.</p>
+
+<pre>
+key = customer email
+  CustomerRegistered   key alice@old.com  → partition 3
+  EmailChanged         key alice@new.com  → partition 7     ◄── the SAME customer, a different partition
+  AddressChanged       key alice@new.com  → partition 7
+
+a consumer of partition 7 can process EmailChanged before the consumer of partition 3
+has processed CustomerRegistered: "email changed for a customer who does not exist yet"
+
+on a COMPACTED topic it is worse: partition 3 keeps alice@old.com's record FOREVER,
+because no later record with that key ever arrives to replace it
+</pre>
+
+    <div class="note">🔑 <strong>Key by identity, never by attribute.</strong> Use the stable, immutable id of
+       the entity whose events must stay ordered — the order id, the account id — and put everything else in the
+       value. If the natural id is composite, build the key the same way everywhere, from the same fields, with
+       the same serializer; the partitions lesson shows how differently serialized keys land on different
+       partitions.</div>
+
+    <h2>Part 3 — One Topic per Aggregate, or per Event Type?</h2>
+
+    <p>Should <code>OrderPlaced</code>, <code>OrderPaid</code> and <code>OrderShipped</code> each get their own
+       topic, or share one <code>orders</code> topic? The answer follows from ordering: Kafka orders records only
+       within one partition of one topic.</p>
+
+<pre>
+separate topics: order-placed, order-paid, order-shipped (each keyed by orderId)
+
+  consumer reads all three topics:
+    order-paid     p2: OrderPaid(o-42)        ◄── fetched first: that topic's consumer was ahead
+    order-placed   p2: OrderPlaced(o-42)      ◄── arrives later
+  "payment for an order that does not exist" — there is NO ordering across topics
+
+one topic: orders (keyed by orderId), three event types in it
+    orders p2: OrderPlaced(o-42), OrderPaid(o-42), OrderShipped(o-42)   ◄── always in this order
+</pre>
+
+    <table class="tbl">
+      <tr><th></th><th>Topic per aggregate (<code>orders</code>)</th><th>Topic per event type</th></tr>
+      <tr><td>Ordering across an entity's events</td><td>Yes, per key</td><td>No</td></tr>
+      <tr><td>Consumer wanting one event type</td><td>Reads and discards the others</td><td>Reads only what it needs</td></tr>
+      <tr><td>Schemas</td><td>Several types per subject: a union, or <code>RecordNameStrategy</code></td><td>One schema per topic; simplest</td></tr>
+      <tr><td>Retention and access control</td><td>One policy for all the aggregate's events</td><td>Per type</td></tr>
+      <tr><td>Good for</td><td>State machines: lifecycle events of one entity</td><td>Independent facts consumed separately</td></tr>
+    </table>
+
+    <p>The usual answer is <strong>one topic per aggregate</strong> for events that describe one entity's
+       lifecycle, because nearly every consumer of such events needs them in order. Separate topics are fine for
+       facts that are genuinely independent of each other. The schema side needs care: with several event types
+       in one topic, register them under <code>RecordNameStrategy</code> or <code>TopicRecordNameStrategy</code>,
+       or as a union in one schema, so each type can evolve.</p>
+
+    <div class="mistake-pair">
+      <p>❌ <strong>One "events" topic for the whole company.</strong> Forty event types, three partitions, keyed
+         inconsistently. Every consumer reads everything and discards most of it; one team's burst of events delays
+         everyone's; retention must suit the most demanding type; access control is all or nothing; and the
+         partition count, set for the first use case, caps every consumer's parallelism.</p>
+      <p>✅ <strong>Topics per aggregate or bounded context, each owned by one team.</strong>
+         <code>orders</code>, <code>payments</code>, <code>shipments</code> — each with a key chosen for its own
+         ordering needs, its own partition count, retention and ACLs. Exercise 6 migrates a god topic.</p>
+    </div>
+
+    <h2>Part 4 — Payloads: Full State, Deltas and Notifications</h2>
+
+    <p>The payload shape decides what consumers can do with a single event, and how they cope with duplicates
+       and gaps.</p>
+
+    <table class="tbl">
+      <tr><th>Shape</th><th>Example</th><th>Duplicate delivered</th><th>Event missed or out of order</th></tr>
+      <tr><td>Delta</td><td><code>BalanceChanged {account, +50}</code></td><td><strong>Applied twice: wrong balance</strong></td><td>Wrong forever</td></tr>
+      <tr><td>Full state</td><td><code>BalanceChanged {account, balance: 1250, version: 88}</code></td><td>Harmless: same value written again</td><td>Next event corrects it; version rejects stale ones</td></tr>
+      <tr><td>Notification</td><td><code>OrderChanged {orderId}</code></td><td>Harmless: one extra lookup</td><td>Harmless, but every consumer calls the source</td></tr>
+      <tr><td>Business event + state</td><td><code>ItemAdded {orderId, item, orderTotal, version}</code></td><td>Detectable by version</td><td>Detectable by version gap</td></tr>
+    </table>
+
+    <p><strong>Deltas make every at-least-once duplicate a correctness bug.</strong> Kafka delivers at least
+       once, so duplicates are normal — after rebalances, restarts and replays. A consumer that adds deltas to a
+       balance adds some of them twice, and there is nothing in the data to detect it unless each event carries an
+       id that the consumer deduplicates on.</p>
+
+<pre>
+deltas:      +50, +20, (+20 again after a rebalance), -10     → consumer balance 80, true balance 60
+full state:  balance=50 v1, balance=70 v2, (balance=70 v2 again), balance=60 v3 → consumer balance 60 ✔
+</pre>
+
+    <p>The practical rule: publish the <strong>business event plus the resulting state and a version</strong>.
+       Consumers that care about what happened read the event type and details; consumers that only need the
+       current value take the state; everyone can use the version to ignore duplicates and stale records. The
+       Spring Boot <a href="../springboot/messaging.html">Messaging lesson</a> shows the cost of thin
+       notifications at scale: every consumer calling the source service back for each event.</p>
+
+    <p><strong>Size limits apply.</strong> A topic accepts records up to about 1 MB by default, and large
+       records slow every consumer that must fetch them. Full state for an order with 3,000 line items, or an event
+       carrying a PDF, does not belong in the record: store the large part in object storage and put a reference
+       and a checksum in the event.</p>
+
+    <h2>Part 5 — The Envelope, Headers, and Ordering You Can Check</h2>
+
+    <p>Every event needs the same few metadata fields, whatever its business content. Without them, consumers
+       cannot deduplicate, order, trace or debug.</p>
+
+    <table class="tbl">
+      <tr><th>Field</th><th>Purpose</th><th>Payload or header?</th></tr>
+      <tr><td><code>eventId</code> (UUID)</td><td>Deduplication; idempotency keys downstream</td><td>Payload — consumers depend on it</td></tr>
+      <tr><td><code>eventType</code></td><td>Which schema and handler apply</td><td>Payload (or record name); may be copied to a header for routing</td></tr>
+      <tr><td><code>occurredAt</code></td><td>Event time, when it happened in the business</td><td>Payload — distinct from the Kafka timestamp</td></tr>
+      <tr><td><code>aggregateId</code>, <code>version</code></td><td>Entity identity and a per-entity sequence number</td><td>Payload — correctness depends on them</td></tr>
+      <tr><td><code>correlationId</code>, <code>causationId</code></td><td>Linking an event to the request and event that caused it</td><td>Header or payload</td></tr>
+      <tr><td>Trace context (<code>traceparent</code>)</td><td>Distributed tracing across services</td><td>Header</td></tr>
+      <tr><td><code>producer</code>, schema version</td><td>Debugging; the registry already carries the schema id</td><td>Header</td></tr>
+    </table>
+
+    <p><strong>Headers are for infrastructure, payloads for meaning.</strong> Record headers (since Kafka 0.11)
+       are key/value byte arrays outside the key and value. The schema registry does not describe or validate
+       them, some tools and connectors drop them, and a consumer that only deserializes the value never sees them.
+       Put anything a business decision depends on in the payload, where its schema is enforced; use headers for
+       tracing, routing and diagnostics. (The CloudEvents specification defines a standard mapping of such
+       metadata to Kafka headers, if you want a common convention.)</p>
+
+    <p><strong>Consumers should check ordering rather than assume it.</strong> Per-key ordering in one partition
+       covers most cases, but real systems also see replays, events for one entity arriving through two paths, and
+       reprocessing after bugs. A per-entity version turns those into something the consumer can detect:</p>
+
+<pre>
+UPDATE orders_view
+   SET status = :status, total = :total, version = :version
+ WHERE order_id = :orderId AND version &lt; :version;        -- stale or duplicate: 0 rows, ignored
+
+INSERT INTO processed_events(event_id) VALUES (:eventId)
+    ON CONFLICT DO NOTHING;                               -- for effects that are not state (emails, charges)
+</pre>
+
+    <p>Note that <code>occurredAt</code> is not a substitute for a version. Clocks on different producers
+       disagree, and two events in the same millisecond cannot be ordered by time at all. A version assigned by the
+       single writer of the entity — incremented with each change, in the same transaction — is the reliable
+       order.</p>
+
+    <h2>Part 6 — Anti-Patterns, Including Personal Data That Never Expires</h2>
+
+    <table class="tbl">
+      <tr><th>Anti-pattern</th><th>Why it hurts</th><th>Instead</th></tr>
+      <tr><td>Events as RPC (request topic + reply topic)</td><td>Correlation ids, timeouts and retries rebuilt by hand; latency of polling</td><td>HTTP or gRPC for request/response; events for the facts that result</td></tr>
+      <tr><td>Raw CDC of internal tables as the public contract</td><td>Every schema change in the service's database breaks consumers</td><td>An outbox of designed domain events; CDC of the outbox (see the Connect lesson)</td></tr>
+      <tr><td><code>EntityUpdated</code> with the whole row and no reason</td><td>Consumers diff payloads to guess what happened</td><td>Named business events carrying the resulting state</td></tr>
+      <tr><td>Money as floating point</td><td>Rounding errors in totals</td><td>Integer minor units, or a decimal type (Avro <code>decimal</code>)</td></tr>
+      <tr><td>Timestamps without a time zone or unit</td><td>Seconds read as milliseconds; local times across zones</td><td>UTC, with the unit in the schema (Avro <code>timestamp-millis</code>)</td></tr>
+      <tr><td>Personal data in long-retention or compacted topics</td><td>A deletion request cannot be honoured in an immutable log</td><td>Keep personal data out, or encrypt it per person (below)</td></tr>
+    </table>
+
+    <p><strong>Personal data and an immutable log.</strong> Privacy law gives people the right to have their data
+       erased, and a Kafka topic with long retention — or a compacted topic, which keeps the latest record per key
+       forever — is designed never to forget. Three approaches exist:</p>
+
+<pre>
+1. keep it out:     events carry a customerId; personal fields live in one service's database
+                    → erase there; events contain nothing personal
+2. compaction:      a "customers" state topic keyed by customerId; to erase, write a TOMBSTONE
+                    (key, null value) → compaction removes older values for that key
+                    → but copies in OTHER topics, consumer databases and backups remain
+3. crypto-shredding: personal fields encrypted with a per-customer key held in a key store;
+                    events keep the ciphertext; to erase, DELETE THE KEY
+                    → every copy everywhere becomes unreadable, including old events and backups
+</pre>
+
+    <p>Keeping personal data out of events is the simplest and should be the default. Crypto-shredding is the
+       answer when events genuinely must carry personal fields and are retained for a long time; its cost is a key
+       lookup per event on both sides and a key service that becomes critical infrastructure. Tombstones alone
+       remove data only from the one compacted topic they are written to.</p>
+
+    <h2>Common Mistakes</h2>
+
+    <table class="tbl">
+      <tr><th>Mistake</th><th>What actually happens</th><th>Do this instead</th></tr>
+      <tr><td>Keying by a mutable attribute (email, status)</td><td>An entity's events split across partitions; compacted topics keep stale records forever</td><td>Key by the immutable entity id</td></tr>
+      <tr><td>Separate topics for one entity's lifecycle events</td><td>No ordering across them: "paid" before "placed"</td><td>One topic per aggregate, keyed by its id</td></tr>
+      <tr><td>A single company-wide events topic</td><td>Shared partitions, retention and ACLs; everyone reads everything</td><td>Topics per aggregate or context, each owned</td></tr>
+      <tr><td>Delta payloads without event ids</td><td>Duplicates silently corrupt totals</td><td>Full resulting state plus a version, or dedup on event id</td></tr>
+      <tr><td>Thin notifications at high volume</td><td>Every consumer calls the source back per event</td><td>Carry the state consumers need</td></tr>
+      <tr><td>Large payloads in records</td><td>Size limits, slow fetches, memory pressure</td><td>Object storage plus a reference</td></tr>
+      <tr><td>No event id</td><td>Duplicates cannot be detected downstream</td><td>A UUID per event, generated once</td></tr>
+      <tr><td>Ordering by <code>occurredAt</code></td><td>Clock skew and ties reorder events</td><td>A per-entity version from the single writer</td></tr>
+      <tr><td>Business data in headers</td><td>Not schema-checked; dropped by some tools</td><td>Payload for meaning, headers for infrastructure</td></tr>
+      <tr><td><code>OrderUpdated</code> for every change</td><td>Consumers reverse-engineer what happened</td><td>Past-tense business events</td></tr>
+      <tr><td>Commands with reply topics for request/response</td><td>Hand-built RPC with polling latency</td><td>HTTP or gRPC</td></tr>
+      <tr><td>Publishing raw database rows via CDC as the contract</td><td>Internal schema changes break consumers</td><td>Outbox events designed for consumers</td></tr>
+      <tr><td>Money as floats; timestamps without units</td><td>Rounding errors; unit confusion</td><td>Integer minor units or decimals; UTC with explicit units</td></tr>
+      <tr><td>Personal data in retained topics</td><td>Erasure requests cannot be met</td><td>Keep it out, or crypto-shred</td></tr>
+    </table>
+
+    <h2>Interview Questions</h2>
+
+    <details class="solution"><summary><strong>Beginner:</strong> How do you choose the key for a Kafka topic?</summary>
+      <p>Start from ordering: the key decides the partition, and Kafka only orders records within a partition. So
+         the key should be the identity of whatever must be processed in order — usually the entity the events are
+         about. For order lifecycle events that is the order id; for balance movements, the account id.</p>
+      <p>Two properties matter besides ordering. The key must be <strong>stable</strong>: derived from an id that
+         never changes, not from an attribute like an email address or a status, or the entity's events move to a
+         new partition when the attribute changes and lose their ordering. And the key's values should be
+         <strong>well distributed</strong>, because a key that is very common — one huge customer — makes one hot
+         partition that no amount of scaling fixes.</p>
+      <p>There are also practical rules: every producer must build and serialize the key the same way, since the
+         partition comes from a hash of the key's bytes; and on compacted topics the key is the identity that
+         compaction keeps the latest value for, so it must be exactly the entity id.</p>
+      <p>If nothing needs ordering — logs, metrics — leaving the key empty spreads load most evenly.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Beginner:</strong> What should an event contain besides its business data?</summary>
+      <p>A small, consistent envelope. An <strong>event id</strong>, generated once when the event is created, so
+         consumers can detect duplicates. An <strong>event type</strong>, so consumers know which schema and handler
+         apply. The <strong>time it occurred</strong> in business terms, which differs from when Kafka received it.
+         The <strong>entity id and a version</strong> — a per-entity sequence number — so consumers can ignore stale
+         and duplicate events.</p>
+      <p>Then tracing and diagnostics: a correlation id linking the event to the request that caused it, a
+         causation id linking it to a preceding event, trace context for distributed tracing, and the producing
+         service's name.</p>
+      <p>Where they go matters. Anything a consumer's logic depends on — the event id, type, version, occurred-at
+         time — belongs in the payload, where the schema enforces it. Tracing and routing metadata can go in record
+         headers, which are outside the schema and ignored by consumers that do not look for them.</p>
+      <p>A consistent envelope across all of an organisation's events is worth agreeing early; it makes generic
+         tooling — deduplication libraries, dead-letter inspection, tracing — work for every topic.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Should each event type have its own topic?</summary>
+      <p>It depends on whether consumers need those events in order with each other, because Kafka provides no
+         ordering across topics.</p>
+      <p>For the lifecycle events of one entity — an order being placed, paid, shipped, cancelled — consumers
+         almost always need them in order. If they were in separate topics, a consumer reading all of them could
+         see a payment before the order exists or a cancellation before the shipment. Putting them in one topic,
+         keyed by the order id, guarantees their order. That is the "topic per aggregate" design, and it is the
+         right default for events about one entity.</p>
+      <p>The costs are manageable: consumers interested in only one type read and skip the others, and the schema
+         must accommodate several types — either a union in one schema or a subject naming strategy that registers
+         each type separately.</p>
+      <p>Separate topics per type make sense for facts that are independent, consumed by different teams, or
+         needing different retention or access control. What I would avoid at the other extreme is one topic for
+         all events across domains, which shares partition counts, retention and access among unrelated teams.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Mid:</strong> Why are delta events dangerous in Kafka, and what do you publish instead?</summary>
+      <p>Because Kafka's normal delivery guarantee is at-least-once. Consumers see duplicates after rebalances,
+         crashes and replays as a matter of course. A delta event — "add 50 to the balance" — is only correct if it
+         is applied exactly once, so every duplicate becomes a wrong balance, and nothing in the resulting data
+         reveals it.</p>
+      <p>Deltas also make gaps permanent. If an event is skipped or lost, the consumer's state is wrong from then on,
+         with no later event to correct it.</p>
+      <p>The alternative is to publish the resulting state along with the event: "item added; order total is now
+         1,250; version 88". Applying a full-state event twice writes the same value twice, which is harmless.
+         Missing one is corrected by the next. And the version lets the consumer reject anything older than what it
+         already has, so replays and out-of-order arrivals are ignored safely.</p>
+      <p>If a consumer truly needs deltas — an analytics job summing sales — each event must carry a unique id, and
+         the consumer must deduplicate on it, ideally in the same transaction as its own writes. So I would publish
+         business events that carry the resulting state and a version, and treat pure deltas as a special case that
+         requires deduplication.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> Design the events for an e-commerce order domain consumed by payments, fulfilment, notifications and analytics.</summary>
+      <p><strong>Topics:</strong> one <code>orders</code> topic for the order aggregate, keyed by order id, carrying
+         its lifecycle events — <code>OrderPlaced</code>, <code>OrderPaid</code>, <code>OrderCancelled</code>,
+         <code>OrderShipped</code> — so every consumer sees one order's events in order. Payments and shipments are
+         separate aggregates owned by other services, with their own topics. Partition count is sized from the
+         slowest consumer's per-partition throughput with growth headroom.</p>
+      <p><strong>Payloads:</strong> each event names what happened and carries the resulting order state that
+         consumers need — status, line items, totals, shipping address reference — plus an envelope: event id,
+         occurred-at, order id and a version incremented on every change. Money is in integer minor units with a
+         currency code; timestamps are UTC with explicit units. Personal data is minimised: the shipping address is
+         referenced by id, not embedded, because notifications and fulfilment can look it up and the event topic
+         should not carry personal data for its whole retention.</p>
+      <p><strong>Production:</strong> the order service writes events through a transactional outbox in the same
+         transaction as the order row, so events exist exactly when the order change does, and the version is
+         assigned in that transaction.</p>
+      <p><strong>Consumption:</strong> payments and fulfilment update their own state with version checks, so
+         duplicates and replays are ignored; notifications deduplicate on event id before sending; analytics reads
+         the full history and can replay from the beginning. Schemas are Avro, registered from CI with
+         <code>FULL_TRANSITIVE</code> compatibility, because four teams deploy independently.</p>
+      <p><strong>Recommendation:</strong> one topic per aggregate keyed by its id, business events carrying
+         resulting state and a version, an outbox for production, idempotent consumers by version or event id, and
+         personal data kept out of events. That set of choices makes ordering, duplicates, replay and erasure each
+         somebody's design decision rather than an incident.</p>
+    </details>
+
+    <details class="solution"><summary><strong>Senior:</strong> A regulator requires that a customer's personal data can be erased on request. Your events are retained for a year. What do you do?</summary>
+      <p>An immutable log with year-long retention cannot have individual records edited or removed, so the design
+         has to make erasure possible without rewriting history.</p>
+      <p><strong>First, reduce what is in the log.</strong> Most events do not need personal data: they can refer to
+         a customer id and let consumers look up details from the customer service, which can erase them in one
+         place. I would audit every event schema and remove names, emails, addresses and phone numbers wherever a
+         reference would do. This is the cheapest and most robust measure.</p>
+      <p><strong>Second, for data that must travel in events, crypto-shredding.</strong> Encrypt personal fields
+         with a key specific to each customer, held in a key management service. Consumers that are allowed to see
+         the data decrypt it. To erase a customer, delete their key: every copy of their data — in every topic,
+         every consumer's database that stored ciphertext, and every backup — becomes unreadable. The costs are
+         key lookups (cached) on both sides, and the key service becoming critical infrastructure that must be
+         highly available and itself backed up with care.</p>
+      <p><strong>Third, compacted state topics</strong> can use tombstones to remove a customer's current record,
+         but that affects only that topic; copies consumers made elsewhere are untouched.</p>
+      <p><strong>And the consumers matter as much as the log.</strong> Every service that stored personal data
+         from events needs its own erasure path, triggered by a <code>CustomerErased</code> event.</p>
+      <p><strong>Recommendation:</strong> keep personal data out of events by default; crypto-shred the fields that
+         must be included; publish an erasure event that every consumer handles; and document which topics may
+         contain personal data at all. Retention settings alone cannot satisfy the requirement.</p>
+    </details>
+
+    <h2>🏋️ Graded Exercises</h2>
+
+    <div class="exercise"><strong>1 (easy):</strong> Compare three candidate keys for an order-events topic.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+events per order: OrderPlaced → OrderPaid → OrderShipped (sometimes OrderCancelled)
+traffic: 2M orders/day; the largest customer (a reseller) places 18% of all orders
+consumers: fulfilment (per-order state machine), loyalty (points per customer, applied as deltas)
+</pre>
+      <table class="tbl">
+        <tr><th>Key</th><th>Ordering</th><th>Distribution</th><th>Verdict</th></tr>
+        <tr><td><code>customerId</code></td><td>All of a customer's orders, in order</td><td>One partition carries 18% of traffic</td><td>Hot partition; fulfilment gains nothing</td></tr>
+        <tr><td><code>orderId</code></td><td>Each order's events, in order</td><td>Even</td><td><strong>Choose this</strong></td></tr>
+        <tr><td><code>customerEmail</code></td><td>Breaks when the email changes</td><td>Even until then</td><td>Never: a mutable attribute</td></tr>
+      </table>
+      <p>Loyalty seems to want customer ordering, but look at what it does: it adds points per order. If each
+         event carries an event id and the loyalty service deduplicates on it, the order in which different orders'
+         points arrive does not matter — addition is commutative. The design need is per-order ordering (for
+         fulfilment) plus idempotency (for loyalty), not per-customer ordering.</p>
+      <p>That is the general move: before accepting a hot key for "ordering", check whether the consumer actually
+         needs order or only needs each event applied once.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>2 (easy):</strong> Write an Avro schema for <code>OrderPaid</code> with a proper
+      envelope, and decide what goes in headers.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+{
+  "type": "record", "name": "OrderPaid", "namespace": "com.acme.orders",
+  "fields": [
+    {"name": "eventId",     "type": {"type": "string", "logicalType": "uuid"}},
+    {"name": "occurredAt",  "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "orderId",     "type": "string"},
+    {"name": "version",     "type": "long", "doc": "per-order sequence, +1 on every change"},
+    {"name": "amount",      "type": "long", "doc": "minor units (cents)"},
+    {"name": "currency",    "type": "string", "doc": "ISO 4217"},
+    {"name": "paymentId",   "type": "string"},
+    {"name": "orderStatus", "type": "string", "default": "PAID"}
+  ]
+}
+
+headers: traceparent, correlation-id, producer=orders-service
+</pre>
+      <table class="tbl">
+        <tr><th>Field</th><th>Where</th><th>Reason</th></tr>
+        <tr><td><code>eventId</code>, <code>version</code></td><td>Payload</td><td>Consumers deduplicate and order by them</td></tr>
+        <tr><td><code>occurredAt</code></td><td>Payload</td><td>Business event time, with its unit in the schema</td></tr>
+        <tr><td><code>amount</code> + <code>currency</code></td><td>Payload</td><td>Integer minor units: no floating-point rounding</td></tr>
+        <tr><td><code>traceparent</code>, <code>correlation-id</code></td><td>Headers</td><td>Infrastructure; no business logic depends on them</td></tr>
+      </table>
+      <p>The event is keyed by <code>orderId</code>. It carries the resulting order status, so a consumer that only
+         needs "is this order paid?" does not have to call the order service.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>3 (medium):</strong> Feed the same event stream, with a duplicate and a replay,
+      into a delta consumer and a version-checked full-state consumer.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+events for account A (in log order), then a rebalance redelivers #3, then an operator replays #2:
+
+  #1  deposit  +100   balance=100  v1
+  #2  withdraw  -30   balance= 70  v2
+  #3  deposit   +50   balance=120  v3
+  #3  (duplicate after rebalance)
+  #2  (replayed during an incident)
+</pre>
+<pre>
+delta consumer:          +100 -30 +50 +50 -30         → 140     ✘ (true balance 120)
+full-state, no version:  100, 70, 120, 120, 70        → 70      ✘ (replay moved it backwards)
+full-state + version:    100(v1) 70(v2) 120(v3) skip(v3) skip(v2) → 120   ✔
+</pre>
+<pre>
+-- the version-checked write
+UPDATE balances SET balance = :balance, version = :version
+ WHERE account = :account AND version &lt; :version;
+</pre>
+      <table class="tbl">
+        <tr><th>Consumer</th><th>Duplicate</th><th>Replay of an older event</th></tr>
+        <tr><td>Delta</td><td>Wrong</td><td>Wrong</td></tr>
+        <tr><td>Full state, no version</td><td>Correct</td><td>Wrong: stale value overwrites newer</td></tr>
+        <tr><td>Full state + version</td><td>Correct</td><td>Correct</td></tr>
+      </table>
+      <p>Full state fixes duplicates; the version fixes staleness. Both are needed, because replays and
+         multi-path delivery happen in real systems even when a single partition is perfectly ordered.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>4 (medium):</strong> A fulfilment service reads <code>order-placed</code> and
+      <code>order-paid</code> as separate topics and occasionally rejects payments for "unknown orders". Explain and
+      fix.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+order-placed  (12 partitions, consumer group lagging 40 s during a busy hour)
+order-paid    (12 partitions, consumer group caught up)
+
+o-9912 placed at 12:00:00.000 → order-placed p5  (consumed at 12:00:41)
+o-9912 paid   at 12:00:03.000 → order-paid   p5  (consumed at 12:00:03)   ◄── 38 s BEFORE the placement
+fulfilment: "payment for unknown order o-9912" → rejected
+</pre>
+      <p>Each topic is ordered only within itself. Lag, retries or rebalances on one topic's consumers let its
+         events fall behind the other's. Same key and same partition number in two topics give no ordering
+         between them.</p>
+      <table class="tbl">
+        <tr><th>Fix</th><th>How</th><th>Trade-off</th></tr>
+        <tr><td>Merge into one <code>orders</code> topic (preferred)</td><td>Both event types, keyed by order id</td><td>Consumers of one type skip the other; schema holds several types</td></tr>
+        <tr><td>Buffer early events</td><td>Hold a payment for an unknown order and retry until the order arrives</td><td>State, timeouts and a rule for orders that never arrive</td></tr>
+        <tr><td>Carry enough state in each event</td><td><code>OrderPaid</code> includes the order details fulfilment needs</td><td>Larger events; still no ordering with cancellations</td></tr>
+      </table>
+      <p>Migrating to one topic: create <code>orders</code>, have the order service publish both types to it (from
+         its outbox), move fulfilment to it, then retire the two old topics once no consumer needs them.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>5 (hard):</strong> Design crypto-shredding for customer events retained for 13
+      months.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+event (Avro), personal fields as ciphertext:
+  { eventId, occurredAt, customerId, version,
+    email_enc: bytes, address_enc: bytes, keyId: "cust-7731/k1",
+    loyaltyTier: "GOLD" }                                   ◄── non-personal fields stay in the clear
+
+producer:   dek = keystore.getOrCreate("cust-7731")          (per-customer data-encryption key)
+            email_enc = AES-GCM(dek, email, aad = eventId)
+consumer:   dek = keystore.get(keyId)   (cached, with a short TTL)
+            email = decrypt(...)  — or NotFound → treat as ERASED
+
+erasure:    keystore.delete("cust-7731")  → publish CustomerErased(cust-7731)
+            every stored copy of email_enc/address_enc, in every topic and backup, is now unreadable
+</pre>
+      <table class="tbl">
+        <tr><th>Concern</th><th>Design choice</th></tr>
+        <tr><td>Key store availability</td><td>Replicated, with consumers caching keys; a key store outage must not stop non-personal processing</td></tr>
+        <tr><td>Erasure latency</td><td>Cache TTL bounds how long a consumer may still decrypt after deletion — state it (e.g. 10 minutes)</td></tr>
+        <tr><td>Consumers that stored plaintext</td><td>They must handle <code>CustomerErased</code> and delete their copies</td></tr>
+        <tr><td>Analytics</td><td>Works on non-personal fields; erased customers' personal fields become null</td></tr>
+        <tr><td>Key-store backups</td><td>Must also honour deletion, or they resurrect keys</td></tr>
+      </table>
+      <p>The key store's backups are the subtle part: a restored backup that contains a deleted key undoes the
+         erasure for every copy of the data. Treat key deletion as a record that restores must replay, and test that
+         an erased customer stays erased after a key-store restore.</p>
+      </details>
+    </div>
+
+    <div class="exercise"><strong>6 (hard):</strong> Migrate a company-wide <code>events</code> topic (40 event
+      types, 3 partitions, keyed by whatever each producer chose) to owned topics without downtime.
+      <details class="solution"><summary>Solution</summary>
+<pre>
+inventory: list every event type, its producer, its consumers, its key, its volume
+            (a consumer reading raw bytes and counting types by schema id gives the real picture)
+
+target:     orders (key orderId, 24 partitions)   payments (key accountId, 12)
+            shipments (key shipmentId, 12)        customers (key customerId, compacted, 6) ...
+</pre>
+<pre>
+phase 1  a small router (Kafka Streams) reads "events" and writes each type to its new topic,
+         re-keyed correctly                      → new topics exist immediately, with history if needed
+phase 2  consumers move one at a time to the new topics (they see the same events, correctly keyed)
+phase 3  producers move one at a time to writing their new topic directly;
+         the router ignores types whose producer has moved (a per-type switch)
+phase 4  when "events" has no producers and no consumers, stop the router; let retention empty it
+</pre>
+      <table class="tbl">
+        <tr><th>Risk</th><th>Mitigation</th></tr>
+        <tr><td>Ordering during the switch of a producer</td><td>Move a producer only when the router has caught up; for keyed types, a brief producer pause guarantees order across the cut-over</td></tr>
+        <tr><td>Duplicates during the overlap</td><td>Consumers deduplicate on event id (add one in the router if producers lacked it)</td></tr>
+        <tr><td>Consumers reading history from the new topics</td><td>Router backfills from the earliest retained offset of <code>events</code></td></tr>
+        <tr><td>Schema subjects</td><td>New topics get their own subjects; register each type from CI</td></tr>
+      </table>
+      <p>The router is what makes it incremental: consumers and producers move independently, each at their own
+         pace, and the old topic stays authoritative until the last producer has moved. Keying correctly in the
+         router means consumers get per-entity ordering on the new topics from the first day, before any producer
+         has changed.</p>
+      </details>
+    </div>
+
+    <div class="takeaways"><h3>🎯 Key Takeaways</h3>
+      <ul>
+        <li><strong>Events are facts, commands are requests, state is a snapshot;</strong> Kafka suits events and state far better than commands.</li>
+        <li><strong>Name events in the past tense from the domain;</strong> <code>OrderUpdated</code> forces consumers to guess what happened.</li>
+        <li><strong>The key defines what is ordered together:</strong> choose it from which events must never be seen out of order.</li>
+        <li><strong>Key by immutable identity, never by a mutable attribute,</strong> or an entity's events split across partitions.</li>
+        <li><strong>Kafka provides no ordering across topics,</strong> so one entity's lifecycle events belong in one topic keyed by its id.</li>
+        <li><strong>A company-wide events topic shares partitions, retention and access among unrelated teams;</strong> use topics per aggregate or context.</li>
+        <li><strong>Several event types in one topic need a union schema or a record-based subject strategy.</strong></li>
+        <li><strong>Delta payloads turn every duplicate into corruption;</strong> publish the resulting state and a version.</li>
+        <li><strong>Full state fixes duplicates; a version also fixes stale and replayed events.</strong></li>
+        <li><strong>Every event needs an id, a type, an occurred-at time, and an entity version.</strong></li>
+        <li><strong>Headers are for tracing and routing;</strong> anything business logic depends on belongs in the schema-checked payload.</li>
+        <li><strong>Order by a version from the single writer, not by timestamps,</strong> which skew and tie.</li>
+        <li><strong>Large payloads belong in object storage,</strong> with a reference and checksum in the event.</li>
+        <li><strong>Before accepting a hot key for ordering, check whether the consumer needs order or only idempotency.</strong></li>
+        <li><strong>Keep personal data out of events;</strong> crypto-shred what must be included, and publish an erasure event.</li>
+      </ul>
+    </div>
+
+    <div class="pager">
+      <a href="schemas.html">← Serialization &amp; Schema Evolution</a>
+      <a href="retention-compaction.html">Retention &amp; Log Compaction →</a>
+    </div>
+  </main>
+</div>
+
+<script src="../../js/sidebar.js"></script>
+<script src="nav.js"></script>
+</body>
+</html>
