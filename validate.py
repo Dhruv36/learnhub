@@ -86,6 +86,7 @@ REVIEWED_THIN = {
     "typescript/branded-types.html",    # 35KB, phantom brands, one-way assignability, smart constructors, limits
     "typescript/tsconfig.html",         # 36KB, tsc --init defaults, module pairs, TS5108/5110/1484/1205, references
     "typescript/modules.html",          # 35KB, type-only imports, TS2835, interop removals, augmentation, cycles
+    "typescript/declaration-files.html", # 37KB, emit output, isolatedDeclarations TS9013/9009, types roots, publishing
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
