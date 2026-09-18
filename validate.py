@@ -83,6 +83,7 @@ REVIEWED_THIN = {
     "typescript/strictness.html",       # 39KB, the eight strict flags, the six outside it, TS7 removals
     "typescript/runtime-validation.html", # 35KB, unknown at the boundary, lying predicates, TS2775, schema-derived types
     "typescript/errors.html",           # 35KB, unknown in catch, TS1196, cause, ES5 target removal, Result
+    "typescript/branded-types.html",    # 35KB, phantom brands, one-way assignability, smart constructors, limits
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
