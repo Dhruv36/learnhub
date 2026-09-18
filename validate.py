@@ -90,6 +90,7 @@ REVIEWED_THIN = {
     "typescript/build-pipeline.html",   # 35KB, transpile vs check, const enum mismatch, erasableSyntaxOnly, diagnostics
     "typescript/classes.html",          # 35KB, private vs #private at runtime, erasability, TS4117, when not to
     "typescript/async-types.html",      # 35KB, combinator types, void loophole, floating promises, async iterables
+    "typescript/compiler-performance.html", # 33KB, diagnostics, skipLibCheck measured, quadratic instantiations, trace
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
