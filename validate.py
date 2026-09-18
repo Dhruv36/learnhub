@@ -88,6 +88,7 @@ REVIEWED_THIN = {
     "typescript/modules.html",          # 35KB, type-only imports, TS2835, interop removals, augmentation, cycles
     "typescript/declaration-files.html", # 37KB, emit output, isolatedDeclarations TS9013/9009, types roots, publishing
     "typescript/build-pipeline.html",   # 35KB, transpile vs check, const enum mismatch, erasableSyntaxOnly, diagnostics
+    "typescript/classes.html",          # 35KB, private vs #private at runtime, erasability, TS4117, when not to
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
