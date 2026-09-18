@@ -78,6 +78,7 @@ REVIEWED_THIN = {
     "typescript/narrowing.html",        # 37KB, CFA, discriminated unions, closure and aliasing holes
     "typescript/generics.html",         # 36KB, inference, keyof constraints, const type params, fake generics
     "typescript/conditional-types.html", # 36KB, distribution, never, infer, TS2589, overloads vs conditionals
+    "typescript/mapped-template-types.html", # 34KB, homomorphism, as-remapping, never filtering, TS2590
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
