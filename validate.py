@@ -71,10 +71,12 @@ REVIEWED_THIN = {
 
     # typescript, reviewed 2026-09-17. Written to the v4 recipe from scratch;
     # every claim verified against tsc 7.0.2 locally.
-    "typescript/types-basics.html",  # 40KB, widening, unions, optionality, Record, type vs interface
-    "typescript/structural-typing.html", # 40-44KB, variance, excess property checks, nominal classes
-    "typescript/functions.html",     # 40-44KB, overloads, this, predicates, void rules
-    "typescript/narrowing.html",     # 40-44KB, CFA, discriminated unions, closure and aliasing holes
+    "typescript/index.html",            # 37KB, erasure, non-erasable syntax, TS7 defaults, bundlers vs tsc
+    "typescript/types-basics.html",     # 40KB, widening, unions, optionality, Record, type vs interface
+    "typescript/structural-typing.html",# 38KB, variance, excess property checks, nominal classes
+    "typescript/functions.html",        # 37KB, overloads, this, predicates, void rules
+    "typescript/narrowing.html",        # 37KB, CFA, discriminated unions, closure and aliasing holes
+    "typescript/generics.html",         # 36KB, inference, keyof constraints, const type params, fake generics
 
     # react, reviewed 2026-09-01 during the rebuild. Rebuilt to the mature
     # standard and judged complete below the baseline - the topic is narrower
